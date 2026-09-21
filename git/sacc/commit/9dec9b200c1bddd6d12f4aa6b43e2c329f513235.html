@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sacc 9dec9b20 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sacc</h1><span class="desc">Mirror of git://bitreich.org/sacc, the sacc gopher client from bitreich.org.</span><p class="url">git clone https://github.com/equwal/sacc</p><p><a href="../../sacc/index.html">Log</a> | <a href="../../sacc/files.html">Files</a> | <a href="../../sacc/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9dec9b200c1bddd6d12f4aa6b43e2c329f513235
+Quentin Rameau &lt;quinq@fifth.space&gt;
+2022-10-15 12:50:09 +0200
+
+tls: Handle local certificate path
+
+Although I believe that every computer should have a user &quot;quinq&quot;,
+use &quot;~/share/sacc/cert&quot; path by default for looking up certificates.
+
+Also, let the user override this default with the environment variable
+SACC_CERT_DIR.
+
+</pre><pre> io.h     |   1 +
+ io_clr.c |   7 +++
+ io_tls.c | 154 ++++++++++++++++++++++++++++++++++++++++++++++++++-------------
+ sacc.c   |   1 +
+ 4 files changed, 132 insertions(+), 31 deletions(-)
+</pre><pre>diff --git a/io.h b/io.h
+index a705355..ae92d8a 100644
+--- a/io.h
++++ b/io.h
+<span class="h">@@ -14,6 +14,7 @@ struct cnx {</span>
+ 
+ extern int tls;
+ 
+<span class="a">+extern int (*iosetup)(void);</span>
+ extern int (*ioclose)(struct cnx *);
+ extern int (*ioconnect)(struct cnx *, struct addrinfo *, const char *);
+ extern void (*ioconnerr)(struct cnx *, const char *, const char *, int);
+diff --git a/io_clr.c b/io_clr.c
+index 142f6a5..07277af 100644
+--- a/io_clr.c
++++ b/io_clr.c
+<span class="h">@@ -7,6 +7,12 @@</span>
+ #include &quot;common.h&quot;
+ #include &quot;io.h&quot;
+ 
+<span class="a">+static int</span>
+<span class="a">+setup_clr(void)</span>
+<span class="a">+{</span>
+<span class="a">+	return 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ static int
+ close_clr(struct cnx *c)
+ {
+<span class="h">@@ -55,6 +61,7 @@ write_clr(struct cnx *c, void *buf, size_t bs)</span>
+ 	return write(c-&gt;sock, buf, bs);
+ }
+ 
+<span class="a">+int (*iosetup)(void) = setup_clr;</span>
+ int (*ioclose)(struct cnx *) = close_clr;
+ int (*ioconnect)(struct cnx *, struct addrinfo *, const char *) = connect_clr;
+ void (*ioconnerr)(struct cnx *, const char *, const char *, int) = connerr_clr;
+diff --git a/io_tls.c b/io_tls.c
+index 3fe7904..b95368e 100644
+--- a/io_tls.c
++++ b/io_tls.c
+<span class="h">@@ -1,4 +1,6 @@</span>
+<span class="a">+#include &lt;errno.h&gt;</span>
+ #include &lt;limits.h&gt;
+<span class="a">+#include &lt;pwd.h&gt;</span>
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+<span class="h">@@ -6,6 +8,7 @@</span>
+ #include &lt;netdb.h&gt;
+ 
+ #include &lt;sys/socket.h&gt;
+<span class="a">+#include &lt;sys/stat.h&gt;</span>
+ 
+ #include &lt;tls.h&gt;
+ 
+<span class="h">@@ -16,8 +19,71 @@</span>
+ #define TLS_ON  1
+ #define TLS_PEM 2
+ 
+<span class="a">+struct pem {</span>
+<span class="a">+	char path[PATH_MAX];</span>
+<span class="a">+	char *dir;</span>
+<span class="a">+	char *cert;</span>
+<span class="a">+	size_t certln;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+ int tls;
+ 
+<span class="a">+static struct pem pem = { .dir = &quot;share/sacc/cert&quot; };</span>
+<span class="a">+</span>
+<span class="a">+static int</span>
+<span class="a">+mkpath(char *path, mode_t mode)</span>
+<span class="a">+{</span>
+<span class="a">+	char *s;</span>
+<span class="a">+	int r;</span>
+<span class="a">+</span>
+<span class="a">+	for (s = path+1; (s = strchr(s, &#x27;/&#x27;)) != NULL; ++s) {</span>
+<span class="a">+		s[0] = &#x27;\0&#x27;;</span>
+<span class="a">+		errno = 0;</span>
+<span class="a">+		r = mkdir(path, mode);</span>
+<span class="a">+		s[0] = &#x27;/&#x27;;</span>
+<span class="a">+		if (r == -1 &amp;&amp; errno != EEXIST)</span>
+<span class="a">+			return -1;</span>
+<span class="a">+	};</span>
+<span class="a">+	if (mkdir(path, S_IRWXU) == -1 &amp;&amp; errno != EEXIST)</span>
+<span class="a">+		return -1;</span>
+<span class="a">+	return 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+static int</span>
+<span class="a">+setup_tls(void)</span>
+<span class="a">+{</span>
+<span class="a">+	struct passwd *pw;</span>
+<span class="a">+	char *p;</span>
+<span class="a">+	int n;</span>
+<span class="a">+</span>
+<span class="a">+	if ((p = getenv(&quot;SACC_CERT_DIR&quot;)) != NULL) {</span>
+<span class="a">+		n = snprintf(pem.path, sizeof(pem.path), &quot;%s/&quot;, p);</span>
+<span class="a">+		if (n &lt; 0 || (unsigned)n &gt;= sizeof(pem.path)) {</span>
+<span class="a">+			diag(&quot;PEM path too long: %s/&quot;, p);</span>
+<span class="a">+			return -1;</span>
+<span class="a">+		}</span>
+<span class="a">+	} else {</span>
+<span class="a">+		if ((pw = getpwuid(geteuid())) == NULL)</span>
+<span class="a">+			return -1;</span>
+<span class="a">+		n = snprintf(pem.path, sizeof(pem.path), &quot;%s/%s/&quot;,</span>
+<span class="a">+		             pw-&gt;pw_dir, pem.dir);</span>
+<span class="a">+		if (n &lt; 0 || (unsigned)n &gt;= sizeof(pem.path)) {</span>
+<span class="a">+			diag(&quot;PEM path too long: %s/%s/&quot;, pw-&gt;pw_dir, pem.dir);</span>
+<span class="a">+			return -1;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	if (mkpath(pem.path, S_IRWXU) == -1) {</span>
+<span class="a">+		diag(&quot;Can&#x27;t create cert dir: %s: %s&quot;,</span>
+<span class="a">+		     pem.path, strerror(errno));</span>
+<span class="a">+	} else {</span>
+<span class="a">+		pem.cert = pem.path + n;</span>
+<span class="a">+		pem.certln = pem.cert - pem.path;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	return 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ static int
+ close_tls(struct cnx *c)
+ {
+<span class="h">@@ -41,6 +107,8 @@ savepem(struct tls *t, char *path)</span>
+ 	const char *s;
+ 	size_t ln;
+ 
+<span class="a">+	if (path == NULL)</span>
+<span class="a">+		return -1;</span>
+ 	if ((s = tls_peer_cert_chain_pem(t, &amp;ln)) == NULL)
+ 		return -1;
+ 	if ((f = fopen(path, &quot;w&quot;)) == NULL)
+<span class="h">@@ -52,55 +120,77 @@ savepem(struct tls *t, char *path)</span>
+ 	return 0;
+ }
+ 
+<span class="d">-static int</span>
+<span class="d">-connect_tls(struct cnx *c, struct addrinfo *ai, const char *host)</span>
+<span class="a">+static char *</span>
+<span class="a">+conftls(struct tls *t, const char *host)</span>
+ {
+<span class="d">-	char pempath[PATH_MAX];</span>
+<span class="d">-	struct tls *t;</span>
+ 	struct tls_config *tc;
+<span class="d">-	char *s;</span>
+<span class="d">-	int r;</span>
+<span class="a">+	char *p;</span>
+<span class="a">+	int n;</span>
+ 
+<span class="d">-	c-&gt;tls = NULL;</span>
+ 	tc = NULL;
+<span class="d">-	s = NULL;</span>
+<span class="d">-	r = -1;</span>
+<span class="a">+	p = NULL;</span>
+ 
+<span class="d">-	if (connect(c-&gt;sock, ai-&gt;ai_addr, ai-&gt;ai_addrlen) == -1)</span>
+<span class="d">-		return -1;</span>
+<span class="a">+	if (pem.cert == NULL)</span>
+<span class="a">+		return NULL;</span>
+ 
+<span class="d">-	if (!tls)</span>
+<span class="d">-		return 0;</span>
+<span class="d">-</span>
+<span class="d">-	if ((t = tls_client()) == NULL)</span>
+<span class="d">-		return -1;</span>
+<span class="a">+	n = snprintf(pem.cert, pem.certln, host);</span>
+<span class="a">+	if (n &lt; 0 || (unsigned)n &gt;= pem.certln) {</span>
+<span class="a">+		diag(&quot;PEM path too long: %s/%s&quot;, pem.cert, host);</span>
+<span class="a">+		return NULL;</span>
+<span class="a">+	}</span>
+ 
+<span class="d">-/* XXX: construct path from getuid home path */</span>
+<span class="d">-	snprintf(pempath, sizeof(pempath), &quot;/home/quinq/share/sacc/%s.pem&quot;, host);</span>
+ 	switch (tls) {
+ 	case TLS_ON:
+ 		/* check if there is a local certificate for target */
+<span class="d">-		if (access(pempath, R_OK) == 0) {</span>
+<span class="a">+		if (access(pem.path, R_OK) == 0) {</span>
+ 			if ((tc = tls_config_new()) == NULL)
+<span class="d">-				goto end;</span>
+<span class="d">-			if (tls_config_set_ca_file(tc, pempath) == -1)</span>
+<span class="a">+				return NULL;</span>
+<span class="a">+			if (tls_config_set_ca_file(tc, pem.path) == -1)</span>
+ 				goto end;
+ 			if (tls_configure(t, tc) == -1)
+ 				goto end;
+<span class="a">+			p = pem.path;</span>
+ 		}
+ 		break;
+ 	case TLS_PEM:
+ 		/* save target certificate to file */
+ 		if ((tc = tls_config_new()) == NULL)
+<span class="d">-			goto end;</span>
+<span class="a">+			return NULL;</span>
+ 		tls_config_insecure_noverifycert(tc);
+ 		if (tls_configure(t, tc) == -1)
+ 			goto end;
+<span class="a">+		p = pem.path;</span>
+ 		break;
+ 	}
+<span class="a">+end:</span>
+<span class="a">+	tls_config_free(tc);</span>
+<span class="a">+	return p;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+static int</span>
+<span class="a">+connect_tls(struct cnx *c, struct addrinfo *ai, const char *host)</span>
+<span class="a">+{</span>
+<span class="a">+	struct tls *t;</span>
+<span class="a">+	char *s, *pempath;</span>
+<span class="a">+	int r;</span>
+<span class="a">+</span>
+<span class="a">+	c-&gt;tls = NULL;</span>
+<span class="a">+	s = NULL;</span>
+<span class="a">+	r = CONN_ERROR;</span>
+<span class="a">+</span>
+<span class="a">+	if (connect(c-&gt;sock, ai-&gt;ai_addr, ai-&gt;ai_addrlen) == -1)</span>
+<span class="a">+		return r;</span>
+<span class="a">+</span>
+<span class="a">+	if (!tls)</span>
+<span class="a">+		return CONN_VALID;</span>
+<span class="a">+</span>
+<span class="a">+	if ((t = tls_client()) == NULL)</span>
+<span class="a">+		return r;</span>
+<span class="a">+</span>
+<span class="a">+	pempath = conftls(t, host);</span>
+ 
+ 	if (tls_connect_socket(t, c-&gt;sock, host) == -1)
+<span class="d">-		return -1;</span>
+<span class="a">+		goto end;</span>
+ 
+ 	do {
+ 		r = tls_handshake(t);
+<span class="h">@@ -120,13 +210,15 @@ connect_tls(struct cnx *c, struct addrinfo *ai, const char *host)</span>
+ 		diag(&quot;Can&#x27;t establish TLS with \&quot;%s\&quot;: %s&quot;,
+ 		     host, tls_error(t));
+ 
+<span class="d">-		s = uiprompt(&quot;Save certificate locally and retry? [yN]: &quot;);</span>
+<span class="d">-		switch (*s) {</span>
+<span class="d">-		case &#x27;Y&#x27;:</span>
+<span class="d">-		case &#x27;y&#x27;:</span>
+<span class="d">-			tls = TLS_PEM;</span>
+<span class="d">-			r = CONN_RETRY;</span>
+<span class="d">-			goto end;</span>
+<span class="a">+		if (pem.cert) {</span>
+<span class="a">+			s = uiprompt(&quot;Save certificate locally and retry? [yN]: &quot;);</span>
+<span class="a">+			switch (*s) {</span>
+<span class="a">+			case &#x27;Y&#x27;:</span>
+<span class="a">+			case &#x27;y&#x27;:</span>
+<span class="a">+				tls = TLS_PEM;</span>
+<span class="a">+				r = CONN_RETRY;</span>
+<span class="a">+				goto end;</span>
+<span class="a">+			}</span>
+ 		}
+ 
+ 		s = uiprompt(&quot;Retry on cleartext? [Yn]: &quot;);
+<span class="h">@@ -143,7 +235,6 @@ connect_tls(struct cnx *c, struct addrinfo *ai, const char *host)</span>
+ 	}
+ end:
+ 	free(s);
+<span class="d">-	tls_config_free(tc);</span>
+ 	if (r != CONN_VALID)
+ 		tls_free(t);
+ 
+<span class="h">@@ -219,6 +310,7 @@ write_tls(struct cnx *c, void *buf, size_t bs)</span>
+ 	return n;
+ }
+ 
+<span class="a">+int (*iosetup)(void) = setup_tls;</span>
+ int (*ioclose)(struct cnx *) = close_tls;
+ int (*ioconnect)(struct cnx *, struct addrinfo *, const char *) = connect_tls;
+ void (*ioconnerr)(struct cnx *, const char *, const char *, int) = connerr_tls;
+diff --git a/sacc.c b/sacc.c
+index 21ca9e0..e76c42d 100644
+--- a/sacc.c
++++ b/sacc.c
+<span class="h">@@ -1113,6 +1113,7 @@ setup(void)</span>
+ 	} else {
+ 		diag = stddiag;
+ 	}
+<span class="a">+	iosetup();</span>
+ }
+ 
+ int</pre>
+</div></body></html>

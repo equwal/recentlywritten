@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sacc 92394502 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sacc</h1><span class="desc">Mirror of git://bitreich.org/sacc, the sacc gopher client from bitreich.org.</span><p class="url">git clone https://github.com/equwal/sacc</p><p><a href="../../sacc/index.html">Log</a> | <a href="../../sacc/files.html">Files</a> | <a href="../../sacc/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 92394502830c460c78633f56a69da4ce5f01d5fa
+Quentin Rameau &lt;quinq@fifth.space&gt;
+2021-04-09 23:58:34 +0200
+
+Add TLS support
+
+TLS will be used when a gophers:// URL is requested.
+
+</pre><pre> Makefile  |   4 +-
+ config.mk |   4 ++
+ sacc.c    | 124 ++++++++++++++++++++++++++++++++++++++++++++++++++++----------
+ 3 files changed, 110 insertions(+), 22 deletions(-)
+</pre><pre>diff --git a/Makefile b/Makefile
+index 43e2fc6..54841cd 100644
+--- a/Makefile
++++ b/Makefile
+<span class="h">@@ -14,7 +14,7 @@ config.h:</span>
+ 	cp config.def.h config.h
+ 
+ $(BIN): $(OBJ)
+<span class="d">-	$(CC) $(OBJ) $(LDFLAGS) $(LIBS) -o $@</span>
+<span class="a">+	$(CC) $(OBJ) $(LDFLAGS) $(LIBS) $(TLSLIBS) -o $@</span>
+ 
+ $(OBJ): config.h config.mk common.h
+ 
+<span class="h">@@ -33,7 +33,7 @@ uninstall:</span>
+ 
+ # Stock FLAGS
+ SACCCFLAGS = -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=700 -D_BSD_SOURCE -D_GNU_SOURCE \
+<span class="d">-             $(CFLAGS)</span>
+<span class="a">+             $(TLSCFLAGS) $(CFLAGS)</span>
+ 
+ .c.o:
+ 	$(CC) $(SACCCFLAGS) -c $&lt;
+diff --git a/config.mk b/config.mk
+index 4308347..41622f9 100644
+--- a/config.mk
++++ b/config.mk
+<span class="h">@@ -12,3 +12,7 @@ LIBS=-lcurses</span>
+ # Define NEED_ASPRINTF and/or NEED_STRCASESTR in your cflags if your system does
+ # not provide asprintf() or strcasestr(), respectively.
+ #CFLAGS = -DNEED_ASPRINTF -DNEED_STRCASESTR
+<span class="a">+</span>
+<span class="a">+# gophers (gopher over TLS) support</span>
+<span class="a">+TLSCFLAGS = -DUSE_TLS</span>
+<span class="a">+TLSLIBS = -ltls</span>
+diff --git a/sacc.c b/sacc.c
+index 2649257..e322022 100644
+--- a/sacc.c
++++ b/sacc.c
+<span class="h">@@ -18,14 +18,26 @@</span>
+ #include &lt;sys/types.h&gt;
+ #include &lt;sys/wait.h&gt;
+ 
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+#include &lt;tls.h&gt;</span>
+<span class="a">+#endif</span>
+<span class="a">+</span>
+ #include &quot;common.h&quot;
+ #include &quot;config.h&quot;
+ 
+<span class="a">+struct cnx {</span>
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+	struct tls *tls;</span>
+<span class="a">+#endif</span>
+<span class="a">+	int sock;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+ static char *mainurl;
+ static Item *mainentry;
+ static int devnullfd;
+ static int parent = 1;
+ static int interactive;
+<span class="a">+static int tls;</span>
+ 
+ static void (*diag)(char *fmt, ...);
+ 
+<span class="h">@@ -417,7 +429,7 @@ molddiritem(char *raw)</span>
+ }
+ 
+ static char *
+<span class="d">-getrawitem(int sock)</span>
+<span class="a">+getrawitem(struct cnx *cnx)</span>
+ {
+ 	char *raw, *buf;
+ 	size_t bn, bs;
+<span class="h">@@ -445,7 +457,18 @@ getrawitem(int sock)</span>
+ 			buf = raw + (bn-1) * BUFSIZ;
+ 			bs = BUFSIZ;
+ 		}
+<span class="d">-	} while ((n = read(sock, buf, bs)) &gt; 0);</span>
+<span class="a">+</span>
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+		if (tls) {</span>
+<span class="a">+			do {</span>
+<span class="a">+				n = tls_read(cnx-&gt;tls, buf, bs);</span>
+<span class="a">+			} while (n == TLS_WANT_POLLIN || n == TLS_WANT_POLLOUT);</span>
+<span class="a">+		} else</span>
+<span class="a">+#endif</span>
+<span class="a">+		{</span>
+<span class="a">+			n = read(cnx-&gt;sock, buf, bs);</span>
+<span class="a">+		}</span>
+<span class="a">+	} while (n &gt; 0);</span>
+ 
+ 	*buf = &#x27;\0&#x27;;
+ 
+<span class="h">@@ -458,7 +481,7 @@ getrawitem(int sock)</span>
+ }
+ 
+ static int
+<span class="d">-sendselector(int sock, const char *selector)</span>
+<span class="a">+sendselector(struct cnx *cnx, const char *selector)</span>
+ {
+ 	char *msg, *p;
+ 	size_t ln;
+<span class="h">@@ -468,10 +491,21 @@ sendselector(int sock, const char *selector)</span>
+ 	msg = p = xmalloc(ln);
+ 	snprintf(msg, ln--, &quot;%s\r\n&quot;, selector);
+ 
+<span class="d">-	while ((n = write(sock, p, ln)) &gt; 0) {</span>
+<span class="a">+	do {</span>
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+		if (tls) {</span>
+<span class="a">+			do {</span>
+<span class="a">+				n = tls_write(cnx-&gt;tls, p, ln);</span>
+<span class="a">+			} while (n == TLS_WANT_POLLIN || n == TLS_WANT_POLLOUT);</span>
+<span class="a">+		} else</span>
+<span class="a">+#endif</span>
+<span class="a">+		{</span>
+<span class="a">+			n = write(cnx-&gt;sock, p, ln);</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+ 		ln -= n;
+ 		p += n;
+<span class="d">-	}</span>
+<span class="a">+	} while (n &gt; 0);</span>
+ 
+ 	free(msg);
+ 	if (n == -1)
+<span class="h">@@ -480,8 +514,20 @@ sendselector(int sock, const char *selector)</span>
+ 	return n;
+ }
+ 
+<span class="a">+static void</span>
+<span class="a">+closecnx(struct cnx *cnx)</span>
+<span class="a">+{</span>
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+	if (tls) {</span>
+<span class="a">+		tls_close(cnx-&gt;tls);</span>
+<span class="a">+		tls_free(cnx-&gt;tls);</span>
+<span class="a">+	}</span>
+<span class="a">+#endif</span>
+<span class="a">+	close(cnx-&gt;sock);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ static int
+<span class="d">-connectto(const char *host, const char *port)</span>
+<span class="a">+connectto(const char *host, const char *port, struct cnx *cnx)</span>
+ {
+ 	sigset_t set, oset;
+ 	static const struct addrinfo hints = {
+<span class="h">@@ -506,10 +552,23 @@ connectto(const char *host, const char *port)</span>
+ 		if ((sock = socket(addr-&gt;ai_family, addr-&gt;ai_socktype,
+ 		                   addr-&gt;ai_protocol)) &lt; 0)
+ 			continue;
+<span class="d">-		if ((r = connect(sock, addr-&gt;ai_addr, addr-&gt;ai_addrlen)) &lt; 0) {</span>
+<span class="a">+</span>
+<span class="a">+		r = connect(sock, addr-&gt;ai_addr, addr-&gt;ai_addrlen);</span>
+<span class="a">+		if (r == -1) {</span>
+ 			close(sock);
+ 			continue;
+ 		}
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+		if (tls) {</span>
+<span class="a">+			if ((cnx-&gt;tls = tls_client()) == NULL) {</span>
+<span class="a">+				diag(&quot;Can&#x27;t establish TLS with \&quot;%s\&quot;: %s&quot;,</span>
+<span class="a">+				     host, tls_error(cnx-&gt;tls));</span>
+<span class="a">+				close(sock);</span>
+<span class="a">+				continue;</span>
+<span class="a">+			}</span>
+<span class="a">+			r = tls_connect_socket(cnx-&gt;tls, sock, host);</span>
+<span class="a">+		}</span>
+<span class="a">+#endif</span>
+ 		break;
+ 	}
+ 
+<span class="h">@@ -526,8 +585,10 @@ connectto(const char *host, const char *port)</span>
+ 	}
+ 
+ 	sigprocmask(SIG_SETMASK, &amp;oset, NULL);
+<span class="d">-	return sock;</span>
+ 
+<span class="a">+	cnx-&gt;sock = sock;</span>
+<span class="a">+</span>
+<span class="a">+	return 0;</span>
+ err:
+ 	sigprocmask(SIG_SETMASK, &amp;oset, NULL);
+ 	return -1;
+<span class="h">@@ -537,13 +598,15 @@ static int</span>
+ download(Item *item, int dest)
+ {
+ 	char buf[BUFSIZ];
+<span class="a">+	struct cnx cnx;</span>
+ 	ssize_t r, w;
+ 	int src;
+ 
+ 	if (!item-&gt;tag) {
+<span class="d">-		if ((src = connectto(item-&gt;host, item-&gt;port)) &lt; 0 ||</span>
+<span class="d">-		    sendselector(src, item-&gt;selector) &lt; 0)</span>
+<span class="a">+		if (connectto(item-&gt;host, item-&gt;port, &amp;cnx) &lt; 0 ||</span>
+<span class="a">+		    sendselector(&amp;cnx, item-&gt;selector) &lt; 0)</span>
+ 			return 0;
+<span class="a">+		src = cnx.sock;</span>
+ 	} else if ((src = open(item-&gt;tag, O_RDONLY)) &lt; 0) {
+ 		printf(&quot;Can&#x27;t open source file %s: %s&quot;,
+ 		       item-&gt;tag, strerror(errno));
+<span class="h">@@ -551,8 +614,20 @@ download(Item *item, int dest)</span>
+ 		return 0;
+ 	}
+ 
+<span class="d">-	w = 0;</span>
+<span class="d">-	while ((r = read(src, buf, BUFSIZ)) &gt; 0) {</span>
+<span class="a">+	for (w = 0; w != -1;) {</span>
+<span class="a">+#ifdef USE_TLS</span>
+<span class="a">+		if (tls) {</span>
+<span class="a">+			do {</span>
+<span class="a">+				r = tls_read(cnx.tls, buf, sizeof(buf));</span>
+<span class="a">+			} while (r == TLS_WANT_POLLIN || r == TLS_WANT_POLLOUT);</span>
+<span class="a">+		} else</span>
+<span class="a">+#endif</span>
+<span class="a">+		{</span>
+<span class="a">+			r = read(src, buf, sizeof(buf));</span>
+<span class="a">+		}</span>
+<span class="a">+		if (r &lt;= 0)</span>
+<span class="a">+			break;</span>
+<span class="a">+</span>
+ 		while ((w = write(dest, buf, r)) &gt; 0)
+ 			r -= w;
+ 	}
+<span class="h">@@ -563,7 +638,7 @@ download(Item *item, int dest)</span>
+ 		errno = 0;
+ 	}
+ 
+<span class="d">-	close(src);</span>
+<span class="a">+	closecnx(&amp;cnx);</span>
+ 
+ 	return (r == 0 &amp;&amp; w == 0);
+ }
+<span class="h">@@ -618,14 +693,15 @@ cleanup:</span>
+ static int
+ fetchitem(Item *item)
+ {
+<span class="d">-	char *raw, *r;</span>
+<span class="d">-	int sock;</span>
+<span class="a">+	struct cnx cnx;</span>
+<span class="a">+	char *raw;</span>
+ 
+<span class="d">-	if ((sock = connectto(item-&gt;host, item-&gt;port)) &lt; 0 ||</span>
+<span class="d">-	    sendselector(sock, item-&gt;selector) &lt; 0)</span>
+<span class="a">+	if (connectto(item-&gt;host, item-&gt;port, &amp;cnx) &lt; 0 ||</span>
+<span class="a">+	    sendselector(&amp;cnx, item-&gt;selector) &lt; 0)</span>
+ 		return 0;
+<span class="d">-	raw = getrawitem(sock);</span>
+<span class="d">-	close(sock);</span>
+<span class="a">+</span>
+<span class="a">+	raw = getrawitem(&amp;cnx);</span>
+<span class="a">+	closecnx(&amp;cnx);</span>
+ 
+ 	if (raw == NULL || !*raw) {
+ 		diag(&quot;Empty response from server&quot;);
+<span class="h">@@ -910,8 +986,16 @@ moldentry(char *url)</span>
+ 	int parsed, ipv6;
+ 
+ 	if (p = strstr(url, &quot;://&quot;)) {
+<span class="d">-		if (strncmp(url, &quot;gopher&quot;, p - url))</span>
+<span class="a">+		if (strncmp(url, &quot;gopher&quot;, p - url) == 0) {</span>
+<span class="a">+			if (tls) {</span>
+<span class="a">+				diag(&quot;Switching from gophers to gopher&quot;);</span>
+<span class="a">+				tls = 0;</span>
+<span class="a">+			}</span>
+<span class="a">+		} else if (strncmp(url, &quot;gophers&quot;, p - url) == 0) {</span>
+<span class="a">+			tls = 1;</span>
+<span class="a">+		} else {</span>
+ 			die(&quot;Protocol not supported: %.*s&quot;, p - url, url);
+<span class="a">+		}</span>
+ 		host = p + 3;
+ 	}
+ </pre>
+</div></body></html>

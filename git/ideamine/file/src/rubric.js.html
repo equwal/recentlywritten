@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/src/rubric.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/rubric.js (4442 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // How ideas are judged and which model builds them. Both triage paths (the MCP tool used by
+<a id="l2" href="#l2">2</a> // /idea-triage and the headless `ideamine triage`) read this file.
+<a id="l3" href="#l3">3</a> 
+<a id="l4" href="#l4">4</a> import path from &#x27;node:path&#x27;;
+<a id="l5" href="#l5">5</a> import { lane, listIdeas } from &#x27;./store.js&#x27;;
+<a id="l6" href="#l6">6</a> import { clip } from &#x27;./text.js&#x27;;
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> // Aliases are what Claude Code accepts (`claude --model sonnet`, Agent tool `model: &quot;sonnet&quot;`),
+<a id="l9" href="#l9">9</a> // so a recommendation stays valid when a new generation ships under the same alias.
+<a id="l10" href="#l10">10</a> // Prices: USD per million input/output tokens.
+<a id="l11" href="#l11">11</a> export const MODELS = [
+<a id="l12" href="#l12">12</a>   {
+<a id="l13" href="#l13">13</a>     alias: &#x27;haiku&#x27;,
+<a id="l14" href="#l14">14</a>     name: &#x27;Claude Haiku 4.5&#x27;,
+<a id="l15" href="#l15">15</a>     price: &#x27;$1/$5&#x27;,
+<a id="l16" href="#l16">16</a>     use: &#x27;mechanical, fully specified, local work: typos, renames, config tweaks, boilerplate, small scripts, lookups&#x27;,
+<a id="l17" href="#l17">17</a>   },
+<a id="l18" href="#l18">18</a>   {
+<a id="l19" href="#l19">19</a>     alias: &#x27;sonnet&#x27;,
+<a id="l20" href="#l20">20</a>     name: &#x27;Claude Sonnet 5&#x27;,
+<a id="l21" href="#l21">21</a>     price: &#x27;$2/$10&#x27;,
+<a id="l22" href="#l22">22</a>     use: &#x27;the default: ordinary features, bug fixes with a clear repro, tests, docs, contained refactors&#x27;,
+<a id="l23" href="#l23">23</a>   },
+<a id="l24" href="#l24">24</a>   {
+<a id="l25" href="#l25">25</a>     alias: &#x27;opus&#x27;,
+<a id="l26" href="#l26">26</a>     name: &#x27;Claude Opus 5&#x27;,
+<a id="l27" href="#l27">27</a>     price: &#x27;$5/$25&#x27;,
+<a id="l28" href="#l28">28</a>     use: &#x27;ambiguous or cross-cutting work: architecture, hard debugging, performance, security, unfamiliar domains&#x27;,
+<a id="l29" href="#l29">29</a>   },
+<a id="l30" href="#l30">30</a>   {
+<a id="l31" href="#l31">31</a>     alias: &#x27;fable&#x27;,
+<a id="l32" href="#l32">32</a>     name: &#x27;Claude Fable 5.1&#x27;,
+<a id="l33" href="#l33">33</a>     price: &#x27;$10/$50&#x27;,
+<a id="l34" href="#l34">34</a>     use: &#x27;only the hardest long-horizon or research-grade problems, where Opus would likely fail&#x27;,
+<a id="l35" href="#l35">35</a>   },
+<a id="l36" href="#l36">36</a> ];
+<a id="l37" href="#l37">37</a> 
+<a id="l38" href="#l38">38</a> export const RUBRIC = `Triage each idea. Be decisive: the user wants a short list worth building, not encouragement.
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a> For every idea return:
+<a id="l41" href="#l41">41</a> - verdict: &quot;do&quot; (clear value, worth building soon) | &quot;maybe&quot; (unclear value, blocked, or needs a decision from the user) | &quot;skip&quot; (low value, already exists, or costs far more than it returns)
+<a id="l42" href="#l42">42</a> - impact: 1-5, how much it would matter to the user or project if it shipped
+<a id="l43" href="#l43">43</a> - size: xs (&lt;15 min) | s (&lt;1 h) | m (a few hours) | l (1-2 days) | xl (multi-day, should be split)
+<a id="l44" href="#l44">44</a> - model: the CHEAPEST model likely to finish it in one pass. A failed attempt on a weaker model plus a retry costs more than the right model once.
+<a id="l45" href="#l45">45</a> ${MODELS.map((m) =&gt; `    ${m.alias.padEnd(6)} ${m.price.padEnd(7)} ${m.use}`).join(&#x27;\n&#x27;)}
+<a id="l46" href="#l46">46</a>     (prices in USD per million input/output tokens)
+<a id="l47" href="#l47">47</a> - title: imperative, at most 60 characters (&quot;Add ...&quot;, &quot;Fix ...&quot;)
+<a id="l48" href="#l48">48</a> - why: one sentence with the deciding reason
+<a id="l49" href="#l49">49</a> - brief: 1-4 sentences an agent can act on without this conversation: goal, scope, and &quot;done when&quot;. Leave empty for skip.
+<a id="l50" href="#l50">50</a> - dup_of: id of an existing idea this one duplicates (use verdict &quot;skip&quot;), if any`;
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> /** JSON Schema for a batch of verdicts; used for `claude -p --json-schema` and the MCP tool. */
+<a id="l53" href="#l53">53</a> export const VERDICT_SCHEMA = {
+<a id="l54" href="#l54">54</a>   type: &#x27;object&#x27;,
+<a id="l55" href="#l55">55</a>   properties: {
+<a id="l56" href="#l56">56</a>     id: { type: &#x27;integer&#x27; },
+<a id="l57" href="#l57">57</a>     verdict: { type: &#x27;string&#x27;, enum: [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;] },
+<a id="l58" href="#l58">58</a>     impact: { type: &#x27;integer&#x27;, minimum: 1, maximum: 5 },
+<a id="l59" href="#l59">59</a>     size: { type: &#x27;string&#x27;, enum: [&#x27;xs&#x27;, &#x27;s&#x27;, &#x27;m&#x27;, &#x27;l&#x27;, &#x27;xl&#x27;] },
+<a id="l60" href="#l60">60</a>     model: { type: &#x27;string&#x27;, enum: MODELS.map((m) =&gt; m.alias) },
+<a id="l61" href="#l61">61</a>     title: { type: &#x27;string&#x27; },
+<a id="l62" href="#l62">62</a>     why: { type: &#x27;string&#x27; },
+<a id="l63" href="#l63">63</a>     brief: { type: &#x27;string&#x27; },
+<a id="l64" href="#l64">64</a>     dup_of: { type: &#x27;integer&#x27; },
+<a id="l65" href="#l65">65</a>   },
+<a id="l66" href="#l66">66</a>   required: [&#x27;id&#x27;, &#x27;verdict&#x27;, &#x27;impact&#x27;, &#x27;size&#x27;, &#x27;model&#x27;, &#x27;title&#x27;, &#x27;why&#x27;, &#x27;brief&#x27;],
+<a id="l67" href="#l67">67</a> };
+<a id="l68" href="#l68">68</a> 
+<a id="l69" href="#l69">69</a> export const BATCH_SCHEMA = {
+<a id="l70" href="#l70">70</a>   type: &#x27;object&#x27;,
+<a id="l71" href="#l71">71</a>   properties: { verdicts: { type: &#x27;array&#x27;, items: VERDICT_SCHEMA } },
+<a id="l72" href="#l72">72</a>   required: [&#x27;verdicts&#x27;],
+<a id="l73" href="#l73">73</a> };
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a> /** Ideas waiting for a verdict: the inbox, or the given ids (re-triage). */
+<a id="l76" href="#l76">76</a> export function pendingIdeas(db, { ids = null, limit = 30 } = {}) {
+<a id="l77" href="#l77">77</a>   if (Array.isArray(ids) &amp;&amp; ids.length) {
+<a id="l78" href="#l78">78</a>     const wanted = new Set(ids.map(Number));
+<a id="l79" href="#l79">79</a>     return db.ideas.filter((i) =&gt; wanted.has(i.id));
+<a id="l80" href="#l80">80</a>   }
+<a id="l81" href="#l81">81</a>   return listIdeas(db, { filter: &#x27;inbox&#x27; }).reverse().slice(0, limit); // oldest first
+<a id="l82" href="#l82">82</a> }
+<a id="l83" href="#l83">83</a> 
+<a id="l84" href="#l84">84</a> /** The rubric plus the ideas to judge, as one prompt. */
+<a id="l85" href="#l85">85</a> export function triagePrompt(db, pending) {
+<a id="l86" href="#l86">86</a>   const pendingIds = new Set(pending.map((i) =&gt; i.id));
+<a id="l87" href="#l87">87</a>   const existing = db.ideas
+<a id="l88" href="#l88">88</a>     .filter((i) =&gt; !pendingIds.has(i.id) &amp;&amp; [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;].includes(lane(i)))
+<a id="l89" href="#l89">89</a>     .slice(-60)
+<a id="l90" href="#l90">90</a>     .map((i) =&gt; `#${i.id} ${clip(i.title, 70)} (${lane(i)})`);
+<a id="l91" href="#l91">91</a>   const lines = [RUBRIC, &#x27;&#x27;];
+<a id="l92" href="#l92">92</a>   if (existing.length) lines.push(&#x27;Existing ideas, for duplicate checks:&#x27;, ...existing, &#x27;&#x27;);
+<a id="l93" href="#l93">93</a>   lines.push(`Ideas to triage (${pending.length}):`);
+<a id="l94" href="#l94">94</a>   for (const i of pending) {
+<a id="l95" href="#l95">95</a>     const ctx = [i.project &amp;&amp; `project: ${path.basename(i.project)}`, i.tags?.length &amp;&amp; `tags: ${i.tags.join(&#x27;, &#x27;)}`]
+<a id="l96" href="#l96">96</a>       .filter(Boolean)
+<a id="l97" href="#l97">97</a>       .join(&#x27;; &#x27;);
+<a id="l98" href="#l98">98</a>     lines.push(`#${i.id}${ctx ? ` [${ctx}]` : &#x27;&#x27;}: ${i.text.replace(/\r?\n/g, &#x27; / &#x27;)}`);
+<a id="l99" href="#l99">99</a>   }
+<a id="l100" href="#l100">100</a>   return lines.join(&#x27;\n&#x27;);
+<a id="l101" href="#l101">101</a> }</pre>
+</div></body></html>

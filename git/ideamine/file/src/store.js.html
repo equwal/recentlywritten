@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/src/store.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/store.js (11788 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // The idea archive: one JSON file shared by every Claude session, project, and model.
+<a id="l2" href="#l2">2</a> // Writers take a directory lock and replace the file atomically, so concurrent sessions,
+<a id="l3" href="#l3">3</a> // the hook, and the CLI can all write at once without losing ideas.
+<a id="l4" href="#l4">4</a> 
+<a id="l5" href="#l5">5</a> import fs from &#x27;node:fs&#x27;;
+<a id="l6" href="#l6">6</a> import os from &#x27;node:os&#x27;;
+<a id="l7" href="#l7">7</a> import path from &#x27;node:path&#x27;;
+<a id="l8" href="#l8">8</a> import { clip, deriveTitle, extractTags, isSimilar, normalizeTags, wordSet } from &#x27;./text.js&#x27;;
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> export const VERDICTS = [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;];
+<a id="l11" href="#l11">11</a> export const SIZES = [&#x27;xs&#x27;, &#x27;s&#x27;, &#x27;m&#x27;, &#x27;l&#x27;, &#x27;xl&#x27;];
+<a id="l12" href="#l12">12</a> export const SIZE_COST = { xs: 1, s: 2, m: 3, l: 5, xl: 8 };
+<a id="l13" href="#l13">13</a> export const MODEL_ALIASES = [&#x27;haiku&#x27;, &#x27;sonnet&#x27;, &#x27;opus&#x27;, &#x27;fable&#x27;];
+<a id="l14" href="#l14">14</a> export const STATUSES = [&#x27;inbox&#x27;, &#x27;triaged&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;, &#x27;dropped&#x27;];
+<a id="l15" href="#l15">15</a> export const FILTERS = [&#x27;open&#x27;, &#x27;inbox&#x27;, &#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;, &#x27;dropped&#x27;, &#x27;all&#x27;];
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> const LOCK_STALE_MS = 5000;
+<a id="l18" href="#l18">18</a> const LOCK_WAIT_MS = 8000;
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> export function home() {
+<a id="l21" href="#l21">21</a>   return process.env.IDEAMINE_HOME || path.join(os.homedir(), &#x27;.ideamine&#x27;);
+<a id="l22" href="#l22">22</a> }
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> export function dbPath() {
+<a id="l25" href="#l25">25</a>   return path.join(home(), &#x27;ideas.json&#x27;);
+<a id="l26" href="#l26">26</a> }
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> function sleepSync(ms) {
+<a id="l29" href="#l29">29</a>   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+<a id="l30" href="#l30">30</a> }
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> const now = () =&gt; new Date().toISOString();
+<a id="l33" href="#l33">33</a> 
+<a id="l34" href="#l34">34</a> function emptyDb() {
+<a id="l35" href="#l35">35</a>   return { version: 1, next_id: 1, ideas: [] };
+<a id="l36" href="#l36">36</a> }
+<a id="l37" href="#l37">37</a> 
+<a id="l38" href="#l38">38</a> /** Read-only snapshot. Safe without the lock because writes are atomic renames. */
+<a id="l39" href="#l39">39</a> export function load() {
+<a id="l40" href="#l40">40</a>   const file = dbPath();
+<a id="l41" href="#l41">41</a>   let raw;
+<a id="l42" href="#l42">42</a>   try {
+<a id="l43" href="#l43">43</a>     raw = fs.readFileSync(file, &#x27;utf8&#x27;).replace(/^﻿/, &#x27;&#x27;);
+<a id="l44" href="#l44">44</a>   } catch (e) {
+<a id="l45" href="#l45">45</a>     if (e.code === &#x27;ENOENT&#x27;) return emptyDb();
+<a id="l46" href="#l46">46</a>     throw e;
+<a id="l47" href="#l47">47</a>   }
+<a id="l48" href="#l48">48</a>   if (!raw.trim()) return emptyDb();
+<a id="l49" href="#l49">49</a>   let db;
+<a id="l50" href="#l50">50</a>   try {
+<a id="l51" href="#l51">51</a>     db = JSON.parse(raw);
+<a id="l52" href="#l52">52</a>   } catch (e) {
+<a id="l53" href="#l53">53</a>     throw new Error(`${file} is not valid JSON (${e.message}). Fix it, or restore ${file}.bak`);
+<a id="l54" href="#l54">54</a>   }
+<a id="l55" href="#l55">55</a>   if (!db || !Array.isArray(db.ideas)) throw new Error(`${file} has no &quot;ideas&quot; array`);
+<a id="l56" href="#l56">56</a>   const maxId = db.ideas.reduce((m, i) =&gt; Math.max(m, Number(i.id) || 0), 0);
+<a id="l57" href="#l57">57</a>   db.next_id = Math.max(Number(db.next_id) || 1, maxId + 1);
+<a id="l58" href="#l58">58</a>   return db;
+<a id="l59" href="#l59">59</a> }
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> function acquireLock() {
+<a id="l62" href="#l62">62</a>   fs.mkdirSync(home(), { recursive: true });
+<a id="l63" href="#l63">63</a>   const lockDir = path.join(home(), &#x27;.lock&#x27;);
+<a id="l64" href="#l64">64</a>   const deadline = Date.now() + LOCK_WAIT_MS;
+<a id="l65" href="#l65">65</a>   for (let attempt = 0; ; attempt++) {
+<a id="l66" href="#l66">66</a>     try {
+<a id="l67" href="#l67">67</a>       fs.mkdirSync(lockDir);
+<a id="l68" href="#l68">68</a>       return () =&gt; fs.rmSync(lockDir, { recursive: true, force: true });
+<a id="l69" href="#l69">69</a>     } catch (e) {
+<a id="l70" href="#l70">70</a>       if (e.code !== &#x27;EEXIST&#x27;) throw e;
+<a id="l71" href="#l71">71</a>     }
+<a id="l72" href="#l72">72</a>     try {
+<a id="l73" href="#l73">73</a>       // A writer holds the lock for milliseconds; an old lock means a crashed process.
+<a id="l74" href="#l74">74</a>       if (Date.now() - fs.statSync(lockDir).mtimeMs &gt; LOCK_STALE_MS) {
+<a id="l75" href="#l75">75</a>         fs.rmSync(lockDir, { recursive: true, force: true });
+<a id="l76" href="#l76">76</a>         continue;
+<a id="l77" href="#l77">77</a>       }
+<a id="l78" href="#l78">78</a>     } catch {
+<a id="l79" href="#l79">79</a>       // The lock vanished between mkdir and stat; the next attempt will likely get it.
+<a id="l80" href="#l80">80</a>     }
+<a id="l81" href="#l81">81</a>     if (Date.now() &gt; deadline) {
+<a id="l82" href="#l82">82</a>       throw new Error(`idea store is busy (lock: ${lockDir}). Delete that folder if no ideamine process is running.`);
+<a id="l83" href="#l83">83</a>     }
+<a id="l84" href="#l84">84</a>     sleepSync(Math.min(10 + attempt * 5, 100));
+<a id="l85" href="#l85">85</a>   }
+<a id="l86" href="#l86">86</a> }
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a> function renameWithRetry(from, to) {
+<a id="l89" href="#l89">89</a>   // Windows refuses to replace a file that another program (editor, antivirus, sync) has open.
+<a id="l90" href="#l90">90</a>   for (let attempt = 0; ; attempt++) {
+<a id="l91" href="#l91">91</a>     try {
+<a id="l92" href="#l92">92</a>       fs.renameSync(from, to);
+<a id="l93" href="#l93">93</a>       return;
+<a id="l94" href="#l94">94</a>     } catch (e) {
+<a id="l95" href="#l95">95</a>       if (attempt &gt;= 40 || ![&#x27;EPERM&#x27;, &#x27;EBUSY&#x27;, &#x27;EACCES&#x27;].includes(e.code)) {
+<a id="l96" href="#l96">96</a>         fs.rmSync(from, { force: true });
+<a id="l97" href="#l97">97</a>         throw e;
+<a id="l98" href="#l98">98</a>       }
+<a id="l99" href="#l99">99</a>       sleepSync(25);
+<a id="l100" href="#l100">100</a>     }
+<a id="l101" href="#l101">101</a>   }
+<a id="l102" href="#l102">102</a> }
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a> function save(db) {
+<a id="l105" href="#l105">105</a>   const file = dbPath();
+<a id="l106" href="#l106">106</a>   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+<a id="l107" href="#l107">107</a>   fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + &#x27;\n&#x27;);
+<a id="l108" href="#l108">108</a>   try {
+<a id="l109" href="#l109">109</a>     fs.copyFileSync(file, `${file}.bak`);
+<a id="l110" href="#l110">110</a>   } catch (e) {
+<a id="l111" href="#l111">111</a>     if (e.code !== &#x27;ENOENT&#x27;) throw e;
+<a id="l112" href="#l112">112</a>   }
+<a id="l113" href="#l113">113</a>   renameWithRetry(tmp, file);
+<a id="l114" href="#l114">114</a> }
+<a id="l115" href="#l115">115</a> 
+<a id="l116" href="#l116">116</a> /** Lock, read, apply `fn(db)`, write. Nothing is written if `fn` throws. */
+<a id="l117" href="#l117">117</a> export function mutate(fn) {
+<a id="l118" href="#l118">118</a>   const release = acquireLock();
+<a id="l119" href="#l119">119</a>   try {
+<a id="l120" href="#l120">120</a>     const db = load();
+<a id="l121" href="#l121">121</a>     const result = fn(db);
+<a id="l122" href="#l122">122</a>     save(db);
+<a id="l123" href="#l123">123</a>     return result;
+<a id="l124" href="#l124">124</a>   } finally {
+<a id="l125" href="#l125">125</a>     release();
+<a id="l126" href="#l126">126</a>   }
+<a id="l127" href="#l127">127</a> }
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a> // ---------------------------------------------------------------------------------------------
+<a id="l130" href="#l130">130</a> // Queries
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a> export function samePath(a, b) {
+<a id="l133" href="#l133">133</a>   if (!a || !b) return false;
+<a id="l134" href="#l134">134</a>   const norm = (p) =&gt; {
+<a id="l135" href="#l135">135</a>     const r = path.resolve(p).replace(/[\\/]+$/, &#x27;&#x27;);
+<a id="l136" href="#l136">136</a>     return process.platform === &#x27;win32&#x27; ? r.toLowerCase() : r;
+<a id="l137" href="#l137">137</a>   };
+<a id="l138" href="#l138">138</a>   return norm(a) === norm(b);
+<a id="l139" href="#l139">139</a> }
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a> export function findIdea(db, id) {
+<a id="l142" href="#l142">142</a>   const n = Number(String(id).replace(/^#/, &#x27;&#x27;));
+<a id="l143" href="#l143">143</a>   return db.ideas.find((i) =&gt; i.id === n) || null;
+<a id="l144" href="#l144">144</a> }
+<a id="l145" href="#l145">145</a> 
+<a id="l146" href="#l146">146</a> export function verdictOf(idea) {
+<a id="l147" href="#l147">147</a>   return idea.status === &#x27;triaged&#x27; ? idea.triage?.verdict || null : null;
+<a id="l148" href="#l148">148</a> }
+<a id="l149" href="#l149">149</a> 
+<a id="l150" href="#l150">150</a> /** Value per unit of effort; untriaged ideas sort last. */
+<a id="l151" href="#l151">151</a> export function priority(idea) {
+<a id="l152" href="#l152">152</a>   const t = idea.triage;
+<a id="l153" href="#l153">153</a>   if (!t) return 0;
+<a id="l154" href="#l154">154</a>   return (Number(t.impact) || 3) / (SIZE_COST[t.size] || 3);
+<a id="l155" href="#l155">155</a> }
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a> /** Lane an idea shows up in on the board. */
+<a id="l158" href="#l158">158</a> export function lane(idea) {
+<a id="l159" href="#l159">159</a>   if (idea.status === &#x27;triaged&#x27;) return idea.triage?.verdict || &#x27;maybe&#x27;;
+<a id="l160" href="#l160">160</a>   return idea.status;
+<a id="l161" href="#l161">161</a> }
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a> const LANE_ORDER = [&#x27;doing&#x27;, &#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;inbox&#x27;, &#x27;skip&#x27;, &#x27;done&#x27;, &#x27;dropped&#x27;];
+<a id="l164" href="#l164">164</a> 
+<a id="l165" href="#l165">165</a> export function matchesFilter(idea, filter) {
+<a id="l166" href="#l166">166</a>   const l = lane(idea);
+<a id="l167" href="#l167">167</a>   switch (filter) {
+<a id="l168" href="#l168">168</a>     case &#x27;all&#x27;:
+<a id="l169" href="#l169">169</a>       return true;
+<a id="l170" href="#l170">170</a>     case &#x27;open&#x27;:
+<a id="l171" href="#l171">171</a>       return [&#x27;doing&#x27;, &#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;inbox&#x27;].includes(l);
+<a id="l172" href="#l172">172</a>     default:
+<a id="l173" href="#l173">173</a>       return l === filter;
+<a id="l174" href="#l174">174</a>   }
+<a id="l175" href="#l175">175</a> }
+<a id="l176" href="#l176">176</a> 
+<a id="l177" href="#l177">177</a> export function listIdeas(db, { filter = &#x27;open&#x27;, project = null, query = &#x27;&#x27;, limit = 0 } = {}) {
+<a id="l178" href="#l178">178</a>   if (!FILTERS.includes(filter)) throw new Error(`unknown filter &quot;${filter}&quot; (use: ${FILTERS.join(&#x27;, &#x27;)})`);
+<a id="l179" href="#l179">179</a>   const words = String(query || &#x27;&#x27;).toLowerCase().split(/\s+/).filter(Boolean);
+<a id="l180" href="#l180">180</a>   let ideas = db.ideas.filter((i) =&gt; matchesFilter(i, filter));
+<a id="l181" href="#l181">181</a>   if (project) ideas = ideas.filter((i) =&gt; samePath(i.project, project));
+<a id="l182" href="#l182">182</a>   if (words.length) {
+<a id="l183" href="#l183">183</a>     ideas = ideas.filter((i) =&gt; {
+<a id="l184" href="#l184">184</a>       const hay = `${i.title}\n${i.text}\n${(i.tags || []).join(&#x27; &#x27;)}`.toLowerCase();
+<a id="l185" href="#l185">185</a>       return words.every((w) =&gt; hay.includes(w));
+<a id="l186" href="#l186">186</a>     });
+<a id="l187" href="#l187">187</a>   }
+<a id="l188" href="#l188">188</a>   ideas.sort((a, b) =&gt; {
+<a id="l189" href="#l189">189</a>     const la = LANE_ORDER.indexOf(lane(a));
+<a id="l190" href="#l190">190</a>     const lb = LANE_ORDER.indexOf(lane(b));
+<a id="l191" href="#l191">191</a>     if (la !== lb) return la - lb;
+<a id="l192" href="#l192">192</a>     if ([&#x27;done&#x27;, &#x27;dropped&#x27;, &#x27;inbox&#x27;].includes(lane(a))) return b.id - a.id; // newest first
+<a id="l193" href="#l193">193</a>     return priority(b) - priority(a) || a.id - b.id;
+<a id="l194" href="#l194">194</a>   });
+<a id="l195" href="#l195">195</a>   return limit &gt; 0 ? ideas.slice(0, limit) : ideas;
+<a id="l196" href="#l196">196</a> }
+<a id="l197" href="#l197">197</a> 
+<a id="l198" href="#l198">198</a> export function counts(db) {
+<a id="l199" href="#l199">199</a>   const c = { inbox: 0, do: 0, maybe: 0, skip: 0, doing: 0, done: 0, dropped: 0 };
+<a id="l200" href="#l200">200</a>   for (const i of db.ideas) c[lane(i)] = (c[lane(i)] || 0) + 1;
+<a id="l201" href="#l201">201</a>   c.open = c.inbox + c.do + c.maybe + c.doing;
+<a id="l202" href="#l202">202</a>   return c;
+<a id="l203" href="#l203">203</a> }
+<a id="l204" href="#l204">204</a> 
+<a id="l205" href="#l205">205</a> /** Best idea to build next: verdict &quot;do&quot;, not started, current project first, then value per effort. */
+<a id="l206" href="#l206">206</a> export function pickNext(db, { project = null, only = false } = {}) {
+<a id="l207" href="#l207">207</a>   let ready = db.ideas.filter((i) =&gt; lane(i) === &#x27;do&#x27;);
+<a id="l208" href="#l208">208</a>   if (only) ready = ready.filter((i) =&gt; samePath(i.project, project));
+<a id="l209" href="#l209">209</a>   ready.sort((a, b) =&gt; {
+<a id="l210" href="#l210">210</a>     const pa = project &amp;&amp; samePath(a.project, project) ? 1 : 0;
+<a id="l211" href="#l211">211</a>     const pb = project &amp;&amp; samePath(b.project, project) ? 1 : 0;
+<a id="l212" href="#l212">212</a>     return pb - pa || priority(b) - priority(a) || a.id - b.id;
+<a id="l213" href="#l213">213</a>   });
+<a id="l214" href="#l214">214</a>   return ready[0] || null;
+<a id="l215" href="#l215">215</a> }
+<a id="l216" href="#l216">216</a> 
+<a id="l217" href="#l217">217</a> function similarTo(db, text, excludeId) {
+<a id="l218" href="#l218">218</a>   const words = wordSet(text);
+<a id="l219" href="#l219">219</a>   if (words.size &lt; 2) return [];
+<a id="l220" href="#l220">220</a>   return db.ideas
+<a id="l221" href="#l221">221</a>     .filter((i) =&gt; i.id !== excludeId &amp;&amp; i.status !== &#x27;dropped&#x27; &amp;&amp; isSimilar(words, wordSet(`${i.title} ${i.text}`)))
+<a id="l222" href="#l222">222</a>     .slice(-2)
+<a id="l223" href="#l223">223</a>     .map((i) =&gt; ({ id: i.id, title: i.title, status: lane(i) }));
+<a id="l224" href="#l224">224</a> }
+<a id="l225" href="#l225">225</a> 
+<a id="l226" href="#l226">226</a> // ---------------------------------------------------------------------------------------------
+<a id="l227" href="#l227">227</a> // Mutations
+<a id="l228" href="#l228">228</a> 
+<a id="l229" href="#l229">229</a> export function addIdeas(texts, { source = &#x27;mcp&#x27;, project = null, session = null, tags = [] } = {}) {
+<a id="l230" href="#l230">230</a>   const items = (Array.isArray(texts) ? texts : [texts]).map((t) =&gt; String(t ?? &#x27;&#x27;).trim()).filter(Boolean);
+<a id="l231" href="#l231">231</a>   if (!items.length) throw new Error(&#x27;idea text is empty&#x27;);
+<a id="l232" href="#l232">232</a>   return mutate((db) =&gt;
+<a id="l233" href="#l233">233</a>     items.map((text) =&gt; {
+<a id="l234" href="#l234">234</a>       const similar = similarTo(db, text, null);
+<a id="l235" href="#l235">235</a>       const stamp = now();
+<a id="l236" href="#l236">236</a>       const idea = {
+<a id="l237" href="#l237">237</a>         id: db.next_id++,
+<a id="l238" href="#l238">238</a>         title: deriveTitle(text),
+<a id="l239" href="#l239">239</a>         text,
+<a id="l240" href="#l240">240</a>         status: &#x27;inbox&#x27;,
+<a id="l241" href="#l241">241</a>         tags: normalizeTags([...extractTags(text), ...normalizeTags(tags)]),
+<a id="l242" href="#l242">242</a>         project: project ? path.resolve(project) : null,
+<a id="l243" href="#l243">243</a>         source,
+<a id="l244" href="#l244">244</a>         created: stamp,
+<a id="l245" href="#l245">245</a>         updated: stamp,
+<a id="l246" href="#l246">246</a>         triage: null,
+<a id="l247" href="#l247">247</a>         notes: [],
+<a id="l248" href="#l248">248</a>       };
+<a id="l249" href="#l249">249</a>       if (session) idea.session = String(session);
+<a id="l250" href="#l250">250</a>       db.ideas.push(idea);
+<a id="l251" href="#l251">251</a>       return { idea, similar };
+<a id="l252" href="#l252">252</a>     }),
+<a id="l253" href="#l253">253</a>   );
+<a id="l254" href="#l254">254</a> }
+<a id="l255" href="#l255">255</a> 
+<a id="l256" href="#l256">256</a> export function normalizeModel(model) {
+<a id="l257" href="#l257">257</a>   const m = String(model || &#x27;&#x27;).toLowerCase();
+<a id="l258" href="#l258">258</a>   return MODEL_ALIASES.find((alias) =&gt; m.includes(alias)) || null;
+<a id="l259" href="#l259">259</a> }
+<a id="l260" href="#l260">260</a> 
+<a id="l261" href="#l261">261</a> function cleanVerdict(v) {
+<a id="l262" href="#l262">262</a>   const verdict = String(v.verdict || &#x27;&#x27;).toLowerCase();
+<a id="l263" href="#l263">263</a>   if (!VERDICTS.includes(verdict)) throw new Error(`verdict must be one of ${VERDICTS.join(&#x27;/&#x27;)}`);
+<a id="l264" href="#l264">264</a>   const impact = Math.min(5, Math.max(1, Math.round(Number(v.impact) || 3)));
+<a id="l265" href="#l265">265</a>   const size = SIZES.includes(String(v.size || &#x27;&#x27;).toLowerCase()) ? String(v.size).toLowerCase() : &#x27;m&#x27;;
+<a id="l266" href="#l266">266</a>   const model = normalizeModel(v.model) || &#x27;sonnet&#x27;;
+<a id="l267" href="#l267">267</a>   return {
+<a id="l268" href="#l268">268</a>     verdict,
+<a id="l269" href="#l269">269</a>     impact,
+<a id="l270" href="#l270">270</a>     size,
+<a id="l271" href="#l271">271</a>     model,
+<a id="l272" href="#l272">272</a>     why: clip(v.why || &#x27;&#x27;, 300),
+<a id="l273" href="#l273">273</a>     brief: verdict === &#x27;skip&#x27; ? &#x27;&#x27; : String(v.brief || &#x27;&#x27;).trim().slice(0, 2000),
+<a id="l274" href="#l274">274</a>   };
+<a id="l275" href="#l275">275</a> }
+<a id="l276" href="#l276">276</a> 
+<a id="l277" href="#l277">277</a> /** Save triage verdicts. Bad items are reported individually instead of failing the batch. */
+<a id="l278" href="#l278">278</a> export function applyTriage(verdicts, { by = null } = {}) {
+<a id="l279" href="#l279">279</a>   if (!Array.isArray(verdicts) || !verdicts.length) throw new Error(&#x27;no verdicts given&#x27;);
+<a id="l280" href="#l280">280</a>   return mutate((db) =&gt;
+<a id="l281" href="#l281">281</a>     verdicts.map((v) =&gt; {
+<a id="l282" href="#l282">282</a>       const idea = findIdea(db, v?.id);
+<a id="l283" href="#l283">283</a>       if (!idea) return { id: v?.id, error: &#x27;no such idea&#x27; };
+<a id="l284" href="#l284">284</a>       let t;
+<a id="l285" href="#l285">285</a>       try {
+<a id="l286" href="#l286">286</a>         t = cleanVerdict(v);
+<a id="l287" href="#l287">287</a>       } catch (e) {
+<a id="l288" href="#l288">288</a>         return { id: idea.id, error: e.message };
+<a id="l289" href="#l289">289</a>       }
+<a id="l290" href="#l290">290</a>       idea.triage = { ...t, at: now(), ...(by ? { by } : {}) };
+<a id="l291" href="#l291">291</a>       if (v.title) idea.title = clip(v.title, 90);
+<a id="l292" href="#l292">292</a>       if (Array.isArray(v.tags)) idea.tags = normalizeTags([...(idea.tags || []), ...v.tags]);
+<a id="l293" href="#l293">293</a>       const dup = Number(v.dup_of);
+<a id="l294" href="#l294">294</a>       if (dup &amp;&amp; dup !== idea.id &amp;&amp; findIdea(db, dup)) idea.dup_of = dup;
+<a id="l295" href="#l295">295</a>       if (idea.status === &#x27;inbox&#x27;) idea.status = &#x27;triaged&#x27;;
+<a id="l296" href="#l296">296</a>       idea.updated = now();
+<a id="l297" href="#l297">297</a>       return { id: idea.id, verdict: t.verdict, model: t.model, size: t.size, title: idea.title };
+<a id="l298" href="#l298">298</a>     }),
+<a id="l299" href="#l299">299</a>   );
+<a id="l300" href="#l300">300</a> }
+<a id="l301" href="#l301">301</a> 
+<a id="l302" href="#l302">302</a> const STATUS_ALIASES = { start: &#x27;doing&#x27;, started: &#x27;doing&#x27;, finish: &#x27;done&#x27;, finished: &#x27;done&#x27;, drop: &#x27;dropped&#x27; };
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a> export function updateIdea(id, patch = {}) {
+<a id="l305" href="#l305">305</a>   return mutate((db) =&gt; {
+<a id="l306" href="#l306">306</a>     const idea = findIdea(db, id);
+<a id="l307" href="#l307">307</a>     if (!idea) throw new Error(`no idea #${id}`);
+<a id="l308" href="#l308">308</a>     if (patch.status) {
+<a id="l309" href="#l309">309</a>       let status = String(patch.status).toLowerCase();
+<a id="l310" href="#l310">310</a>       status = STATUS_ALIASES[status] || status;
+<a id="l311" href="#l311">311</a>       if (status === &#x27;reopen&#x27; || status === &#x27;open&#x27;) status = idea.triage ? &#x27;triaged&#x27; : &#x27;inbox&#x27;;
+<a id="l312" href="#l312">312</a>       if (!STATUSES.includes(status)) throw new Error(`status must be one of ${STATUSES.join(&#x27;, &#x27;)}, or reopen`);
+<a id="l313" href="#l313">313</a>       idea.status = status;
+<a id="l314" href="#l314">314</a>       if (status === &#x27;done&#x27; || status === &#x27;dropped&#x27;) idea.closed = now();
+<a id="l315" href="#l315">315</a>       else delete idea.closed;
+<a id="l316" href="#l316">316</a>     }
+<a id="l317" href="#l317">317</a>     if (patch.text) idea.text = String(patch.text).trim();
+<a id="l318" href="#l318">318</a>     if (patch.title) idea.title = clip(patch.title, 90);
+<a id="l319" href="#l319">319</a>     else if (patch.text) idea.title = deriveTitle(idea.text);
+<a id="l320" href="#l320">320</a>     if (Array.isArray(patch.tags)) idea.tags = normalizeTags(patch.tags);
+<a id="l321" href="#l321">321</a>     if (patch.project !== undefined) idea.project = patch.project ? path.resolve(patch.project) : null;
+<a id="l322" href="#l322">322</a>     if (patch.model) {
+<a id="l323" href="#l323">323</a>       const model = normalizeModel(patch.model);
+<a id="l324" href="#l324">324</a>       if (!model) throw new Error(`model must be one of ${MODEL_ALIASES.join(&#x27;, &#x27;)}`);
+<a id="l325" href="#l325">325</a>       idea.triage = { ...(idea.triage || { verdict: &#x27;do&#x27;, impact: 3, size: &#x27;m&#x27;, why: &#x27;&#x27;, brief: &#x27;&#x27; }), model };
+<a id="l326" href="#l326">326</a>       if (idea.status === &#x27;inbox&#x27;) idea.status = &#x27;triaged&#x27;;
+<a id="l327" href="#l327">327</a>     }
+<a id="l328" href="#l328">328</a>     if (patch.note) {
+<a id="l329" href="#l329">329</a>       idea.notes ||= [];
+<a id="l330" href="#l330">330</a>       idea.notes.push({ at: now(), text: String(patch.note).trim() });
+<a id="l331" href="#l331">331</a>     }
+<a id="l332" href="#l332">332</a>     idea.updated = now();
+<a id="l333" href="#l333">333</a>     return idea;
+<a id="l334" href="#l334">334</a>   });
+<a id="l335" href="#l335">335</a> }</pre>
+</div></body></html>
