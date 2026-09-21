@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>librivox/src/uploader.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>librivox</h1><span class="desc">Automated youtube uploading of audiobooks</span><p class="url">git clone https://github.com/equwal/librivox</p><p><a href="../../../librivox/index.html">Log</a> | <a href="../../../librivox/files.html">Files</a> | <a href="../../../librivox/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/uploader.py (6657 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> #!/usr/bin/python
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import httplib
+<a id="l4" href="#l4">4</a> import httplib2
+<a id="l5" href="#l5">5</a> import os
+<a id="l6" href="#l6">6</a> import random
+<a id="l7" href="#l7">7</a> import sys
+<a id="l8" href="#l8">8</a> import time
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> from apiclient.discovery import build
+<a id="l11" href="#l11">11</a> from apiclient.errors import HttpError
+<a id="l12" href="#l12">12</a> from apiclient.http import MediaFileUpload
+<a id="l13" href="#l13">13</a> from oauth2client.client import flow_from_clientsecrets
+<a id="l14" href="#l14">14</a> from oauth2client.file import Storage
+<a id="l15" href="#l15">15</a> from oauth2client.tools import argparser, run_flow
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> 
+<a id="l18" href="#l18">18</a> # Explicitly tell the underlying HTTP transport library not to retry, since
+<a id="l19" href="#l19">19</a> # we are handling retry logic ourselves.
+<a id="l20" href="#l20">20</a> httplib2.RETRIES = 1
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> # Maximum number of times to retry before giving up.
+<a id="l23" href="#l23">23</a> MAX_RETRIES = 10
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> # Always retry when these exceptions are raised.
+<a id="l26" href="#l26">26</a> RETRIABLE_EXCEPTIONS = (httplib2.HttpLib2Error, IOError, httplib.NotConnected,
+<a id="l27" href="#l27">27</a>   httplib.IncompleteRead, httplib.ImproperConnectionState,
+<a id="l28" href="#l28">28</a>   httplib.CannotSendRequest, httplib.CannotSendHeader,
+<a id="l29" href="#l29">29</a>   httplib.ResponseNotReady, httplib.BadStatusLine)
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> # Always retry when an apiclient.errors.HttpError with one of these status
+<a id="l32" href="#l32">32</a> # codes is raised.
+<a id="l33" href="#l33">33</a> RETRIABLE_STATUS_CODES = [500, 502, 503, 504]
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> # The CLIENT_SECRETS_FILE variable specifies the name of a file that contains
+<a id="l36" href="#l36">36</a> # the OAuth 2.0 information for this application, including its client_id and
+<a id="l37" href="#l37">37</a> # client_secret. You can acquire an OAuth 2.0 client ID and client secret from
+<a id="l38" href="#l38">38</a> # the Google Developers Console at
+<a id="l39" href="#l39">39</a> # https://console.developers.google.com/.
+<a id="l40" href="#l40">40</a> # Please ensure that you have enabled the YouTube Data API for your project.
+<a id="l41" href="#l41">41</a> # For more information about using OAuth2 to access the YouTube Data API, see:
+<a id="l42" href="#l42">42</a> #   https://developers.google.com/youtube/v3/guides/authentication
+<a id="l43" href="#l43">43</a> # For more information about the client_secrets.json file format, see:
+<a id="l44" href="#l44">44</a> #   https://developers.google.com/api-client-library/python/guide/aaa_client_secrets
+<a id="l45" href="#l45">45</a> CLIENT_SECRETS_FILE = &quot;client_secrets.json&quot;
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a> # This OAuth 2.0 access scope allows an application to upload files to the
+<a id="l48" href="#l48">48</a> # authenticated user&#x27;s YouTube channel, but doesn&#x27;t allow other types of access.
+<a id="l49" href="#l49">49</a> YOUTUBE_UPLOAD_SCOPE = &quot;https://www.googleapis.com/auth/youtube.upload&quot;
+<a id="l50" href="#l50">50</a> YOUTUBE_API_SERVICE_NAME = &quot;youtube&quot;
+<a id="l51" href="#l51">51</a> YOUTUBE_API_VERSION = &quot;v3&quot;
+<a id="l52" href="#l52">52</a> 
+<a id="l53" href="#l53">53</a> # This variable defines a message to display if the CLIENT_SECRETS_FILE is
+<a id="l54" href="#l54">54</a> # missing.
+<a id="l55" href="#l55">55</a> MISSING_CLIENT_SECRETS_MESSAGE = &quot;&quot;&quot;
+<a id="l56" href="#l56">56</a> WARNING: Please configure OAuth 2.0
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a> To make this sample run you will need to populate the client_secrets.json file
+<a id="l59" href="#l59">59</a> found at:
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a>    %s
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> with information from the Developers Console
+<a id="l64" href="#l64">64</a> https://console.developers.google.com/
+<a id="l65" href="#l65">65</a> 
+<a id="l66" href="#l66">66</a> For more information about the client_secrets.json file format, please visit:
+<a id="l67" href="#l67">67</a> https://developers.google.com/api-client-library/python/guide/aaa_client_secrets
+<a id="l68" href="#l68">68</a> &quot;&quot;&quot; % os.path.abspath(os.path.join(os.path.dirname(__file__),
+<a id="l69" href="#l69">69</a>                                    CLIENT_SECRETS_FILE))
+<a id="l70" href="#l70">70</a> 
+<a id="l71" href="#l71">71</a> VALID_PRIVACY_STATUSES = (&quot;public&quot;, &quot;private&quot;, &quot;unlisted&quot;)
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a> 
+<a id="l74" href="#l74">74</a> def get_authenticated_service(args):
+<a id="l75" href="#l75">75</a>   flow = flow_from_clientsecrets(CLIENT_SECRETS_FILE,
+<a id="l76" href="#l76">76</a>     scope=YOUTUBE_UPLOAD_SCOPE,
+<a id="l77" href="#l77">77</a>     message=MISSING_CLIENT_SECRETS_MESSAGE)
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a>   storage = Storage(&quot;%s-oauth2.json&quot; % sys.argv[0])
+<a id="l80" href="#l80">80</a>   credentials = storage.get()
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a>   if credentials is None or credentials.invalid:
+<a id="l83" href="#l83">83</a>     credentials = run_flow(flow, storage, args)
+<a id="l84" href="#l84">84</a> 
+<a id="l85" href="#l85">85</a>   return build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION,
+<a id="l86" href="#l86">86</a>     http=credentials.authorize(httplib2.Http()))
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a> def initialize_upload(youtube, options):
+<a id="l89" href="#l89">89</a>   tags = None
+<a id="l90" href="#l90">90</a>   if options.keywords:
+<a id="l91" href="#l91">91</a>     tags = options.keywords.split(&quot;,&quot;)
+<a id="l92" href="#l92">92</a> 
+<a id="l93" href="#l93">93</a>   body=dict(
+<a id="l94" href="#l94">94</a>     snippet=dict(
+<a id="l95" href="#l95">95</a>       title=options.title,
+<a id="l96" href="#l96">96</a>       description=options.description,
+<a id="l97" href="#l97">97</a>       tags=tags,
+<a id="l98" href="#l98">98</a>       categoryId=options.category
+<a id="l99" href="#l99">99</a>     ),
+<a id="l100" href="#l100">100</a>     status=dict(
+<a id="l101" href="#l101">101</a>       privacyStatus=options.privacyStatus
+<a id="l102" href="#l102">102</a>     )
+<a id="l103" href="#l103">103</a>   )
+<a id="l104" href="#l104">104</a> 
+<a id="l105" href="#l105">105</a>   # Call the API&#x27;s videos.insert method to create and upload the video.
+<a id="l106" href="#l106">106</a>   insert_request = youtube.videos().insert(
+<a id="l107" href="#l107">107</a>     part=&quot;,&quot;.join(body.keys()),
+<a id="l108" href="#l108">108</a>     body=body,
+<a id="l109" href="#l109">109</a>     # The chunksize parameter specifies the size of each chunk of data, in
+<a id="l110" href="#l110">110</a>     # bytes, that will be uploaded at a time. Set a higher value for
+<a id="l111" href="#l111">111</a>     # reliable connections as fewer chunks lead to faster uploads. Set a lower
+<a id="l112" href="#l112">112</a>     # value for better recovery on less reliable connections.
+<a id="l113" href="#l113">113</a>     #
+<a id="l114" href="#l114">114</a>     # Setting &quot;chunksize&quot; equal to -1 in the code below means that the entire
+<a id="l115" href="#l115">115</a>     # file will be uploaded in a single HTTP request. (If the upload fails,
+<a id="l116" href="#l116">116</a>     # it will still be retried where it left off.) This is usually a best
+<a id="l117" href="#l117">117</a>     # practice, but if you&#x27;re using Python older than 2.6 or if you&#x27;re
+<a id="l118" href="#l118">118</a>     # running on App Engine, you should set the chunksize to something like
+<a id="l119" href="#l119">119</a>     # 1024 * 1024 (1 megabyte).
+<a id="l120" href="#l120">120</a>     media_body=MediaFileUpload(options.file, chunksize=-1, resumable=True)
+<a id="l121" href="#l121">121</a>   )
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a>   resumable_upload(insert_request)
+<a id="l124" href="#l124">124</a> 
+<a id="l125" href="#l125">125</a> # This method implements an exponential backoff strategy to resume a
+<a id="l126" href="#l126">126</a> # failed upload.
+<a id="l127" href="#l127">127</a> def resumable_upload(insert_request):
+<a id="l128" href="#l128">128</a>   response = None
+<a id="l129" href="#l129">129</a>   error = None
+<a id="l130" href="#l130">130</a>   retry = 0
+<a id="l131" href="#l131">131</a>   while response is None:
+<a id="l132" href="#l132">132</a>     try:
+<a id="l133" href="#l133">133</a>       print &quot;Uploading file...&quot;
+<a id="l134" href="#l134">134</a>       status, response = insert_request.next_chunk()
+<a id="l135" href="#l135">135</a>       if &#x27;id&#x27; in response:
+<a id="l136" href="#l136">136</a>         print &quot;Video id &#x27;%s&#x27; was successfully uploaded.&quot; % response[&#x27;id&#x27;]
+<a id="l137" href="#l137">137</a>       else:
+<a id="l138" href="#l138">138</a>         exit(&quot;The upload failed with an unexpected response: %s&quot; % response)
+<a id="l139" href="#l139">139</a>     except HttpError, e:
+<a id="l140" href="#l140">140</a>       if e.resp.status in RETRIABLE_STATUS_CODES:
+<a id="l141" href="#l141">141</a>         error = &quot;A retriable HTTP error %d occurred:\n%s&quot; % (e.resp.status,
+<a id="l142" href="#l142">142</a>                                                              e.content)
+<a id="l143" href="#l143">143</a>       else:
+<a id="l144" href="#l144">144</a>         raise
+<a id="l145" href="#l145">145</a>     except RETRIABLE_EXCEPTIONS, e:
+<a id="l146" href="#l146">146</a>       error = &quot;A retriable error occurred: %s&quot; % e
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a>     if error is not None:
+<a id="l149" href="#l149">149</a>       print error
+<a id="l150" href="#l150">150</a>       retry += 1
+<a id="l151" href="#l151">151</a>       if retry &gt; MAX_RETRIES:
+<a id="l152" href="#l152">152</a>         exit(&quot;No longer attempting to retry.&quot;)
+<a id="l153" href="#l153">153</a> 
+<a id="l154" href="#l154">154</a>       max_sleep = 2 ** retry
+<a id="l155" href="#l155">155</a>       sleep_seconds = random.random() * max_sleep
+<a id="l156" href="#l156">156</a>       print &quot;Sleeping %f seconds and then retrying...&quot; % sleep_seconds
+<a id="l157" href="#l157">157</a>       time.sleep(sleep_seconds)
+<a id="l158" href="#l158">158</a> 
+<a id="l159" href="#l159">159</a> if __name__ == &#x27;__main__&#x27;:
+<a id="l160" href="#l160">160</a>   argparser.add_argument(&quot;--file&quot;, required=True, help=&quot;Video file to upload&quot;)
+<a id="l161" href="#l161">161</a>   argparser.add_argument(&quot;--title&quot;, help=&quot;Video title&quot;, default=&quot;Test Title&quot;)
+<a id="l162" href="#l162">162</a>   argparser.add_argument(&quot;--description&quot;, help=&quot;Video description&quot;,
+<a id="l163" href="#l163">163</a>     default=&quot;Test Description&quot;)
+<a id="l164" href="#l164">164</a>   argparser.add_argument(&quot;--category&quot;, default=&quot;22&quot;,
+<a id="l165" href="#l165">165</a>     help=&quot;Numeric video category. &quot; +
+<a id="l166" href="#l166">166</a>       &quot;See https://developers.google.com/youtube/v3/docs/videoCategories/list&quot;)
+<a id="l167" href="#l167">167</a>   argparser.add_argument(&quot;--keywords&quot;, help=&quot;Video keywords, comma separated&quot;,
+<a id="l168" href="#l168">168</a>     default=&quot;&quot;)
+<a id="l169" href="#l169">169</a>   argparser.add_argument(&quot;--privacyStatus&quot;, choices=VALID_PRIVACY_STATUSES,
+<a id="l170" href="#l170">170</a>     default=VALID_PRIVACY_STATUSES[0], help=&quot;Video privacy status.&quot;)
+<a id="l171" href="#l171">171</a>   args = argparser.parse_args()
+<a id="l172" href="#l172">172</a> 
+<a id="l173" href="#l173">173</a>   if not os.path.exists(args.file):
+<a id="l174" href="#l174">174</a>     exit(&quot;Please specify a valid file using the --file= parameter.&quot;)
+<a id="l175" href="#l175">175</a> 
+<a id="l176" href="#l176">176</a>   youtube = get_authenticated_service(args)
+<a id="l177" href="#l177">177</a>   try:
+<a id="l178" href="#l178">178</a>     initialize_upload(youtube, args)
+<a id="l179" href="#l179">179</a>   except HttpError, e:
+<a id="l180" href="#l180">180</a>     print &quot;An HTTP error %d occurred:\n%s&quot; % (e.resp.status, e.content)</pre>
+</div></body></html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>pass-simple/readpassphrase.c - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>pass-simple</h1><span class="desc">fork of zerous&#x27; minimal pass rewrite with bugfixes</span><p class="url">git clone https://github.com/equwal/pass-simple</p><p><a href="../../pass-simple/index.html">Log</a> | <a href="../../pass-simple/files.html">Files</a> | <a href="../../pass-simple/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>readpassphrase.c (5310 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> /*	$OpenBSD: readpassphrase.c,v 1.25 2015/09/14 10:45:27 guenther Exp $	*/
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> /*
+<a id="l4" href="#l4">4</a>  * Copyright (c) 2000-2002, 2007, 2010
+<a id="l5" href="#l5">5</a>  *	Todd C. Miller &lt;Todd.Miller@courtesan.com&gt;
+<a id="l6" href="#l6">6</a>  *
+<a id="l7" href="#l7">7</a>  * Permission to use, copy, modify, and distribute this software for any
+<a id="l8" href="#l8">8</a>  * purpose with or without fee is hereby granted, provided that the above
+<a id="l9" href="#l9">9</a>  * copyright notice and this permission notice appear in all copies.
+<a id="l10" href="#l10">10</a>  *
+<a id="l11" href="#l11">11</a>  * THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+<a id="l12" href="#l12">12</a>  * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+<a id="l13" href="#l13">13</a>  * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+<a id="l14" href="#l14">14</a>  * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+<a id="l15" href="#l15">15</a>  * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+<a id="l16" href="#l16">16</a>  * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+<a id="l17" href="#l17">17</a>  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+<a id="l18" href="#l18">18</a>  *
+<a id="l19" href="#l19">19</a>  * Sponsored in part by the Defense Advanced Research Projects
+<a id="l20" href="#l20">20</a>  * Agency (DARPA) and Air Force Research Laboratory, Air Force
+<a id="l21" href="#l21">21</a>  * Materiel Command, USAF, under agreement number F39502-99-1-0512.
+<a id="l22" href="#l22">22</a>  */
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> #include &lt;ctype.h&gt;
+<a id="l25" href="#l25">25</a> #include &lt;errno.h&gt;
+<a id="l26" href="#l26">26</a> #include &lt;fcntl.h&gt;
+<a id="l27" href="#l27">27</a> #include &lt;paths.h&gt;
+<a id="l28" href="#l28">28</a> #include &lt;pwd.h&gt;
+<a id="l29" href="#l29">29</a> #include &lt;signal.h&gt;
+<a id="l30" href="#l30">30</a> #include &lt;string.h&gt;
+<a id="l31" href="#l31">31</a> #include &lt;termios.h&gt;
+<a id="l32" href="#l32">32</a> #include &lt;unistd.h&gt;
+<a id="l33" href="#l33">33</a> 
+<a id="l34" href="#l34">34</a> #include &quot;readpassphrase.h&quot;
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> #ifdef TCSASOFT
+<a id="l37" href="#l37">37</a> #define _T_FLUSH	(TCSAFLUSH|TCSASOFT)
+<a id="l38" href="#l38">38</a> #else
+<a id="l39" href="#l39">39</a> #define _T_FLUSH	(TCSAFLUSH)
+<a id="l40" href="#l40">40</a> #endif
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> static volatile sig_atomic_t signo[_NSIG];
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> static void handler(int);
+<a id="l45" href="#l45">45</a> 
+<a id="l46" href="#l46">46</a> char *
+<a id="l47" href="#l47">47</a> readpassphrase(const char *prompt, char *buf, size_t bufsiz, int flags)
+<a id="l48" href="#l48">48</a> {
+<a id="l49" href="#l49">49</a> 	ssize_t nr;
+<a id="l50" href="#l50">50</a> 	int input, output, save_errno, i, need_restart;
+<a id="l51" href="#l51">51</a> 	char ch, *p, *end;
+<a id="l52" href="#l52">52</a> 	struct termios term, oterm;
+<a id="l53" href="#l53">53</a> 	struct sigaction sa, savealrm, saveint, savehup, savequit, saveterm;
+<a id="l54" href="#l54">54</a> 	struct sigaction savetstp, savettin, savettou, savepipe;
+<a id="l55" href="#l55">55</a> 
+<a id="l56" href="#l56">56</a> 	/* I suppose we could alloc on demand in this case (XXX). */
+<a id="l57" href="#l57">57</a> 	if (bufsiz == 0) {
+<a id="l58" href="#l58">58</a> 		errno = EINVAL;
+<a id="l59" href="#l59">59</a> 		return(NULL);
+<a id="l60" href="#l60">60</a> 	}
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> restart:
+<a id="l63" href="#l63">63</a> 	for (i = 0; i &lt; _NSIG; i++)
+<a id="l64" href="#l64">64</a> 		signo[i] = 0;
+<a id="l65" href="#l65">65</a> 	nr = -1;
+<a id="l66" href="#l66">66</a> 	save_errno = 0;
+<a id="l67" href="#l67">67</a> 	need_restart = 0;
+<a id="l68" href="#l68">68</a> 	/*
+<a id="l69" href="#l69">69</a> 	 * Read and write to /dev/tty if available.  If not, read from
+<a id="l70" href="#l70">70</a> 	 * stdin and write to stderr unless a tty is required.
+<a id="l71" href="#l71">71</a> 	 */
+<a id="l72" href="#l72">72</a> 	if ((flags &amp; RPP_STDIN) ||
+<a id="l73" href="#l73">73</a> 	    (input = output = open(_PATH_TTY, O_RDWR)) == -1) {
+<a id="l74" href="#l74">74</a> 		if (flags &amp; RPP_REQUIRE_TTY) {
+<a id="l75" href="#l75">75</a> 			errno = ENOTTY;
+<a id="l76" href="#l76">76</a> 			return(NULL);
+<a id="l77" href="#l77">77</a> 		}
+<a id="l78" href="#l78">78</a> 		input = STDIN_FILENO;
+<a id="l79" href="#l79">79</a> 		output = STDERR_FILENO;
+<a id="l80" href="#l80">80</a> 	}
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> 	/*
+<a id="l83" href="#l83">83</a> 	 * Turn off echo if possible.
+<a id="l84" href="#l84">84</a> 	 * If we are using a tty but are not the foreground pgrp this will
+<a id="l85" href="#l85">85</a> 	 * generate SIGTTOU, so do it *before* installing the signal handlers.
+<a id="l86" href="#l86">86</a> 	 */
+<a id="l87" href="#l87">87</a> 	if (input != STDIN_FILENO &amp;&amp; tcgetattr(input, &amp;oterm) == 0) {
+<a id="l88" href="#l88">88</a> 		memcpy(&amp;term, &amp;oterm, sizeof(term));
+<a id="l89" href="#l89">89</a> 		if (!(flags &amp; RPP_ECHO_ON))
+<a id="l90" href="#l90">90</a> 			term.c_lflag &amp;= ~(ECHO | ECHONL);
+<a id="l91" href="#l91">91</a> #ifdef VSTATUS
+<a id="l92" href="#l92">92</a> 		if (term.c_cc[VSTATUS] != _POSIX_VDISABLE)
+<a id="l93" href="#l93">93</a> 			term.c_cc[VSTATUS] = _POSIX_VDISABLE;
+<a id="l94" href="#l94">94</a> #endif
+<a id="l95" href="#l95">95</a> 		(void)tcsetattr(input, _T_FLUSH, &amp;term);
+<a id="l96" href="#l96">96</a> 	} else {
+<a id="l97" href="#l97">97</a> 		memset(&amp;term, 0, sizeof(term));
+<a id="l98" href="#l98">98</a> 		term.c_lflag |= ECHO;
+<a id="l99" href="#l99">99</a> 		memset(&amp;oterm, 0, sizeof(oterm));
+<a id="l100" href="#l100">100</a> 		oterm.c_lflag |= ECHO;
+<a id="l101" href="#l101">101</a> 	}
+<a id="l102" href="#l102">102</a> 
+<a id="l103" href="#l103">103</a> 	/*
+<a id="l104" href="#l104">104</a> 	 * Catch signals that would otherwise cause the user to end
+<a id="l105" href="#l105">105</a> 	 * up with echo turned off in the shell.  Don&#x27;t worry about
+<a id="l106" href="#l106">106</a> 	 * things like SIGXCPU and SIGVTALRM for now.
+<a id="l107" href="#l107">107</a> 	 */
+<a id="l108" href="#l108">108</a> 	sigemptyset(&amp;sa.sa_mask);
+<a id="l109" href="#l109">109</a> 	sa.sa_flags = 0;		/* don&#x27;t restart system calls */
+<a id="l110" href="#l110">110</a> 	sa.sa_handler = handler;
+<a id="l111" href="#l111">111</a> 	(void)sigaction(SIGALRM, &amp;sa, &amp;savealrm);
+<a id="l112" href="#l112">112</a> 	(void)sigaction(SIGHUP, &amp;sa, &amp;savehup);
+<a id="l113" href="#l113">113</a> 	(void)sigaction(SIGINT, &amp;sa, &amp;saveint);
+<a id="l114" href="#l114">114</a> 	(void)sigaction(SIGPIPE, &amp;sa, &amp;savepipe);
+<a id="l115" href="#l115">115</a> 	(void)sigaction(SIGQUIT, &amp;sa, &amp;savequit);
+<a id="l116" href="#l116">116</a> 	(void)sigaction(SIGTERM, &amp;sa, &amp;saveterm);
+<a id="l117" href="#l117">117</a> 	(void)sigaction(SIGTSTP, &amp;sa, &amp;savetstp);
+<a id="l118" href="#l118">118</a> 	(void)sigaction(SIGTTIN, &amp;sa, &amp;savettin);
+<a id="l119" href="#l119">119</a> 	(void)sigaction(SIGTTOU, &amp;sa, &amp;savettou);
+<a id="l120" href="#l120">120</a> 
+<a id="l121" href="#l121">121</a> 	if (!(flags &amp; RPP_STDIN))
+<a id="l122" href="#l122">122</a> 		(void)write(output, prompt, strlen(prompt));
+<a id="l123" href="#l123">123</a> 	end = buf + bufsiz - 1;
+<a id="l124" href="#l124">124</a> 	p = buf;
+<a id="l125" href="#l125">125</a> 	while ((nr = read(input, &amp;ch, 1)) == 1 &amp;&amp; ch != &#x27;\n&#x27; &amp;&amp; ch != &#x27;\r&#x27;) {
+<a id="l126" href="#l126">126</a> 		if (p &lt; end) {
+<a id="l127" href="#l127">127</a> 			if ((flags &amp; RPP_SEVENBIT))
+<a id="l128" href="#l128">128</a> 				ch &amp;= 0x7f;
+<a id="l129" href="#l129">129</a> 			if (isalpha((unsigned char)ch)) {
+<a id="l130" href="#l130">130</a> 				if ((flags &amp; RPP_FORCELOWER))
+<a id="l131" href="#l131">131</a> 					ch = (char)tolower((unsigned char)ch);
+<a id="l132" href="#l132">132</a> 				if ((flags &amp; RPP_FORCEUPPER))
+<a id="l133" href="#l133">133</a> 					ch = (char)toupper((unsigned char)ch);
+<a id="l134" href="#l134">134</a> 			}
+<a id="l135" href="#l135">135</a> 			*p++ = ch;
+<a id="l136" href="#l136">136</a> 		}
+<a id="l137" href="#l137">137</a> 	}
+<a id="l138" href="#l138">138</a> 	*p = &#x27;\0&#x27;;
+<a id="l139" href="#l139">139</a> 	save_errno = errno;
+<a id="l140" href="#l140">140</a> 	if (!(term.c_lflag &amp; ECHO))
+<a id="l141" href="#l141">141</a> 		(void)write(output, &quot;\n&quot;, 1);
+<a id="l142" href="#l142">142</a> 
+<a id="l143" href="#l143">143</a> 	/* Restore old terminal settings and signals. */
+<a id="l144" href="#l144">144</a> 	if (memcmp(&amp;term, &amp;oterm, sizeof(term)) != 0) {
+<a id="l145" href="#l145">145</a> 		while (tcsetattr(input, _T_FLUSH, &amp;oterm) == -1 &amp;&amp;
+<a id="l146" href="#l146">146</a> 		    errno == EINTR &amp;&amp; !signo[SIGTTOU])
+<a id="l147" href="#l147">147</a> 			continue;
+<a id="l148" href="#l148">148</a> 	}
+<a id="l149" href="#l149">149</a> 	(void)sigaction(SIGALRM, &amp;savealrm, NULL);
+<a id="l150" href="#l150">150</a> 	(void)sigaction(SIGHUP, &amp;savehup, NULL);
+<a id="l151" href="#l151">151</a> 	(void)sigaction(SIGINT, &amp;saveint, NULL);
+<a id="l152" href="#l152">152</a> 	(void)sigaction(SIGQUIT, &amp;savequit, NULL);
+<a id="l153" href="#l153">153</a> 	(void)sigaction(SIGPIPE, &amp;savepipe, NULL);
+<a id="l154" href="#l154">154</a> 	(void)sigaction(SIGTERM, &amp;saveterm, NULL);
+<a id="l155" href="#l155">155</a> 	(void)sigaction(SIGTSTP, &amp;savetstp, NULL);
+<a id="l156" href="#l156">156</a> 	(void)sigaction(SIGTTIN, &amp;savettin, NULL);
+<a id="l157" href="#l157">157</a> 	(void)sigaction(SIGTTOU, &amp;savettou, NULL);
+<a id="l158" href="#l158">158</a> 	if (input != STDIN_FILENO)
+<a id="l159" href="#l159">159</a> 		(void)close(input);
+<a id="l160" href="#l160">160</a> 
+<a id="l161" href="#l161">161</a> 	/*
+<a id="l162" href="#l162">162</a> 	 * If we were interrupted by a signal, resend it to ourselves
+<a id="l163" href="#l163">163</a> 	 * now that we have restored the signal handlers.
+<a id="l164" href="#l164">164</a> 	 */
+<a id="l165" href="#l165">165</a> 	for (i = 0; i &lt; _NSIG; i++) {
+<a id="l166" href="#l166">166</a> 		if (signo[i]) {
+<a id="l167" href="#l167">167</a> 			kill(getpid(), i);
+<a id="l168" href="#l168">168</a> 			switch (i) {
+<a id="l169" href="#l169">169</a> 			case SIGTSTP:
+<a id="l170" href="#l170">170</a> 			case SIGTTIN:
+<a id="l171" href="#l171">171</a> 			case SIGTTOU:
+<a id="l172" href="#l172">172</a> 				need_restart = 1;
+<a id="l173" href="#l173">173</a> 			}
+<a id="l174" href="#l174">174</a> 		}
+<a id="l175" href="#l175">175</a> 	}
+<a id="l176" href="#l176">176</a> 	if (need_restart)
+<a id="l177" href="#l177">177</a> 		goto restart;
+<a id="l178" href="#l178">178</a> 
+<a id="l179" href="#l179">179</a> 	if (save_errno)
+<a id="l180" href="#l180">180</a> 		errno = save_errno;
+<a id="l181" href="#l181">181</a> 	return(nr == -1 ? NULL : buf);
+<a id="l182" href="#l182">182</a> }
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a> static void handler(int s)
+<a id="l185" href="#l185">185</a> {
+<a id="l186" href="#l186">186</a> 	signo[s] = 1;
+<a id="l187" href="#l187">187</a> }</pre>
+</div></body></html>

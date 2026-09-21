@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay ca1a576e - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit ca1a576e27c7e45fe5ff5a5c4b14552923c1fa6c
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 17:32:02 -0700
+
+Stop Whisper looping on a phrase, which Japanese triggers constantly
+
+Japanese captions degenerated into the same sentence repeated - one segment
+came back as &quot;私はそれを見つけたことがありました&quot; four times - and decoding
+slowed to RTF 1.2-2.2 because the loop generates tokens indefinitely.
+
+Part of this was self-inflicted: the previous caption is fed back as
+initial_prompt for continuity, so once a looped caption is emitted it primes
+the model to loop again on the next segment. A caption detected as repetitive
+now clears that context instead of seeding it.
+
+Also added a decoder-level repetition_penalty (default 1.15, --repetition-penalty
+to tune) and a post-filter. The filter handles both observed shapes: identical
+chunks joined across segments, and a unit looping to the end of a chunk. The
+latter needed anchoring at the end rather than the start, because the loop does
+not always begin at the beginning - &quot;この日の日の日の日&quot; is &quot;こ&quot; then &quot;の日&quot;
+four times. Whole phrases collapse on a single repeat; short words need three
+in a row, since doubling is normal speech.
+
+After this, RTF on the same machine returned to 0.45-0.88 with no repeats.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> livecap.py          | 60 ++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ tests/test_smoke.py | 36 ++++++++++++++++++++++++++++++++
+ 2 files changed, 95 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/livecap.py b/livecap.py
+index 3e59794..692043b 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -400,6 +400,53 @@ def valid_language(code):</span>
+         return bool(re.fullmatch(r&quot;[a-z]{2,3}&quot;, code))
+ 
+ 
+<span class="a">+def collapse_looping_tail(s, min_reps=3):</span>
+<span class="a">+    &quot;&quot;&quot;Trim a unit that repeats to the end of the string.</span>
+<span class="a">+</span>
+<span class="a">+    The loop does not necessarily start at the beginning - &quot;この日の日の日の日&quot;</span>
+<span class="a">+    is &quot;こ&quot; followed by &quot;の日&quot; four times - so anchor the search at the end.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    n = len(s)</span>
+<span class="a">+    for p in range(1, n // min_reps + 1):</span>
+<span class="a">+        unit = s[n - p:]</span>
+<span class="a">+        k = 0</span>
+<span class="a">+        while (k + 1) * p &lt;= n and s[n - (k + 1) * p: n - k * p] == unit:</span>
+<span class="a">+            k += 1</span>
+<span class="a">+        if k &gt;= min_reps:</span>
+<span class="a">+            return s[: n - (k - 1) * p]</span>
+<span class="a">+    return s</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def collapse_repeats(text):</span>
+<span class="a">+    &quot;&quot;&quot;Whisper degenerates into repeating a phrase; keep one copy.</span>
+<span class="a">+</span>
+<span class="a">+    Two shapes show up: identical chunks joined from consecutive segments</span>
+<span class="a">+    (&quot;A A A&quot;), and a unit looped inside one chunk (&quot;この日の日の日&quot;).</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    s = &quot; &quot;.join(text.split())</span>
+<span class="a">+    if not s:</span>
+<span class="a">+        return s</span>
+<span class="a">+</span>
+<span class="a">+    out = []</span>
+<span class="a">+    for c in s.split(&quot; &quot;):</span>
+<span class="a">+        # Only whole phrases collapse on a single repeat; short words legitimately</span>
+<span class="a">+        # repeat (&quot;very very good&quot;), so those need three in a row.</span>
+<span class="a">+        run = 1 if len(c) &gt;= 8 else 2</span>
+<span class="a">+        if len(out) &gt;= run and all(x == c for x in out[-run:]):</span>
+<span class="a">+            continue</span>
+<span class="a">+        out.append(c)</span>
+<span class="a">+</span>
+<span class="a">+    return &quot; &quot;.join(collapse_looping_tail(c) for c in out)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def is_repetitive(text):</span>
+<span class="a">+    &quot;&quot;&quot;True when a caption is mostly one phrase repeated.&quot;&quot;&quot;</span>
+<span class="a">+    s = &quot; &quot;.join(text.split())</span>
+<span class="a">+    if len(s) &lt; 8:</span>
+<span class="a">+        return False</span>
+<span class="a">+    return len(collapse_repeats(s)) * 2 &lt; len(s)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def looks_hallucinated(text):
+     t = text.strip().lower()
+     if len(t) &gt; 40:
+<span class="h">@@ -461,6 +508,7 @@ class Transcriber:</span>
+             vad_filter=final,
+             no_speech_threshold=0.6,
+             log_prob_threshold=-1.0,
+<span class="a">+            repetition_penalty=a.repetition_penalty,</span>
+             without_timestamps=True,
+         )
+         parts, nsp = [], []
+<span class="h">@@ -518,8 +566,14 @@ class Transcriber:</span>
+                     if nsp &gt; 0.75 or looks_hallucinated(text):
+                         log(&quot;dropped (no_speech=%.2f): %r&quot; % (nsp, text))
+                         continue
+<span class="a">+                    looped = is_repetitive(text)</span>
+<span class="a">+                    text = collapse_repeats(text)</span>
+<span class="a">+                    if looped:</span>
+<span class="a">+                        # Feeding a looped caption back as the prompt is how the</span>
+<span class="a">+                        # loop sustains itself across segments.</span>
+<span class="a">+                        self.context = &quot;&quot;</span>
+                     tr = self.translate(a16) if self.args.translate else &quot;&quot;
+<span class="d">-                    if not self.args.no_context:</span>
+<span class="a">+                    if not self.args.no_context and not looped:</span>
+                         self.context = (self.context + &quot; &quot; + text)[-220:]
+                     took = time.time() - t0
+                     log(&quot;FINAL %4.1fs audio in %4.1fs (rtf %.2f)  %s&quot;
+<span class="h">@@ -888,6 +942,10 @@ def build_parser():</span>
+     g.add_argument(&quot;--compute&quot;, default=&quot;int8&quot;, help=&quot;int8|int8_float32|float32|float16&quot;)
+     g.add_argument(&quot;--threads&quot;, type=int, default=max(2, (os.cpu_count() or 8) - 2))
+     g.add_argument(&quot;--beam&quot;, type=int, default=5)
+<span class="a">+    g.add_argument(&quot;--repetition-penalty&quot;, type=float, default=1.15,</span>
+<span class="a">+                   help=&quot;discourage Whisper from looping on a phrase; &quot;</span>
+<span class="a">+                        &quot;Japanese and Chinese need this more than European &quot;</span>
+<span class="a">+                        &quot;languages. 1.0 disables it&quot;)</span>
+     g.add_argument(&quot;--translate&quot;, action=&quot;store_true&quot;,
+                    help=&quot;also emit an English translation line&quot;)
+     g.add_argument(&quot;--no-context&quot;, action=&quot;store_true&quot;,
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index 7b2ccb0..6b9d9b2 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+<span class="h">@@ -76,6 +76,42 @@ def test_captions_file_keeps_last_n_lines(tmp_path=None):</span>
+             os.chdir(cwd)
+ 
+ 
+<span class="a">+def test_collapse_repeated_chunks():</span>
+<span class="a">+    &quot;&quot;&quot;Consecutive segments repeating the same sentence collapse to one.&quot;&quot;&quot;</span>
+<span class="a">+    one = &quot;私はそれを見つけたことがありました&quot;</span>
+<span class="a">+    assert livecap.collapse_repeats(&quot; &quot;.join([one] * 4)) == one</span>
+<span class="a">+    assert livecap.collapse_repeats(one) == one</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_collapse_repeated_unit_inside_a_segment():</span>
+<span class="a">+    &quot;&quot;&quot;The loop need not start at the beginning of the string.&quot;&quot;&quot;</span>
+<span class="a">+    assert livecap.collapse_repeats(&quot;この日の日の日の日&quot;) == &quot;この日&quot;</span>
+<span class="a">+    assert livecap.collapse_repeats(&quot;abababab&quot;) == &quot;ab&quot;</span>
+<span class="a">+    assert livecap.collapse_repeats(&quot;xabababab&quot;) == &quot;xab&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_short_words_may_repeat_twice():</span>
+<span class="a">+    &quot;&quot;&quot;Doubling is normal speech; a longer run is Whisper looping.&quot;&quot;&quot;</span>
+<span class="a">+    assert livecap.collapse_repeats(&quot;very very good&quot;) == &quot;very very good&quot;</span>
+<span class="a">+    assert livecap.collapse_repeats(&quot;no no no no no&quot;) == &quot;no no&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_collapse_leaves_normal_text_alone():</span>
+<span class="a">+    for text in [&quot;今日はとてもいい天気ですね。&quot;,</span>
+<span class="a">+                 &quot;Kyllä se tästä, kyllä se tästä.&quot;,</span>
+<span class="a">+                 &quot;Привет, как дела сегодня?&quot;,</span>
+<span class="a">+                 &quot;the cat sat on the mat&quot;]:</span>
+<span class="a">+        assert livecap.collapse_repeats(text) == &quot; &quot;.join(text.split()), text</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_is_repetitive():</span>
+<span class="a">+    one = &quot;私はそれを見つけたことがありました&quot;</span>
+<span class="a">+    assert livecap.is_repetitive(&quot; &quot;.join([one] * 4))</span>
+<span class="a">+    assert not livecap.is_repetitive(one)</span>
+<span class="a">+    assert not livecap.is_repetitive(&quot;Kyllä se tästä, kyllä se tästä.&quot;)</span>
+<span class="a">+    assert not livecap.is_repetitive(&quot;hi&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def test_model_resolution():
+     &quot;&quot;&quot;An explicit --model must win, even when it equals the default.&quot;&quot;&quot;
+     import tempfile</pre>
+</div></body></html>

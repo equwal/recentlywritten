@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay 542f2736 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 542f27364d5ad0bc458514d1c965f43ae214915f
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 18:47:41 -0700
+
+Constrain automatic language detection to the languages in use
+
+Whisper answers with any of 99 languages, decides afresh every call, and has
+little evidence in a short utterance, so --lang auto flipped mid-conversation
+and picked languages that are never watched.
+
+Detection is now restricted to --langs, with close relatives folded in:
+Estonian counts toward Finnish, Ukrainian and Bulgarian toward Russian,
+Galician toward Portuguese, Catalan toward Spanish. Without folding a clip can
+lose because fi and et split the vote and a third language wins outright.
+Evidence then accumulates across segments weighted by duration, and a
+challenger must lead by a margin for several consecutive detections before it
+takes over.
+
+Restriction alone made things worse, which the real-audio test caught: deleting
+the competitors inflates confidence, so &quot;en 0.38, ko 0.25, nn 0.10&quot; becomes a
+commanding en 0.85 and the session locks onto English from one ambiguous
+leading window. How much mass lands inside the allowed set is the honest
+signal, so a reading that mostly falls outside it is downweighted and never
+adopted - the detector returns None and lets Whisper handle that segment.
+
+On a Finnish clip sampled in short windows, plain Whisper committed to en on
+the ambiguous window; this declines to guess there and holds fi across all
+eleven remaining windows.
+
+Detection runs on a schedule rather than per segment. It costs an encoder pass,
+but passing an explicit language to transcribe() skips Whisper&#x27;s internal
+detection, so steady-state cost is about neutral. The resolved language is
+published so the control panel can show &quot;auto -&gt; ja&quot;.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> README.md           |  42 +++++++++++++-
+ control.html        |   9 ++-
+ livecap.py          | 158 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ tests/test_smoke.py | 117 ++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 318 insertions(+), 8 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 94205bd..acc9508 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -86,9 +86,45 @@ for a few seconds. Defaults cover `fi,ru,ja,es,pt,en,auto`:</span>
+ toward standard orthography and will not reliably reproduce regional slang.
+ Brazilian and European Portuguese are both `pt`.
+ 
+<span class="d">-**`auto` re-detects per segment**, which flips on short or noisy audio and can</span>
+<span class="d">-mislabel mid-sentence. For deliberate language changes the `1`–`9` keys are far</span>
+<span class="d">-more reliable.</span>
+<span class="a">+### How `auto` decides</span>
+<span class="a">+</span>
+<span class="a">+Whisper&#x27;s own detection answers with any of 99 languages, decides afresh on</span>
+<span class="a">+every call, and has little to go on in a two-word utterance. `auto` here is</span>
+<span class="a">+built on top of it and constrained to the languages you actually configured:</span>
+<span class="a">+</span>
+<span class="a">+1. **Restricted to `--langs`.** A Finnish clip cannot come back as Estonian.</span>
+<span class="a">+2. **Close relatives are folded in.** Whisper splits mass between neighbours,</span>
+<span class="a">+   so Estonian counts toward Finnish, Ukrainian and Bulgarian toward Russian,</span>
+<span class="a">+   Galician toward Portuguese, Catalan toward Spanish. Otherwise a clip can</span>
+<span class="a">+   lose because `fi` and `et` split the vote and a third language wins.</span>
+<span class="a">+3. **Reliability gate.** Restricting the set deletes the competitors and so</span>
+<span class="a">+   inflates confidence — `en 0.38, ko 0.25, nn 0.10` looks like a commanding</span>
+<span class="a">+   `en` once `ko` and `nn` are dropped. If too little mass lands inside your</span>
+<span class="a">+   set, it declines to guess and lets Whisper handle that one segment.</span>
+<span class="a">+4. **Evidence accumulates over time**, weighted by segment length, instead of</span>
+<span class="a">+   each segment deciding alone.</span>
+<span class="a">+5. **Hysteresis.** A new language must lead by a margin for several</span>
+<span class="a">+   consecutive detections before it takes over, so one odd segment cannot</span>
+<span class="a">+   flip the caption language mid-conversation.</span>
+<span class="a">+</span>
+<span class="a">+Detection runs on a schedule (`--detect-every`, default 6 s) rather than every</span>
+<span class="a">+segment. It costs an encoder pass, but passing an explicit language into</span>
+<span class="a">+Whisper skips its *internal* detection, so the steady-state cost is roughly</span>
+<span class="a">+neutral.</span>
+<span class="a">+</span>
+<span class="a">+Measured on a Finnish clip in short windows, plain Whisper committed to `en`</span>
+<span class="a">+on an ambiguous leading window; the detector declined to guess there and then</span>
+<span class="a">+held `fi` across every remaining window.</span>
+<span class="a">+</span>
+<span class="a">+| flag | default | effect |</span>
+<span class="a">+|---|---|---|</span>
+<span class="a">+| `--detect-every` | `6.0` | seconds between detection passes |</span>
+<span class="a">+| `--detect-min-audio` | `1.6` | skip detection on shorter segments |</span>
+<span class="a">+| `--detect-margin` | `1.3` | how far a challenger must lead to switch |</span>
+<span class="a">+| `--detect-hold` | `2` | consecutive detections before switching |</span>
+<span class="a">+</span>
+<span class="a">+The control panel shows `auto → ja` once it settles. Pinning with `1`–`9` is</span>
+<span class="a">+still the most reliable option when you already know the language.</span>
+ 
+ ### Choosing what gets captioned
+ 
+diff --git a/control.html b/control.html
+index 4e391e4..29a8be0 100644
+--- a/control.html
++++ b/control.html
+<span class="h">@@ -154,8 +154,13 @@</span>
+     const dot = document.createElement(&quot;span&quot;);
+     dot.className = &quot;dot &quot; + (state.loading ? &quot;busy&quot; : &quot;up&quot;);
+     el(&quot;conn&quot;).appendChild(dot);
+<span class="d">-    el(&quot;conn&quot;).appendChild(document.createTextNode(</span>
+<span class="d">-      (NAMES[state.lang] || state.lang) + &quot; · &quot; + state.model));</span>
+<span class="a">+    let label = NAMES[state.lang] || state.lang;</span>
+<span class="a">+    if (state.lang === &quot;auto&quot;) {</span>
+<span class="a">+      label += state.detected</span>
+<span class="a">+        ? &quot; → &quot; + (NAMES[state.detected] || state.detected)</span>
+<span class="a">+        : &quot; (listening…)&quot;;</span>
+<span class="a">+    }</span>
+<span class="a">+    el(&quot;conn&quot;).appendChild(document.createTextNode(label + &quot; · &quot; + state.model));</span>
+   }
+ 
+   function renderFeed() {
+diff --git a/livecap.py b/livecap.py
+index 692043b..36796fb 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -323,11 +323,13 @@ class Controller:</span>
+         self.tr = None                      # set once the Transcriber exists
+         self.cmds = queue.Queue()           # model swaps run on the worker thread
+         self.loading = False
+<span class="a">+        self.detected = None                # what &#x27;auto&#x27; has settled on</span>
+ 
+     def status(self):
+         return {
+             &quot;type&quot;: &quot;status&quot;,
+             &quot;lang&quot;: self.args.lang,
+<span class="a">+            &quot;detected&quot;: self.detected,</span>
+             &quot;model&quot;: self.args.model,
+             &quot;loading&quot;: self.loading,
+             &quot;translate&quot;: bool(self.args.translate),
+<span class="h">@@ -352,8 +354,12 @@ class Controller:</span>
+                 return
+             if val != self.args.lang:
+                 self.args.lang = val
+<span class="a">+                self.detected = None</span>
+                 if self.tr is not None:
+                     self.tr.context = &quot;&quot;        # old-language prompt would poison it
+<span class="a">+                    # Evidence gathered for a different language is worthless.</span>
+<span class="a">+                    self.tr.detector.reset()</span>
+<span class="a">+                    self.tr._last_detect = 0.0</span>
+                 log(&quot;language -&gt; %s&quot; % val)
+                 self.bus.publish({&quot;type&quot;: &quot;clear&quot;})
+             self.push_status()
+<span class="h">@@ -388,6 +394,105 @@ class Controller:</span>
+             self.push_status()
+ 
+ 
+<span class="a">+# Whisper spreads probability across close relatives. When the relative is not</span>
+<span class="a">+# one of the languages in use, its mass belongs to the neighbour that is -</span>
+<span class="a">+# otherwise a Finnish clip can lose to Finnish-plus-Estonian splitting the vote.</span>
+<span class="a">+CONFUSABLE = {</span>
+<span class="a">+    &quot;et&quot;: &quot;fi&quot;,                                          # Estonian</span>
+<span class="a">+    &quot;uk&quot;: &quot;ru&quot;, &quot;be&quot;: &quot;ru&quot;, &quot;bg&quot;: &quot;ru&quot;, &quot;mk&quot;: &quot;ru&quot;,      # Cyrillic Slavic</span>
+<span class="a">+    &quot;sr&quot;: &quot;ru&quot;, &quot;kk&quot;: &quot;ru&quot;,</span>
+<span class="a">+    &quot;gl&quot;: &quot;pt&quot;,                                          # Galician leans Portuguese</span>
+<span class="a">+    &quot;ca&quot;: &quot;es&quot;, &quot;oc&quot;: &quot;es&quot;, &quot;an&quot;: &quot;es&quot;,                  # Iberian Romance</span>
+<span class="a">+    &quot;cy&quot;: &quot;en&quot;, &quot;gd&quot;: &quot;en&quot;,                              # frequent English mis-picks</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class LanguageDetector:</span>
+<span class="a">+    &quot;&quot;&quot;Language identification restricted to the languages actually in use.</span>
+<span class="a">+</span>
+<span class="a">+    Three things make Whisper&#x27;s own per-window detection unreliable here:</span>
+<span class="a">+    it may answer with any of 99 languages, it decides afresh every call so the</span>
+<span class="a">+    answer flaps mid-conversation, and short utterances carry little evidence.</span>
+<span class="a">+</span>
+<span class="a">+    So: fold the distribution onto the allowed set, accumulate it over time with</span>
+<span class="a">+    a decay, and only switch when a challenger leads by a margin for several</span>
+<span class="a">+    observations in a row.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, allowed, margin=1.3, hold=2, decay=0.55, min_audio=1.6,</span>
+<span class="a">+                 min_mass=0.5, min_confidence=0.55):</span>
+<span class="a">+        self.allowed = [c for c in allowed if c != &quot;auto&quot;] or [&quot;en&quot;]</span>
+<span class="a">+        self.margin = margin</span>
+<span class="a">+        self.hold = hold</span>
+<span class="a">+        self.decay = decay</span>
+<span class="a">+        self.min_audio = min_audio</span>
+<span class="a">+        # Restricting the distribution deletes the competitors, which inflates</span>
+<span class="a">+        # confidence: &quot;en 0.38, ko 0.25, nn 0.10&quot; becomes a commanding en 0.85.</span>
+<span class="a">+        # How much mass landed inside the allowed set is the honest signal of</span>
+<span class="a">+        # whether this audio is any of these languages at all.</span>
+<span class="a">+        self.min_mass = min_mass</span>
+<span class="a">+        self.min_confidence = min_confidence</span>
+<span class="a">+        self.scores = {c: 0.0 for c in self.allowed}</span>
+<span class="a">+        self.current = None</span>
+<span class="a">+        self._pending = None</span>
+<span class="a">+        self._pending_n = 0</span>
+<span class="a">+</span>
+<span class="a">+    def reset(self):</span>
+<span class="a">+        self.scores = {c: 0.0 for c in self.allowed}</span>
+<span class="a">+        self.current = None</span>
+<span class="a">+        self._pending, self._pending_n = None, 0</span>
+<span class="a">+</span>
+<span class="a">+    def fold(self, probs):</span>
+<span class="a">+        &quot;&quot;&quot;Restrict the distribution to the allowed set, returning (dict, mass).&quot;&quot;&quot;</span>
+<span class="a">+        out = {c: 0.0 for c in self.allowed}</span>
+<span class="a">+        for lang, p in probs:</span>
+<span class="a">+            target = lang if lang in out else CONFUSABLE.get(lang)</span>
+<span class="a">+            if target in out:</span>
+<span class="a">+                out[target] += p</span>
+<span class="a">+        return out, sum(out.values())</span>
+<span class="a">+</span>
+<span class="a">+    def confidence(self):</span>
+<span class="a">+        total = sum(self.scores.values())</span>
+<span class="a">+        if total &lt;= 0 or self.current is None:</span>
+<span class="a">+            return 0.0</span>
+<span class="a">+        return self.scores[self.current] / total</span>
+<span class="a">+</span>
+<span class="a">+    def observe(self, probs, duration=3.0):</span>
+<span class="a">+        &quot;&quot;&quot;Feed one detection result; returns the language to actually use.&quot;&quot;&quot;</span>
+<span class="a">+        folded, mass = self.fold(probs)</span>
+<span class="a">+        if mass &lt;= 0:</span>
+<span class="a">+            return self.current</span>
+<span class="a">+</span>
+<span class="a">+        # Longer audio is better evidence than a two-word utterance, and mass</span>
+<span class="a">+        # outside the allowed set means this probably is not one of them.</span>
+<span class="a">+        reliability = min(1.0, mass / self.min_mass) if self.min_mass &gt; 0 else 1.0</span>
+<span class="a">+        weight = max(0.05, min(1.0, duration / 3.0)) * reliability</span>
+<span class="a">+        for code in self.scores:</span>
+<span class="a">+            self.scores[code] = (self.scores[code] * self.decay</span>
+<span class="a">+                                 + (folded[code] / mass) * weight)</span>
+<span class="a">+</span>
+<span class="a">+        best = max(self.scores, key=lambda c: self.scores[c])</span>
+<span class="a">+        if self.current is None:</span>
+<span class="a">+            # Adopting a language from one ambiguous reading is how a whole</span>
+<span class="a">+            # session ends up locked to the wrong one.</span>
+<span class="a">+            total = sum(self.scores.values())</span>
+<span class="a">+            share = self.scores[best] / total if total &gt; 0 else 0.0</span>
+<span class="a">+            if mass &gt;= self.min_mass and share &gt;= self.min_confidence:</span>
+<span class="a">+                self.current = best</span>
+<span class="a">+            return self.current</span>
+<span class="a">+</span>
+<span class="a">+        leader, held = self.scores[best], self.scores[self.current]</span>
+<span class="a">+        if best != self.current and leader &gt; held * self.margin:</span>
+<span class="a">+            self._pending_n = self._pending_n + 1 if self._pending == best else 1</span>
+<span class="a">+            self._pending = best</span>
+<span class="a">+            if self._pending_n &gt;= self.hold:</span>
+<span class="a">+                self.current = best</span>
+<span class="a">+                self._pending, self._pending_n = None, 0</span>
+<span class="a">+        else:</span>
+<span class="a">+            self._pending, self._pending_n = None, 0</span>
+<span class="a">+        return self.current</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def valid_language(code):
+     if code == &quot;auto&quot;:
+         return True
+<span class="h">@@ -469,6 +574,42 @@ class Transcriber:</span>
+         log(&quot;model ready in %.1fs&quot; % (time.time() - t0))
+         self.context = &quot;&quot;
+         self.busy = threading.Event()
+<span class="a">+        self.detector = LanguageDetector(</span>
+<span class="a">+            args.langs, margin=args.detect_margin, hold=args.detect_hold,</span>
+<span class="a">+            min_audio=args.detect_min_audio)</span>
+<span class="a">+        self._last_detect = 0.0</span>
+<span class="a">+</span>
+<span class="a">+    def pick_language(self, audio, duration, ctl=None):</span>
+<span class="a">+        &quot;&quot;&quot;Resolve &#x27;auto&#x27; to one of the configured languages.</span>
+<span class="a">+</span>
+<span class="a">+        Detection runs on a schedule rather than every segment: it costs an</span>
+<span class="a">+        encoder pass, and once the answer is settled re-deciding constantly is</span>
+<span class="a">+        what makes it flap. Passing an explicit language into transcribe() also</span>
+<span class="a">+        skips Whisper&#x27;s own internal detection, so this is close to free.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        a = self.args</span>
+<span class="a">+        if a.lang != &quot;auto&quot;:</span>
+<span class="a">+            return a.lang</span>
+<span class="a">+</span>
+<span class="a">+        due = (self.detector.current is None</span>
+<span class="a">+               or time.time() - self._last_detect &gt;= a.detect_every)</span>
+<span class="a">+        if due and duration &gt;= self.detector.min_audio:</span>
+<span class="a">+            self._last_detect = time.time()</span>
+<span class="a">+            try:</span>
+<span class="a">+                _, _, probs = self.model.detect_language(audio)</span>
+<span class="a">+            except Exception as e:</span>
+<span class="a">+                log(&quot;language detection failed:&quot;, repr(e))</span>
+<span class="a">+                return self.detector.current</span>
+<span class="a">+            before = self.detector.current</span>
+<span class="a">+            now = self.detector.observe(probs, duration)</span>
+<span class="a">+            if now != before:</span>
+<span class="a">+                log(&quot;detected language: %s (confidence %.2f)&quot;</span>
+<span class="a">+                    % (now, self.detector.confidence()))</span>
+<span class="a">+                self.context = &quot;&quot;          # prompt from another language misleads</span>
+<span class="a">+                if ctl is not None:</span>
+<span class="a">+                    ctl.detected = now</span>
+<span class="a">+                    ctl.push_status()</span>
+<span class="a">+        return self.detector.current</span>
+ 
+     def reload(self, name, ctl):
+         &quot;&quot;&quot;Swap the model in place. Runs on the worker thread.&quot;&quot;&quot;
+<span class="h">@@ -495,11 +636,12 @@ class Transcriber:</span>
+         ctl.push_status()
+         log(&quot;model -&gt; %s (%.1fs)&quot; % (name, time.time() - t0))
+ 
+<span class="d">-    def run(self, audio, final):</span>
+<span class="a">+    def run(self, audio, final, language=None):</span>
+         a = self.args
+<span class="a">+        lang = language or (None if a.lang == &quot;auto&quot; else a.lang)</span>
+         segs, info = self.model.transcribe(
+             audio,
+<span class="d">-            language=None if a.lang == &quot;auto&quot; else a.lang,</span>
+<span class="a">+            language=lang,</span>
+             task=&quot;transcribe&quot;,
+             beam_size=a.beam if final else 1,
+             temperature=0.0,
+<span class="h">@@ -556,7 +698,9 @@ class Transcriber:</span>
+                 t0 = time.time()
+                 a16 = to_whisper(audio, sr)
+                 dur = len(a16) / TARGET_SR
+<span class="d">-                text, nsp, _ = self.run(a16, final=(kind == &quot;final&quot;))</span>
+<span class="a">+                lang = (self.pick_language(a16, dur, ctl) if kind == &quot;final&quot;</span>
+<span class="a">+                        else self.detector.current)</span>
+<span class="a">+                text, nsp, _ = self.run(a16, final=(kind == &quot;final&quot;), language=lang)</span>
+                 if not text:
+                     if kind == &quot;final&quot;:
+                         log(&quot;no speech recognised in %.1fs segment &quot;
+<span class="h">@@ -942,6 +1086,14 @@ def build_parser():</span>
+     g.add_argument(&quot;--compute&quot;, default=&quot;int8&quot;, help=&quot;int8|int8_float32|float32|float16&quot;)
+     g.add_argument(&quot;--threads&quot;, type=int, default=max(2, (os.cpu_count() or 8) - 2))
+     g.add_argument(&quot;--beam&quot;, type=int, default=5)
+<span class="a">+    g.add_argument(&quot;--detect-every&quot;, type=float, default=6.0,</span>
+<span class="a">+                   help=&quot;seconds between language-detection passes when --lang auto&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--detect-min-audio&quot;, type=float, default=1.6,</span>
+<span class="a">+                   help=&quot;skip detection on segments shorter than this&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--detect-margin&quot;, type=float, default=1.3,</span>
+<span class="a">+                   help=&quot;how far a new language must lead before switching&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--detect-hold&quot;, type=int, default=2,</span>
+<span class="a">+                   help=&quot;consecutive detections needed before switching&quot;)</span>
+     g.add_argument(&quot;--repetition-penalty&quot;, type=float, default=1.15,
+                    help=&quot;discourage Whisper from looping on a phrase; &quot;
+                         &quot;Japanese and Chinese need this more than European &quot;
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index 6b9d9b2..41686ba 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+<span class="h">@@ -112,6 +112,123 @@ def test_is_repetitive():</span>
+     assert not livecap.is_repetitive(&quot;hi&quot;)
+ 
+ 
+<span class="a">+LANGS = [&quot;fi&quot;, &quot;ru&quot;, &quot;ja&quot;, &quot;es&quot;, &quot;pt&quot;, &quot;en&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _det(**kw):</span>
+<span class="a">+    return livecap.LanguageDetector(LANGS + [&quot;auto&quot;], **kw)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_ignores_languages_not_in_use():</span>
+<span class="a">+    &quot;&quot;&quot;An outsider may win outright and still not be the answer.</span>
+<span class="a">+</span>
+<span class="a">+    But only when enough evidence lands inside the set - if the audio is</span>
+<span class="a">+    overwhelmingly a language not in use, the honest answer is &quot;no idea&quot;,</span>
+<span class="a">+    not the best of the leftovers.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    # de leads, yet fi holds the majority of the mass that is actually usable</span>
+<span class="a">+    assert d.observe([(&quot;de&quot;, 0.3), (&quot;fi&quot;, 0.55), (&quot;ja&quot;, 0.05)], duration=4) == &quot;fi&quot;</span>
+<span class="a">+</span>
+<span class="a">+    d2 = _det()</span>
+<span class="a">+    # here de dominates and almost nothing is in the set: refuse to guess</span>
+<span class="a">+    assert d2.observe([(&quot;de&quot;, 0.7), (&quot;fi&quot;, 0.2), (&quot;ja&quot;, 0.05)], duration=4) is None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_folds_close_relatives():</span>
+<span class="a">+    &quot;&quot;&quot;Estonian mass belongs to Finnish; Ukrainian to Russian; Galician to Portuguese.&quot;&quot;&quot;</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    folded, mass = d.fold([(&quot;et&quot;, 0.5), (&quot;fi&quot;, 0.3), (&quot;ru&quot;, 0.1)])</span>
+<span class="a">+    assert folded[&quot;fi&quot;] == 0.8, folded</span>
+<span class="a">+    assert 0.89 &lt; mass &lt; 0.91, mass</span>
+<span class="a">+</span>
+<span class="a">+    folded, _ = d.fold([(&quot;uk&quot;, 0.4), (&quot;bg&quot;, 0.2), (&quot;ru&quot;, 0.1)])</span>
+<span class="a">+    assert abs(folded[&quot;ru&quot;] - 0.7) &lt; 1e-9, folded</span>
+<span class="a">+</span>
+<span class="a">+    folded, _ = d.fold([(&quot;gl&quot;, 0.6), (&quot;es&quot;, 0.2)])</span>
+<span class="a">+    assert abs(folded[&quot;pt&quot;] - 0.6) &lt; 1e-9 and abs(folded[&quot;es&quot;] - 0.2) &lt; 1e-9, folded</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_splits_do_not_lose_to_an_outsider():</span>
+<span class="a">+    &quot;&quot;&quot;fi+et together beat ja, even though ja beats each individually.&quot;&quot;&quot;</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    assert d.observe([(&quot;fi&quot;, 0.3), (&quot;et&quot;, 0.3), (&quot;ja&quot;, 0.35)], duration=4) == &quot;fi&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_does_not_flap_on_one_odd_segment():</span>
+<span class="a">+    d = _det(hold=2)</span>
+<span class="a">+    for _ in range(4):</span>
+<span class="a">+        d.observe([(&quot;ja&quot;, 0.95)], duration=4)</span>
+<span class="a">+    assert d.current == &quot;ja&quot;</span>
+<span class="a">+    # a single confident Spanish reading must not switch it</span>
+<span class="a">+    assert d.observe([(&quot;es&quot;, 0.95)], duration=4) == &quot;ja&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_switches_when_change_is_sustained():</span>
+<span class="a">+    d = _det(hold=2)</span>
+<span class="a">+    for _ in range(4):</span>
+<span class="a">+        d.observe([(&quot;ja&quot;, 0.95)], duration=4)</span>
+<span class="a">+    assert d.current == &quot;ja&quot;</span>
+<span class="a">+    d.observe([(&quot;ru&quot;, 0.95)], duration=4)</span>
+<span class="a">+    d.observe([(&quot;ru&quot;, 0.95)], duration=4)</span>
+<span class="a">+    for _ in range(3):</span>
+<span class="a">+        d.observe([(&quot;ru&quot;, 0.95)], duration=4)</span>
+<span class="a">+    assert d.current == &quot;ru&quot;, d.scores</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_weights_short_audio_less():</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    for _ in range(3):</span>
+<span class="a">+        d.observe([(&quot;en&quot;, 0.9)], duration=5)</span>
+<span class="a">+    strong = dict(d.scores)</span>
+<span class="a">+    d2 = _det()</span>
+<span class="a">+    for _ in range(3):</span>
+<span class="a">+        d2.observe([(&quot;en&quot;, 0.9)], duration=0.5)</span>
+<span class="a">+    assert strong[&quot;en&quot;] &gt; d2.scores[&quot;en&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_reset_and_confidence():</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    d.observe([(&quot;ja&quot;, 0.99)], duration=4)</span>
+<span class="a">+    assert d.current == &quot;ja&quot; and d.confidence() &gt; 0.9</span>
+<span class="a">+    d.reset()</span>
+<span class="a">+    assert d.current is None and d.confidence() == 0.0</span>
+<span class="a">+    assert all(v == 0.0 for v in d.scores.values())</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_defers_on_an_ambiguous_first_reading():</span>
+<span class="a">+    &quot;&quot;&quot;Restricting the set inflates confidence; mass outside it is the tell.</span>
+<span class="a">+</span>
+<span class="a">+    &quot;en 0.38, ko 0.25, nn 0.10&quot; looks like a commanding en once ko and nn are</span>
+<span class="a">+    dropped, but only 0.38 of the mass was ever inside the allowed set.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    assert d.observe([(&quot;en&quot;, 0.38), (&quot;ko&quot;, 0.25), (&quot;nn&quot;, 0.10)], duration=2) is None</span>
+<span class="a">+    assert d.current is None</span>
+<span class="a">+    # a genuinely confident reading is adopted immediately afterwards</span>
+<span class="a">+    assert d.observe([(&quot;fi&quot;, 0.96), (&quot;nn&quot;, 0.02), (&quot;en&quot;, 0.01)], duration=4) == &quot;fi&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_adopts_a_confident_first_reading():</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    assert d.observe([(&quot;ja&quot;, 0.93), (&quot;zh&quot;, 0.04)], duration=4) == &quot;ja&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_low_mass_never_locks_in():</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    for _ in range(5):</span>
+<span class="a">+        d.observe([(&quot;de&quot;, 0.6), (&quot;nl&quot;, 0.3), (&quot;en&quot;, 0.05)], duration=4)</span>
+<span class="a">+    assert d.current is None, d.scores</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_detector_handles_empty_and_unusable_input():</span>
+<span class="a">+    d = _det()</span>
+<span class="a">+    assert d.observe([], duration=4) is None</span>
+<span class="a">+    assert d.observe([(&quot;de&quot;, 0.9), (&quot;zh&quot;, 0.1)], duration=4) is None</span>
+<span class="a">+    d.observe([(&quot;fi&quot;, 0.9)], duration=4)</span>
+<span class="a">+    assert d.observe([(&quot;de&quot;, 1.0)], duration=4) == &quot;fi&quot;   # keeps the last good one</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def test_model_resolution():
+     &quot;&quot;&quot;An explicit --model must win, even when it equals the default.&quot;&quot;&quot;
+     import tempfile</pre>
+</div></body></html>

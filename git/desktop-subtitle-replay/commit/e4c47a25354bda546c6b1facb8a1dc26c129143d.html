@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay e4c47a25 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit e4c47a25354bda546c6b1facb8a1dc26c129143d
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 03:51:25 -0700
+
+Fix translation silently returning the source language
+
+--anki-translate produced Finnish where English was expected. Two causes,
+both silent.
+
+large-v3-turbo, the offline default, is a transcription-only fine-tune: asked
+to translate it returns the source language rather than failing. Translation
+now routes to a model that supports the task, with --translate-model to
+override, and says so when it substitutes. Verified on the same clip: turbo
+returned &quot;Aaaah, kyllä se tästä&quot;, small returned &quot;Ah, that&#x27;s it.&quot;
+
+Translating one short sentence at a time also starved Whisper of context and
+encouraged that echo. The clip is now translated once and aligned to sentences
+by timestamp, which is both better and faster than N calls.
+
+Whisper&#x27;s Finnish-to-English remains weak regardless (&quot;sen verran syrjäisillä
+seuduilla&quot; became &quot;the lake of Sennvera&quot;), so the README points at Yomitan
+lookups instead of machine-translated card backs.
+
+Also:
+- --watch with no folder now reads OBS&#x27;s own config for the recording path,
+  honouring Simple vs Advanced output mode. OBS writes its ini files with a
+  UTF-8 BOM, which makes configparser raise MissingSectionHeaderError; that
+  was being swallowed, so detection would have failed for everyone.
+- start.ps1 runs both halves together.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> README.md              |  24 ++++++++-
+ start.ps1              |  51 +++++++++++++++++++
+ subtitle.py            | 131 ++++++++++++++++++++++++++++++++++++++++++-------
+ tests/test_subtitle.py |  65 ++++++++++++++++++++++++
+ 4 files changed, 250 insertions(+), 21 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 13d5e15..6f61f83 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -34,6 +34,16 @@ mistakes. Replay needs accuracy and does not care about time.</span>
+ .\setup.ps1
+ ```
+ 
+<span class="a">+## Start everything</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+.\start.ps1</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+Runs both halves: live captions, plus a watcher that subtitles every replay clip</span>
+<span class="a">+OBS saves and serves it as a mining page. `-Lang ru`, `-LiveOnly`, `-ReplayOnly`</span>
+<span class="a">+and `-Model` adjust it. The two halves are also usable separately, below.</span>
+<span class="a">+</span>
+ ## Live captions
+ 
+ ```bash
+<span class="h">@@ -102,10 +112,12 @@ Writes `clip.srt` and `clip.html` next to the clip. The HTML page is the mining</span>
+ surface: video on the left, every sentence listed as selectable text, click to
+ seek, `Loop cue` to repeat a line while you work it out.
+ 
+<span class="d">-Watch your replay folder and subtitle clips automatically as OBS saves them:</span>
+<span class="a">+Watch your replay folder and subtitle clips automatically as OBS saves them.</span>
+<span class="a">+With no folder given, it reads OBS&#x27;s own config to find where recordings go</span>
+<span class="a">+(honouring Simple vs Advanced output mode):</span>
+ 
+ ```bash
+<span class="d">-.\.venv\Scripts\python.exe subtitle.py --watch &quot;C:\Users\you\Videos&quot; --serve</span>
+<span class="a">+.\.venv\Scripts\python.exe subtitle.py --watch --serve</span>
+ ```
+ 
+ `--serve` matters more than it looks. Opening `clip.html` from `file://`
+<span class="h">@@ -132,6 +144,14 @@ its own, which is usually what you want.</span>
+ Screenshots need Pillow (`pip install pillow`); without it the image column is
+ left empty and everything else still works.
+ 
+<span class="a">+**Two things about `--anki-translate`.** First, `large-v3-turbo` is a</span>
+<span class="a">+transcription-only fine-tune and *cannot translate* — asked to, it silently</span>
+<span class="a">+returns the source language. Translation is therefore routed to `small` unless</span>
+<span class="a">+you set `--translate-model`. Second, Whisper&#x27;s Finnish→English is genuinely</span>
+<span class="a">+weak: it rendered *&quot;sen verran syrjäisillä seuduilla&quot;* as &quot;the lake of Sennvera&quot;.</span>
+<span class="a">+For learning, Yomitan&#x27;s dictionary lookups are far more trustworthy than a</span>
+<span class="a">+machine-translated card back.</span>
+<span class="a">+</span>
+ ## Speed, honestly
+ 
+ Measured on a 16-core CPU, no CUDA, `int8`, on real Finnish speech:
+diff --git a/start.ps1 b/start.ps1
+new file mode 100644
+index 0000000..2866a1d
+--- /dev/null
++++ b/start.ps1
+<span class="h">@@ -0,0 +1,51 @@</span>
+<span class="a">+# Starts both halves: live captions now, and automatic subtitling of every</span>
+<span class="a">+# replay clip OBS saves.</span>
+<span class="a">+#</span>
+<span class="a">+#   .\start.ps1                     # Finnish</span>
+<span class="a">+#   .\start.ps1 -Lang ru            # Russian</span>
+<span class="a">+#   .\start.ps1 -Lang ja -Model base</span>
+<span class="a">+#   .\start.ps1 -LiveOnly</span>
+<span class="a">+#</span>
+<span class="a">+# Two windows open. Close either to stop that half.</span>
+<span class="a">+</span>
+<span class="a">+param(</span>
+<span class="a">+    [string]$Lang = &quot;fi&quot;,</span>
+<span class="a">+    [string]$Model = &quot;small&quot;,</span>
+<span class="a">+    [string]$ReplayModel = &quot;large-v3-turbo&quot;,</span>
+<span class="a">+    [string]$WatchFolder = &quot;&quot;,</span>
+<span class="a">+    [int]$ServePort = 8778,</span>
+<span class="a">+    [switch]$LiveOnly,</span>
+<span class="a">+    [switch]$ReplayOnly</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+$ErrorActionPreference = &quot;Stop&quot;</span>
+<span class="a">+Set-Location $PSScriptRoot</span>
+<span class="a">+$py = &quot;.\.venv\Scripts\python.exe&quot;</span>
+<span class="a">+if (-not (Test-Path $py)) { throw &quot;Run .\setup.ps1 first.&quot; }</span>
+<span class="a">+</span>
+<span class="a">+if (-not $ReplayOnly) {</span>
+<span class="a">+    Write-Host &quot;Starting live captions ($Lang, $Model)...&quot; -ForegroundColor Cyan</span>
+<span class="a">+    Start-Process -FilePath $py `</span>
+<span class="a">+        -ArgumentList &quot;.\livecap.py&quot;, &quot;--lang&quot;, $Lang, &quot;--model&quot;, $Model `</span>
+<span class="a">+        -WorkingDirectory $PSScriptRoot</span>
+<span class="a">+    Start-Sleep -Seconds 2</span>
+<span class="a">+    Write-Host &quot;  OBS overlay   http://127.0.0.1:8777/overlay.html?ws=8765&quot;</span>
+<span class="a">+    Write-Host &quot;  Reader        http://127.0.0.1:8777/reader.html?ws=8765&quot; -ForegroundColor Green</span>
+<span class="a">+    Write-Host &quot;  Control       http://127.0.0.1:8777/control.html?ws=8765&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+if (-not $LiveOnly) {</span>
+<span class="a">+    $watchArgs = @(&quot;.\subtitle.py&quot;, &quot;--lang&quot;, $Lang, &quot;--model&quot;, $ReplayModel,</span>
+<span class="a">+                   &quot;--serve&quot;, &quot;$ServePort&quot;, &quot;--watch&quot;)</span>
+<span class="a">+    if ($WatchFolder) { $watchArgs += $WatchFolder }</span>
+<span class="a">+</span>
+<span class="a">+    Write-Host &quot;&quot;</span>
+<span class="a">+    Write-Host &quot;Starting replay watcher ($ReplayModel)...&quot; -ForegroundColor Cyan</span>
+<span class="a">+    Start-Process -FilePath $py -ArgumentList $watchArgs -WorkingDirectory $PSScriptRoot</span>
+<span class="a">+    Start-Sleep -Seconds 2</span>
+<span class="a">+    Write-Host &quot;  Clips         http://127.0.0.1:$ServePort/&quot; -ForegroundColor Green</span>
+<span class="a">+    Write-Host &quot;  Save a replay in OBS and its mining page appears there.&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+Write-Host &quot;&quot;</span>
+<span class="a">+Write-Host &quot;Open the Reader and the Clips pages in the browser where Yomitan lives.&quot; -ForegroundColor Yellow</span>
+diff --git a/subtitle.py b/subtitle.py
+index 91aedb7..298f614 100644
+--- a/subtitle.py
++++ b/subtitle.py
+<span class="h">@@ -503,6 +503,32 @@ class Subtitler:</span>
+                                   compute_type=args.compute,
+                                   cpu_threads=args.threads, num_workers=1)
+         log(&quot;model ready in %.1fs&quot; % (time.time() - t0))
+<span class="a">+        self._tmodel = None</span>
+<span class="a">+        self._tname = None</span>
+<span class="a">+</span>
+<span class="a">+    def translator(self):</span>
+<span class="a">+        &quot;&quot;&quot;A model that can actually translate.</span>
+<span class="a">+</span>
+<span class="a">+        large-v3-turbo is a transcription-only fine-tune: asked to translate it</span>
+<span class="a">+        returns the source language instead, silently. Fall back to a model</span>
+<span class="a">+        that supports the task rather than emitting untranslated text.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        from faster_whisper import WhisperModel</span>
+<span class="a">+</span>
+<span class="a">+        a = self.args</span>
+<span class="a">+        name = a.translate_model or a.model</span>
+<span class="a">+        if not a.translate_model and &quot;turbo&quot; in a.model.lower():</span>
+<span class="a">+            name = &quot;small&quot;</span>
+<span class="a">+            log(&quot;note: %s cannot translate (transcription-only fine-tune); &quot;</span>
+<span class="a">+                &quot;using %r instead - override with --translate-model&quot; % (a.model, name))</span>
+<span class="a">+        if name == a.model:</span>
+<span class="a">+            return self.model</span>
+<span class="a">+        if self._tmodel is None or self._tname != name:</span>
+<span class="a">+            log(&quot;loading translation model %r ...&quot; % name)</span>
+<span class="a">+            self._tmodel = WhisperModel(name, device=a.device, compute_type=a.compute,</span>
+<span class="a">+                                        cpu_threads=a.threads, num_workers=1)</span>
+<span class="a">+            self._tname = name</span>
+<span class="a">+        return self._tmodel</span>
+ 
+     def run(self, path):
+         from faster_whisper.audio import decode_audio
+<span class="h">@@ -524,7 +550,8 @@ class Subtitler:</span>
+             return None
+ 
+         t0 = time.time()
+<span class="d">-        segments, info = self.model.transcribe(</span>
+<span class="a">+        engine = self.translator() if a.translate else self.model</span>
+<span class="a">+        segments, info = engine.transcribe(</span>
+             audio,
+             language=None if a.lang == &quot;auto&quot; else a.lang,
+             task=&quot;translate&quot; if a.translate else &quot;transcribe&quot;,
+<span class="h">@@ -566,27 +593,82 @@ class Subtitler:</span>
+         return out
+ 
+     def translate_cues(self, audio, cues):
+<span class="d">-        &quot;&quot;&quot;English for the back of each card, translated per sentence.&quot;&quot;&quot;</span>
+<span class="a">+        &quot;&quot;&quot;English for the back of each card.</span>
+<span class="a">+</span>
+<span class="a">+        Translating one short sentence at a time starves Whisper of context and</span>
+<span class="a">+        it often just echoes the source language back. Translating the whole</span>
+<span class="a">+        clip once and aligning by timestamp is both better and faster.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        log(&quot;translating for card backs...&quot;)</span>
+<span class="a">+        try:</span>
+<span class="a">+            segs, _ = self.translator().transcribe(</span>
+<span class="a">+                audio, language=None if self.args.lang == &quot;auto&quot; else self.args.lang,</span>
+<span class="a">+                task=&quot;translate&quot;, beam_size=self.args.beam,</span>
+<span class="a">+                temperature=[0.0, 0.2, 0.4],</span>
+<span class="a">+                condition_on_previous_text=True, vad_filter=True)</span>
+<span class="a">+            segs = list(segs)</span>
+<span class="a">+        except Exception as e:</span>
+<span class="a">+            log(&quot;translation failed: %s&quot; % e)</span>
+<span class="a">+            return [&quot;&quot;] * len(cues)</span>
+<span class="a">+</span>
+         out = []
+<span class="d">-        log(&quot;translating %d sentences for card backs...&quot; % len(cues))</span>
+         for start, end, _ in cues:
+<span class="d">-            lo, hi = max(0, int(start * 16000)), min(len(audio), int(end * 16000))</span>
+<span class="d">-            clip = audio[lo:hi]</span>
+<span class="d">-            if len(clip) &lt; 1600:</span>
+<span class="d">-                out.append(&quot;&quot;)</span>
+<span class="d">-                continue</span>
+<span class="d">-            try:</span>
+<span class="d">-                segs, _ = self.model.transcribe(</span>
+<span class="d">-                    clip, language=None if self.args.lang == &quot;auto&quot; else self.args.lang,</span>
+<span class="d">-                    task=&quot;translate&quot;, beam_size=self.args.beam, temperature=0.0,</span>
+<span class="d">-                    condition_on_previous_text=False, vad_filter=False,</span>
+<span class="d">-                    without_timestamps=True)</span>
+<span class="d">-                out.append(&quot; &quot;.join(s.text.strip() for s in segs).strip())</span>
+<span class="d">-            except Exception:</span>
+<span class="d">-                out.append(&quot;&quot;)</span>
+<span class="a">+            parts = [s.text.strip() for s in segs</span>
+<span class="a">+                     if s.start &lt; end - 0.15 and s.end &gt; start + 0.15]</span>
+<span class="a">+            out.append(re.sub(r&quot;\s+&quot;, &quot; &quot;, &quot; &quot;.join(parts)).strip())</span>
+         return out
+ 
+ 
+<span class="a">+def obs_recording_folder():</span>
+<span class="a">+    &quot;&quot;&quot;Where OBS writes recordings and replay-buffer clips, from its own config.</span>
+<span class="a">+</span>
+<span class="a">+    Which key holds it depends on the output mode, so read Mode first rather</span>
+<span class="a">+    than guessing.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    import configparser</span>
+<span class="a">+</span>
+<span class="a">+    root = Path(os.environ.get(&quot;APPDATA&quot;, &quot;&quot;)) / &quot;obs-studio&quot;</span>
+<span class="a">+    if not root.is_dir():</span>
+<span class="a">+        return None</span>
+<span class="a">+</span>
+<span class="a">+    profile_dir = None</span>
+<span class="a">+    for name in (&quot;user.ini&quot;, &quot;global.ini&quot;):</span>
+<span class="a">+        cfg = configparser.RawConfigParser(strict=False)</span>
+<span class="a">+        try:</span>
+<span class="a">+            cfg.read(root / name, encoding=&quot;utf-8-sig&quot;)</span>
+<span class="a">+            profile_dir = cfg.get(&quot;Basic&quot;, &quot;ProfileDir&quot;, fallback=None) or profile_dir</span>
+<span class="a">+        except (configparser.Error, OSError):</span>
+<span class="a">+            pass</span>
+<span class="a">+</span>
+<span class="a">+    profiles = root / &quot;basic&quot; / &quot;profiles&quot;</span>
+<span class="a">+    candidates = []</span>
+<span class="a">+    if profile_dir and (profiles / profile_dir).is_dir():</span>
+<span class="a">+        candidates.append(profiles / profile_dir)</span>
+<span class="a">+    if profiles.is_dir():</span>
+<span class="a">+        candidates.extend(p for p in profiles.iterdir() if p.is_dir())</span>
+<span class="a">+</span>
+<span class="a">+    for prof in candidates:</span>
+<span class="a">+        cfg = configparser.RawConfigParser(strict=False)</span>
+<span class="a">+        try:</span>
+<span class="a">+            cfg.read(prof / &quot;basic.ini&quot;, encoding=&quot;utf-8-sig&quot;)</span>
+<span class="a">+        except (configparser.Error, OSError):</span>
+<span class="a">+            continue</span>
+<span class="a">+        mode = (cfg.get(&quot;Output&quot;, &quot;Mode&quot;, fallback=&quot;&quot;) or &quot;&quot;).lower()</span>
+<span class="a">+        if mode.startswith(&quot;adv&quot;):</span>
+<span class="a">+            keys = [(&quot;AdvOut&quot;, &quot;RecFilePath&quot;), (&quot;AdvOut&quot;, &quot;FFFilePath&quot;),</span>
+<span class="a">+                    (&quot;SimpleOutput&quot;, &quot;FilePath&quot;)]</span>
+<span class="a">+        else:</span>
+<span class="a">+            keys = [(&quot;SimpleOutput&quot;, &quot;FilePath&quot;), (&quot;AdvOut&quot;, &quot;RecFilePath&quot;)]</span>
+<span class="a">+        for section, key in keys:</span>
+<span class="a">+            raw = cfg.get(section, key, fallback=None)</span>
+<span class="a">+            if not raw:</span>
+<span class="a">+                continue</span>
+<span class="a">+            path = Path(raw.replace(&quot;\\\\&quot;, &quot;\\&quot;).strip())</span>
+<span class="a">+            if path.is_dir():</span>
+<span class="a">+                return path</span>
+<span class="a">+    return None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ class _Limited:
+     &quot;&quot;&quot;Feeds copyfile only the bytes belonging to the requested range.&quot;&quot;&quot;
+ 
+<span class="h">@@ -732,8 +814,9 @@ def main():</span>
+         description=&quot;Subtitle recordings and replay clips&quot;,
+         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+     p.add_argument(&quot;files&quot;, nargs=&quot;*&quot;, help=&quot;video/audio files to subtitle&quot;)
+<span class="d">-    p.add_argument(&quot;--watch&quot;, metavar=&quot;FOLDER&quot;,</span>
+<span class="d">-                   help=&quot;watch a folder and subtitle clips as they appear&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--watch&quot;, nargs=&quot;?&quot;, const=&quot;auto&quot;, default=None, metavar=&quot;FOLDER&quot;,</span>
+<span class="a">+                   help=&quot;watch a folder and subtitle clips as they appear; &quot;</span>
+<span class="a">+                        &quot;with no folder, read OBS&#x27;s own recording path&quot;)</span>
+     p.add_argument(&quot;--poll&quot;, type=float, default=3.0, help=&quot;watch interval (s)&quot;)
+ 
+     p.add_argument(&quot;--model&quot;, default=&quot;large-v3-turbo&quot;,
+<span class="h">@@ -745,6 +828,9 @@ def main():</span>
+     p.add_argument(&quot;--beam&quot;, type=int, default=5)
+     p.add_argument(&quot;--translate&quot;, action=&quot;store_true&quot;,
+                    help=&quot;write English subtitles instead of the original language&quot;)
+<span class="a">+    p.add_argument(&quot;--translate-model&quot;, default=None,</span>
+<span class="a">+                   help=&quot;model used for translation; defaults to --model, except &quot;</span>
+<span class="a">+                        &quot;for turbo builds which cannot translate at all&quot;)</span>
+ 
+     p.add_argument(&quot;--format&quot;, default=&quot;srt&quot;, choices=sorted(WRITERS))
+     p.add_argument(&quot;--width&quot;, type=int, default=42, help=&quot;max characters per line&quot;)
+<span class="h">@@ -782,6 +868,13 @@ def main():</span>
+     if not args.files and not args.watch:
+         p.error(&quot;give some files, or --watch a folder&quot;)
+ 
+<span class="a">+    if args.watch == &quot;auto&quot;:</span>
+<span class="a">+        found = obs_recording_folder()</span>
+<span class="a">+        if not found:</span>
+<span class="a">+            p.error(&quot;could not find OBS&#x27;s recording folder; pass --watch FOLDER&quot;)</span>
+<span class="a">+        args.watch = str(found)</span>
+<span class="a">+        log(&quot;OBS records to: %s&quot; % args.watch)</span>
+<span class="a">+</span>
+     sub = Subtitler(args)
+ 
+     done = []
+diff --git a/tests/test_subtitle.py b/tests/test_subtitle.py
+index 9e5d1e3..65f23f4 100644
+--- a/tests/test_subtitle.py
++++ b/tests/test_subtitle.py
+<span class="h">@@ -140,6 +140,71 @@ def test_esc_strips_tabs_and_newlines():</span>
+     assert subtitle.esc(&quot;a\tb\nc &quot;) == &quot;a b c&quot;
+ 
+ 
+<span class="a">+def test_obs_folder_detection_handles_bom_and_output_mode():</span>
+<span class="a">+    &quot;&quot;&quot;OBS writes its ini files with a UTF-8 BOM, which trips configparser.&quot;&quot;&quot;</span>
+<span class="a">+    import os</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        root = Path(d) / &quot;obs-studio&quot;</span>
+<span class="a">+        prof = root / &quot;basic&quot; / &quot;profiles&quot; / &quot;Untitled&quot;</span>
+<span class="a">+        prof.mkdir(parents=True)</span>
+<span class="a">+        recdir = Path(d) / &quot;recordings&quot;</span>
+<span class="a">+        recdir.mkdir()</span>
+<span class="a">+        simpledir = Path(d) / &quot;simple&quot;</span>
+<span class="a">+        simpledir.mkdir()</span>
+<span class="a">+</span>
+<span class="a">+        (root / &quot;user.ini&quot;).write_text(</span>
+<span class="a">+            &quot;﻿[Basic]\nProfile=Untitled\nProfileDir=Untitled\n&quot;, encoding=&quot;utf-8&quot;)</span>
+<span class="a">+        (prof / &quot;basic.ini&quot;).write_text(</span>
+<span class="a">+            &quot;﻿[Output]\nMode=Advanced\n\n&quot;</span>
+<span class="a">+            &quot;[SimpleOutput]\nFilePath=%s\n\n&quot;</span>
+<span class="a">+            &quot;[AdvOut]\nRecFilePath=%s\n&quot;</span>
+<span class="a">+            % (str(simpledir).replace(&quot;\\&quot;, &quot;\\\\&quot;),</span>
+<span class="a">+               str(recdir).replace(&quot;\\&quot;, &quot;\\\\&quot;)),</span>
+<span class="a">+            encoding=&quot;utf-8&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        old = os.environ.get(&quot;APPDATA&quot;)</span>
+<span class="a">+        os.environ[&quot;APPDATA&quot;] = d</span>
+<span class="a">+        try:</span>
+<span class="a">+            found = subtitle.obs_recording_folder()</span>
+<span class="a">+        finally:</span>
+<span class="a">+            if old is None:</span>
+<span class="a">+                os.environ.pop(&quot;APPDATA&quot;, None)</span>
+<span class="a">+            else:</span>
+<span class="a">+                os.environ[&quot;APPDATA&quot;] = old</span>
+<span class="a">+</span>
+<span class="a">+    assert found is not None, &quot;BOM or mode parsing failed&quot;</span>
+<span class="a">+    assert Path(found) == recdir, (found, recdir)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_obs_folder_detection_simple_mode():</span>
+<span class="a">+    import os</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        root = Path(d) / &quot;obs-studio&quot;</span>
+<span class="a">+        prof = root / &quot;basic&quot; / &quot;profiles&quot; / &quot;P&quot;</span>
+<span class="a">+        prof.mkdir(parents=True)</span>
+<span class="a">+        simpledir = Path(d) / &quot;simple&quot;</span>
+<span class="a">+        simpledir.mkdir()</span>
+<span class="a">+        (root / &quot;user.ini&quot;).write_text(&quot;﻿[Basic]\nProfileDir=P\n&quot;, encoding=&quot;utf-8&quot;)</span>
+<span class="a">+        (prof / &quot;basic.ini&quot;).write_text(</span>
+<span class="a">+            &quot;﻿[Output]\nMode=Simple\n\n[SimpleOutput]\nFilePath=%s\n&quot;</span>
+<span class="a">+            % str(simpledir).replace(&quot;\\&quot;, &quot;\\\\&quot;), encoding=&quot;utf-8&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        old = os.environ.get(&quot;APPDATA&quot;)</span>
+<span class="a">+        os.environ[&quot;APPDATA&quot;] = d</span>
+<span class="a">+        try:</span>
+<span class="a">+            found = subtitle.obs_recording_folder()</span>
+<span class="a">+        finally:</span>
+<span class="a">+            if old is None:</span>
+<span class="a">+                os.environ.pop(&quot;APPDATA&quot;, None)</span>
+<span class="a">+            else:</span>
+<span class="a">+                os.environ[&quot;APPDATA&quot;] = old</span>
+<span class="a">+    assert Path(found) == simpledir, found</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def test_range_requests_are_served():
+     &quot;&quot;&quot;Without 206 support a browser will not seek in a &lt;video&gt; at all.&quot;&quot;&quot;
+     import http.client</pre>
+</div></body></html>

@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vibeslop-dickt 2cfdb23f - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>vibeslop-dickt</h1><span class="desc">make your own vibeslop dickt in just a few minutes</span><p class="url">git clone https://github.com/equwal/vibeslop-dickt</p><p><a href="../../vibeslop-dickt/index.html">Log</a> | <a href="../../vibeslop-dickt/files.html">Files</a> | <a href="../../vibeslop-dickt/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 2cfdb23faeea991ed48d358eb4f2db69d9eb3af8
+Spenser Truex &lt;truex@equwal.com&gt;
+2026-05-20 17:55:45 -0700
+
+initial commit
+
+</pre><pre> dickt_convert.py | 295 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 295 insertions(+)
+</pre><pre>diff --git a/dickt_convert.py b/dickt_convert.py
+new file mode 100755
+index 0000000..63e2eac
+--- /dev/null
++++ b/dickt_convert.py
+<span class="h">@@ -0,0 +1,295 @@</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+Kenkyusha 新和英大辞典 — English → Portuguese translator</span>
+<span class="a">+Uses Google Translate (no API key needed).</span>
+<span class="a">+</span>
+<span class="a">+Run:  python translate_kenkyusha.py &lt;input_zip_or_dir&gt; &lt;output_dir&gt;</span>
+<span class="a">+</span>
+<span class="a">+Speed improvements over v1:</span>
+<span class="a">+  • Sentinel-joined batches  — segments joined with a rare delimiter, one HTTP call per batch</span>
+<span class="a">+  • Thread pool              — WORKERS concurrent requests</span>
+<span class="a">+  • Exponential backoff      — on 429 / transient errors</span>
+<span class="a">+  • tqdm progress bar (optional; pip install tqdm)</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+import json</span>
+<span class="a">+import re</span>
+<span class="a">+import sys</span>
+<span class="a">+import time</span>
+<span class="a">+import urllib.request</span>
+<span class="a">+import urllib.parse</span>
+<span class="a">+import urllib.error</span>
+<span class="a">+import zipfile</span>
+<span class="a">+import tempfile</span>
+<span class="a">+import shutil</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+from concurrent.futures import ThreadPoolExecutor, as_completed</span>
+<span class="a">+</span>
+<span class="a">+try:</span>
+<span class="a">+    from tqdm import tqdm</span>
+<span class="a">+    HAS_TQDM = True</span>
+<span class="a">+except ImportError:</span>
+<span class="a">+    HAS_TQDM = False</span>
+<span class="a">+</span>
+<span class="a">+# ── Config ────────────────────────────────────────────────────────────────────</span>
+<span class="a">+</span>
+<span class="a">+TARGET_LANG    = sys.argv[3] if len(sys.argv) &gt; 3 else None</span>
+<span class="a">+BATCH_SIZE     = 40      # segments joined per HTTP call</span>
+<span class="a">+WORKERS        = 8       # concurrent threads</span>
+<span class="a">+RETRY_LIMIT    = 6       # max attempts per batch</span>
+<span class="a">+BACKOFF_BASE   = 1.5     # seconds; doubles each retry</span>
+<span class="a">+REQUEST_GAP    = 0.02    # polite pause after each successful request</span>
+<span class="a">+</span>
+<span class="a">+# Sentinel must survive a round-trip through Google Translate unchanged.</span>
+<span class="a">+# This Unicode private-use sequence is invisible and never appears in dictionary text.</span>
+<span class="a">+SEP = &quot;\uE000|\uE001&quot;</span>
+<span class="a">+</span>
+<span class="a">+# ── Google Translate (gtx endpoint, sentinel-batching) ────────────────────────</span>
+<span class="a">+</span>
+<span class="a">+_HEADERS = {</span>
+<span class="a">+    &quot;User-Agent&quot;: (</span>
+<span class="a">+        &quot;Mozilla/5.0 (Windows NT 10.0; Win64; x64) &quot;</span>
+<span class="a">+        &quot;AppleWebKit/537.36 (KHTML, like Gecko) &quot;</span>
+<span class="a">+        &quot;Chrome/124.0.0.0 Safari/537.36&quot;</span>
+<span class="a">+    )</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def translate_batch(texts: list[str]) -&gt; list[str]:</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    Translate a list of strings in one HTTP call by joining them with SEP.</span>
+<span class="a">+    Splits the translated result back on the same separator.</span>
+<span class="a">+    Falls back to originals on permanent failure.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if not texts:</span>
+<span class="a">+        return texts</span>
+<span class="a">+</span>
+<span class="a">+    joined = SEP.join(t[:4000] for t in texts)</span>
+<span class="a">+    encoded = urllib.parse.quote(joined)</span>
+<span class="a">+    url = (</span>
+<span class="a">+        f&quot;https://translate.googleapis.com/translate_a/single&quot;</span>
+<span class="a">+        f&quot;?client=gtx&amp;sl=en&amp;tl={TARGET_LANG}&amp;dt=t&amp;q={encoded}&quot;</span>
+<span class="a">+    )</span>
+<span class="a">+    req = urllib.request.Request(url, headers=_HEADERS)</span>
+<span class="a">+</span>
+<span class="a">+    delay = BACKOFF_BASE</span>
+<span class="a">+    for attempt in range(RETRY_LIMIT):</span>
+<span class="a">+        try:</span>
+<span class="a">+            with urllib.request.urlopen(req, timeout=15) as resp:</span>
+<span class="a">+                result = json.loads(resp.read().decode(&quot;utf-8&quot;))</span>
+<span class="a">+</span>
+<span class="a">+            # result[0] is a list of [translated_chunk, original_chunk, ...]</span>
+<span class="a">+            translated_joined = &quot;&quot;.join(</span>
+<span class="a">+                item[0] for item in result[0] if isinstance(item[0], str)</span>
+<span class="a">+            )</span>
+<span class="a">+</span>
+<span class="a">+            # Split on any variant the translator may have introduced</span>
+<span class="a">+            # (it sometimes adds spaces around the separator)</span>
+<span class="a">+            parts = re.split(r&quot;\s*\uE000\s*\|\s*\uE001\s*&quot;, translated_joined)</span>
+<span class="a">+</span>
+<span class="a">+            # Pad or trim to match input length</span>
+<span class="a">+            while len(parts) &lt; len(texts):</span>
+<span class="a">+                parts.append(texts[len(parts)])</span>
+<span class="a">+</span>
+<span class="a">+            time.sleep(REQUEST_GAP)</span>
+<span class="a">+            return parts[:len(texts)]</span>
+<span class="a">+</span>
+<span class="a">+        except urllib.error.HTTPError as e:</span>
+<span class="a">+            code = e.code</span>
+<span class="a">+            print(f&quot;\n  ⚠  HTTP {code} (attempt {attempt+1}); backing off {delay:.1f}s …&quot;, flush=True)</span>
+<span class="a">+            time.sleep(delay)</span>
+<span class="a">+            delay *= 2</span>
+<span class="a">+</span>
+<span class="a">+        except Exception as e:</span>
+<span class="a">+            print(f&quot;\n  ⚠  Error (attempt {attempt+1}): {e}; backing off {delay:.1f}s …&quot;, flush=True)</span>
+<span class="a">+            time.sleep(delay)</span>
+<span class="a">+            delay *= 2</span>
+<span class="a">+</span>
+<span class="a">+    print(f&quot;  ✗  Giving up on batch of {len(texts)} — keeping originals&quot;, flush=True)</span>
+<span class="a">+    return texts</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ── Per-line segment extraction ───────────────────────────────────────────────</span>
+<span class="a">+</span>
+<span class="a">+def extract_english_segments(text: str):</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    Return list of (start, end, english_text) for all English portions.</span>
+<span class="a">+</span>
+<span class="a">+    Two patterns in this dictionary:</span>
+<span class="a">+      A) Lines with ideographic space U+3000 — English is everything after it.</span>
+<span class="a">+      B) Standalone English lines (no U+3000, contains Latin letters,</span>
+<span class="a">+         not a JP/romaji header).</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    segments = []</span>
+<span class="a">+    pos = 0</span>
+<span class="a">+    for line in text.split(&quot;\n&quot;):</span>
+<span class="a">+        line_len = len(line)</span>
+<span class="a">+        if &quot;\u3000&quot; in line:</span>
+<span class="a">+            idx = line.index(&quot;\u3000&quot;) + 1</span>
+<span class="a">+            eng = line[idx:]</span>
+<span class="a">+            if re.search(r&quot;[a-zA-Z]{2,}&quot;, eng):</span>
+<span class="a">+                start = pos + idx</span>
+<span class="a">+                segments.append((start, start + len(eng), eng))</span>
+<span class="a">+        else:</span>
+<span class="a">+            if (re.search(r&quot;[a-zA-Z]{2,}&quot;, line)</span>
+<span class="a">+                    and not line.strip().startswith(&quot;[ローマ字]&quot;)</span>
+<span class="a">+                    and not re.match(r&#x27;^[\u4e00-\u9fff\u3040-\u30ff].*\[ローマ字\]&#x27;, line)):</span>
+<span class="a">+                segments.append((pos, pos + line_len, line))</span>
+<span class="a">+        pos += line_len + 1</span>
+<span class="a">+    return segments</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def apply_translations(text: str, segments, translations) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;Splice translations back into the original string at the correct offsets.&quot;&quot;&quot;</span>
+<span class="a">+    if not segments:</span>
+<span class="a">+        return text</span>
+<span class="a">+    result = []</span>
+<span class="a">+    prev = 0</span>
+<span class="a">+    for (start, end, _), t in zip(segments, translations):</span>
+<span class="a">+        result.append(text[prev:start])</span>
+<span class="a">+        result.append(t)</span>
+<span class="a">+        prev = end</span>
+<span class="a">+    result.append(text[prev:])</span>
+<span class="a">+    return &quot;&quot;.join(result)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ── Batched + parallel translation of a flat list ────────────────────────────</span>
+<span class="a">+</span>
+<span class="a">+def translate_all(flat_eng: list[str]) -&gt; list[str]:</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    Translate every string in flat_eng using WORKERS threads and BATCH_SIZE</span>
+<span class="a">+    grouping.  Returns a list of the same length with translated strings.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    total = len(flat_eng)</span>
+<span class="a">+    if total == 0:</span>
+<span class="a">+        return []</span>
+<span class="a">+</span>
+<span class="a">+    batches = []</span>
+<span class="a">+    for start in range(0, total, BATCH_SIZE):</span>
+<span class="a">+        batches.append((start, flat_eng[start:start + BATCH_SIZE]))</span>
+<span class="a">+</span>
+<span class="a">+    results = [&quot;&quot;] * total</span>
+<span class="a">+</span>
+<span class="a">+    pbar = tqdm(total=total, unit=&quot;seg&quot;, dynamic_ncols=True, leave=False) if HAS_TQDM else None</span>
+<span class="a">+</span>
+<span class="a">+    def worker(start_idx, texts):</span>
+<span class="a">+        translated = translate_batch(texts)</span>
+<span class="a">+        return start_idx, translated</span>
+<span class="a">+</span>
+<span class="a">+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:</span>
+<span class="a">+        futures = {pool.submit(worker, s, t): s for s, t in batches}</span>
+<span class="a">+        for fut in as_completed(futures):</span>
+<span class="a">+            start_idx, translated = fut.result()</span>
+<span class="a">+            for i, t in enumerate(translated):</span>
+<span class="a">+                results[start_idx + i] = t</span>
+<span class="a">+            if pbar:</span>
+<span class="a">+                pbar.update(len(translated))</span>
+<span class="a">+            else:</span>
+<span class="a">+                done = sum(1 for r in results if r)</span>
+<span class="a">+                print(f&quot;    {done}/{total} segments done   \r&quot;, end=&quot;&quot;, flush=True)</span>
+<span class="a">+</span>
+<span class="a">+    if pbar:</span>
+<span class="a">+        pbar.close()</span>
+<span class="a">+    else:</span>
+<span class="a">+        print()</span>
+<span class="a">+</span>
+<span class="a">+    return results</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ── File processor ────────────────────────────────────────────────────────────</span>
+<span class="a">+</span>
+<span class="a">+def process_term_bank(input_path: Path, output_path: Path):</span>
+<span class="a">+    print(f&quot;\n📖  {input_path.name}&quot;, flush=True)</span>
+<span class="a">+    with open(input_path, &quot;r&quot;, encoding=&quot;utf-8&quot;) as f:</span>
+<span class="a">+        data = json.load(f)</span>
+<span class="a">+</span>
+<span class="a">+    all_segs = []</span>
+<span class="a">+    for i, entry in enumerate(data):</span>
+<span class="a">+        if (isinstance(entry, list) and len(entry) &gt; 5</span>
+<span class="a">+                and isinstance(entry[5], list) and entry[5]</span>
+<span class="a">+                and isinstance(entry[5][0], str)):</span>
+<span class="a">+            segs = extract_english_segments(entry[5][0])</span>
+<span class="a">+            if segs:</span>
+<span class="a">+                all_segs.append((i, segs))</span>
+<span class="a">+</span>
+<span class="a">+    flat_eng   = []</span>
+<span class="a">+    flat_index = []</span>
+<span class="a">+    for ai, (_, segs) in enumerate(all_segs):</span>
+<span class="a">+        for si, (_, _, eng) in enumerate(segs):</span>
+<span class="a">+            flat_eng.append(eng)</span>
+<span class="a">+            flat_index.append((ai, si))</span>
+<span class="a">+</span>
+<span class="a">+    total = len(flat_eng)</span>
+<span class="a">+    print(f&quot;    {len(data)} entries — {total} English segments to translate&quot;, flush=True)</span>
+<span class="a">+</span>
+<span class="a">+    flat_translated = translate_all(flat_eng)</span>
+<span class="a">+</span>
+<span class="a">+    trans_map = {idx: t for idx, t in zip(flat_index, flat_translated)}</span>
+<span class="a">+    for ai, (entry_i, segs) in enumerate(all_segs):</span>
+<span class="a">+        seg_trans = [trans_map.get((ai, si), segs[si][2]) for si in range(len(segs))]</span>
+<span class="a">+        data[entry_i][5][0] = apply_translations(data[entry_i][5][0], segs, seg_trans)</span>
+<span class="a">+</span>
+<span class="a">+    output_path.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+    with open(output_path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as f:</span>
+<span class="a">+        json.dump(data, f, ensure_ascii=False, indent=2)</span>
+<span class="a">+    print(f&quot;    ✓ saved → {output_path.name}&quot;, flush=True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ── Main ──────────────────────────────────────────────────────────────────────</span>
+<span class="a">+</span>
+<span class="a">+def main():</span>
+<span class="a">+    if len(sys.argv) &lt; 4:</span>
+<span class="a">+        print(&quot;Usage: python translate_kenkyusha.py &lt;input_zip&gt; &lt;output_dir&gt; &lt;target_lang&gt;&quot;)</span>
+<span class="a">+        sys.exit(1)</span>
+<span class="a">+</span>
+<span class="a">+    input_path = Path(sys.argv[1])</span>
+<span class="a">+    output_dir = Path(sys.argv[2])</span>
+<span class="a">+    output_dir.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+</span>
+<span class="a">+    print(f&quot;⚙  Workers={WORKERS}  BatchSize={BATCH_SIZE}  Target={TARGET_LANG}&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    if input_path.suffix.lower() != &quot;.zip&quot;:</span>
+<span class="a">+        print(f&quot;Error: {input_path} is not a .zip file&quot;)</span>
+<span class="a">+        sys.exit(1)</span>
+<span class="a">+    print(f&quot;📦  Extracting {input_path.name} …&quot;, flush=True)</span>
+<span class="a">+    _tmpdir = tempfile.mkdtemp(prefix=&quot;kenkyusha_&quot;)</span>
+<span class="a">+    with zipfile.ZipFile(input_path, &quot;r&quot;) as zf:</span>
+<span class="a">+        zf.extractall(_tmpdir)</span>
+<span class="a">+    candidates = list(Path(_tmpdir).rglob(&quot;term_bank_1.json&quot;))</span>
+<span class="a">+    input_dir = candidates[0].parent if candidates else Path(_tmpdir)</span>
+<span class="a">+    print(f&quot;    → unpacked to {input_dir}&quot;, flush=True)</span>
+<span class="a">+</span>
+<span class="a">+    try:</span>
+<span class="a">+        idx_src = input_dir / &quot;index.json&quot;</span>
+<span class="a">+        if idx_src.exists():</span>
+<span class="a">+            with open(idx_src, encoding=&quot;utf-8&quot;) as f:</span>
+<span class="a">+                idx = json.load(f)</span>
+<span class="a">+            idx[&quot;title&quot;]    = idx.get(&quot;title&quot;, &quot;Dictionary&quot;) + f&quot; ({TARGET_LANG.upper()})&quot;</span>
+<span class="a">+            idx[&quot;revision&quot;] = idx.get(&quot;revision&quot;, &quot;1&quot;) + f&quot;-{TARGET_LANG}&quot;</span>
+<span class="a">+            with open(output_dir / &quot;index.json&quot;, &quot;w&quot;, encoding=&quot;utf-8&quot;) as f:</span>
+<span class="a">+                json.dump(idx, f, ensure_ascii=False, indent=2)</span>
+<span class="a">+            print(&quot;📝  index.json updated&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        term_banks = sorted(input_dir.glob(&quot;term_bank_*.json&quot;),</span>
+<span class="a">+                            key=lambda p: int(re.search(r&#x27;\d+&#x27;, p.name).group()))</span>
+<span class="a">+        print(f&quot;Found {len(term_banks)} term_bank files&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        if not term_banks:</span>
+<span class="a">+            print(&quot;⚠  No term_bank_*.json files found — check the zip structure.&quot;)</span>
+<span class="a">+            sys.exit(1)</span>
+<span class="a">+</span>
+<span class="a">+        t0 = time.time()</span>
+<span class="a">+        for tb in term_banks:</span>
+<span class="a">+            process_term_bank(tb, output_dir / tb.name)</span>
+<span class="a">+</span>
+<span class="a">+        elapsed = int(time.time() - t0)</span>
+<span class="a">+        print(f&quot;\n✅  Done in {elapsed//60}m {elapsed%60}s&quot;)</span>
+<span class="a">+        print(f&quot;📁  Output: {output_dir}&quot;)</span>
+<span class="a">+        print(&quot;\nNext: zip the output folder contents and import into Yomitan.&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    finally:</span>
+<span class="a">+        if _tmpdir:</span>
+<span class="a">+            shutil.rmtree(_tmpdir, ignore_errors=True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    main()</span></pre>
+</div></body></html>
