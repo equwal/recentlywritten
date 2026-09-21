@@ -13,18 +13,17 @@ edits to any post.
 truncated at exactly 1 MiB and are unreadable, so they were deleted rather
 than served as downloads that fail halfway.
 
-## Pages never archived (6)
+## Pages never archived (5)
 
 No copy of these survives online. Re-create each as `pages/<name>.md`.
 
 - arabic-poem.html
-- cervido.html
 - deksesop2.html
 - idoj-de-orfisto.html
 - intervjuoj-de-aejk.html
 - noveloj-de-la-ondo.html
 
-## Attachments referenced by the posts and pages (119)
+## Attachments referenced by the posts and pages (123)
 
 - 25-noveloj/25-noveloj.epub  — used by 25-noveloj.html
 - 25-noveloj/25-noveloj.mobi  — used by 25-noveloj.html
@@ -32,6 +31,10 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - 25-noveloj/25-noveloj.txt  — used by 25-noveloj.html
 - 25-noveloj/25-noveloj.zip  — used by 25-noveloj.html
 - book/bible-as-literature-bates.pdf  — used by biblio.html
+- book/budhismaj-rakontoj-16-malalta-kvalito.mp3  — used by cervido.html
+- book/budhismaj-rakontoj-16-malalta-kvalito.ogg  — used by cervido.html
+- book/budhismaj-rakontoj-16.mp3  — used by cervido.html
+- book/budhismaj-rakontoj-16.ogg  — used by cervido.html
 - book/rut-lit.epub  — used by rut.html
 - book/rut-lit.mobi  — used by rut.html
 - book/rut-lit.pdf  — used by rut.html
