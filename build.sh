@@ -217,8 +217,11 @@ echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WOR
 # git/ and git.html share this web root but are published by deploy-git.sh,
 # not built here. Excluding them keeps --delete from treating them as stale:
 # rsync never deletes an excluded path on the receiving side.
+# static/book/ holds book files that stay out of the repo (see .gitignore).
+# They exist only on the server, so the same rule protects them.
 if [ "$DEPLOY" = yes ]; then
     rsync -avzP --delete --exclude=/git/ --exclude=/git.html \
+        --exclude=/static/book/ \
         "$SITE_DIR/" "$DEPLOY_HOST:$DEPLOY_PATH"
     ssh "$DEPLOY_HOST" "chmod -R a+rX $DEPLOY_PATH"
 fi
