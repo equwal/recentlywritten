@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sacc d16bb53d - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sacc</h1><span class="desc">Mirror of git://bitreich.org/sacc, the sacc gopher client from bitreich.org.</span><p class="url">git clone https://github.com/equwal/sacc</p><p><a href="../../sacc/index.html">Log</a> | <a href="../../sacc/files.html">Files</a> | <a href="../../sacc/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit d16bb53db353da7b817b18809adf57b57c4f973e
+Quentin Rameau &lt;quinq@fifth.space&gt;
+2024-03-28 12:13:51 +0100
+
+UI: Add pazz0&#x27;s dungeon-crawler-like interface
+
+This definitely looks fun and interesting
+
+</pre><pre> ui_rogue.c | 938 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 938 insertions(+)
+</pre><pre>diff --git a/ui_rogue.c b/ui_rogue.c
+new file mode 100644
+index 0000000..cd8859c
+--- /dev/null
++++ b/ui_rogue.c
+<span class="h">@@ -0,0 +1,938 @@</span>
+<span class="a">+#include &lt;stdarg.h&gt;</span>
+<span class="a">+#include &lt;stdint.h&gt;</span>
+<span class="a">+#include &lt;stdio.h&gt;</span>
+<span class="a">+#include &lt;stdlib.h&gt;</span>
+<span class="a">+#include &lt;string.h&gt;</span>
+<span class="a">+#include &lt;term.h&gt;</span>
+<span class="a">+#include &lt;termios.h&gt;</span>
+<span class="a">+#include &lt;unistd.h&gt;</span>
+<span class="a">+#include &lt;sys/types.h&gt;</span>
+<span class="a">+</span>
+<span class="a">+#include &quot;common.h&quot;</span>
+<span class="a">+#include &quot;config.h&quot;</span>
+<span class="a">+</span>
+<span class="a">+#define C(c) #c</span>
+<span class="a">+#define S(c) C(c)</span>
+<span class="a">+</span>
+<span class="a">+/* ncurses doesn&#x27;t define those in term.h, where they&#x27;re used */</span>
+<span class="a">+#ifndef OK</span>
+<span class="a">+#define OK (0)</span>
+<span class="a">+#endif</span>
+<span class="a">+#ifndef ERR</span>
+<span class="a">+#define ERR (-1)</span>
+<span class="a">+#endif</span>
+<span class="a">+</span>
+<span class="a">+static struct termios tsave;</span>
+<span class="a">+static struct termios tsacc;</span>
+<span class="a">+static Item *curentry;</span>
+<span class="a">+static int termset = ERR;</span>
+<span class="a">+static char bufout[256];</span>
+<span class="a">+static char bufout2[256];</span>
+<span class="a">+</span>
+<span class="a">+void drawscreen(void);</span>
+<span class="a">+</span>
+<span class="a">+uint32_t</span>
+<span class="a">+fnv1a(int n,...)</span>
+<span class="a">+{</span>
+<span class="a">+	int i;</span>
+<span class="a">+	char *s;</span>
+<span class="a">+	va_list l;</span>
+<span class="a">+	uint32_t h;</span>
+<span class="a">+</span>
+<span class="a">+	h = 0x811c9dc5;</span>
+<span class="a">+</span>
+<span class="a">+	va_start(l, n); </span>
+<span class="a">+	for (i = 0; i &lt; n; i++) {</span>
+<span class="a">+		for (s = va_arg(l, char*); *s; s++) {</span>
+<span class="a">+			h ^= *s;</span>
+<span class="a">+			h *= 0x01000193;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	va_end(l);</span>
+<span class="a">+</span>
+<span class="a">+	return h;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+uint32_t</span>
+<span class="a">+xorshift(uint32_t *s)</span>
+<span class="a">+{</span>
+<span class="a">+	*s ^= *s &lt;&lt; 13;</span>
+<span class="a">+	*s ^= *s &gt;&gt; 17;</span>
+<span class="a">+	*s ^= *s &lt;&lt; 5;</span>
+<span class="a">+	return *s;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+struct cell {</span>
+<span class="a">+	char c;</span>
+<span class="a">+	size_t nitems;</span>
+<span class="a">+	Item **items;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+#define MAPHEIGHT (25)</span>
+<span class="a">+#define MAPWIDTH (80)</span>
+<span class="a">+struct cell map[MAPHEIGHT][MAPWIDTH];</span>
+<span class="a">+</span>
+<span class="a">+struct room {</span>
+<span class="a">+	struct room *p;</span>
+<span class="a">+	void *d;</span>
+<span class="a">+	size_t x, y;</span>
+<span class="a">+	size_t w, h;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+struct rect {</span>
+<span class="a">+	struct rect *next, *next2;</span>
+<span class="a">+	struct room *room;</span>
+<span class="a">+	size_t x1, y1;</span>
+<span class="a">+	size_t x2, y2;</span>
+<span class="a">+	size_t d;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+struct rect *</span>
+<span class="a">+randomneighbor(struct rect *x, struct rect *rs, uint32_t *prng)</span>
+<span class="a">+{</span>
+<span class="a">+	struct rect *r, *result;</span>
+<span class="a">+	size_t n;</span>
+<span class="a">+</span>
+<span class="a">+	n = 0;</span>
+<span class="a">+	result = NULL;</span>
+<span class="a">+	for (r = rs; r; r = r-&gt;next) {</span>
+<span class="a">+		if (r-&gt;y2 &lt; x-&gt;y1 || r-&gt;y1 &gt; x-&gt;y2 || r-&gt;x2 &lt; x-&gt;x1 || r-&gt;x1 &gt; x-&gt;x2)</span>
+<span class="a">+			continue;</span>
+<span class="a">+		if ((r-&gt;y2 == x-&gt;y1 || r-&gt;y1 == x-&gt;y2) &amp;&amp; (r-&gt;x2 == x-&gt;x1 || r-&gt;x1 == x-&gt;x2))</span>
+<span class="a">+			continue;</span>
+<span class="a">+		n++;</span>
+<span class="a">+		if (xorshift(prng) / (1. + UINT32_MAX) &lt; 1. / n)</span>
+<span class="a">+			result = r;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	return result;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define ROOM_HEIGHT_MIN 3</span>
+<span class="a">+#define ROOM_WIDTH_MIN 5</span>
+<span class="a">+#define ROOM_MARGIN_MIN 1</span>
+<span class="a">+#define CELL_HEIGHT_MIN (ROOM_HEIGHT_MIN + ROOM_MARGIN_MIN + 3)</span>
+<span class="a">+#define CELL_WIDTH_MIN (ROOM_WIDTH_MIN + ROOM_MARGIN_MIN + 3)</span>
+<span class="a">+size_t</span>
+<span class="a">+generaterooms_gnarf(uint32_t prng, struct room *rs, size_t l)</span>
+<span class="a">+{</span>
+<span class="a">+	struct rect *queuehead, *queuetail;</span>
+<span class="a">+	struct rect *r, *t;</span>
+<span class="a">+	struct rect *rects, *walk;</span>
+<span class="a">+	size_t w, h, i, j, rl, n;</span>
+<span class="a">+	int vertical;</span>
+<span class="a">+	struct room *room;</span>
+<span class="a">+</span>
+<span class="a">+	r = malloc(sizeof(*r));</span>
+<span class="a">+	r-&gt;x1 = r-&gt;y1 = ROOM_MARGIN_MIN;</span>
+<span class="a">+	r-&gt;x2 = MAPWIDTH;</span>
+<span class="a">+	r-&gt;y2 = MAPHEIGHT;</span>
+<span class="a">+	r-&gt;d = 0;</span>
+<span class="a">+</span>
+<span class="a">+	queuetail = r;</span>
+<span class="a">+	queuetail-&gt;next = NULL;</span>
+<span class="a">+	queuehead = r;</span>
+<span class="a">+</span>
+<span class="a">+	rects = NULL;</span>
+<span class="a">+	rl = 0;</span>
+<span class="a">+</span>
+<span class="a">+	while (queuehead) {</span>
+<span class="a">+		r = queuehead;</span>
+<span class="a">+		if (queuetail == queuehead)</span>
+<span class="a">+			queuetail = NULL;</span>
+<span class="a">+		queuehead = queuehead-&gt;next;</span>
+<span class="a">+</span>
+<span class="a">+		if (r-&gt;x2 - r-&gt;x1 &gt;= CELL_WIDTH_MIN * 2 &amp;&amp; r-&gt;y2 - r-&gt;y1 &gt;= CELL_HEIGHT_MIN * 2) {</span>
+<span class="a">+			vertical = xorshift(&amp;prng) &amp; 1;</span>
+<span class="a">+		} else if (r-&gt;x2 - r-&gt;x1 &gt;= CELL_WIDTH_MIN * 2) {</span>
+<span class="a">+			vertical = 0;</span>
+<span class="a">+		} else if (r-&gt;y2 - r-&gt;y1 &gt;= CELL_HEIGHT_MIN * 2) {</span>
+<span class="a">+			vertical = 1;</span>
+<span class="a">+		} else {</span>
+<span class="a">+			r-&gt;next = rects;</span>
+<span class="a">+			rects = r;</span>
+<span class="a">+			rl++;</span>
+<span class="a">+			continue;</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+<span class="a">+		if (vertical) {</span>
+<span class="a">+			w = r-&gt;x2 - r-&gt;x1;</span>
+<span class="a">+			h = CELL_HEIGHT_MIN + xorshift(&amp;prng) % (1 + r-&gt;y2 - r-&gt;y1 - CELL_HEIGHT_MIN * 2);</span>
+<span class="a">+		} else {</span>
+<span class="a">+			w = CELL_WIDTH_MIN + xorshift(&amp;prng) % (1 + r-&gt;x2 - r-&gt;x1 - CELL_WIDTH_MIN * 2);</span>
+<span class="a">+			h = r-&gt;y2 - r-&gt;y1;</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+<span class="a">+		t = malloc(sizeof(*t));</span>
+<span class="a">+		t-&gt;x1 = r-&gt;x1;</span>
+<span class="a">+		t-&gt;y1 = r-&gt;y1;</span>
+<span class="a">+		t-&gt;x2 = r-&gt;x1 + w;</span>
+<span class="a">+		t-&gt;y2 = r-&gt;y1 + h;</span>
+<span class="a">+		t-&gt;d = r-&gt;d + 1;</span>
+<span class="a">+		t-&gt;next = NULL;</span>
+<span class="a">+		t-&gt;room = NULL;</span>
+<span class="a">+</span>
+<span class="a">+		if (!queuetail) {</span>
+<span class="a">+			queuehead = t;</span>
+<span class="a">+			queuetail = t;</span>
+<span class="a">+		} else {</span>
+<span class="a">+			queuetail-&gt;next = t;</span>
+<span class="a">+			queuetail = t;</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+<span class="a">+		t = malloc(sizeof(*t));</span>
+<span class="a">+		if (vertical) {</span>
+<span class="a">+			t-&gt;x1 = r-&gt;x1;</span>
+<span class="a">+			t-&gt;y1 = r-&gt;y1 + h;</span>
+<span class="a">+		} else {</span>
+<span class="a">+			t-&gt;x1 = r-&gt;x1 + w;</span>
+<span class="a">+			t-&gt;y1 = r-&gt;y1;</span>
+<span class="a">+		}</span>
+<span class="a">+		t-&gt;x2 = r-&gt;x2;</span>
+<span class="a">+		t-&gt;y2 = r-&gt;y2;</span>
+<span class="a">+		t-&gt;d = r-&gt;d + 1;</span>
+<span class="a">+		t-&gt;next = NULL;</span>
+<span class="a">+		t-&gt;room = NULL;</span>
+<span class="a">+</span>
+<span class="a">+		queuetail-&gt;next = t;</span>
+<span class="a">+		queuetail = t;</span>
+<span class="a">+</span>
+<span class="a">+		free(r);</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	if (l &gt; rl)</span>
+<span class="a">+		l = rl;</span>
+<span class="a">+</span>
+<span class="a">+	for (r = rects; r; r = r-&gt;next) {</span>
+<span class="a">+		if (MAPHEIGHT / 2 &gt;= r-&gt;y1 &amp;&amp; MAPHEIGHT / 2 &lt; r-&gt;y2 &amp;&amp;</span>
+<span class="a">+		    MAPWIDTH / 2 &gt;= r-&gt;x1 &amp;&amp; MAPWIDTH / 2 &lt; r-&gt;x2)</span>
+<span class="a">+			break;</span>
+<span class="a">+	}</span>
+<span class="a">+	</span>
+<span class="a">+	i = 0;</span>
+<span class="a">+	rs[i].w = ROOM_WIDTH_MIN + xorshift(&amp;prng) % (1 + r-&gt;x2 - r-&gt;x1 - ROOM_MARGIN_MIN - ROOM_WIDTH_MIN);</span>
+<span class="a">+	rs[i].h = ROOM_HEIGHT_MIN + xorshift(&amp;prng) % (1 + r-&gt;y2 - r-&gt;y1 - ROOM_MARGIN_MIN - ROOM_HEIGHT_MIN);</span>
+<span class="a">+	rs[i].x = r-&gt;x1 + xorshift(&amp;prng) % (1 + r-&gt;x2 - r-&gt;x1 - ROOM_MARGIN_MIN - rs[i].w);</span>
+<span class="a">+	rs[i].y = r-&gt;y1 + xorshift(&amp;prng) % (1 + r-&gt;y2 - r-&gt;y1 - ROOM_MARGIN_MIN - rs[i].h);</span>
+<span class="a">+	rs[i].p = NULL;</span>
+<span class="a">+	r-&gt;room = &amp;rs[i];</span>
+<span class="a">+</span>
+<span class="a">+	walk = r;</span>
+<span class="a">+	walk-&gt;next2 = NULL;</span>
+<span class="a">+</span>
+<span class="a">+	i++;</span>
+<span class="a">+	for (; i &lt; l;) {</span>
+<span class="a">+		t = randomneighbor(r, rects, &amp;prng);</span>
+<span class="a">+		if (!t || t-&gt;room) {</span>
+<span class="a">+			n = 0;</span>
+<span class="a">+			for (t = walk; t; t = t-&gt;next2) {</span>
+<span class="a">+				n++;</span>
+<span class="a">+				if (xorshift(&amp;prng) / (1. + UINT32_MAX) &lt; 1. / n)</span>
+<span class="a">+					r = t;</span>
+<span class="a">+				</span>
+<span class="a">+			}</span>
+<span class="a">+			continue;</span>
+<span class="a">+		}</span>
+<span class="a">+		rs[i].w = ROOM_WIDTH_MIN + xorshift(&amp;prng) % (1 + t-&gt;x2 - t-&gt;x1 - ROOM_MARGIN_MIN - ROOM_WIDTH_MIN);</span>
+<span class="a">+		rs[i].h = ROOM_HEIGHT_MIN + xorshift(&amp;prng) % (1 + t-&gt;y2 - t-&gt;y1 - ROOM_MARGIN_MIN - ROOM_HEIGHT_MIN);</span>
+<span class="a">+		rs[i].x = t-&gt;x1 + xorshift(&amp;prng) % (1 + t-&gt;x2 - t-&gt;x1 - ROOM_MARGIN_MIN - rs[i].w);</span>
+<span class="a">+		rs[i].y = t-&gt;y1 + xorshift(&amp;prng) % (1 + t-&gt;y2 - t-&gt;y1 - ROOM_MARGIN_MIN - rs[i].h);</span>
+<span class="a">+		rs[i].p = r-&gt;room;</span>
+<span class="a">+		t-&gt;room = &amp;rs[i];</span>
+<span class="a">+		i++;</span>
+<span class="a">+		r = t;</span>
+<span class="a">+		r-&gt;next2 = walk;</span>
+<span class="a">+		walk = r;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	for (r = rects; r;) {</span>
+<span class="a">+		t = r-&gt;next;</span>
+<span class="a">+		free(r);</span>
+<span class="a">+		r = t;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	return l;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+size_t</span>
+<span class="a">+distance(size_t x1, size_t y1, size_t x2, size_t y2)</span>
+<span class="a">+{</span>
+<span class="a">+	size_t d;</span>
+<span class="a">+</span>
+<span class="a">+	if (y1 &lt; y2)</span>
+<span class="a">+		d = y2 - y1;</span>
+<span class="a">+	else</span>
+<span class="a">+		d = y1 - y2;</span>
+<span class="a">+	if (x1 &lt; x2)</span>
+<span class="a">+		d += x2 - x1;</span>
+<span class="a">+	else</span>
+<span class="a">+		d += x1 - x2;</span>
+<span class="a">+</span>
+<span class="a">+	return d;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+nearestpoints(struct room *a, struct room *b, size_t *ax, size_t *ay, size_t *bx, size_t *by)</span>
+<span class="a">+{</span>
+<span class="a">+	if (a-&gt;y &gt;= b-&gt;y &amp;&amp; a-&gt;y &lt; b-&gt;y + b-&gt;h) {</span>
+<span class="a">+		*ay = *by = a-&gt;y;</span>
+<span class="a">+	} else if (b-&gt;y &gt;= a-&gt;y &amp;&amp; b-&gt;y &lt; a-&gt;y + a-&gt;h) {</span>
+<span class="a">+		*ay = *by = b-&gt;y;</span>
+<span class="a">+	} else if (a-&gt;y &gt;= b-&gt;y) {</span>
+<span class="a">+		*ay = a-&gt;y;</span>
+<span class="a">+		*by = b-&gt;y + b-&gt;h - 1;</span>
+<span class="a">+	} else if (b-&gt;y &gt;= a-&gt;y) {</span>
+<span class="a">+		*ay = a-&gt;y + a-&gt;h - 1;</span>
+<span class="a">+		*by = b-&gt;y;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	if (a-&gt;x &gt;= b-&gt;x &amp;&amp; a-&gt;x &lt; b-&gt;x + b-&gt;w) {</span>
+<span class="a">+		*ax = *bx = a-&gt;x;</span>
+<span class="a">+	} else if (b-&gt;x &gt;= a-&gt;x &amp;&amp; b-&gt;x &lt; a-&gt;x + a-&gt;w) {</span>
+<span class="a">+		*ax = *bx = b-&gt;x;</span>
+<span class="a">+	} else if (a-&gt;x &gt;= b-&gt;x) {</span>
+<span class="a">+		*ax = a-&gt;x;</span>
+<span class="a">+		*bx = b-&gt;x + b-&gt;w - 1;</span>
+<span class="a">+	} else if (b-&gt;x &gt;= a-&gt;x) {</span>
+<span class="a">+		*ax = a-&gt;x + a-&gt;w - 1;</span>
+<span class="a">+		*bx = b-&gt;x;</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+connectrooms(struct room *a, struct room *b)</span>
+<span class="a">+{</span>
+<span class="a">+	size_t i, j;</span>
+<span class="a">+	ssize_t ii;</span>
+<span class="a">+	size_t x1, y1;</span>
+<span class="a">+	size_t x2, y2;</span>
+<span class="a">+</span>
+<span class="a">+	nearestpoints(a, b, &amp;x1, &amp;y1, &amp;x2, &amp;y2);</span>
+<span class="a">+</span>
+<span class="a">+	if (y1 &gt; y2) {</span>
+<span class="a">+		ii = -1;</span>
+<span class="a">+	} else if (y2 &gt; y1) {</span>
+<span class="a">+		ii = 1;</span>
+<span class="a">+	} else {</span>
+<span class="a">+		ii = 0;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+printf(&quot;%lu\t%lu\t%d\n&quot;, y1, y2, ii);</span>
+<span class="a">+*/</span>
+<span class="a">+	for (i = y1; i != y2; i += ii)</span>
+<span class="a">+		map[i][x1].c = &#x27;.&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+	if (x1 &gt; x2) {</span>
+<span class="a">+		ii = -1;</span>
+<span class="a">+	} else if (x2 &gt; x1) {</span>
+<span class="a">+		ii = 1;</span>
+<span class="a">+	} else {</span>
+<span class="a">+		ii = 0;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	for (i = x1; i != x2; i += ii)</span>
+<span class="a">+		map[y2][i].c = &#x27;.&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+rendermap(void)</span>
+<span class="a">+{</span>
+<span class="a">+	size_t i, j;</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; MAPHEIGHT; i++) {</span>
+<span class="a">+		for (j = 0; j &lt; MAPWIDTH; j++)</span>
+<span class="a">+			putchar(map[i][j].c);</span>
+<span class="a">+		putchar(&#x27;\n&#x27;);</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+size_t</span>
+<span class="a">+placeitems_hash(Item *item, size_t *assocs, size_t k)</span>
+<span class="a">+{</span>
+<span class="a">+	Dir *dir;</span>
+<span class="a">+	Item *citem;</span>
+<span class="a">+	size_t i;</span>
+<span class="a">+</span>
+<span class="a">+	dir = item-&gt;dat;</span>
+<span class="a">+	for (i = 0; i &lt; dir-&gt;nitems; i++) {</span>
+<span class="a">+		citem = &amp;dir-&gt;items[i];</span>
+<span class="a">+		/* TODO Somewhere else */</span>
+<span class="a">+		if (!citem-&gt;host || !citem-&gt;port || !citem-&gt;selector)</span>
+<span class="a">+			continue;</span>
+<span class="a">+		assocs[i] = fnv1a(6, item-&gt;host, item-&gt;port, item-&gt;selector, citem-&gt;host, citem-&gt;port, citem-&gt;selector) % k;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	return k;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define POSITIONS_LENGTH 4</span>
+<span class="a">+enum {</span>
+<span class="a">+	Portal,</span>
+<span class="a">+	StaircaseDown,</span>
+<span class="a">+	Bookshelf,</span>
+<span class="a">+	Back</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+size_t px, py;</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+generatemap(Item *item, int new)</span>
+<span class="a">+{</span>
+<span class="a">+	Dir *dir;</span>
+<span class="a">+	Item *citem;</span>
+<span class="a">+	size_t i, j, k, l, ir;</span>
+<span class="a">+	size_t x, y;</span>
+<span class="a">+	ssize_t n, m;</span>
+<span class="a">+	size_t *cassocs;</span>
+<span class="a">+	struct room *rooms, *r;</span>
+<span class="a">+	struct {</span>
+<span class="a">+		unsigned char x, y;</span>
+<span class="a">+	} positions[POSITIONS_LENGTH];</span>
+<span class="a">+	uint32_t prng;</span>
+<span class="a">+	char buffer[3];</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; MAPHEIGHT; i++) {</span>
+<span class="a">+		for (j = 0; j &lt; MAPWIDTH; j++) {</span>
+<span class="a">+			map[i][j].c = &#x27;#&#x27;;</span>
+<span class="a">+			free(map[i][j].items);</span>
+<span class="a">+			map[i][j].items = NULL;</span>
+<span class="a">+			map[i][j].nitems = 0;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	dir = item-&gt;dat;</span>
+<span class="a">+	for (j = l = 0; j &lt; dir-&gt;nitems; j++) {</span>
+<span class="a">+		if (dir-&gt;items[j].type == &#x27;0&#x27; ||</span>
+<span class="a">+		    dir-&gt;items[j].type == &#x27;1&#x27;)</span>
+<span class="a">+			l++;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	k = 1 + l / 10;</span>
+<span class="a">+	rooms = calloc(k, sizeof(*rooms));</span>
+<span class="a">+	if (!rooms)</span>
+<span class="a">+		return;</span>
+<span class="a">+	k = generaterooms_gnarf(fnv1a(3, item-&gt;host, item-&gt;port, item-&gt;selector), rooms, k);</span>
+<span class="a">+</span>
+<span class="a">+	cassocs = calloc(dir-&gt;nitems, sizeof(*cassocs));</span>
+<span class="a">+	if (!cassocs)</span>
+<span class="a">+		goto cleanup;</span>
+<span class="a">+</span>
+<span class="a">+	k = placeitems_hash(item, cassocs, k);</span>
+<span class="a">+</span>
+<span class="a">+	/* Insert rooms */</span>
+<span class="a">+	for (i = 0; i &lt; k; i++) {</span>
+<span class="a">+		for (y = rooms[i].y; y &lt; rooms[i].y + rooms[i].h; y++) {</span>
+<span class="a">+			for (x = rooms[i].x; x &lt; rooms[i].x + rooms[i].w; x++)</span>
+<span class="a">+				map[y][x].c = &#x27;.&#x27;;</span>
+<span class="a">+		} </span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	/* Insert connections */</span>
+<span class="a">+	for (i = 0; i &lt; k; i++) {</span>
+<span class="a">+		if (rooms[i].p)</span>
+<span class="a">+			connectrooms(&amp;rooms[i], rooms[i].p);</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	/*</span>
+<span class="a">+		Insert items</span>
+<span class="a">+		The placement of items affects the initial placement of the player, because they could have gone back to this map, so they should appear at the elevator/portal/stair they used.</span>
+<span class="a">+	*/</span>
+<span class="a">+	ir = fnv1a(4, item-&gt;host, item-&gt;port, item-&gt;selector, &quot;initial_room&quot;) % k;</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; k; i++) {</span>
+<span class="a">+		snprintf(buffer, sizeof(buffer), &quot;%d&quot;, i);</span>
+<span class="a">+		prng = fnv1a(4, item-&gt;host, item-&gt;port, item-&gt;selector, buffer);</span>
+<span class="a">+		for (j = 0, n = 0, m = rooms[i].h * rooms[i].w; j &lt; m; j++) {</span>
+<span class="a">+			if ((m - j) * (xorshift(&amp;prng) / (double)UINT32_MAX) &lt; POSITIONS_LENGTH - n) {</span>
+<span class="a">+				positions[n].x = rooms[i].x + j % rooms[i].w;</span>
+<span class="a">+				positions[n].y = rooms[i].y + j / rooms[i].w;</span>
+<span class="a">+				n++;</span>
+<span class="a">+			}</span>
+<span class="a">+			if (n == POSITIONS_LENGTH)</span>
+<span class="a">+				break;</span>
+<span class="a">+		}</span>
+<span class="a">+		for (j = 0; j &lt; dir-&gt;nitems; j++) {</span>
+<span class="a">+			if (cassocs[j] != i)</span>
+<span class="a">+				continue;</span>
+<span class="a">+</span>
+<span class="a">+			citem = &amp;dir-&gt;items[j];</span>
+<span class="a">+			switch (citem-&gt;type) {</span>
+<span class="a">+			case &#x27;0&#x27;:</span>
+<span class="a">+				x = positions[Bookshelf].x;</span>
+<span class="a">+				y = positions[Bookshelf].y;</span>
+<span class="a">+				if (map[y][x].nitems)</span>
+<span class="a">+					map[y][x].c = &#x27;E&#x27;;</span>
+<span class="a">+				else</span>
+<span class="a">+					map[y][x].c = &#x27;?&#x27;;</span>
+<span class="a">+				break;</span>
+<span class="a">+			case &#x27;1&#x27;:</span>
+<span class="a">+				if (strcmp(citem-&gt;host, item-&gt;host) || strcmp(citem-&gt;port, item-&gt;port)) {</span>
+<span class="a">+					x = positions[Portal].x;</span>
+<span class="a">+					y = positions[Portal].y;</span>
+<span class="a">+					if (map[y][x].nitems)</span>
+<span class="a">+						map[y][x].c = &#x27;O&#x27;;</span>
+<span class="a">+					else</span>
+<span class="a">+						map[y][x].c = &#x27;0&#x27;;</span>
+<span class="a">+				} else {</span>
+<span class="a">+					x = positions[StaircaseDown].x;</span>
+<span class="a">+					y = positions[StaircaseDown].y;</span>
+<span class="a">+					if (map[y][x].nitems)</span>
+<span class="a">+						map[y][x].c = &#x27;L&#x27;;</span>
+<span class="a">+					else</span>
+<span class="a">+						map[y][x].c = &#x27;&gt;&#x27;;</span>
+<span class="a">+				}</span>
+<span class="a">+				break;</span>
+<span class="a">+			default:</span>
+<span class="a">+				continue;</span>
+<span class="a">+			}</span>
+<span class="a">+			map[y][x].nitems++;</span>
+<span class="a">+			map[y][x].items = realloc(map[y][x].items, map[y][x].nitems * sizeof(*map[y][x].items));</span>
+<span class="a">+			map[y][x].items[map[y][x].nitems-1] = citem;</span>
+<span class="a">+</span>
+<span class="a">+			if (new &amp;&amp; j == dir-&gt;curline &amp;&amp; citem-&gt;raw) {</span>
+<span class="a">+				px = x;</span>
+<span class="a">+				py = y;</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+<span class="a">+		if (i == ir &amp;&amp; item-&gt;entry != item) {</span>
+<span class="a">+			y = positions[Back].y;</span>
+<span class="a">+			x = positions[Back].x;</span>
+<span class="a">+			if (strcmp(item-&gt;entry-&gt;host, item-&gt;host) || strcmp(item-&gt;entry-&gt;port, item-&gt;port))</span>
+<span class="a">+				map[y][x].c = &#x27;0&#x27;;</span>
+<span class="a">+			else</span>
+<span class="a">+				map[y][x].c = &#x27;&lt;&#x27;;</span>
+<span class="a">+			map[y][x].nitems++;</span>
+<span class="a">+			map[y][x].items = realloc(map[y][x].items, map[y][x].nitems * sizeof(*map[y][x].items));</span>
+<span class="a">+			map[y][x].items[map[y][x].nitems-1] = item-&gt;entry;</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+<span class="a">+		if (i == ir &amp;&amp; new &amp;&amp; !dir-&gt;items[dir-&gt;curline].raw) {</span>
+<span class="a">+			px = positions[Back].x;</span>
+<span class="a">+			py = positions[Back].y;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	free(cassocs);</span>
+<span class="a">+</span>
+<span class="a">+cleanup:</span>
+<span class="a">+	free(rooms);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+uisetup(void)</span>
+<span class="a">+{</span>
+<span class="a">+	tcgetattr(0, &amp;tsave);</span>
+<span class="a">+	tsacc = tsave;</span>
+<span class="a">+	tsacc.c_lflag &amp;= ~(ECHO|ICANON);</span>
+<span class="a">+	tsacc.c_cc[VMIN] = 1;</span>
+<span class="a">+	tsacc.c_cc[VTIME] = 0;</span>
+<span class="a">+	tcsetattr(0, TCSANOW, &amp;tsacc);</span>
+<span class="a">+</span>
+<span class="a">+	if (termset != OK)</span>
+<span class="a">+		/* setupterm call exits on error */</span>
+<span class="a">+		termset = setupterm(NULL, 1, NULL);</span>
+<span class="a">+	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+uicleanup(void)</span>
+<span class="a">+{</span>
+<span class="a">+	tcsetattr(0, TCSANOW, &amp;tsave);</span>
+<span class="a">+</span>
+<span class="a">+	if (termset != OK)</span>
+<span class="a">+		return;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+char *</span>
+<span class="a">+uiprompt(char *fmt, ...)</span>
+<span class="a">+{</span>
+<span class="a">+	va_list ap;</span>
+<span class="a">+	char *input = NULL;</span>
+<span class="a">+	size_t n;</span>
+<span class="a">+	ssize_t r;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(save_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(cursor_address, lines-1, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	putp(tparm(clr_eol, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	va_start(ap, fmt);</span>
+<span class="a">+	vsnprintf(bufout, sizeof(bufout), fmt, ap);</span>
+<span class="a">+	va_end(ap);</span>
+<span class="a">+</span>
+<span class="a">+	n = mbsprint(bufout, columns);</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(clr_eol, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(cursor_address, lines-1, n, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	tsacc.c_lflag |= (ECHO|ICANON);</span>
+<span class="a">+	tcsetattr(0, TCSANOW, &amp;tsacc);</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+</span>
+<span class="a">+	n = 0;</span>
+<span class="a">+	r = getline(&amp;input, &amp;n, stdin);</span>
+<span class="a">+</span>
+<span class="a">+	tsacc.c_lflag &amp;= ~(ECHO|ICANON);</span>
+<span class="a">+	tcsetattr(0, TCSANOW, &amp;tsacc);</span>
+<span class="a">+	putp(tparm(restore_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+</span>
+<span class="a">+	if (r == -1) {</span>
+<span class="a">+		clearerr(stdin);</span>
+<span class="a">+		clear(&amp;input);</span>
+<span class="a">+	} else if (input[r - 1] == &#x27;\n&#x27;) {</span>
+<span class="a">+		input[--r] = &#x27;\0&#x27;;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	return input;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+displaybar(char *s) {</span>
+<span class="a">+	size_t n;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(save_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(cursor_address, lines-2, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	putp(tparm(enter_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	n = mbsprint(s, columns);</span>
+<span class="a">+	for (n = columns - n; n; n--)</span>
+<span class="a">+		putchar(&#x27; &#x27;);</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(exit_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(restore_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+vdisplayinfoline(char *fmt, va_list ap)</span>
+<span class="a">+{</span>
+<span class="a">+	putp(tparm(save_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(cursor_address, lines-1, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	vsnprintf(bufout, sizeof(bufout), fmt, ap);</span>
+<span class="a">+</span>
+<span class="a">+	mbsprint(bufout, columns);</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(clr_eol, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(restore_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+uistatus(char *fmt, ...)</span>
+<span class="a">+{</span>
+<span class="a">+	va_list ap;</span>
+<span class="a">+	size_t n;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(save_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(cursor_address, lines-1, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	va_start(ap, fmt);</span>
+<span class="a">+	n = vsnprintf(bufout, sizeof(bufout), fmt, ap);</span>
+<span class="a">+	va_end(ap);</span>
+<span class="a">+</span>
+<span class="a">+	if (n &lt; sizeof(bufout)-1) {</span>
+<span class="a">+		snprintf(bufout+n, sizeof(bufout)-n,</span>
+<span class="a">+		         &quot; [Press a key to continue \xe2\x98\x83]&quot;);</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	mbsprint(bufout, columns);</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(clr_eol, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(restore_cursor, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+</span>
+<span class="a">+	getchar();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+displayinfoline(char *fmt, ...)</span>
+<span class="a">+{</span>
+<span class="a">+	va_list ap;</span>
+<span class="a">+</span>
+<span class="a">+	va_start(ap, fmt);</span>
+<span class="a">+	vdisplayinfoline(fmt, ap);</span>
+<span class="a">+	va_end(ap);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+Item *</span>
+<span class="a">+showmenu(char *title, Item **item, size_t l)</span>
+<span class="a">+{</span>
+<span class="a">+	size_t i;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(enter_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	printf(&quot;%s\n&quot;, title);</span>
+<span class="a">+	putp(tparm(exit_standout_mode, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	for (i = 0; i &lt; l; i++)</span>
+<span class="a">+		printf(&quot;%lu\t%s\n&quot;, i, item[i]-&gt;username);</span>
+<span class="a">+</span>
+<span class="a">+	if (!scanf(&quot;%lu&quot;, &amp;i) || i &gt;= l)</span>
+<span class="a">+		return NULL;</span>
+<span class="a">+	fflush(stdout);</span>
+<span class="a">+</span>
+<span class="a">+	return item[i];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+Item *</span>
+<span class="a">+prompt(char *text, Item *item)</span>
+<span class="a">+{</span>
+<span class="a">+	displayinfoline(text, item-&gt;username);</span>
+<span class="a">+	getchar();</span>
+<span class="a">+	return item;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+Item *</span>
+<span class="a">+interact(Item *item)</span>
+<span class="a">+{</span>
+<span class="a">+	Item *selection;</span>
+<span class="a">+</span>
+<span class="a">+	selection = NULL;</span>
+<span class="a">+</span>
+<span class="a">+	switch (map[py][px].c) {</span>
+<span class="a">+	case &#x27;?&#x27;:</span>
+<span class="a">+	case &#x27;0&#x27;:</span>
+<span class="a">+	case &#x27;&gt;&#x27;:</span>
+<span class="a">+	case &#x27;&lt;&#x27;:</span>
+<span class="a">+		selection = map[py][px].items[0];</span>
+<span class="a">+		break;</span>
+<span class="a">+	case &#x27;E&#x27;:</span>
+<span class="a">+		selection = showmenu(&quot;Bookshelf&quot;, map[py][px].items, map[py][px].nitems);</span>
+<span class="a">+		break;</span>
+<span class="a">+	case &#x27;O&#x27;:</span>
+<span class="a">+		selection = showmenu(&quot;Portal machine&quot;, map[py][px].items, map[py][px].nitems);</span>
+<span class="a">+		break;</span>
+<span class="a">+	case &#x27;L&#x27;:</span>
+<span class="a">+		selection = showmenu(&quot;Elevator&quot;, map[py][px].items, map[py][px].nitems);</span>
+<span class="a">+		break;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	drawscreen();</span>
+<span class="a">+</span>
+<span class="a">+	if (selection) {</span>
+<span class="a">+		switch (map[py][px].c) {</span>
+<span class="a">+		case &#x27;?&#x27;:</span>
+<span class="a">+		case &#x27;E&#x27;:</span>
+<span class="a">+			displayinfoline(&quot;A loading bar?! In a book?!&quot;);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;O&#x27;:</span>
+<span class="a">+		case &#x27;0&#x27;:</span>
+<span class="a">+			displayinfoline(&quot;You are getting transported through time and space.&quot;);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;L&#x27;:</span>
+<span class="a">+			displayinfoline(&quot;You hear elevator music...&quot;);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;&lt;&#x27;:</span>
+<span class="a">+		case &#x27;&gt;&#x27;:</span>
+<span class="a">+			displayinfoline(&quot;Too many stairs...&quot;);</span>
+<span class="a">+			break;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	return selection;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+describe(size_t x, size_t y, int verbose)</span>
+<span class="a">+{</span>
+<span class="a">+	switch (map[y][x].c) {</span>
+<span class="a">+	case &#x27;E&#x27;:</span>
+<span class="a">+		displayinfoline(&quot;A bookshelf.&quot;);</span>
+<span class="a">+		break;</span>
+<span class="a">+	case &#x27;O&#x27;:</span>
+<span class="a">+		displayinfoline(&quot;A portal machine.&quot;);</span>
+<span class="a">+		break;</span>
+<span class="a">+	case &#x27;L&#x27;:</span>
+<span class="a">+		displayinfoline(&quot;An elevator.&quot;);</span>
+<span class="a">+		break;</span>
+<span class="a">+	case &#x27;?&#x27;:</span>
+<span class="a">+	case &#x27;&gt;&#x27;:</span>
+<span class="a">+	case &#x27;&lt;&#x27;:</span>
+<span class="a">+	case &#x27;0&#x27;:</span>
+<span class="a">+		if (*map[y][x].items[0]-&gt;username) {</span>
+<span class="a">+			displayinfoline(&quot;&#x27;%s&#x27;.&quot;, map[y][x].items[0]-&gt;username);</span>
+<span class="a">+		} else {</span>
+<span class="a">+			itemuri(map[y][x].items[0], bufout2, sizeof(bufout2));</span>
+<span class="a">+			displayinfoline(&quot;&#x27;%s&#x27;.&quot;, bufout2);</span>
+<span class="a">+		}</span>
+<span class="a">+		break;</span>
+<span class="a">+	default:</span>
+<span class="a">+		if (verbose) {</span>
+<span class="a">+			switch (map[y][x].c) {</span>
+<span class="a">+			case &#x27;.&#x27;:</span>
+<span class="a">+				displayinfoline(&quot;Floor.&quot;);</span>
+<span class="a">+				break;</span>
+<span class="a">+			case &#x27;#&#x27;:</span>
+<span class="a">+				displayinfoline(&quot;Wall.&quot;);</span>
+<span class="a">+				break;</span>
+<span class="a">+			}</span>
+<span class="a">+		} else {</span>
+<span class="a">+			displayinfoline(&quot;&quot;);</span>
+<span class="a">+		}</span>
+<span class="a">+		break;</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+move(ssize_t dx, ssize_t dy)</span>
+<span class="a">+{</span>
+<span class="a">+	size_t x, y;</span>
+<span class="a">+</span>
+<span class="a">+	/* allow wraparound of the world for the lulz, even if it&#x27;s not happening */</span>
+<span class="a">+	y = (MAPHEIGHT + py + dy) % MAPHEIGHT;</span>
+<span class="a">+	x = (MAPWIDTH + px + dx) % MAPWIDTH;</span>
+<span class="a">+</span>
+<span class="a">+	if (map[y][x].c == &#x27;#&#x27;)</span>
+<span class="a">+		return;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(cursor_address, py, px, 0, 0, 0, 0, 0, 0, 0 ));</span>
+<span class="a">+	putchar(map[py][px].c);</span>
+<span class="a">+</span>
+<span class="a">+	py = y;</span>
+<span class="a">+	px = x;</span>
+<span class="a">+	putp(tparm(cursor_address, py, px, 0, 0, 0, 0, 0, 0, 0 ));</span>
+<span class="a">+	putchar(&#x27;@&#x27;);</span>
+<span class="a">+	putp(tparm(cursor_address, py, px, 0, 0, 0, 0, 0, 0, 0 ));</span>
+<span class="a">+</span>
+<span class="a">+	describe(x, y, 0);</span>
+<span class="a">+	putp(tparm(cursor_address, py, px, 0, 0, 0, 0, 0, 0, 0 ));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+drawscreen(void)</span>
+<span class="a">+{</span>
+<span class="a">+	Dir *dir;</span>
+<span class="a">+</span>
+<span class="a">+	putp(tparm(clear_screen, 0, 0, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+	rendermap();</span>
+<span class="a">+</span>
+<span class="a">+	if (curentry-&gt;entry != curentry &amp;&amp; (dir = curentry-&gt;entry-&gt;dat)) {</span>
+<span class="a">+		displaybar(dir-&gt;items[dir-&gt;curline].username);</span>
+<span class="a">+	} else {</span>
+<span class="a">+		itemuri(curentry, bufout, sizeof(bufout));</span>
+<span class="a">+		displaybar(bufout);</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	move(0, 0);</span>
+<span class="a">+</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+uidisplay(Item *entry)</span>
+<span class="a">+{</span>
+<span class="a">+	if (!entry || entry-&gt;type != &#x27;1&#x27;)</span>
+<span class="a">+		return;</span>
+<span class="a">+</span>
+<span class="a">+	generatemap(entry, curentry != entry);</span>
+<span class="a">+</span>
+<span class="a">+	curentry = entry;</span>
+<span class="a">+	drawscreen();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+lookmode(void)</span>
+<span class="a">+{</span>
+<span class="a">+	size_t x, y;</span>
+<span class="a">+</span>
+<span class="a">+	x = px;</span>
+<span class="a">+	y = py;</span>
+<span class="a">+</span>
+<span class="a">+	for (;;) {</span>
+<span class="a">+		switch (getchar()) {</span>
+<span class="a">+		case 0x1B:</span>
+<span class="a">+		case &#x27;q&#x27;:</span>
+<span class="a">+			putp(tparm(cursor_address, py, px, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+			return;</span>
+<span class="a">+		case &#x27;h&#x27;:</span>
+<span class="a">+			x = (MAPWIDTH + x - 1) % MAPWIDTH;</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;j&#x27;:</span>
+<span class="a">+			y = (y + 1) % MAPHEIGHT;</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;k&#x27;:</span>
+<span class="a">+			y = (MAPHEIGHT + y - 1) % MAPHEIGHT;</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;l&#x27;:</span>
+<span class="a">+			x = (x + 1) % MAPWIDTH;</span>
+<span class="a">+			break;</span>
+<span class="a">+		}</span>
+<span class="a">+		putp(tparm(cursor_address, y, x, 0, 0, 0, 0, 0, 0, 0));</span>
+<span class="a">+		describe(x, y, 1);</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+Item *</span>
+<span class="a">+uiselectitem(Item *entry)</span>
+<span class="a">+{</span>
+<span class="a">+	Dir *dir;</span>
+<span class="a">+	Item *e;</span>
+<span class="a">+	size_t i;</span>
+<span class="a">+</span>
+<span class="a">+	if (!entry || !(dir = entry-&gt;dat))</span>
+<span class="a">+		return NULL;</span>
+<span class="a">+</span>
+<span class="a">+	for (;;) {</span>
+<span class="a">+		switch (getchar()) {</span>
+<span class="a">+		case &#x27;h&#x27;:</span>
+<span class="a">+			move(-1, 0);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;j&#x27;:</span>
+<span class="a">+			move(0, 1);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;k&#x27;:</span>
+<span class="a">+			move(0, -1);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;l&#x27;:</span>
+<span class="a">+			move(1, 0);</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;L&#x27;:</span>
+<span class="a">+			lookmode();</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27; &#x27;:</span>
+<span class="a">+			/* Portals, stairs, bookshelfs */</span>
+<span class="a">+			if (e = interact(entry)) {</span>
+<span class="a">+				if (e-&gt;type == &#x27;1&#x27;) {</span>
+<span class="a">+					for (i = 0; i &lt; dir-&gt;nitems; i++) {</span>
+<span class="a">+						if (e == &amp;dir-&gt;items[i]) {</span>
+<span class="a">+							dir-&gt;curline = i;</span>
+<span class="a">+							break;</span>
+<span class="a">+						}</span>
+<span class="a">+					}</span>
+<span class="a">+				}</span>
+<span class="a">+				return e;</span>
+<span class="a">+			}</span>
+<span class="a">+			break;</span>
+<span class="a">+		case &#x27;q&#x27;:</span>
+<span class="a">+			return NULL;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+uisigwinch(int signal)</span>
+<span class="a">+{</span>
+<span class="a">+	Dir *dir;</span>
+<span class="a">+</span>
+<span class="a">+	if (termset == OK)</span>
+<span class="a">+		del_curterm(cur_term);</span>
+<span class="a">+	termset = setupterm(NULL, 1, NULL);</span>
+<span class="a">+</span>
+<span class="a">+	if (!curentry || !(dir = curentry-&gt;dat))</span>
+<span class="a">+		return;</span>
+<span class="a">+</span>
+<span class="a">+	uidisplay(curentry);</span>
+<span class="a">+}</span></pre>
+</div></body></html>
