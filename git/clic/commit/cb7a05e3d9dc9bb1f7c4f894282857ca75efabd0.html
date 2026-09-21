@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>clic cb7a05e3 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>clic</h1><span class="desc">MIRROR ONLY Gopher client with pretty colours in Common Lisp</span><p class="url">git clone https://github.com/equwal/clic</p><p><a href="../../clic/index.html">Log</a> | <a href="../../clic/files.html">Files</a> | <a href="../../clic/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit cb7a05e3d9dc9bb1f7c4f894282857ca75efabd0
+Solene Rapenne &lt;solene@perso.pw&gt;
+2017-11-11 00:30:27 +0000
+
+This is a major rework.
+
+- Sbcl now use a link to &quot;extension.so&quot; to get information about the height of the terminal, ecl default to a hardcoded value.
+- Response from server is now buffered instead of being displayed for each line received
+- when the display is more than the terminal height, break display loop
+
+- output to file is broken because it currently ask to display next page...
+
+</pre><pre> Makefile         |  10 ++-
+ TODO             |   5 +-
+ clic.lisp        | 264 ++++++++++++++++++++++++++++++++++---------------------
+ extension.c      |   8 ++
+ make-binary.lisp |   8 +-
+ test.lisp        |   2 +
+ 6 files changed, 189 insertions(+), 108 deletions(-)
+</pre><pre>diff --git a/Makefile b/Makefile
+index 3ad30a1..1a0990f 100644
+--- a/Makefile
++++ b/Makefile
+<span class="h">@@ -10,12 +10,16 @@ MANDIR = ${PREFIX}/share/man/man1</span>
+ 
+ all: ${BIN}
+ 
+<span class="d">-${BIN}: clic.lisp</span>
+<span class="a">+${BIN}: clic.lisp make-binary.lisp</span>
+ 	${LISP} --load make-binary.lisp
+ 
+<span class="d">-standalone: clic.lisp</span>
+<span class="a">+standalone: clic.lisp extension make-binary.lisp</span>
+ 	${MAKE} -e LISP=sbcl
+ 
+<span class="a">+extension: extension.c</span>
+<span class="a">+	cc -fPIC -c extension.c</span>
+<span class="a">+	ld -shared -o extension.so extension.o</span>
+<span class="a">+</span>
+ install: ${BIN}
+ 	@echo installing executable to &quot;${DESTDIR}${PREFIX}/bin&quot;
+ 	@mkdir -p &quot;${DESTDIR}${BINDIR}&quot;
+<span class="h">@@ -27,7 +31,7 @@ uninstall:</span>
+ 	@rm -f &quot;${DESTDIR}${BINDIR}/${BIN}&quot;
+ 
+ clean:
+<span class="d">-	rm -f &quot;${BIN}&quot; clic.o clic.eclh clic.cxx bookmark-test</span>
+<span class="a">+	rm -f &quot;${BIN}&quot; clic.o clic.eclh clic.cxx bookmark-test extension.so</span>
+ 
+ test: clean all
+ 	@sh run-test.sh ${LISP}
+diff --git a/TODO b/TODO
+index fcbfef0..6f0c7d9 100644
+--- a/TODO
++++ b/TODO
+<span class="h">@@ -8,6 +8,7 @@</span>
+ 
+ * CODE
+ 
+<span class="d">-- TODO find a better color scheme</span>
+<span class="a">+- TODO remove the pagination if using stdout or not in shell</span>
+<span class="a">+- TODO make the c-termsize working on ecl</span>
+ - DONE use CLOS to store data
+<span class="d">-- TODO store the whole page and deal with it later (but not if it&#x27;s not a 0 or 1 type)</span>
+<span class="a">+- DONE store the whole page and deal with it later</span>
+diff --git a/clic.lisp b/clic.lisp
+index 2566017..9ed8d25 100644
+--- a/clic.lisp
++++ b/clic.lisp
+<span class="h">@@ -5,11 +5,32 @@</span>
+   #+ecl
+   (require &#x27;sockets))
+ 
+<span class="a">+;;;; C binding to get terminal informations</span>
+<span class="a">+;;;; SBCL only</span>
+<span class="a">+#+sbcl</span>
+<span class="a">+(progn</span>
+<span class="a">+  (load-shared-object &quot;./extension.so&quot;)</span>
+<span class="a">+  (declaim (inline termsize))</span>
+<span class="a">+  (sb-alien:define-alien-routine &quot;termsize&quot; int)</span>
+<span class="a">+  (defun c-termsize ()</span>
+<span class="a">+    &quot;return terminal height&quot;</span>
+<span class="a">+    (sb-alien:with-alien ((res int (termsize))))))</span>
+<span class="a">+</span>
+<span class="a">+#+ecl</span>
+<span class="a">+(progn</span>
+<span class="a">+  &quot;we don&#x27;t do C binding with ecl&quot;</span>
+<span class="a">+  (defun c-termsize()</span>
+<span class="a">+    40))</span>
+<span class="a">+;;;; END C binding</span>
+<span class="a">+</span>
+ ;; structure to store links
+ (defstruct location host port type uri)
+ 
+ ;;;; BEGIN GLOBAL VARIABLES
+ 
+<span class="a">+;;; array of lines in buffer</span>
+<span class="a">+(defparameter *buffer* nil)</span>
+<span class="a">+</span>
+ ;;; a list containing the last viewed pages
+ (defparameter *history*   &#x27;())
+ 
+<span class="h">@@ -82,7 +103,7 @@</span>
+   &quot;Used to display gopher response with color one line at a time&quot;
+   (let ((line-type (subseq line 0 1))
+ 	(infos (split (subseq line 1) #\Tab)))
+<span class="d">-    </span>
+<span class="a">+</span>
+     ;; see RFC 1436
+     ;; section 3.8
+     (when (and
+<span class="h">@@ -156,72 +177,40 @@</span>
+ 	;; I image
+ 	(check &quot;I&quot; &#x27;unimplemented)))))
+ 
+<span class="d">-(defun getpage(host port uri &amp;optional (type &quot;1&quot;))</span>
+<span class="a">+</span>
+<span class="a">+(defun getpage(host port uri)</span>
+   &quot;connect and display&quot;
+<span class="a">+</span>
+<span class="a">+  ;; we reset the buffer</span>
+<span class="a">+  (setf *buffer*</span>
+<span class="a">+	(make-array 200</span>
+<span class="a">+		    :fill-pointer 0</span>
+<span class="a">+		    :initial-element nil</span>
+<span class="a">+		    :adjustable t))</span>
+   
+<span class="d">-  (let ((here (make-location :host host :port port :uri uri :type type)))</span>
+<span class="d">-    </span>
+<span class="d">-    ;; goes to the history !</span>
+<span class="d">-    (push here *history*)</span>
+<span class="a">+  ;; we prepare informations about the connection</span>
+<span class="a">+  (let* ((address (sb-bsd-sockets:get-host-by-name host))</span>
+<span class="a">+	 (host (car (sb-bsd-sockets:host-ent-addresses address)))</span>
+<span class="a">+	 (socket (make-instance &#x27;sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))</span>
+     
+<span class="d">-    ;; we reset the links table ONLY if we have a new folder</span>
+<span class="d">-    (when (string= &quot;1&quot; type)</span>
+<span class="d">-      (setf *links* (make-hash-table)))</span>
+<span class="d">-</span>
+<span class="d">-    (when *offline*</span>
+<span class="d">-      (ensure-directories-exist (concatenate &#x27;string</span>
+<span class="d">-					     &quot;history/&quot;</span>
+<span class="d">-					     (location-host here)</span>
+<span class="d">-					     &quot;/&quot;</span>
+<span class="d">-					     (location-uri here)</span>
+<span class="d">-					     &quot;/&quot;)))</span>
+<span class="d">-</span>
+<span class="a">+    (sb-bsd-sockets:socket-connect socket host port)</span>
+     
+<span class="d">-    ;; we prepare informations about the connection</span>
+<span class="d">-    (let* ((address (sb-bsd-sockets:get-host-by-name host))</span>
+<span class="d">-	   (host (car (sb-bsd-sockets:host-ent-addresses address)))</span>
+<span class="d">-	   (socket (make-instance &#x27;sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))</span>
+<span class="a">+    ;; we open a stream for input/output</span>
+<span class="a">+    (let ((stream (sb-bsd-sockets:socket-make-stream socket :input t :output t)))</span>
+       
+<span class="d">-      (sb-bsd-sockets:socket-connect socket host port)</span>
+<span class="a">+      ;; sending the request here</span>
+<span class="a">+      ;; if the selector is 1 we omit it</span>
+<span class="a">+      (format stream &quot;~a~%&quot; uri)</span>
+<span class="a">+      (force-output stream)</span>
+       
+<span class="d">-      ;; we open a stream for input/output</span>
+<span class="d">-      (let ((stream (sb-bsd-sockets:socket-make-stream socket :input t :output t)))</span>
+<span class="d">-	</span>
+<span class="d">-	;; sending the request here</span>
+<span class="d">-	;; if the selector is 1 we omit it</span>
+<span class="d">-	(format stream &quot;~a~%&quot; uri)</span>
+<span class="d">-	(force-output stream)</span>
+<span class="d">-</span>
+<span class="d">-	(let ((save-offline (if *offline*</span>
+<span class="d">-				(open (concatenate &#x27;string</span>
+<span class="d">-						   &quot;history/&quot;</span>
+<span class="d">-						   (location-host here)</span>
+<span class="d">-						   &quot;/&quot;</span>
+<span class="d">-						   (location-uri here)</span>
+<span class="d">-						   (location-type here))</span>
+<span class="d">-				      :direction :output</span>
+<span class="d">-				      :if-does-not-exist :create</span>
+<span class="d">-				      :if-exists :supersede)</span>
+<span class="d">-				nil)))</span>
+<span class="d">-	  </span>
+<span class="d">-	  ;; for each line we receive we display it</span>
+<span class="d">-	  (loop for line = (read-line stream nil nil)</span>
+<span class="d">-	     while line do</span>
+<span class="d">-	       (when save-offline</span>
+<span class="d">-		 (format save-offline &quot;~a~%&quot; line))</span>
+<span class="d">-	       (cond</span>
+<span class="d">-		 ((string= &quot;1&quot; type)</span>
+<span class="d">-		  (formatted-output line))</span>
+<span class="d">-		 ((string= &quot;0&quot; type)</span>
+<span class="d">-		  (format t &quot;~a~%&quot; line))))</span>
+<span class="d">-	  (and save-offline (close save-offline)))))))</span>
+<span class="a">+      ;; for each line we receive we display it</span>
+<span class="a">+      (loop for line = (read-line stream nil nil)</span>
+<span class="a">+	 while line</span>
+<span class="a">+	 do</span>
+<span class="a">+	   (vector-push line *buffer*)))))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ 
+<span class="d">-(defun visit(destination)</span>
+<span class="d">-  &quot;visit a location&quot;</span>
+<span class="d">-  (getpage (location-host destination)</span>
+<span class="d">-	   (location-port destination)</span>
+<span class="d">-	   (location-uri  destination)</span>
+<span class="d">-	   (location-type destination)))</span>
+ 
+ (defun g(key)
+   &quot;browse to the N-th link&quot;
+<span class="h">@@ -271,7 +260,6 @@</span>
+ 					(location-type bookmark)
+ 					(location-uri bookmark))
+ 			   &#x27;file line-number))))
+<span class="d">-</span>
+ (defun help-shell()
+   &quot;show help for the shell&quot;
+   (format t &quot;number : go to link n~%&quot;)
+<span class="h">@@ -282,47 +270,7 @@</span>
+   (format t &quot;help   : show this help~%&quot;)
+   (format t &quot;x or q : exit the shell, go back to REPL~%&quot;))
+ 
+<span class="d">-(defun shell()</span>
+<span class="d">-  &quot;Shell for user interaction&quot;</span>
+<span class="d">-  (format t &quot;clic =&gt; &quot;)</span>
+<span class="d">-  (force-output)</span>
+ 
+<span class="d">-  ;; we loop until X or Q is typed</span>
+<span class="d">-  (loop for user-input = (format nil &quot;~a&quot; (read nil nil))</span>
+<span class="d">-	while (not (or</span>
+<span class="d">-		    (string= &quot;X&quot; user-input)</span>
+<span class="d">-		    (string= &quot;Q&quot; user-input)))</span>
+<span class="d">-	do</span>
+<span class="d">-	(cond</span>
+<span class="d">-</span>
+<span class="d">-	 ;; show help</span>
+<span class="d">-	 ((string= &quot;HELP&quot; user-input)</span>
+<span class="d">-	  (help-shell))</span>
+<span class="d">-</span>
+<span class="d">-	 ;; bookmark current link</span>
+<span class="d">-	 ((string= &quot;A&quot; user-input)</span>
+<span class="d">-	  (add-bookmark))</span>
+<span class="d">-</span>
+<span class="d">-	 ;; show bookmarks</span>
+<span class="d">-	 ((string= &quot;B&quot; user-input)</span>
+<span class="d">-	  (show-bookmarks))</span>
+<span class="d">-</span>
+<span class="d">-	 ;; go to previous page</span>
+<span class="d">-	 ((string= &quot;P&quot; user-input)</span>
+<span class="d">-	  (p))</span>
+<span class="d">-</span>
+<span class="d">-	 ;; show history</span>
+<span class="d">-	 ((string= &quot;H&quot; user-input)</span>
+<span class="d">-	  (format t &quot;~{~a~%~}&quot; *history*))</span>
+<span class="d">-</span>
+<span class="d">-	 ;; follow a link</span>
+<span class="d">-	 (t</span>
+<span class="d">-	  ;; we ignore error in case of bad input</span>
+<span class="d">-	  ;; just do nothing</span>
+<span class="d">-	  (ignore-errors</span>
+<span class="d">-	    (g (parse-integer user-input)))))</span>
+<span class="d">-	(format t &quot;clic =&gt; &quot;)</span>
+<span class="d">-	(force-output)))</span>
+ 
+ (defun parse-url(url)
+   &quot;parse a gopher url and return a location&quot;
+<span class="h">@@ -364,6 +312,120 @@</span>
+   #+ecl
+   (car (last (cdr (si::command-args)))))
+   
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+(defun user-input(input)</span>
+<span class="a">+  (cond</span>
+<span class="a">+    ;; show help</span>
+<span class="a">+    ((string= &quot;HELP&quot; input)</span>
+<span class="a">+     (help-shell))</span>
+<span class="a">+    </span>
+<span class="a">+    ;; bookmark current link</span>
+<span class="a">+    ((string= &quot;A&quot; input)</span>
+<span class="a">+     (add-bookmark))</span>
+<span class="a">+    </span>
+<span class="a">+    ;; show bookmarks</span>
+<span class="a">+    ((string= &quot;B&quot; input)</span>
+<span class="a">+     (show-bookmarks))</span>
+<span class="a">+    </span>
+<span class="a">+    ;; go to previous page</span>
+<span class="a">+    ((string= &quot;P&quot; input)</span>
+<span class="a">+     (p))</span>
+<span class="a">+</span>
+<span class="a">+    ;; exit</span>
+<span class="a">+    ((or (string= &quot;X&quot; input)</span>
+<span class="a">+	 (string= &quot;Q&quot; input))</span>
+<span class="a">+     (quit))</span>
+<span class="a">+	  </span>
+<span class="a">+    </span>
+<span class="a">+    ;; show history</span>
+<span class="a">+    ((string= &quot;H&quot; input)</span>
+<span class="a">+     (format t &quot;~{~a~%~}&quot; *history*))</span>
+<span class="a">+    </span>
+<span class="a">+    ;; follow a link</span>
+<span class="a">+    (t</span>
+<span class="a">+     ;; we ignore error in case of bad input</span>
+<span class="a">+     ;; just do nothing</span>
+<span class="a">+     (ignore-errors</span>
+<span class="a">+       (g (parse-integer input))))))</span>
+<span class="a">+</span>
+<span class="a">+(defun display-buffer(type)</span>
+<span class="a">+  &quot;display the buffer&quot;</span>
+<span class="a">+  (let ((rows (c-termsize)))</span>
+<span class="a">+    (let ((input nil))</span>
+<span class="a">+      (loop for line across *buffer*</span>
+<span class="a">+	 counting line into row</span>
+<span class="a">+	 do</span>
+<span class="a">+	   (when (= row (- rows 3)) ; -1 for text - 1 for input and -1 for can&#x27;t remember</span>
+<span class="a">+	     (setf row 0)</span>
+<span class="a">+	     (format t &quot;~a------- press enter to next or a shell command ---------~a~%&quot;</span>
+<span class="a">+		     (get-color &#x27;cyan)</span>
+<span class="a">+		     (get-color  &#x27;white))</span>
+<span class="a">+	     (let ((first-input (read-char)))</span>
+<span class="a">+	       (when (not (or (char= #\NewLine first-input)</span>
+<span class="a">+			      (char= #\Space first-input)))</span>
+<span class="a">+		 (unread-char first-input)</span>
+<span class="a">+		 (let ((input-text (format nil &quot;~a&quot; (read))))</span>
+<span class="a">+		   (setf input input-text)</span>
+<span class="a">+		   (loop-finish)))))</span>
+<span class="a">+	 (cond</span>
+<span class="a">+	   ((string= &quot;1&quot; type)</span>
+<span class="a">+	    (formatted-output line))</span>
+<span class="a">+	   ((string= &quot;0&quot; type)</span>
+<span class="a">+	    (format t &quot;~a~%&quot; line))))</span>
+<span class="a">+      (when input</span>
+<span class="a">+	(user-input input)))))</span>
+<span class="a">+</span>
+<span class="a">+(defun visit(destination)</span>
+<span class="a">+  &quot;visit a location&quot;</span>
+<span class="a">+  </span>
+<span class="a">+  (getpage (location-host destination)</span>
+<span class="a">+	   (location-port destination)</span>
+<span class="a">+	   (location-uri  destination))</span>
+<span class="a">+</span>
+<span class="a">+  ;; we reset the links table ONLY if we have a new folder</span>
+<span class="a">+  (when (string= &quot;1&quot; (location-type destination))</span>
+<span class="a">+    (setf *links* (make-hash-table)))</span>
+<span class="a">+  </span>
+<span class="a">+  ;; goes to the history !</span>
+<span class="a">+  (push destination *history*)</span>
+<span class="a">+</span>
+<span class="a">+  (display-buffer (location-type destination))</span>
+<span class="a">+    </span>
+<span class="a">+</span>
+<span class="a">+  (when *offline*</span>
+<span class="a">+    (let ((path (concatenate &#x27;string</span>
+<span class="a">+			     &quot;history/&quot; (location-host destination)</span>
+<span class="a">+			     &quot;/&quot; (location-uri destination) &quot;/&quot;)))</span>
+<span class="a">+      (ensure-directories-exist path)</span>
+<span class="a">+      </span>
+<span class="a">+      (with-open-file</span>
+<span class="a">+	  (save-offline (concatenate</span>
+<span class="a">+			 &#x27;string  path (location-type destination))</span>
+<span class="a">+			:direction :output</span>
+<span class="a">+			:if-does-not-exist :create</span>
+<span class="a">+			:if-exists :supersede)</span>
+<span class="a">+	</span>
+<span class="a">+	(loop for line in *buffer*</span>
+<span class="a">+	   while line</span>
+<span class="a">+	   do</span>
+<span class="a">+	     (format save-offline &quot;~a~%&quot; line))))))</span>
+<span class="a">+</span>
+<span class="a">+(defun shell()</span>
+<span class="a">+  &quot;Shell for user interaction&quot;</span>
+<span class="a">+  (format t &quot;clic =&gt; &quot;)</span>
+<span class="a">+  (force-output)</span>
+<span class="a">+</span>
+<span class="a">+  ;; we loop until X or Q is typed</span>
+<span class="a">+  (loop for input = (format nil &quot;~a&quot; (read nil nil))</span>
+<span class="a">+     while (not (or</span>
+<span class="a">+		 (string= &quot;X&quot; input)</span>
+<span class="a">+		 (string= &quot;Q&quot; input)))</span>
+<span class="a">+     do</span>
+<span class="a">+       (user-input input)</span>
+<span class="a">+       (format t &quot;clic =&gt; &quot;)</span>
+<span class="a">+       (force-output)))</span>
+<span class="a">+</span>
+ (defun main()
+   &quot;fetch argument, display page and go to shell if type is 1&quot;
+   (let ((destination 
+diff --git a/extension.c b/extension.c
+new file mode 100644
+index 0000000..9c4c57a
+--- /dev/null
++++ b/extension.c
+<span class="h">@@ -0,0 +1,8 @@</span>
+<span class="a">+#include &lt;sys/ioctl.h&gt;</span>
+<span class="a">+</span>
+<span class="a">+int termsize()</span>
+<span class="a">+{</span>
+<span class="a">+  struct winsize w;</span>
+<span class="a">+  ioctl(0,TIOCGWINSZ, &amp;w);</span>
+<span class="a">+  return(w.ws_row);</span>
+<span class="a">+}</span>
+diff --git a/make-binary.lisp b/make-binary.lisp
+index 0154d42..25bf46c 100644
+--- a/make-binary.lisp
++++ b/make-binary.lisp
+<span class="h">@@ -14,10 +14,14 @@</span>
+   (require &#x27;sb-bsd-sockets)
+   (sb-ext:disable-debugger)
+   (load &quot;clic.lisp&quot;)
+<span class="a">+  #+sb-core-compression</span>
+<span class="a">+  (sb-ext:save-lisp-and-die &quot;clic&quot;</span>
+<span class="a">+			    :executable t</span>
+<span class="a">+			    :compression 5</span>
+<span class="a">+			    :toplevel &#x27;main)</span>
+<span class="a">+  #-sb-core-compression</span>
+   (sb-ext:save-lisp-and-die &quot;clic&quot;
+ 			    :executable t
+<span class="d">-			    #+sb-core-compression</span>
+<span class="d">-			    (values :compression 5)</span>
+ 			    :toplevel &#x27;main))
+ 
+ (format t &quot;INFO =&gt; Compilation done (or at least it should)~%&quot;)
+diff --git a/test.lisp b/test.lisp
+index 424edc6..1f97d57 100644
+--- a/test.lisp
++++ b/test.lisp
+<span class="h">@@ -13,6 +13,7 @@</span>
+ (g 1)
+ (add-bookmark)
+ (getpage &quot;bitreich.org&quot; 70 &quot;/&quot;)
+<span class="a">+(display-buffer &quot;1&quot;)</span>
+ (g 7) ;; going to radio
+ (g 1) ;; going back
+ (g 21) ;; banana !
+<span class="h">@@ -25,6 +26,7 @@</span>
+ (show-bookmarks)
+ (g 1)
+ 
+<span class="a">+(print *links*)</span>
+ 
+ (print *history*)
+ (format t &quot;~%&quot;)</pre>
+</div></body></html>

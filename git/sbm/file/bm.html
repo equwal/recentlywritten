@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm/bm - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm</h1><span class="desc">dmenu bookmarks. Instantly fuzzy search thousands of bookmarks and plumb them</span><p class="url">git clone https://github.com/equwal/sbm</p><p><a href="../../sbm/index.html">Log</a> | <a href="../../sbm/files.html">Files</a> | <a href="../../sbm/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>bm (20008 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> #!/bin/sh
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> # bm: bookmarks in a plain file, picked with dmenu (or fzf).
+<a id="l4" href="#l4">4</a> #
+<a id="l5" href="#l5">5</a> #     URL&lt;tab&gt;description&lt;tab&gt;tag tag tag
+<a id="l6" href="#l6">6</a> #
+<a id="l7" href="#l7">7</a> # bm owns that file and nothing else. Importing, link checking, the web page
+<a id="l8" href="#l8">8</a> # and so on are separate bm-* filters; see README.
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> DMENULINES=${DMENULINES:-15}
+<a id="l11" href="#l11">11</a> DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/sbm
+<a id="l12" href="#l12">12</a> BOOKMARKS=${BOOKMARKS:-$DATADIR/bookmarks}
+<a id="l13" href="#l13">13</a> USERTAGS=${USERTAGS:-$DATADIR/usertags}
+<a id="l14" href="#l14">14</a> ENGINES=${SBM_ENGINES:-$DATADIR/engines}
+<a id="l15" href="#l15">15</a> SEARCH=${SBM_SEARCH:-https://duckduckgo.com/?q=%s}
+<a id="l16" href="#l16">16</a> USAGE=$BOOKMARKS.usage
+<a id="l17" href="#l17">17</a> TAB=$(printf &#x27;\t&#x27;)
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> # Two URLs are the same bookmark when they differ only in scheme, a leading
+<a id="l20" href="#l20">20</a> # www., trailing slashes or the case of the host.
+<a id="l21" href="#l21">21</a> AWK_NORM=&#x27;
+<a id="l22" href="#l22">22</a> function norm(u,    host, rest, i) {
+<a id="l23" href="#l23">23</a>     sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, &quot;&quot;, u)
+<a id="l24" href="#l24">24</a>     i = index(u, &quot;/&quot;)
+<a id="l25" href="#l25">25</a>     if (i) { host = substr(u, 1, i - 1); rest = substr(u, i) }
+<a id="l26" href="#l26">26</a>     else   { host = u; rest = &quot;&quot; }
+<a id="l27" href="#l27">27</a>     host = tolower(host)
+<a id="l28" href="#l28">28</a>     sub(/^www\./, &quot;&quot;, host)
+<a id="l29" href="#l29">29</a>     sub(/\/+$/, &quot;&quot;, rest)
+<a id="l30" href="#l30">30</a>     return host rest
+<a id="l31" href="#l31">31</a> }&#x27;
+<a id="l32" href="#l32">32</a> 
+<a id="l33" href="#l33">33</a> die () {
+<a id="l34" href="#l34">34</a>     printf &#x27;bm: %s\n&#x27; &quot;$*&quot; &gt;&amp;2
+<a id="l35" href="#l35">35</a>     exit 1
+<a id="l36" href="#l36">36</a> }
+<a id="l37" href="#l37">37</a> 
+<a id="l38" href="#l38">38</a> have () {
+<a id="l39" href="#l39">39</a>     command -v &quot;$1&quot; &gt;/dev/null 2&gt;&amp;1
+<a id="l40" href="#l40">40</a> }
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> usage () {
+<a id="l43" href="#l43">43</a>     cat &lt;&lt;&#x27;EOF&#x27;
+<a id="l44" href="#l44">44</a> usage: bm [-t tag] [-S order] [action]
+<a id="l45" href="#l45">45</a> Without an action: browse. Pick a bookmark, then what to do with it. Text
+<a id="l46" href="#l46">46</a> that is no bookmark is opened as an address, or searched for on the web.
+<a id="l47" href="#l47">47</a>   -o, --open        open a bookmark, an address or a web search
+<a id="l48" href="#l48">48</a>                     (-p, --plumb is the same)
+<a id="l49" href="#l49">49</a>   -c, --copy        copy a bookmark&#x27;s URL to the clipboard
+<a id="l50" href="#l50">50</a>       --print       print a bookmark&#x27;s URL
+<a id="l51" href="#l51">51</a>   -a, --add [url]   add a bookmark; the url defaults to the selection
+<a id="l52" href="#l52">52</a>   -e, --edit        open the bookmark file in $EDITOR at a bookmark
+<a id="l53" href="#l53">53</a>   -d, --delete      delete a bookmark
+<a id="l54" href="#l54">54</a>   -l, --list        print the bookmarks
+<a id="l55" href="#l55">55</a>   -m, --merge       add the bookmarks on stdin, skipping the known ones
+<a id="l56" href="#l56">56</a>   -t, --tag &lt;tag&gt;   only consider bookmarks with this tag
+<a id="l57" href="#l57">57</a>   -S, --sort &lt;o&gt;    used (default), recent, url, desc or tag
+<a id="l58" href="#l58">58</a>   -h, --help
+<a id="l59" href="#l59">59</a> EOF
+<a id="l60" href="#l60">60</a> }
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> # ---- external programs: menu, clipboard, opener ----
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> # dmenu whenever there is a display to draw it on. fzf stands in on a bare
+<a id="l65" href="#l65">65</a> # terminal, or when dmenu is not installed.
+<a id="l66" href="#l66">66</a> pickmenu () {
+<a id="l67" href="#l67">67</a>     [ -n &quot;$SBM_MENU&quot; ] &amp;&amp; return
+<a id="l68" href="#l68">68</a>     if [ -n &quot;$DISPLAY$WAYLAND_DISPLAY&quot; ]; then
+<a id="l69" href="#l69">69</a>         order=&#x27;dmenu fzf&#x27;
+<a id="l70" href="#l70">70</a>     else
+<a id="l71" href="#l71">71</a>         order=&#x27;fzf dmenu&#x27;
+<a id="l72" href="#l72">72</a>     fi
+<a id="l73" href="#l73">73</a>     for menu in $order; do
+<a id="l74" href="#l74">74</a>         if have &quot;$menu&quot;; then
+<a id="l75" href="#l75">75</a>             SBM_MENU=$menu
+<a id="l76" href="#l76">76</a>             return
+<a id="l77" href="#l77">77</a>         fi
+<a id="l78" href="#l78">78</a>     done
+<a id="l79" href="#l79">79</a>     # shellcheck disable=SC2016
+<a id="l80" href="#l80">80</a>     die &#x27;no menu program found: install dmenu or fzf, or set $SBM_MENU&#x27;
+<a id="l81" href="#l81">81</a> }
+<a id="l82" href="#l82">82</a> 
+<a id="l83" href="#l83">83</a> # $SBM_MENU may carry arguments, so it is split on purpose.
+<a id="l84" href="#l84">84</a> custommenu () {
+<a id="l85" href="#l85">85</a>     # shellcheck disable=SC2086
+<a id="l86" href="#l86">86</a>     $SBM_MENU &quot;$@&quot;
+<a id="l87" href="#l87">87</a> }
+<a id="l88" href="#l88">88</a> 
+<a id="l89" href="#l89">89</a> fzfcmd () {
+<a id="l90" href="#l90">90</a>     # shellcheck disable=SC2086
+<a id="l91" href="#l91">91</a>     fzf -i --reverse --height=40% $SBM_FZF_OPTS &quot;$@&quot;
+<a id="l92" href="#l92">92</a> }
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a> # fzfpick &lt;fzf options&gt;: the chosen line, or else what was typed, which is
+<a id="l95" href="#l95">95</a> # what dmenu gives by itself.
+<a id="l96" href="#l96">96</a> fzfpick () {
+<a id="l97" href="#l97">97</a>     out=$(fzfcmd --print-query &quot;$@&quot;)
+<a id="l98" href="#l98">98</a>     chosen=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p)
+<a id="l99" href="#l99">99</a>     printf &#x27;%s\n&#x27; &quot;${chosen:-$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)}&quot;
+<a id="l100" href="#l100">100</a> }
+<a id="l101" href="#l101">101</a> 
+<a id="l102" href="#l102">102</a> # pick &lt;prompt&gt;: choices on stdin; the chosen line, or the typed text.
+<a id="l103" href="#l103">103</a> pick () {
+<a id="l104" href="#l104">104</a>     case $SBM_MENU in
+<a id="l105" href="#l105">105</a>         fzf)   fzfpick --prompt=&quot;$1 &quot; ;;
+<a id="l106" href="#l106">106</a>         dmenu) dmenu -i -l &quot;$DMENULINES&quot; -p &quot;$1&quot; ;;
+<a id="l107" href="#l107">107</a>         *)     custommenu pick &quot;$1&quot; ;;
+<a id="l108" href="#l108">108</a>     esac
+<a id="l109" href="#l109">109</a> }
+<a id="l110" href="#l110">110</a> 
+<a id="l111" href="#l111">111</a> # pickmulti &lt;prompt&gt;: like pick, for any number of lines.
+<a id="l112" href="#l112">112</a> pickmulti () {
+<a id="l113" href="#l113">113</a>     choices=$(cat)
+<a id="l114" href="#l114">114</a>     case $SBM_MENU in
+<a id="l115" href="#l115">115</a>         fzf)
+<a id="l116" href="#l116">116</a>             while :; do
+<a id="l117" href="#l117">117</a>                 out=$(printf &#x27;%s\n&#x27; &quot;$choices&quot; | fzfcmd --multi --print-query \
+<a id="l118" href="#l118">118</a>                       --prompt=&quot;$1 &quot; --header=&#x27;TAB marks, ENTER confirms. No match: ENTER creates the typed tag, ESC finishes.&#x27;)
+<a id="l119" href="#l119">119</a>                 chosen=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed 1d)
+<a id="l120" href="#l120">120</a>                 if [ -n &quot;$chosen&quot; ]; then
+<a id="l121" href="#l121">121</a>                     printf &#x27;%s\n&#x27; &quot;$chosen&quot;
+<a id="l122" href="#l122">122</a>                     break
+<a id="l123" href="#l123">123</a>                 fi
+<a id="l124" href="#l124">124</a>                 typed=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)
+<a id="l125" href="#l125">125</a>                 [ -n &quot;$typed&quot; ] || break
+<a id="l126" href="#l126">126</a>                 printf &#x27;%s\n&#x27; &quot;$typed&quot;
+<a id="l127" href="#l127">127</a>             done
+<a id="l128" href="#l128">128</a>             ;;
+<a id="l129" href="#l129">129</a>         dmenu)
+<a id="l130" href="#l130">130</a>             while :; do
+<a id="l131" href="#l131">131</a>                 one=$(printf &#x27;done | (choose when done)\n%s\n&#x27; &quot;$choices&quot; \
+<a id="l132" href="#l132">132</a>                       | dmenu -i -l &quot;$DMENULINES&quot; -p &quot;$1&quot;)
+<a id="l133" href="#l133">133</a>                 # An empty answer means the menu was closed.
+<a id="l134" href="#l134">134</a>                 [ -z &quot;$one&quot; ] || [ &quot;${one%% *}&quot; = &#x27;done&#x27; ] &amp;&amp; break
+<a id="l135" href="#l135">135</a>                 printf &#x27;%s\n&#x27; &quot;$one&quot;
+<a id="l136" href="#l136">136</a>             done
+<a id="l137" href="#l137">137</a>             ;;
+<a id="l138" href="#l138">138</a>         *)  printf &#x27;%s\n&#x27; &quot;$choices&quot; | custommenu multi &quot;$1&quot; ;;
+<a id="l139" href="#l139">139</a>     esac
+<a id="l140" href="#l140">140</a> }
+<a id="l141" href="#l141">141</a> 
+<a id="l142" href="#l142">142</a> # ask &lt;prompt&gt; [default]: free text on stdout.
+<a id="l143" href="#l143">143</a> ask () {
+<a id="l144" href="#l144">144</a>     case $SBM_MENU in
+<a id="l145" href="#l145">145</a>         fzf)
+<a id="l146" href="#l146">146</a>             printf &#x27;%s%s: &#x27; &quot;$1&quot; &quot;${2:+ [$2]}&quot; &gt;&amp;2
+<a id="l147" href="#l147">147</a>             IFS= read -r reply || reply=
+<a id="l148" href="#l148">148</a>             printf &#x27;%s\n&#x27; &quot;${reply:-$2}&quot;
+<a id="l149" href="#l149">149</a>             ;;
+<a id="l150" href="#l150">150</a>         dmenu)
+<a id="l151" href="#l151">151</a>             if [ -n &quot;$2&quot; ]; then printf &#x27;%s\n&#x27; &quot;$2&quot;; fi | dmenu -p &quot;$1:&quot;
+<a id="l152" href="#l152">152</a>             ;;
+<a id="l153" href="#l153">153</a>         *)
+<a id="l154" href="#l154">154</a>             if [ -n &quot;$2&quot; ]; then printf &#x27;%s\n&#x27; &quot;$2&quot;; fi | custommenu ask &quot;$1&quot;
+<a id="l155" href="#l155">155</a>             ;;
+<a id="l156" href="#l156">156</a>     esac
+<a id="l157" href="#l157">157</a> }
+<a id="l158" href="#l158">158</a> 
+<a id="l159" href="#l159">159</a> clip_out () {
+<a id="l160" href="#l160">160</a>     # shellcheck disable=SC2086,SC2016
+<a id="l161" href="#l161">161</a>     if   [ -n &quot;$SBM_COPY&quot; ]; then $SBM_COPY
+<a id="l162" href="#l162">162</a>     elif [ -n &quot;$WAYLAND_DISPLAY&quot; ] &amp;&amp; have wl-copy; then wl-copy
+<a id="l163" href="#l163">163</a>     elif have xclip; then xclip -i -selection clipboard
+<a id="l164" href="#l164">164</a>     elif have xsel; then xsel -ib
+<a id="l165" href="#l165">165</a>     else die &#x27;no clipboard program found: set $SBM_COPY&#x27;
+<a id="l166" href="#l166">166</a>     fi
+<a id="l167" href="#l167">167</a> }
+<a id="l168" href="#l168">168</a> 
+<a id="l169" href="#l169">169</a> # The primary selection first, then the clipboard. Never fatal: without
+<a id="l170" href="#l170">170</a> # either there is just no URL to suggest.
+<a id="l171" href="#l171">171</a> clip_in () {
+<a id="l172" href="#l172">172</a>     # shellcheck disable=SC2086
+<a id="l173" href="#l173">173</a>     if   [ -n &quot;$SBM_PASTE&quot; ]; then $SBM_PASTE
+<a id="l174" href="#l174">174</a>     elif [ -n &quot;$WAYLAND_DISPLAY&quot; ] &amp;&amp; have wl-paste; then
+<a id="l175" href="#l175">175</a>         wl-paste -n -p; echo; wl-paste -n
+<a id="l176" href="#l176">176</a>     elif have xclip; then
+<a id="l177" href="#l177">177</a>         xclip -o; echo; xclip -o -selection clipboard
+<a id="l178" href="#l178">178</a>     elif have xsel; then
+<a id="l179" href="#l179">179</a>         xsel -op; echo; xsel -ob
+<a id="l180" href="#l180">180</a>     fi 2&gt;/dev/null
+<a id="l181" href="#l181">181</a> }
+<a id="l182" href="#l182">182</a> 
+<a id="l183" href="#l183">183</a> opener () {
+<a id="l184" href="#l184">184</a>     # shellcheck disable=SC2086,SC2016
+<a id="l185" href="#l185">185</a>     if   [ -n &quot;$SBM_OPEN&quot; ]; then $SBM_OPEN &quot;$1&quot;
+<a id="l186" href="#l186">186</a>     elif have xdg-open; then xdg-open &quot;$1&quot;
+<a id="l187" href="#l187">187</a>     else die &#x27;no opener found: set $SBM_OPEN&#x27;
+<a id="l188" href="#l188">188</a>     fi
+<a id="l189" href="#l189">189</a> }
+<a id="l190" href="#l190">190</a> 
+<a id="l191" href="#l191">191</a> # ---- the bookmark file ----
+<a id="l192" href="#l192">192</a> 
+<a id="l193" href="#l193">193</a> # Bookmarks restricted to $tagfilter and ordered by $sortorder, each followed
+<a id="l194" href="#l194">194</a> # by a fourth field: how often it was used.
+<a id="l195" href="#l195">195</a> rows () {
+<a id="l196" href="#l196">196</a>     SBM_TAG=$tagfilter SBM_ORDER=$sortorder SBM_USAGE=$USAGE awk -F&#x27;\t&#x27; &#x27;
+<a id="l197" href="#l197">197</a>         BEGIN {
+<a id="l198" href="#l198">198</a>             while ((getline line &lt; ENVIRON[&quot;SBM_USAGE&quot;]) &gt; 0) {
+<a id="l199" href="#l199">199</a>                 split(line, f, &quot;\t&quot;)
+<a id="l200" href="#l200">200</a>                 used[f[1]] = f[2]
+<a id="l201" href="#l201">201</a>             }
+<a id="l202" href="#l202">202</a>             order = ENVIRON[&quot;SBM_ORDER&quot;]
+<a id="l203" href="#l203">203</a>         }
+<a id="l204" href="#l204">204</a>         NF == 0 || /^#/ { next }
+<a id="l205" href="#l205">205</a>         ENVIRON[&quot;SBM_TAG&quot;] != &quot;&quot; {
+<a id="l206" href="#l206">206</a>             hit = 0
+<a id="l207" href="#l207">207</a>             n = split($3, tags, &quot; &quot;)
+<a id="l208" href="#l208">208</a>             for (i = 1; i &lt;= n; i++)
+<a id="l209" href="#l209">209</a>                 if (tags[i] == ENVIRON[&quot;SBM_TAG&quot;]) hit = 1
+<a id="l210" href="#l210">210</a>             if (!hit) next
+<a id="l211" href="#l211">211</a>         }
+<a id="l212" href="#l212">212</a>         {
+<a id="l213" href="#l213">213</a>             if (order == &quot;used&quot;)        key = sprintf(&quot;%09d&quot;, 999999999 - used[$1])
+<a id="l214" href="#l214">214</a>             else if (order == &quot;recent&quot;) key = sprintf(&quot;%09d&quot;, 999999999 - NR)
+<a id="l215" href="#l215">215</a>             else if (order == &quot;desc&quot;)   key = tolower($2)
+<a id="l216" href="#l216">216</a>             else if (order == &quot;tag&quot;)    key = tolower($3)
+<a id="l217" href="#l217">217</a>             else                        key = &quot;&quot;
+<a id="l218" href="#l218">218</a>             printf &quot;%s\t%s\t%s\t%s\t%s\t%d\n&quot;, key, tolower($1), $1, $2, $3, used[$1]
+<a id="l219" href="#l219">219</a>         }&#x27; &quot;$BOOKMARKS&quot; | LC_ALL=C sort -t&quot;$TAB&quot; -k1,1 -k2,2 | cut -f3-
+<a id="l220" href="#l220">220</a> }
+<a id="l221" href="#l221">221</a> 
+<a id="l222" href="#l222">222</a> # details &lt;url&gt;: a bookmark in full, one field per line.
+<a id="l223" href="#l223">223</a> details () {
+<a id="l224" href="#l224">224</a>     rows | SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] {
+<a id="l225" href="#l225">225</a>         printf &quot;%s\n%s\ntags: %s\nused: %d\n&quot;, $1, $2, $3, $4
+<a id="l226" href="#l226">226</a>         exit
+<a id="l227" href="#l227">227</a>     }&#x27;
+<a id="l228" href="#l228">228</a> }
+<a id="l229" href="#l229">229</a> 
+<a id="l230" href="#l230">230</a> is_bookmark () {
+<a id="l231" href="#l231">231</a>     SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { found = 1; exit }
+<a id="l232" href="#l232">232</a>         END { exit !found }&#x27; &quot;$BOOKMARKS&quot;
+<a id="l233" href="#l233">233</a> }
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> # For fzf a fifth field is added, and it is all that is listed. The first
+<a id="l236" href="#l236">236</a> # four feed the preview, which follows the cursor.
+<a id="l237" href="#l237">237</a> PREVIEW=&quot;printf &#x27;%s\n%s\ntags: %s\nused: %s\n&#x27; {1} {2} {3} {4}&quot;
+<a id="l238" href="#l238">238</a> fzfrows () {
+<a id="l239" href="#l239">239</a>     awk -F&#x27;\t&#x27; &#x27;NF {
+<a id="l240" href="#l240">240</a>         desc = $2
+<a id="l241" href="#l241">241</a>         if (length(desc) &gt; 44) desc = substr(desc, 1, 42) &quot;..&quot;
+<a id="l242" href="#l242">242</a>         printf &quot;%s\t%-44s  %-18s  %s\n&quot;, $0, desc, $3, $1
+<a id="l243" href="#l243">243</a>     }&#x27;
+<a id="l244" href="#l244">244</a> }
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a> # withpreview &lt;fzf command and options&gt;: for the output of fzfrows.
+<a id="l247" href="#l247">247</a> withpreview () {
+<a id="l248" href="#l248">248</a>     &quot;$@&quot; --delimiter=&quot;$TAB&quot; --with-nth=5.. \
+<a id="l249" href="#l249">249</a>          --preview-window=down:5:wrap --preview=&quot;$PREVIEW&quot;
+<a id="l250" href="#l250">250</a> }
+<a id="l251" href="#l251">251</a> 
+<a id="l252" href="#l252">252</a> # choose &lt;prompt&gt;: a bookmark&#x27;s URL, or whatever else the user typed.
+<a id="l253" href="#l253">253</a> choose () {
+<a id="l254" href="#l254">254</a>     if [ &quot;$SBM_MENU&quot; = fzf ]; then
+<a id="l255" href="#l255">255</a>         rows | fzfrows | withpreview fzfpick --prompt=&quot;$1 &quot;
+<a id="l256" href="#l256">256</a>     else
+<a id="l257" href="#l257">257</a>         rows | cut -f1-3 | pick &quot;$1&quot;
+<a id="l258" href="#l258">258</a>     fi | cut -f1
+<a id="l259" href="#l259">259</a> }
+<a id="l260" href="#l260">260</a> 
+<a id="l261" href="#l261">261</a> # choose_url &lt;prompt&gt;: like choose, but only a bookmark will do.
+<a id="l262" href="#l262">262</a> choose_url () {
+<a id="l263" href="#l263">263</a>     if [ -z &quot;$(rows)&quot; ]; then
+<a id="l264" href="#l264">264</a>         [ -n &quot;$tagfilter&quot; ] &amp;&amp; die &quot;no bookmarks tagged &#x27;$tagfilter&#x27;&quot;
+<a id="l265" href="#l265">265</a>         die &#x27;no bookmarks yet; add one with: bm --add&#x27;
+<a id="l266" href="#l266">266</a>     fi
+<a id="l267" href="#l267">267</a>     url=$(choose &quot;$1&quot;)
+<a id="l268" href="#l268">268</a>     [ -n &quot;$url&quot; ] || exit 1
+<a id="l269" href="#l269">269</a>     is_bookmark &quot;$url&quot; || die &quot;not a bookmark: $url&quot;
+<a id="l270" href="#l270">270</a>     printf &#x27;%s\n&#x27; &quot;$url&quot;
+<a id="l271" href="#l271">271</a> }
+<a id="l272" href="#l272">272</a> 
+<a id="l273" href="#l273">273</a> # find_dup &lt;url&gt;: print the bookmark that is the same page as &lt;url&gt;, if any.
+<a id="l274" href="#l274">274</a> find_dup () {
+<a id="l275" href="#l275">275</a>     SBM_URL=$1 awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;
+<a id="l276" href="#l276">276</a>         BEGIN { want = norm(ENVIRON[&quot;SBM_URL&quot;]) }
+<a id="l277" href="#l277">277</a>         NF &amp;&amp; !/^#/ &amp;&amp; norm($1) == want { print; exit }&#x27; &quot;$BOOKMARKS&quot;
+<a id="l278" href="#l278">278</a> }
+<a id="l279" href="#l279">279</a> 
+<a id="l280" href="#l280">280</a> # tmpfile &lt;file&gt;: create an empty temporary file and print its name. Beside
+<a id="l281" href="#l281">281</a> # &lt;file&gt; if that directory can be written to, else in $TMPDIR. noclobber makes
+<a id="l282" href="#l282">282</a> # the shell create it with O_EXCL, so a file or symlink planted under that
+<a id="l283" href="#l283">283</a> # name in a shared /tmp is refused rather than followed: mktemp, in POSIX.
+<a id="l284" href="#l284">284</a> tmpfile () {
+<a id="l285" href="#l285">285</a>     for candidate in &quot;$1.tmp.$$&quot; &quot;${TMPDIR:-/tmp}/sbm.$$.${1##*/}&quot;; do
+<a id="l286" href="#l286">286</a>         if (umask 077; set -C; : &gt; &quot;$candidate&quot;) 2&gt;/dev/null; then
+<a id="l287" href="#l287">287</a>             printf &#x27;%s\n&#x27; &quot;$candidate&quot;
+<a id="l288" href="#l288">288</a>             return 0
+<a id="l289" href="#l289">289</a>         fi
+<a id="l290" href="#l290">290</a>     done
+<a id="l291" href="#l291">291</a>     return 1
+<a id="l292" href="#l292">292</a> }
+<a id="l293" href="#l293">293</a> 
+<a id="l294" href="#l294">294</a> # rewrite &lt;file&gt;: replace &lt;file&gt; with stdin. Through cat, not mv, so that a
+<a id="l295" href="#l295">295</a> # symlinked file stays a symlink and keeps its mode.
+<a id="l296" href="#l296">296</a> rewrite () {
+<a id="l297" href="#l297">297</a>     tmp=$(tmpfile &quot;$1&quot;) || die &quot;cannot create a temporary file for $1&quot;
+<a id="l298" href="#l298">298</a>     cat &gt; &quot;$tmp&quot; &amp;&amp; cat &quot;$tmp&quot; &gt; &quot;$1&quot;
+<a id="l299" href="#l299">299</a>     rc=$?
+<a id="l300" href="#l300">300</a>     rm -f &quot;$tmp&quot;
+<a id="l301" href="#l301">301</a>     return $rc
+<a id="l302" href="#l302">302</a> }
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a> # bump &lt;url&gt;: count a use, for the &quot;used&quot; order. The counts live beside the
+<a id="l305" href="#l305">305</a> # bookmark file, which stays a plain list: url, count, time of last use.
+<a id="l306" href="#l306">306</a> # srand() returns the previous seed, and the first seed is the time of day:
+<a id="l307" href="#l307">307</a> # that is &quot;date +%s&quot; for a POSIX that has no %s.
+<a id="l308" href="#l308">308</a> bump () {
+<a id="l309" href="#l309">309</a>     [ -e &quot;$USAGE&quot; ] || : &gt; &quot;$USAGE&quot; || return 0
+<a id="l310" href="#l310">310</a>     SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;
+<a id="l311" href="#l311">311</a>         BEGIN { OFS = &quot;\t&quot;; srand(); now = srand() }
+<a id="l312" href="#l312">312</a>         $1 == ENVIRON[&quot;SBM_URL&quot;] { $2 = $2 + 1; $3 = now; seen = 1 }
+<a id="l313" href="#l313">313</a>         { print }
+<a id="l314" href="#l314">314</a>         END { if (!seen) print ENVIRON[&quot;SBM_URL&quot;], 1, now }
+<a id="l315" href="#l315">315</a>     &#x27; &quot;$USAGE&quot; | rewrite &quot;$USAGE&quot;
+<a id="l316" href="#l316">316</a> }
+<a id="l317" href="#l317">317</a> 
+<a id="l318" href="#l318">318</a> # learn_tags: tag names on stdin; the ones $USERTAGS lacks are appended to it.
+<a id="l319" href="#l319">319</a> learn_tags () {
+<a id="l320" href="#l320">320</a>     [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;
+<a id="l321" href="#l321">321</a>     while IFS= read -r name; do
+<a id="l322" href="#l322">322</a>         [ -n &quot;$name&quot; ] || continue
+<a id="l323" href="#l323">323</a>         sed &#x27;s/[ |].*//&#x27; &quot;$USERTAGS&quot; | grep -Fxq -- &quot;$name&quot; \
+<a id="l324" href="#l324">324</a>             || printf &#x27;%s | \n&#x27; &quot;$name&quot; &gt;&gt; &quot;$USERTAGS&quot;
+<a id="l325" href="#l325">325</a>     done
+<a id="l326" href="#l326">326</a> }
+<a id="l327" href="#l327">327</a> 
+<a id="l328" href="#l328">328</a> # changed &lt;message&gt;: the file was written. bm-commit, where installed, keeps
+<a id="l329" href="#l329">329</a> # its history in git.
+<a id="l330" href="#l330">330</a> changed () {
+<a id="l331" href="#l331">331</a>     if have bm-commit; then bm-commit &quot;$1&quot;; fi
+<a id="l332" href="#l332">332</a> }
+<a id="l333" href="#l333">333</a> 
+<a id="l334" href="#l334">334</a> # ---- actions ----
+<a id="l335" href="#l335">335</a> 
+<a id="l336" href="#l336">336</a> copy_url () {
+<a id="l337" href="#l337">337</a>     bump &quot;$1&quot;
+<a id="l338" href="#l338">338</a>     printf &#x27;%s&#x27; &quot;$1&quot; | clip_out
+<a id="l339" href="#l339">339</a> }
+<a id="l340" href="#l340">340</a> 
+<a id="l341" href="#l341">341</a> open_url () {
+<a id="l342" href="#l342">342</a>     bump &quot;$1&quot;
+<a id="l343" href="#l343">343</a>     opener &quot;$1&quot;
+<a id="l344" href="#l344">344</a> }
+<a id="l345" href="#l345">345</a> 
+<a id="l346" href="#l346">346</a> edit_url () {
+<a id="l347" href="#l347">347</a>     line=$(SBM_URL=$1 awk -F&#x27;\t&#x27; \
+<a id="l348" href="#l348">348</a>            &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { print NR; exit }&#x27; &quot;$BOOKMARKS&quot;)
+<a id="l349" href="#l349">349</a>     ${VISUAL:-${EDITOR:-vi}} &quot;+${line:-1}&quot; &quot;$BOOKMARKS&quot;
+<a id="l350" href="#l350">350</a>     changed &#x27;bm: edit&#x27;
+<a id="l351" href="#l351">351</a> }
+<a id="l352" href="#l352">352</a> 
+<a id="l353" href="#l353">353</a> delete_url () {
+<a id="l354" href="#l354">354</a>     for file in &quot;$BOOKMARKS&quot; &quot;$USAGE&quot;; do
+<a id="l355" href="#l355">355</a>         [ -e &quot;$file&quot; ] || continue
+<a id="l356" href="#l356">356</a>         SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 != ENVIRON[&quot;SBM_URL&quot;]&#x27; &quot;$file&quot; \
+<a id="l357" href="#l357">357</a>             | rewrite &quot;$file&quot; || die &quot;could not rewrite $file&quot;
+<a id="l358" href="#l358">358</a>     done
+<a id="l359" href="#l359">359</a>     changed &quot;bm: delete $1&quot;
+<a id="l360" href="#l360">360</a> }
+<a id="l361" href="#l361">361</a> 
+<a id="l362" href="#l362">362</a> # urlencode &lt;text&gt;: for a query string. awk has no ord(), hence the table.
+<a id="l363" href="#l363">363</a> urlencode () {
+<a id="l364" href="#l364">364</a>     printf &#x27;%s&#x27; &quot;$1&quot; | LC_ALL=C awk &#x27;
+<a id="l365" href="#l365">365</a>         BEGIN { for (i = 1; i &lt; 256; i++) ord[sprintf(&quot;%c&quot;, i)] = i }
+<a id="l366" href="#l366">366</a>         {
+<a id="l367" href="#l367">367</a>             for (i = 1; i &lt;= length($0); i++) {
+<a id="l368" href="#l368">368</a>                 c = substr($0, i, 1)
+<a id="l369" href="#l369">369</a>                 if (c ~ /[A-Za-z0-9._~-]/) out = out c
+<a id="l370" href="#l370">370</a>                 else if (c == &quot; &quot;)         out = out &quot;+&quot;
+<a id="l371" href="#l371">371</a>                 else                       out = out sprintf(&quot;%%%02X&quot;, ord[c])
+<a id="l372" href="#l372">372</a>             }
+<a id="l373" href="#l373">373</a>         }
+<a id="l374" href="#l374">374</a>         END { printf &quot;%s&quot;, out }&#x27;
+<a id="l375" href="#l375">375</a> }
+<a id="l376" href="#l376">376</a> 
+<a id="l377" href="#l377">377</a> # go &lt;text&gt;: open text that is not a bookmark. One word with &quot;://&quot; or a dot
+<a id="l378" href="#l378">378</a> # in it is an address. Anything else is a web search: by the engine whose
+<a id="l379" href="#l379">379</a> # keyword is the first word ($ENGINES holds &quot;keyword | url with %s&quot; lines),
+<a id="l380" href="#l380">380</a> # or else by $SEARCH.
+<a id="l381" href="#l381">381</a> go () {
+<a id="l382" href="#l382">382</a>     case $1 in
+<a id="l383" href="#l383">383</a>         *&#x27; &#x27;*) ;;
+<a id="l384" href="#l384">384</a>         *://*) opener &quot;$1&quot;; return ;;
+<a id="l385" href="#l385">385</a>         *.*)   opener &quot;https://$1&quot;; return ;;
+<a id="l386" href="#l386">386</a>     esac
+<a id="l387" href="#l387">387</a>     engine=$SEARCH
+<a id="l388" href="#l388">388</a>     query=$1
+<a id="l389" href="#l389">389</a>     if [ &quot;${1%% *}&quot; != &quot;$1&quot; ] &amp;&amp; [ -r &quot;$ENGINES&quot; ]; then
+<a id="l390" href="#l390">390</a>         found=$(SBM_KEY=${1%% *} awk -F&#x27; *[|] *&#x27; \
+<a id="l391" href="#l391">391</a>                 &#x27;$1 == ENVIRON[&quot;SBM_KEY&quot;] { print $2; exit }&#x27; &quot;$ENGINES&quot;)
+<a id="l392" href="#l392">392</a>         if [ -n &quot;$found&quot; ]; then
+<a id="l393" href="#l393">393</a>             engine=$found
+<a id="l394" href="#l394">394</a>             query=${1#* }
+<a id="l395" href="#l395">395</a>         fi
+<a id="l396" href="#l396">396</a>     fi
+<a id="l397" href="#l397">397</a>     opener &quot;$(printf &#x27;%s\n&#x27; &quot;$engine&quot; | sed &quot;s|%s|$(urlencode &quot;$query&quot;)|&quot;)&quot;
+<a id="l398" href="#l398">398</a> }
+<a id="l399" href="#l399">399</a> 
+<a id="l400" href="#l400">400</a> plumb () {
+<a id="l401" href="#l401">401</a>     url=$(choose &#x27;open:&#x27;)
+<a id="l402" href="#l402">402</a>     [ -n &quot;$url&quot; ] || exit 1
+<a id="l403" href="#l403">403</a>     if is_bookmark &quot;$url&quot;; then open_url &quot;$url&quot;; else go &quot;$url&quot;; fi
+<a id="l404" href="#l404">404</a> }
+<a id="l405" href="#l405">405</a> 
+<a id="l406" href="#l406">406</a> # Exit status 3 means &quot;already bookmarked&quot;.
+<a id="l407" href="#l407">407</a> add () {
+<a id="l408" href="#l408">408</a>     url=$1
+<a id="l409" href="#l409">409</a>     if [ -z &quot;$url&quot; ]; then
+<a id="l410" href="#l410">410</a>         url=$(ask &#x27;url&#x27; &quot;$(clip_in | grep &#x27;://&#x27; | head -n 1)&quot;)
+<a id="l411" href="#l411">411</a>     fi
+<a id="l412" href="#l412">412</a>     url=$(printf &#x27;%s&#x27; &quot;$url&quot; | tr -d &#x27;[:space:]&#x27;)
+<a id="l413" href="#l413">413</a>     [ -n &quot;$url&quot; ] || exit 1
+<a id="l414" href="#l414">414</a> 
+<a id="l415" href="#l415">415</a>     dup=$(find_dup &quot;$url&quot;)
+<a id="l416" href="#l416">416</a>     if [ -n &quot;$dup&quot; ]; then
+<a id="l417" href="#l417">417</a>         printf &#x27;bm: already bookmarked:\n%s\n&#x27; &quot;$dup&quot; &gt;&amp;2
+<a id="l418" href="#l418">418</a>         exit 3
+<a id="l419" href="#l419">419</a>     fi
+<a id="l420" href="#l420">420</a> 
+<a id="l421" href="#l421">421</a>     # bm-title, where installed, fetches the page&#x27;s title.
+<a id="l422" href="#l422">422</a>     title=
+<a id="l423" href="#l423">423</a>     if have bm-title; then title=$(bm-title &quot;$url&quot;); fi
+<a id="l424" href="#l424">424</a>     desc=$(ask &#x27;description&#x27; &quot;$title&quot; | tr &#x27;\t&#x27; &#x27; &#x27;)
+<a id="l425" href="#l425">425</a> 
+<a id="l426" href="#l426">426</a>     [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;
+<a id="l427" href="#l427">427</a>     names=$(pickmulti &#x27;tags:&#x27; &lt; &quot;$USERTAGS&quot; | sed &#x27;s/[ |].*//&#x27; | sed &#x27;/^$/d&#x27; \
+<a id="l428" href="#l428">428</a>             | sort -u)
+<a id="l429" href="#l429">429</a>     printf &#x27;%s\n&#x27; &quot;$names&quot; | learn_tags
+<a id="l430" href="#l430">430</a>     tags=$(printf &#x27;%s\n&#x27; &quot;$names&quot; | paste -sd &#x27; &#x27; -)
+<a id="l431" href="#l431">431</a> 
+<a id="l432" href="#l432">432</a>     printf &#x27;%s\t%s\t%s\n&#x27; &quot;$url&quot; &quot;$desc&quot; &quot;$tags&quot; &gt;&gt; &quot;$BOOKMARKS&quot;
+<a id="l433" href="#l433">433</a>     changed &quot;bm: add $url&quot;
+<a id="l434" href="#l434">434</a> }
+<a id="l435" href="#l435">435</a> 
+<a id="l436" href="#l436">436</a> # merge: bookmark lines on stdin (a bare URL per line will do); the ones not
+<a id="l437" href="#l437">437</a> # known yet are appended. This is how the output of bm-import gets in.
+<a id="l438" href="#l438">438</a> merge () {
+<a id="l439" href="#l439">439</a>     new=$(tmpfile &quot;$BOOKMARKS&quot;) || die &#x27;cannot create a temporary file&#x27;
+<a id="l440" href="#l440">440</a>     SBM_FILE=$BOOKMARKS SBM_NEW=$new awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;
+<a id="l441" href="#l441">441</a>         BEGIN {
+<a id="l442" href="#l442">442</a>             while ((getline line &lt; ENVIRON[&quot;SBM_FILE&quot;]) &gt; 0) {
+<a id="l443" href="#l443">443</a>                 split(line, f, &quot;\t&quot;)
+<a id="l444" href="#l444">444</a>                 seen[norm(f[1])] = 1
+<a id="l445" href="#l445">445</a>             }
+<a id="l446" href="#l446">446</a>         }
+<a id="l447" href="#l447">447</a>         NF == 0 || /^#/ { next }
+<a id="l448" href="#l448">448</a>         seen[norm($1)]++ { skipped++; next }
+<a id="l449" href="#l449">449</a>         { printf &quot;%s\t%s\t%s\n&quot;, $1, $2, $3 &gt; ENVIRON[&quot;SBM_NEW&quot;]; added++ }
+<a id="l450" href="#l450">450</a>         END { printf &quot;added %d, skipped %d duplicates\n&quot;, added, skipped }&#x27;
+<a id="l451" href="#l451">451</a>     cut -f3 &quot;$new&quot; | tr &#x27; &#x27; &#x27;\n&#x27; | sort -u | learn_tags
+<a id="l452" href="#l452">452</a>     cat &quot;$new&quot; &gt;&gt; &quot;$BOOKMARKS&quot;
+<a id="l453" href="#l453">453</a>     rm -f &quot;$new&quot;
+<a id="l454" href="#l454">454</a>     changed &#x27;bm: merge&#x27;
+<a id="l455" href="#l455">455</a> }
+<a id="l456" href="#l456">456</a> 
+<a id="l457" href="#l457">457</a> nextorder () {
+<a id="l458" href="#l458">458</a>     case $sortorder in
+<a id="l459" href="#l459">459</a>         used)   sortorder=recent ;;
+<a id="l460" href="#l460">460</a>         recent) sortorder=url ;;
+<a id="l461" href="#l461">461</a>         url)    sortorder=desc ;;
+<a id="l462" href="#l462">462</a>         desc)   sortorder=tag ;;
+<a id="l463" href="#l463">463</a>         *)      sortorder=used ;;
+<a id="l464" href="#l464">464</a>     esac
+<a id="l465" href="#l465">465</a> }
+<a id="l466" href="#l466">466</a> 
+<a id="l467" href="#l467">467</a> picktag () {
+<a id="l468" href="#l468">468</a>     tag=$( { printf &#x27;(all)\n&#x27;; cut -f3 &quot;$BOOKMARKS&quot; | tr &#x27; &#x27; &#x27;\n&#x27; \
+<a id="l469" href="#l469">469</a>              | sed &#x27;/^$/d&#x27; | sort -u; } | pick &#x27;tag:&#x27;)
+<a id="l470" href="#l470">470</a>     case $tag in
+<a id="l471" href="#l471">471</a>         &#x27;&#x27;)      ;;
+<a id="l472" href="#l472">472</a>         &#x27;(all)&#x27;) tagfilter= ;;
+<a id="l473" href="#l473">473</a>         *)       tagfilter=$tag ;;
+<a id="l474" href="#l474">474</a>     esac
+<a id="l475" href="#l475">475</a> }
+<a id="l476" href="#l476">476</a> 
+<a id="l477" href="#l477">477</a> # add exits, which must not end a browsing session; and when it refuses a
+<a id="l478" href="#l478">478</a> # duplicate the user has to get to see that before the list comes back.
+<a id="l479" href="#l479">479</a> add_inside () {
+<a id="l480" href="#l480">480</a>     ( add &#x27;&#x27; )
+<a id="l481" href="#l481">481</a>     if [ $? -eq 3 ]; then
+<a id="l482" href="#l482">482</a>         ask &#x27;already bookmarked; press ENTER&#x27; &gt;/dev/null
+<a id="l483" href="#l483">483</a>     fi
+<a id="l484" href="#l484">484</a> }
+<a id="l485" href="#l485">485</a> 
+<a id="l486" href="#l486">486</a> # browse_fzf: fzf can bind keys, so one list does everything. Opening and
+<a id="l487" href="#l487">487</a> # copying leave it, the other keys come back to it.
+<a id="l488" href="#l488">488</a> browse_fzf () {
+<a id="l489" href="#l489">489</a>     while :; do
+<a id="l490" href="#l490">490</a>         header=&quot;ENTER open  ^Y copy  ^A add  ^D delete  ^E edit  ^T tag [${tagfilter:-all}]  ^S sort [$sortorder]&quot;
+<a id="l491" href="#l491">491</a>         out=$(rows | fzfrows | withpreview fzfcmd --print-query \
+<a id="l492" href="#l492">492</a>               --expect=ctrl-y,ctrl-a,ctrl-d,ctrl-e,ctrl-t,ctrl-s \
+<a id="l493" href="#l493">493</a>               --header=&quot;$header&quot; --prompt=&#x27;bookmark: &#x27;)
+<a id="l494" href="#l494">494</a>         [ -n &quot;$out&quot; ] || exit 1
+<a id="l495" href="#l495">495</a>         typed=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)
+<a id="l496" href="#l496">496</a>         key=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p)
+<a id="l497" href="#l497">497</a>         url=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 3p | cut -f1)
+<a id="l498" href="#l498">498</a> 
+<a id="l499" href="#l499">499</a>         case $key in
+<a id="l500" href="#l500">500</a>             ctrl-a) add_inside; continue ;;
+<a id="l501" href="#l501">501</a>             ctrl-t) picktag; continue ;;
+<a id="l502" href="#l502">502</a>             ctrl-s) nextorder; continue ;;
+<a id="l503" href="#l503">503</a>         esac
+<a id="l504" href="#l504">504</a>         if [ -z &quot;$url&quot; ]; then
+<a id="l505" href="#l505">505</a>             [ -n &quot;$key&quot; ] &amp;&amp; continue
+<a id="l506" href="#l506">506</a>             [ -n &quot;$typed&quot; ] || exit 1
+<a id="l507" href="#l507">507</a>             go &quot;$typed&quot;
+<a id="l508" href="#l508">508</a>             exit 0
+<a id="l509" href="#l509">509</a>         fi
+<a id="l510" href="#l510">510</a>         case $key in
+<a id="l511" href="#l511">511</a>             ctrl-y) copy_url &quot;$url&quot;; exit 0 ;;
+<a id="l512" href="#l512">512</a>             ctrl-e) edit_url &quot;$url&quot; ;;
+<a id="l513" href="#l513">513</a>             ctrl-d)
+<a id="l514" href="#l514">514</a>                 case $(ask &quot;delete $url? (y/N)&quot;) in
+<a id="l515" href="#l515">515</a>                     y|Y|yes) delete_url &quot;$url&quot; ;;
+<a id="l516" href="#l516">516</a>                 esac
+<a id="l517" href="#l517">517</a>                 ;;
+<a id="l518" href="#l518">518</a>             *)      open_url &quot;$url&quot;; exit 0 ;;
+<a id="l519" href="#l519">519</a>         esac
+<a id="l520" href="#l520">520</a>     done
+<a id="l521" href="#l521">521</a> }
+<a id="l522" href="#l522">522</a> 
+<a id="l523" href="#l523">523</a> # browse_menu: dmenu can neither bind keys nor preview, so a second menu does
+<a id="l524" href="#l524">524</a> # both: it shows the bookmark in full and asks what to do with it. Closing it
+<a id="l525" href="#l525">525</a> # goes back to the list; closing the list leaves.
+<a id="l526" href="#l526">526</a> browse_menu () {
+<a id="l527" href="#l527">527</a>     while :; do
+<a id="l528" href="#l528">528</a>         chosen=$( { printf &#x27;[add]\n&#x27;; rows | cut -f1-3; } | pick &#x27;bookmark:&#x27;)
+<a id="l529" href="#l529">529</a>         [ -n &quot;$chosen&quot; ] || exit 1
+<a id="l530" href="#l530">530</a>         if [ &quot;$chosen&quot; = &#x27;[add]&#x27; ]; then
+<a id="l531" href="#l531">531</a>             add_inside
+<a id="l532" href="#l532">532</a>             continue
+<a id="l533" href="#l533">533</a>         fi
+<a id="l534" href="#l534">534</a>         url=$(printf &#x27;%s\n&#x27; &quot;$chosen&quot; | cut -f1)
+<a id="l535" href="#l535">535</a>         if ! is_bookmark &quot;$url&quot;; then
+<a id="l536" href="#l536">536</a>             go &quot;$chosen&quot;
+<a id="l537" href="#l537">537</a>             exit 0
+<a id="l538" href="#l538">538</a>         fi
+<a id="l539" href="#l539">539</a>         action=$( { printf &#x27;open\ncopy\nedit\ndelete\n&#x27;
+<a id="l540" href="#l540">540</a>                     details &quot;$url&quot; | sed &#x27;s/^/  /&#x27;; } | pick &#x27;do:&#x27;)
+<a id="l541" href="#l541">541</a>         case $action in
+<a id="l542" href="#l542">542</a>             open)   open_url &quot;$url&quot;; exit 0 ;;
+<a id="l543" href="#l543">543</a>             copy)   copy_url &quot;$url&quot;; exit 0 ;;
+<a id="l544" href="#l544">544</a>             edit)   edit_url &quot;$url&quot; ;;
+<a id="l545" href="#l545">545</a>             delete) delete_url &quot;$url&quot; ;;
+<a id="l546" href="#l546">546</a>         esac
+<a id="l547" href="#l547">547</a>     done
+<a id="l548" href="#l548">548</a> }
+<a id="l549" href="#l549">549</a> 
+<a id="l550" href="#l550">550</a> # ---- main ----
+<a id="l551" href="#l551">551</a> 
+<a id="l552" href="#l552">552</a> setaction () {
+<a id="l553" href="#l553">553</a>     if [ -n &quot;$action&quot; ]; then
+<a id="l554" href="#l554">554</a>         printf &#x27;bm: only one action at a time\n&#x27; &gt;&amp;2
+<a id="l555" href="#l555">555</a>         exit 2
+<a id="l556" href="#l556">556</a>     fi
+<a id="l557" href="#l557">557</a>     action=$1
+<a id="l558" href="#l558">558</a> }
+<a id="l559" href="#l559">559</a> 
+<a id="l560" href="#l560">560</a> # needarg &lt;flag&gt; &lt;count of remaining arguments&gt; &lt;value&gt;
+<a id="l561" href="#l561">561</a> needarg () {
+<a id="l562" href="#l562">562</a>     if [ &quot;$2&quot; -lt 2 ] || [ -z &quot;$3&quot; ]; then
+<a id="l563" href="#l563">563</a>         printf &#x27;bm: %s needs an argument\n&#x27; &quot;$1&quot; &gt;&amp;2
+<a id="l564" href="#l564">564</a>         exit 2
+<a id="l565" href="#l565">565</a>     fi
+<a id="l566" href="#l566">566</a> }
+<a id="l567" href="#l567">567</a> 
+<a id="l568" href="#l568">568</a> action=
+<a id="l569" href="#l569">569</a> addurl=
+<a id="l570" href="#l570">570</a> tagfilter=
+<a id="l571" href="#l571">571</a> sortorder=${SBM_SORT:-used}
+<a id="l572" href="#l572">572</a> while [ $# -gt 0 ]; do
+<a id="l573" href="#l573">573</a>     case $1 in
+<a id="l574" href="#l574">574</a>         -h|--help)   setaction help ;;
+<a id="l575" href="#l575">575</a>         -c|--copy)   setaction copy ;;
+<a id="l576" href="#l576">576</a>         --print)     setaction print ;;
+<a id="l577" href="#l577">577</a>         -o|--open|-p|--plumb) setaction open ;;
+<a id="l578" href="#l578">578</a>         -e|--edit)   setaction edit ;;
+<a id="l579" href="#l579">579</a>         -d|--delete) setaction delete ;;
+<a id="l580" href="#l580">580</a>         -l|--list)   setaction list ;;
+<a id="l581" href="#l581">581</a>         -m|--merge)  setaction merge ;;
+<a id="l582" href="#l582">582</a>         -a|--add)
+<a id="l583" href="#l583">583</a>             setaction add
+<a id="l584" href="#l584">584</a>             case ${2-} in
+<a id="l585" href="#l585">585</a>                 &#x27;&#x27;|-*) ;;
+<a id="l586" href="#l586">586</a>                 *) addurl=$2; shift ;;
+<a id="l587" href="#l587">587</a>             esac
+<a id="l588" href="#l588">588</a>             ;;
+<a id="l589" href="#l589">589</a>         -t|--tag)
+<a id="l590" href="#l590">590</a>             needarg &quot;$1&quot; $# &quot;${2-}&quot;
+<a id="l591" href="#l591">591</a>             tagfilter=$2
+<a id="l592" href="#l592">592</a>             shift
+<a id="l593" href="#l593">593</a>             ;;
+<a id="l594" href="#l594">594</a>         -S|--sort)
+<a id="l595" href="#l595">595</a>             needarg &quot;$1&quot; $# &quot;${2-}&quot;
+<a id="l596" href="#l596">596</a>             sortorder=$2
+<a id="l597" href="#l597">597</a>             shift
+<a id="l598" href="#l598">598</a>             ;;
+<a id="l599" href="#l599">599</a>         *)
+<a id="l600" href="#l600">600</a>             printf &#x27;bm: unknown argument: %s\n&#x27; &quot;$1&quot; &gt;&amp;2
+<a id="l601" href="#l601">601</a>             usage &gt;&amp;2
+<a id="l602" href="#l602">602</a>             exit 2
+<a id="l603" href="#l603">603</a>             ;;
+<a id="l604" href="#l604">604</a>     esac
+<a id="l605" href="#l605">605</a>     shift
+<a id="l606" href="#l606">606</a> done
+<a id="l607" href="#l607">607</a> 
+<a id="l608" href="#l608">608</a> case $sortorder in
+<a id="l609" href="#l609">609</a>     used|recent|url|desc|tag) ;;
+<a id="l610" href="#l610">610</a>     *)
+<a id="l611" href="#l611">611</a>         printf &#x27;bm: unknown sort order: %s\n&#x27; &quot;$sortorder&quot; &gt;&amp;2
+<a id="l612" href="#l612">612</a>         exit 2
+<a id="l613" href="#l613">613</a>         ;;
+<a id="l614" href="#l614">614</a> esac
+<a id="l615" href="#l615">615</a> 
+<a id="l616" href="#l616">616</a> if [ &quot;$action&quot; = help ]; then
+<a id="l617" href="#l617">617</a>     usage
+<a id="l618" href="#l618">618</a>     exit 0
+<a id="l619" href="#l619">619</a> fi
+<a id="l620" href="#l620">620</a> 
+<a id="l621" href="#l621">621</a> mkdir -p &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; || die &quot;cannot create directory for $BOOKMARKS&quot;
+<a id="l622" href="#l622">622</a> [ -e &quot;$BOOKMARKS&quot; ] || : &gt; &quot;$BOOKMARKS&quot; || die &quot;cannot create $BOOKMARKS&quot;
+<a id="l623" href="#l623">623</a> 
+<a id="l624" href="#l624">624</a> if awk &#x27;!/\t/ &amp;&amp; !/^#/ &amp;&amp; NF { found = 1; exit } END { exit !found }&#x27; &quot;$BOOKMARKS&quot;
+<a id="l625" href="#l625">625</a> then
+<a id="l626" href="#l626">626</a>     printf &#x27;bm: %s has lines in the old format; run: bm-migrate\n&#x27; &quot;$BOOKMARKS&quot; &gt;&amp;2
+<a id="l627" href="#l627">627</a> fi
+<a id="l628" href="#l628">628</a> 
+<a id="l629" href="#l629">629</a> case $action in
+<a id="l630" href="#l630">630</a>     list|merge) ;;
+<a id="l631" href="#l631">631</a>     *) pickmenu ;;
+<a id="l632" href="#l632">632</a> esac
+<a id="l633" href="#l633">633</a> 
+<a id="l634" href="#l634">634</a> case $action in
+<a id="l635" href="#l635">635</a>     &#x27;&#x27;)
+<a id="l636" href="#l636">636</a>         if [ &quot;$SBM_MENU&quot; = fzf ]; then browse_fzf; else browse_menu; fi
+<a id="l637" href="#l637">637</a>         ;;
+<a id="l638" href="#l638">638</a>     open)   plumb ;;
+<a id="l639" href="#l639">639</a>     copy)   url=$(choose_url &#x27;copy:&#x27;)   &amp;&amp; copy_url &quot;$url&quot; ;;
+<a id="l640" href="#l640">640</a>     print)  url=$(choose_url &#x27;print:&#x27;)  &amp;&amp; bump &quot;$url&quot; &amp;&amp; printf &#x27;%s\n&#x27; &quot;$url&quot; ;;
+<a id="l641" href="#l641">641</a>     edit)   url=$(choose_url &#x27;edit:&#x27;)   &amp;&amp; edit_url &quot;$url&quot; ;;
+<a id="l642" href="#l642">642</a>     delete) url=$(choose_url &#x27;delete:&#x27;) &amp;&amp; delete_url &quot;$url&quot; \
+<a id="l643" href="#l643">643</a>                 &amp;&amp; printf &#x27;deleted %s\n&#x27; &quot;$url&quot; ;;
+<a id="l644" href="#l644">644</a>     add)    add &quot;$addurl&quot; ;;
+<a id="l645" href="#l645">645</a>     list)   rows | cut -f1-3 ;;
+<a id="l646" href="#l646">646</a>     merge)  merge ;;
+<a id="l647" href="#l647">647</a> esac</pre>
+</div></body></html>

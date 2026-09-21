@@ -1,0 +1,2100 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay 9f889866 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9f8898667f6a95057bf21f130d51f73b0d11d420
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 03:45:31 -0700
+
+Add replay mining workflow and offline subtitler
+
+The live captioner only served half the need: subtitles are read in the moment
+to follow along, but the saved replay clips are where Anki cards get made, and
+those two jobs want opposite trade-offs. Live needs speed and tolerates errors;
+replay needs accuracy and ignores latency.
+
+subtitle.py transcribes clips offline with large-v3-turbo, which is far too slow
+live but markedly better - it produces &quot;harvakseltaan&quot; where small produces
+&quot;harvokseltaan&quot;. It writes SRT/VTT, a per-clip mining page, and optional Anki
+rows with per-sentence audio and screenshots.
+
+Mining happens through Yomitan, which reads DOM text, so the deliverable is
+hoverable HTML rather than pixels: reader.html for live and clip.html for
+replays, both keeping each sentence as a bare text node. Timestamps render from
+CSS attr() so Yomitan cannot absorb them into the mined sentence.
+
+Cues are grouped by sentence first and only then split to fit a line, so a card
+never begins mid-sentence; short trailing runts fold back into the previous cue.
+
+Fixes found while testing:
+- Video seeking was silently impossible over http, because Python&#x27;s stock
+  handler ignores Range requests. Added a 206-capable server; scrubbing is most
+  of what mining involves.
+- Subtitle sync only followed timeupdate, which does not fire while paused, so
+  scrubbing never updated the text. Now also bound to seeked.
+- wrap() gave up when no split fit the width and emitted one long line.
+
+--stream implements LocalAgreement streaming but stays off: measured on a 17.6s
+Finnish clip it was worse on both axes, at 3.58x real time with small, and
+garbled with the smaller models fast enough to keep up. It is the right mode on
+a GPU and is documented as such.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> .github/workflows/ci.yml |   7 +-
+ README.md                | 357 +++++++++++----------
+ control.html             |   2 +
+ livecap.py               | 211 +++++++++++-
+ reader.html              | 232 ++++++++++++++
+ requirements.txt         |   1 +
+ subtitle.py              | 816 +++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_subtitle.py   | 202 ++++++++++++
+ 8 files changed, 1660 insertions(+), 168 deletions(-)
+</pre><pre>diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index f032299..c91b793 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+<span class="h">@@ -26,12 +26,15 @@ jobs:</span>
+           pip install -r requirements.txt
+ 
+       - name: Byte-compile
+<span class="d">-        run: python -m compileall -q livecap.py bench.py</span>
+<span class="a">+        run: python -m compileall -q livecap.py bench.py subtitle.py</span>
+ 
+       - name: CLI smoke check
+         run: |
+           python livecap.py --help
+           python bench.py --help
+<span class="a">+          python subtitle.py --help</span>
+ 
+       - name: Tests
+<span class="d">-        run: python tests/test_smoke.py</span>
+<span class="a">+        run: |</span>
+<span class="a">+          python tests/test_smoke.py</span>
+<span class="a">+          python tests/test_subtitle.py</span>
+diff --git a/README.md b/README.md
+index 8f78e18..13d5e15 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -1,25 +1,32 @@</span>
+<span class="d">-# livecap — live captions for OBS</span>
+<span class="a">+# desktop-subtitle-replay</span>
+ 
+<span class="d">-Real-time speech captions for OBS Studio on Windows. Captures audio, detects</span>
+<span class="d">-speech, transcribes it with Whisper, and renders it into a transparent Browser</span>
+<span class="d">-Source overlay.</span>
+<span class="a">+Live subtitles for anything playing on your desktop, plus a mining workflow for</span>
+<span class="a">+the clips you save afterwards. Built for language learning: understand it now,</span>
+<span class="a">+turn it into Anki cards later.</span>
+ 
+ Runs entirely on your machine. No API keys, no cloud, no internet after the
+<span class="d">-model is downloaded. Built for Finnish, works with any language Whisper</span>
+<span class="d">-supports.</span>
+<span class="a">+model downloads.</span>
+ 
+ ```
+<span class="d">-audio device ──► VAD segmenter ──► faster-whisper ──► WebSocket ──► overlay.html</span>
+<span class="d">-                                                  └─► captions.txt (GDI+ fallback)</span>
+<span class="a">+                    ┌─► OBS overlay        (captions on the stream)</span>
+<span class="a">+desktop audio ──────┼─► reader.html        (selectable text — Yomitan mines it)</span>
+<span class="a">+   (live)           └─► captions.txt/log   (plain text)</span>
+<span class="a">+</span>
+<span class="a">+replay clip ────────┬─► clip.srt           (subtitles)</span>
+<span class="a">+   (offline)        ├─► clip.html          (video + hoverable synced subs)</span>
+<span class="a">+                    └─► clip.anki.tsv      (one card per sentence + audio)</span>
+ ```
+ 
+<span class="a">+Two halves, because they want opposite things. Live needs speed and accepts</span>
+<span class="a">+mistakes. Replay needs accuracy and does not care about time.</span>
+<span class="a">+</span>
+ ## Requirements
+ 
+ - Windows 10/11
+ - Python 3.9–3.12 (3.11 recommended)
+<span class="d">-- OBS Studio 28+</span>
+<span class="a">+- OBS Studio 28+ (only for the live overlay)</span>
+ - ~2 GB disk for the model cache
+<span class="d">-- A GPU is *not* required — this is tuned to run on CPU</span>
+<span class="a">+- A GPU is *not* required, but it changes what is possible — see below</span>
+ 
+ ## Install
+ 
+<span class="h">@@ -27,132 +34,174 @@ audio device ──► VAD segmenter ──► faster-whisper ──► WebSocke</span>
+ .\setup.ps1
+ ```
+ 
+<span class="d">-Creates a `.venv` and installs dependencies. One-time.</span>
+<span class="d">-</span>
+<span class="d">-## Run</span>
+<span class="a">+## Live captions</span>
+ 
+ ```bash
+ .\run.ps1
+ ```
+ 
+<span class="d">-Prints a Browser Source URL. In OBS: **+ → Browser**, paste it, set</span>
+<span class="d">-**1920 × 1080**, and untick **Shutdown source when not visible**.</span>
+<span class="a">+Prints three URLs:</span>
+ 
+<span class="d">-```</span>
+<span class="d">-http://127.0.0.1:8777/overlay.html?ws=8765&amp;lines=2&amp;size=42&amp;hide=8</span>
+<span class="d">-```</span>
+<span class="a">+| page | where it goes |</span>
+<span class="a">+|---|---|</span>
+<span class="a">+| `overlay.html` | OBS Browser Source — captions burned into the stream |</span>
+<span class="a">+| `reader.html` | **your real browser** — selectable text for Yomitan |</span>
+<span class="a">+| `control.html` | language and model switching while running |</span>
+ 
+<span class="d">-The overlay is transparent and places captions in the lower third. Keep the</span>
+<span class="d">-console window open while streaming; Ctrl+C stops it.</span>
+<span class="a">+For OBS: **+ → Browser**, paste the overlay URL, **1920 × 1080**, untick</span>
+<span class="a">+**Shutdown source when not visible**.</span>
+ 
+<span class="d">-Check your devices first if needed:</span>
+<span class="a">+For mining: open `reader.html` in the browser where Yomitan is installed. Each</span>
+<span class="a">+sentence is a plain DOM text node, so Yomitan&#x27;s popup and its sentence field</span>
+<span class="a">+work normally. The timestamp is drawn with CSS rather than text, so it never</span>
+<span class="a">+gets absorbed into the sentence you mine.</span>
+<span class="a">+</span>
+<span class="a">+### Changing language and model mid-session</span>
+<span class="a">+</span>
+<span class="a">+Open `control.html`. Language switches on one click or keys `1`–`9` and applies</span>
+<span class="a">+to the next sentence — no reload. Model switching reloads and pauses captions</span>
+<span class="a">+for a few seconds. Defaults cover `fi,ru,ja,es,pt,en,auto`:</span>
+ 
+ ```bash
+<span class="d">-.\run.ps1 --list-devices</span>
+<span class="a">+.\run.ps1 --langs fi,ru,ja,es,pt,en,auto --lang fi</span>
+ ```
+ 
+<span class="d">-## Changing language and model while streaming</span>
+<span class="a">+**Whisper has no regional variants.** Argentine Spanish is `es`; there is no</span>
+<span class="a">+`es-AR`. It handles Rioplatense pronunciation and *voseo*, but normalises</span>
+<span class="a">+toward standard orthography and will not reliably reproduce regional slang.</span>
+<span class="a">+Brazilian and European Portuguese are both `pt`.</span>
+ 
+<span class="d">-`run.ps1` also prints a control panel URL. Open it in any browser (a second</span>
+<span class="d">-monitor, a phone on the same machine, or an OBS dock via</span>
+<span class="d">-**Docks → Custom Browser Docks**):</span>
+<span class="a">+**`auto` re-detects per segment**, which flips on short or noisy audio and can</span>
+<span class="a">+mislabel mid-sentence. For deliberate language changes the `1`–`9` keys are far</span>
+<span class="a">+more reliable.</span>
+ 
+<span class="d">-```</span>
+<span class="d">-http://127.0.0.1:8777/control.html?ws=8765</span>
+<span class="d">-```</span>
+<span class="a">+### Choosing what gets captioned</span>
+<span class="a">+</span>
+<span class="a">+Default loopback captures everything your speakers play. Your own microphone is</span>
+<span class="a">+*not* included unless OBS monitors it, and music gets transcribed too.</span>
+ 
+<span class="d">-- **Language** — one click, or press `1`–`9`. Applies to the next sentence.</span>
+<span class="d">-  No restart and no model reload, so it is effectively instant.</span>
+<span class="d">-- **Model** — a dropdown. Swapping reloads the model, which pauses captions for</span>
+<span class="d">-  a few seconds; the panel shows a *loading* state while it happens.</span>
+<span class="d">-- **Toggles** — English translation, live partial text, and clear captions.</span>
+<span class="d">-- A live feed of what is being recognised, so you can sanity-check without</span>
+<span class="d">-  looking at the stream.</span>
+<span class="a">+With [VB-Audio Virtual Cable](https://vb-audio.com/Cable/), send only what you</span>
+<span class="a">+want captioned:</span>
+ 
+<span class="d">-Choose which languages get buttons:</span>
+<span class="a">+1. OBS → **Settings → Audio → Advanced → Monitoring Device** = `CABLE Input`</span>
+<span class="a">+2. Audio Mixer → gear on each source → **Advanced Audio Properties** →</span>
+<span class="a">+   **Audio Monitoring** = **Monitor and Output**</span>
+<span class="a">+3. Leave music and alerts on **Monitor Off**</span>
+ 
+ ```bash
+<span class="d">-.\run.ps1 --langs fi,ru,ja,es,pt,en,auto --lang fi</span>
+<span class="a">+.\run.ps1 --mic --audio-device CABLE</span>
+ ```
+ 
+<span class="d">-That default set covers Finnish, Russian, Japanese, Spanish, Portuguese,</span>
+<span class="d">-English and auto-detect. Any [Whisper language code](https://github.com/openai/whisper#available-models-and-languages)</span>
+<span class="d">-works.</span>
+<span class="d">-</span>
+<span class="d">-Two things worth knowing:</span>
+<span class="a">+## Subtitling replay clips</span>
+ 
+<span class="d">-- **Whisper has no regional variants.** Argentine Spanish is `es` — there is no</span>
+<span class="d">-  `es-AR`. The model handles Rioplatense pronunciation and *voseo* as part of</span>
+<span class="d">-  `es`, but it normalises toward standard orthography and will not reliably</span>
+<span class="d">-  reproduce regional slang. The same applies to Brazilian vs. European</span>
+<span class="d">-  Portuguese: both are `pt`.</span>
+<span class="d">-- **`auto` re-detects per segment**, which sounds ideal for multilingual streams</span>
+<span class="d">-  but flips on short or noisy utterances and can mislabel mid-sentence. For a</span>
+<span class="d">-  stream that switches language deliberately, the `1`–`9` keys are far more</span>
+<span class="d">-  reliable than `auto`.</span>
+<span class="a">+```bash</span>
+<span class="a">+.\.venv\Scripts\python.exe subtitle.py clip.mp4</span>
+<span class="a">+```</span>
+ 
+<span class="d">-Wider models are better at non-English audio. If you mostly caption Russian or</span>
+<span class="d">-Japanese, `medium` is worth the latency if your CPU can take it — check with</span>
+<span class="d">-`bench.py` first.</span>
+<span class="a">+Writes `clip.srt` and `clip.html` next to the clip. The HTML page is the mining</span>
+<span class="a">+surface: video on the left, every sentence listed as selectable text, click to</span>
+<span class="a">+seek, `Loop cue` to repeat a line while you work it out.</span>
+ 
+<span class="d">-## Choosing what gets captioned</span>
+<span class="a">+Watch your replay folder and subtitle clips automatically as OBS saves them:</span>
+ 
+<span class="d">-**Default (`--loopback`)** captures everything your speakers play — guests,</span>
+<span class="d">-video, game audio, music. Zero setup. The catch: your own microphone is *not*</span>
+<span class="d">-included unless OBS monitors it, and music gets fed to Whisper too.</span>
+<span class="a">+```bash</span>
+<span class="a">+.\.venv\Scripts\python.exe subtitle.py --watch &quot;C:\Users\you\Videos&quot; --serve</span>
+<span class="a">+```</span>
+ 
+<span class="d">-**Recommended: route a dedicated mix through a virtual cable.** With</span>
+<span class="d">-[VB-Audio Virtual Cable](https://vb-audio.com/Cable/) installed:</span>
+<span class="a">+`--serve` matters more than it looks. Opening `clip.html` from `file://`</span>
+<span class="a">+requires enabling Yomitan&#x27;s *Allow access to file URLs*, and serving it through</span>
+<span class="a">+`python -m http.server` **silently breaks video seeking**, because that server</span>
+<span class="a">+ignores HTTP Range requests. `--serve` runs a range-capable server, so scrubbing</span>
+<span class="a">+works and Yomitan needs no extra permission.</span>
+ 
+<span class="d">-1. OBS → **Settings → Audio → Advanced → Monitoring Device** =</span>
+<span class="d">-   `CABLE Input (VB-Audio Virtual Cable)`</span>
+<span class="d">-2. Audio Mixer → gear icon on each source you want captioned →</span>
+<span class="d">-   **Advanced Audio Properties** → **Audio Monitoring** = **Monitor and Output**</span>
+<span class="d">-   (this keeps the source audible to viewers; *Monitor Only* would mute it)</span>
+<span class="d">-3. Leave music, game and alert sources on **Monitor Off**</span>
+<span class="d">-4. Run:</span>
+<span class="a">+### Anki cards</span>
+ 
+ ```bash
+<span class="d">-.\run.ps1 --mic --audio-device CABLE</span>
+<span class="a">+.\.venv\Scripts\python.exe subtitle.py clip.mp4 --anki</span>
+ ```
+ 
+<span class="d">-Accuracy improves noticeably once Whisper stops trying to transcribe your</span>
+<span class="d">-background music.</span>
+<span class="a">+Produces `clip.anki.tsv` (one row per sentence) plus a media folder of</span>
+<span class="a">+per-sentence audio clips, with columns: sentence, translation, `[sound:…]`,</span>
+<span class="a">+`&lt;img&gt;`, source file, timestamp. Copy the media into your Anki</span>
+<span class="a">+`collection.media` and import the TSV.</span>
+<span class="a">+</span>
+<span class="a">+This is the batch path. If you mine word-by-word with Yomitan, use `clip.html`</span>
+<span class="a">+instead and let Yomitan build the cards — it captures the sentence context on</span>
+<span class="a">+its own, which is usually what you want.</span>
+ 
+<span class="d">-## Model selection</span>
+<span class="a">+Screenshots need Pillow (`pip install pillow`); without it the image column is</span>
+<span class="a">+left empty and everything else still works.</span>
+ 
+<span class="d">-Measured on a 16-core CPU with no CUDA GPU, `int8` quantisation:</span>
+<span class="a">+## Speed, honestly</span>
+ 
+<span class="d">-| model | real speech RTF | latency per segment | Finnish quality |</span>
+<span class="d">-|---|---|---|---|</span>
+<span class="d">-| `tiny` | 0.07 | ~0.4 s | poor |</span>
+<span class="d">-| `base` | 0.10 | ~0.6 s | weak |</span>
+<span class="d">-| **`small`** (default) | **0.57** | **~2.5 s** | good |</span>
+<span class="d">-| `large-v3-turbo` | 1.77 | ~10.6 s | unusable — falls behind |</span>
+<span class="a">+Measured on a 16-core CPU, no CUDA, `int8`, on real Finnish speech:</span>
+<span class="a">+</span>
+<span class="a">+| model | RTF | verdict |</span>
+<span class="a">+|---|---|---|</span>
+<span class="a">+| `tiny` | 0.07 | fast, poor Finnish |</span>
+<span class="a">+| `base` | 0.10 | fast, weak Finnish |</span>
+<span class="a">+| **`small`** (live default) | **0.57** | the practical ceiling on CPU |</span>
+<span class="a">+| `large-v3-turbo` (replay default) | 1.77 | too slow live, ideal offline |</span>
+ 
+<span class="d">-RTF (real-time factor) below ~0.6 keeps up with continuous speech. Without a</span>
+<span class="d">-CUDA GPU, `small` is the largest model that stays real-time, which is why it is</span>
+<span class="d">-the default. With an NVIDIA GPU, add `--compute-device cuda --compute float16`</span>
+<span class="d">-and `large-v3` becomes viable.</span>
+<span class="a">+RTF is measured over a whole file. **Per segment during a live stream it is</span>
+<span class="a">+worse** — short utterances pay a fixed encoder cost, so real sessions show 0.55</span>
+<span class="a">+to 1.4, occasionally decoding slower than real time. Expect captions **3–8 s</span>
+<span class="a">+behind the speaker**, not 1 s. That is inherent to the approach, not a bug.</span>
+ 
+ Benchmark your own machine:
+ 
+ ```bash
+<span class="d">-.\.venv\Scripts\python.exe .\bench.py --models small,medium</span>
+<span class="a">+.\.venv\Scripts\python.exe bench.py --models small,medium</span>
+ ```
+ 
+<span class="d">-Synthetic audio makes models look faster than they are, because there are fewer</span>
+<span class="d">-tokens to decode. For a realistic number, point it at a recording:</span>
+<span class="a">+Synthetic audio flatters models because there are fewer tokens to decode. Point</span>
+<span class="a">+it at a real recording for a number you can trust:</span>
+ 
+ ```bash
+<span class="d">-.\.venv\Scripts\python.exe .\bench.py --wav selftest.wav</span>
+<span class="a">+.\.venv\Scripts\python.exe bench.py --wav selftest.wav</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+### Why it is not truly real-time</span>
+<span class="a">+</span>
+<span class="a">+Whisper is an offline encoder-decoder over fixed 30-second windows. It cannot</span>
+<span class="a">+emit a word until it has a chunk to process, so this waits for a pause and</span>
+<span class="a">+transcribes the finished utterance. That is chunked pseudo-streaming, not</span>
+<span class="a">+streaming ASR.</span>
+<span class="a">+</span>
+<span class="a">+Engines that genuinely stream — Kaldi/Vosk online decoding, sherpa-onnx</span>
+<span class="a">+Zipformer transducers — emit ~200–500 ms after the sound. Vosk covers Russian,</span>
+<span class="a">+Japanese, Spanish and Portuguese, **but has no Finnish model**. Nothing</span>
+<span class="a">+genuinely streaming covers this language set; Whisper covers all of it and is</span>
+<span class="a">+not streaming.</span>
+<span class="a">+</span>
+<span class="a">+`--stream` implements LocalAgreement streaming (Macháček et al.): re-decode a</span>
+<span class="a">+growing buffer, commit only the prefix two consecutive decodes agree on. It is</span>
+<span class="a">+**off by default because it measured worse here on both axes**, on the same</span>
+<span class="a">+17.6 s Finnish clip:</span>
+<span class="a">+</span>
+<span class="a">+| mode | speed | output |</span>
+<span class="a">+|---|---|---|</span>
+<span class="a">+| chunked `small` | 0.57× | *&quot;Nyt ollaan taas sen verran syrjäisillä seuduilla ja harvakseltaan kuljetuilla seuduilla.&quot;* |</span>
+<span class="a">+| `--stream small` | 3.58× | too slow to run |</span>
+<span class="a">+| `--stream base` | 0.96× | *&quot;Tolaan taas sen verran Syrjää Näissä ei sillä seudulla…&quot;* |</span>
+<span class="a">+| `--stream tiny` | 0.34× | *&quot;Kösitäästä. Ja tolaa on… parvaksiautaa&quot;* |</span>
+<span class="a">+</span>
+<span class="a">+The models fast enough to stream are too weak for Finnish; the model good</span>
+<span class="a">+enough for Finnish is 3.6× too slow. **With a CUDA GPU this inverts** — run</span>
+<span class="a">+`--stream --compute-device cuda --compute float16 --model large-v3` and</span>
+<span class="a">+LocalAgreement becomes the better mode.</span>
+<span class="a">+</span>
+<span class="a">+To reduce latency without it, shorten the silence needed to close a caption and</span>
+<span class="a">+free up CPU:</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+.\run.ps1 --pause 0.4 --no-partials</span>
+ ```
+ 
+ ### Better Finnish at the same speed
+ 
+<span class="d">-Stock `small` is a generalist. A Finnish-fine-tuned `small` is the same size —</span>
+<span class="d">-so the same speed — but markedly better at Finnish.</span>
+<span class="d">-`get-finnish-model.ps1` fetches one and converts it to CTranslate2:</span>
+<span class="a">+Stock `small` is a generalist. A Finnish-fine-tuned `small` is the same size, so</span>
+<span class="a">+the same speed, but markedly better at Finnish:</span>
+ 
+ ```bash
+ .\get-finnish-model.ps1
+<span class="h">@@ -162,45 +211,48 @@ so the same speed — but markedly better at Finnish.</span>
+ .\run.ps1 --model .\build\models\fi-small-ct2
+ ```
+ 
+<span class="d">-The conversion needs ~8 GB free and pulls in torch, which is used only for that</span>
+<span class="d">-one-off step. Use `-BuildRoot D:\somewhere` to build on another drive, and</span>
+<span class="d">-delete `.venv-convert` under the build root afterwards to reclaim the space.</span>
+<span class="a">+Needs ~8 GB free and pulls torch for the one-off conversion; use</span>
+<span class="a">+`-BuildRoot D:\somewhere` to build elsewhere, then delete `.venv-convert`.</span>
+ 
+<span class="d">-## Caption latency and stream delay</span>
+<span class="a">+## Syncing captions to the picture</span>
+ 
+<span class="d">-The overlay is composited into the program feed *before* any stream delay or</span>
+<span class="d">-replay buffer, so captions ride along with the video automatically — a buffer</span>
+<span class="d">-needs no special handling.</span>
+<span class="a">+The overlay is composited before any stream delay or replay buffer, so captions</span>
+<span class="a">+ride along with the video automatically.</span>
+ 
+<span class="d">-A caption appears roughly **2.5 s after the sentence ends**: inference time plus</span>
+<span class="d">-the 0.65 s of silence used to detect the end of the sentence. To lock captions</span>
+<span class="d">-to lips, delay the picture to match:</span>
+<span class="a">+To line captions up with lips, delay the picture by the caption latency:</span>
+ 
+<span class="d">-- **Render Delay** filter of `2500` ms on your video sources</span>
+<span class="d">-- **Sync Offset** of `2500` ms on the audio sources</span>
+<span class="d">-  (Advanced Audio Properties)</span>
+<span class="a">+- **Render Delay** filter of `2500`–`4000` ms on video sources</span>
+<span class="a">+- matching **Sync Offset** on audio sources (Advanced Audio Properties)</span>
+ 
+<span class="d">-If you already run a replay buffer or stream delay, the extra 2.5 s costs you</span>
+<span class="d">-nothing.</span>
+<span class="a">+If you already run a replay buffer, this costs you nothing.</span>
+ 
+ ## Options
+ 
+<span class="a">+`livecap.py`:</span>
+<span class="a">+</span>
+ | flag | default | effect |
+ |---|---|---|
+<span class="d">-| `--lang` | `fi` | `fi`, `en`, `sv`, … or `auto` |</span>
+<span class="d">-| `--model` | `small` | model name or a local CTranslate2 directory |</span>
+<span class="d">-| `--mic` | off | capture an input device instead of desktop output |</span>
+<span class="d">-| `--audio-device` | auto | index from `--list-devices`, or part of the name |</span>
+<span class="d">-| `--pause` | `0.65` | silence (s) that ends a caption; lower = snappier, more fragments |</span>
+<span class="a">+| `--lang` / `--langs` | `fi` / `fi,ru,ja,es,pt,en,auto` | active language, and the panel&#x27;s buttons |</span>
+<span class="a">+| `--model` | `small` | model name or local CTranslate2 directory |</span>
+<span class="a">+| `--mic` / `--audio-device` | loopback / auto | capture an input device instead |</span>
+<span class="a">+| `--pause` | `0.65` | silence that closes a caption; lower is snappier |</span>
+ | `--min-speech` | `0.45` | ignore bursts shorter than this |
+<span class="d">-| `--max-seg` | `11.0` | force a cut during non-stop speech |</span>
+<span class="d">-| `--vad-floor` | `0.004` | absolute level gate; raise if noise triggers captions |</span>
+<span class="d">-| `--vad-ratio` | `3.0` | gate relative to the running noise floor |</span>
+<span class="d">-| `--no-partials` | off | only show finished sentences; roughly halves CPU |</span>
+<span class="d">-| `--translate` | off | add an English line beneath the original |</span>
+<span class="d">-| `--lines` / `--size` | `2` / `42` | overlay line count and font size |</span>
+<span class="d">-| `--hide` | `8` | fade the overlay out after N idle seconds |</span>
+<span class="d">-| `--compute-device` | `cpu` | `cuda` if you have an NVIDIA GPU |</span>
+<span class="a">+| `--vad-floor` / `--vad-ratio` | `0.004` / `3.0` | speech gate, absolute and relative |</span>
+<span class="a">+| `--no-partials` | off | finished sentences only; roughly halves CPU |</span>
+<span class="a">+| `--stream` | off | LocalAgreement streaming (see above) |</span>
+<span class="a">+| `--translate` | off | add an English line |</span>
+<span class="a">+| `--compute-device` | `cpu` | `cuda` with an NVIDIA GPU |</span>
+<span class="a">+</span>
+<span class="a">+`subtitle.py`:</span>
+<span class="a">+</span>
+<span class="a">+| flag | default | effect |</span>
+<span class="a">+|---|---|---|</span>
+<span class="a">+| `--model` | `large-v3-turbo` | accuracy over speed |</span>
+<span class="a">+| `--watch FOLDER` | — | subtitle clips as they appear |</span>
+<span class="a">+| `--serve [PORT]` | — | range-capable server so seeking works |</span>
+<span class="a">+| `--anki` / `--anki-translate` | off | card export, with English backs |</span>
+<span class="a">+| `--format` | `srt` | `srt`, `vtt`, `txt` |</span>
+<span class="a">+| `--width` / `--max-chars` | `42` / `84` | line and cue length |</span>
+ 
+ ## Diagnostics
+ 
+<span class="h">@@ -208,65 +260,42 @@ nothing.</span>
+ .\run.ps1 --selftest 12
+ ```
+ 
+<span class="d">-Records 12 s, writes `selftest.wav`, transcribes it once and reports the</span>
+<span class="d">-real-time factor. Run this first — speak or play audio during those 12 seconds</span>
+<span class="d">-and check what comes back.</span>
+<span class="a">+Records 12 s, writes `selftest.wav`, transcribes it and reports the real-time</span>
+<span class="a">+factor. Run this first.</span>
+ 
+ ```bash
+ .\run.ps1 --meter
+ ```
+ 
+<span class="d">-Live level meter showing the VAD gate, for tuning `--vad-floor`. Add</span>
+<span class="d">-`--verbose` to log every segment the VAD decides to send.</span>
+<span class="a">+Level meter with the VAD gate, for tuning `--vad-floor`. `--verbose` logs every</span>
+<span class="a">+segment the VAD sends.</span>
+ 
+ | symptom | cause |
+ |---|---|
+<span class="d">-| `no speech recognised in N.Ns segment` | music/noise reaching Whisper, or wrong `--lang` |</span>
+<span class="d">-| nothing at all in the log | VAD never fires — check `--meter`, wrong device |</span>
+<span class="d">-| `backlog full` | model too slow for real time; use a smaller one |</span>
+<span class="d">-| red dot in the overlay | overlay lost the WebSocket; it retries automatically |</span>
+<span class="a">+| `no speech recognised in N.Ns segment` | music/noise, or wrong `--lang` |</span>
+<span class="a">+| nothing in the log at all | VAD never fires — check `--meter` and device |</span>
+<span class="a">+| `backlog full` | model too slow; use a smaller one |</span>
+<span class="a">+| video will not seek | server ignoring Range requests — use `--serve` |</span>
+<span class="a">+| red dot in overlay/reader | lost the WebSocket; it retries automatically |</span>
+ 
+<span class="d">-Whisper likes to hallucinate stock phrases over silence (`Tekstitys: YLE`,</span>
+<span class="a">+Whisper hallucinates stock phrases over silence (`Tekstitys: YLE`,</span>
+ `Kiitos kun katsoit!`, `Thanks for watching`). Short results matching those are
+<span class="d">-filtered out, alongside a no-speech-probability threshold.</span>
+<span class="a">+filtered, alongside a no-speech-probability threshold.</span>
+ 
+<span class="d">-## Overlay styling</span>
+<span class="a">+## Tests</span>
+ 
+<span class="d">-Append query parameters to the Browser Source URL:</span>
+<span class="a">+```bash</span>
+<span class="a">+.\.venv\Scripts\python.exe tests\test_smoke.py</span>
+<span class="a">+```</span>
+ 
+<span class="d">-| param | example | effect |</span>
+<span class="d">-|---|---|---|</span>
+<span class="d">-| `size` | `size=52` | font size in px |</span>
+<span class="d">-| `lines` | `lines=3` | how many lines stay on screen |</span>
+<span class="d">-| `align` | `align=top` | `top`, `center`, default bottom |</span>
+<span class="d">-| `fg` | `fg=ffe066` | text colour (hex, no `#`) |</span>
+<span class="d">-| `accent` | `accent=7dd3fc` | translation line colour |</span>
+<span class="d">-| `box` | `box=0` | remove the dark background pill |</span>
+<span class="d">-| `hide` | `hide=0` | never auto-hide |</span>
+<span class="d">-| `tr` | `tr=1` | show translation lines (with `--translate`) |</span>
+<span class="d">-</span>
+<span class="d">-## Text output</span>
+<span class="d">-</span>
+<span class="d">-`captions.txt` holds the last few lines for an OBS **Text (GDI+)** source with</span>
+<span class="d">-*Read from file*, if you would rather avoid browser sources. `captions.log`</span>
+<span class="d">-keeps the full timestamped transcript of the session, which doubles as stream</span>
+<span class="d">-notes.</span>
+<span class="d">-</span>
+<span class="d">-## How it works</span>
+<span class="d">-</span>
+<span class="d">-`livecap.py` pulls 32 ms blocks from a WASAPI device via `soundcard`, tracks a</span>
+<span class="d">-running noise floor, and marks blocks as speech when they exceed</span>
+<span class="d">-`max(noise × ratio, floor)`. Speech accumulates into a segment; a segment closes</span>
+<span class="d">-on `--pause` of trailing silence or at `--max-seg`. Closed segments go to</span>
+<span class="d">-faster-whisper on a worker thread and are published as `final`. While a segment</span>
+<span class="d">-is still open, idle worker time is spent transcribing the partial buffer and</span>
+<span class="d">-publishing lower-confidence `partial` text, so captions appear before the</span>
+<span class="d">-speaker finishes. Results are broadcast over WebSocket to `overlay.html` and</span>
+<span class="d">-mirrored to disk.</span>
+<span class="a">+```bash</span>
+<span class="a">+.\.venv\Scripts\python.exe tests\test_subtitle.py</span>
+<span class="a">+```</span>
+ 
+ ## License
+ 
+<span class="d">-MIT — see [LICENSE](LICENSE).</span>
+<span class="d">-</span>
+<span class="d">-Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (MIT) and</span>
+<span class="d">-OpenAI&#x27;s Whisper models.</span>
+<span class="a">+MIT — see [LICENSE](LICENSE). Uses</span>
+<span class="a">+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) (MIT) and OpenAI&#x27;s</span>
+<span class="a">+Whisper models. Streaming mode follows the LocalAgreement policy from</span>
+<span class="a">+Macháček, Dabre &amp; Bojar, *Turning Whisper into Real-Time Transcription System*</span>
+<span class="a">+(2023).</span>
+diff --git a/control.html b/control.html
+index bf7f083..4e391e4 100644
+--- a/control.html
++++ b/control.html
+<span class="h">@@ -81,6 +81,7 @@</span>
+     &lt;div class=&quot;row&quot;&gt;
+       &lt;button id=&quot;translate&quot;&gt;English translation&lt;/button&gt;
+       &lt;button id=&quot;partials&quot;&gt;Live partial text&lt;/button&gt;
+<span class="a">+      &lt;button id=&quot;test&quot;&gt;Send test caption&lt;/button&gt;</span>
+       &lt;button id=&quot;clear&quot;&gt;Clear captions&lt;/button&gt;
+     &lt;/div&gt;
+   &lt;/div&gt;
+<span class="h">@@ -217,6 +218,7 @@</span>
+   el(&quot;translate&quot;).onclick = () =&gt; state &amp;&amp; send(&quot;set_translate&quot;, !state.translate);
+   el(&quot;partials&quot;).onclick = () =&gt; state &amp;&amp; send(&quot;set_partials&quot;, !state.partials);
+   el(&quot;clear&quot;).onclick = () =&gt; send(&quot;clear&quot;);
+<span class="a">+  el(&quot;test&quot;).onclick = () =&gt; send(&quot;test&quot;);</span>
+ 
+   document.addEventListener(&quot;keydown&quot;, (e) =&gt; {
+     if (e.target.tagName === &quot;SELECT&quot;) return;
+diff --git a/livecap.py b/livecap.py
+index 0693dce..2b4201b 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -283,6 +283,8 @@ def http_server(args):</span>
+     log(&quot;  &quot; + url)
+     log(&quot;Control panel (open in any browser):&quot;)
+     log(&quot;  http://127.0.0.1:%d/control.html?ws=%d&quot; % (args.http_port, args.ws_port))
+<span class="a">+    log(&quot;Reader for Yomitan mining (open in your real browser):&quot;)</span>
+<span class="a">+    log(&quot;  http://127.0.0.1:%d/reader.html?ws=%d&quot; % (args.http_port, args.ws_port))</span>
+     return srv
+ 
+ 
+<span class="h">@@ -351,6 +353,13 @@ class Controller:</span>
+         elif cmd == &quot;clear&quot;:
+             self.bus.publish({&quot;type&quot;: &quot;clear&quot;})
+ 
+<span class="a">+        elif cmd == &quot;test&quot;:</span>
+<span class="a">+            # Lets you position the OBS overlay without having to talk.</span>
+<span class="a">+            text = val if isinstance(val, str) and val.strip() else \</span>
+<span class="a">+                &quot;Testiteksti — проверка — テスト — caption preview&quot;</span>
+<span class="a">+            self.bus.publish({&quot;type&quot;: &quot;final&quot;, &quot;text&quot;: text, &quot;tr&quot;: &quot;&quot;,</span>
+<span class="a">+                              &quot;ts&quot;: time.time()})</span>
+<span class="a">+</span>
+         elif cmd == &quot;status&quot;:
+             self.push_status()
+ 
+<span class="h">@@ -504,6 +513,190 @@ class Transcriber:</span>
+ 
+ # ---------------------------------------------------------- segmentation ----
+ 
+<span class="a">+SENT_END = (&quot;.&quot;, &quot;!&quot;, &quot;?&quot;, &quot;…&quot;, &quot;。&quot;, &quot;！&quot;, &quot;？&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def norm_word(w):</span>
+<span class="a">+    return re.sub(r&quot;[^\w]&quot;, &quot;&quot;, w.strip().lower(), flags=re.UNICODE)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class StreamDecoder:</span>
+<span class="a">+    &quot;&quot;&quot;LocalAgreement streaming (Macháček et al.).</span>
+<span class="a">+</span>
+<span class="a">+    Whisper cannot decode incrementally, so instead we re-decode a growing</span>
+<span class="a">+    buffer and only commit the prefix that two consecutive hypotheses agree</span>
+<span class="a">+    on. Agreement is a good proxy for stability: text that survives another</span>
+<span class="a">+    decode with more audio behind it rarely changes again. This trades CPU</span>
+<span class="a">+    for latency - words appear while someone is still talking, rather than</span>
+<span class="a">+    a whole sentence landing after they stop.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, tr, bus, args):</span>
+<span class="a">+        self.tr, self.bus, self.args = tr, bus, args</span>
+<span class="a">+        self.native = []            # unconsumed audio at capture rate</span>
+<span class="a">+        self.prev = []              # previous hypothesis, uncommitted part</span>
+<span class="a">+        self.sentence = []          # committed words of the sentence in progress</span>
+<span class="a">+        self.speech = 0.0           # seconds of speech currently buffered</span>
+<span class="a">+</span>
+<span class="a">+    # ---- audio -------------------------------------------------------</span>
+<span class="a">+    def add(self, block, voiced, dur):</span>
+<span class="a">+        self.native.append(block)</span>
+<span class="a">+        if voiced:</span>
+<span class="a">+            self.speech += dur</span>
+<span class="a">+</span>
+<span class="a">+    def buffered_seconds(self, sr):</span>
+<span class="a">+        return sum(len(b) for b in self.native) / sr</span>
+<span class="a">+</span>
+<span class="a">+    def _audio16(self, sr):</span>
+<span class="a">+        return to_whisper(np.concatenate(self.native), sr)</span>
+<span class="a">+</span>
+<span class="a">+    def _trim(self, cut_s, sr):</span>
+<span class="a">+        &quot;&quot;&quot;Drop audio up to cut_s seconds, keeping block boundaries simple.&quot;&quot;&quot;</span>
+<span class="a">+        drop = int(cut_s * sr)</span>
+<span class="a">+        merged = np.concatenate(self.native)</span>
+<span class="a">+        merged = merged[min(drop, len(merged)):]</span>
+<span class="a">+        self.native = [merged] if len(merged) else []</span>
+<span class="a">+        self.speech = max(0.0, self.speech - cut_s)</span>
+<span class="a">+</span>
+<span class="a">+    # ---- decoding ----------------------------------------------------</span>
+<span class="a">+    def _hypothesis(self, sr):</span>
+<span class="a">+        a = self.args</span>
+<span class="a">+        audio = self._audio16(sr)</span>
+<span class="a">+        # Whisper invents text when handed a very short buffer, and in</span>
+<span class="a">+        # streaming that invention gets committed before real audio arrives.</span>
+<span class="a">+        if len(audio) &lt; int(a.stream_min_audio * TARGET_SR):</span>
+<span class="a">+            return [], audio</span>
+<span class="a">+        segs, _ = self.tr.model.transcribe(</span>
+<span class="a">+            audio,</span>
+<span class="a">+            language=None if a.lang == &quot;auto&quot; else a.lang,</span>
+<span class="a">+            beam_size=1,</span>
+<span class="a">+            temperature=0.0,</span>
+<span class="a">+            condition_on_previous_text=False,</span>
+<span class="a">+            initial_prompt=(self.tr.context or None) if not a.no_context else None,</span>
+<span class="a">+            vad_filter=False,</span>
+<span class="a">+            word_timestamps=True,</span>
+<span class="a">+            no_speech_threshold=0.6,</span>
+<span class="a">+            log_prob_threshold=-1.0,</span>
+<span class="a">+        )</span>
+<span class="a">+        words = []</span>
+<span class="a">+        for s in segs:</span>
+<span class="a">+            words.extend(getattr(s, &quot;words&quot;, None) or [])</span>
+<span class="a">+        return words, audio</span>
+<span class="a">+</span>
+<span class="a">+    def step(self, sr):</span>
+<span class="a">+        words, _ = self._hypothesis(sr)</span>
+<span class="a">+        if not words:</span>
+<span class="a">+            return</span>
+<span class="a">+</span>
+<span class="a">+        k = 0</span>
+<span class="a">+        while (k &lt; len(words) and k &lt; len(self.prev)</span>
+<span class="a">+               and norm_word(words[k].word) == norm_word(self.prev[k].word)</span>
+<span class="a">+               and norm_word(words[k].word)):</span>
+<span class="a">+            k += 1</span>
+<span class="a">+</span>
+<span class="a">+        confirmed, rest = words[:k], words[k:]</span>
+<span class="a">+        if confirmed:</span>
+<span class="a">+            cut = confirmed[-1].end</span>
+<span class="a">+            self.sentence.extend(confirmed)</span>
+<span class="a">+            self._trim(cut, sr)</span>
+<span class="a">+            # Remaining words are now measured against a shorter buffer.</span>
+<span class="a">+            for w in rest:</span>
+<span class="a">+                w.start = max(0.0, w.start - cut)</span>
+<span class="a">+                w.end = max(0.0, w.end - cut)</span>
+<span class="a">+        self.prev = rest</span>
+<span class="a">+</span>
+<span class="a">+        text = self._text(self.sentence)</span>
+<span class="a">+        tail = self._text(rest)</span>
+<span class="a">+        if confirmed and text and text.strip().endswith(SENT_END):</span>
+<span class="a">+            self.flush()</span>
+<span class="a">+        elif text or tail:</span>
+<span class="a">+            self.bus.publish({&quot;type&quot;: &quot;partial&quot;,</span>
+<span class="a">+                              &quot;text&quot;: (text + &quot; &quot; + tail).strip(),</span>
+<span class="a">+                              &quot;ts&quot;: time.time()})</span>
+<span class="a">+</span>
+<span class="a">+    @staticmethod</span>
+<span class="a">+    def _text(words):</span>
+<span class="a">+        return re.sub(r&quot;\s+&quot;, &quot; &quot;, &quot;&quot;.join(w.word for w in words)).strip()</span>
+<span class="a">+</span>
+<span class="a">+    def flush(self, drop_audio=False):</span>
+<span class="a">+        &quot;&quot;&quot;Emit the sentence built so far as a final caption.&quot;&quot;&quot;</span>
+<span class="a">+        text = self._text(self.sentence)</span>
+<span class="a">+        self.sentence = []</span>
+<span class="a">+        if drop_audio:</span>
+<span class="a">+            self.native, self.prev, self.speech = [], [], 0.0</span>
+<span class="a">+        if not text or looks_hallucinated(text):</span>
+<span class="a">+            if text:</span>
+<span class="a">+                log(&quot;dropped: %r&quot; % text)</span>
+<span class="a">+            return</span>
+<span class="a">+        if not self.args.no_context:</span>
+<span class="a">+            self.tr.context = (self.tr.context + &quot; &quot; + text)[-220:]</span>
+<span class="a">+        log(&quot;FINAL  %s&quot; % text)</span>
+<span class="a">+        self.bus.publish({&quot;type&quot;: &quot;final&quot;, &quot;text&quot;: text, &quot;tr&quot;: &quot;&quot;, &quot;ts&quot;: time.time()})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def stream_segmenter(cap, tr, args, stop, bus):</span>
+<span class="a">+    &quot;&quot;&quot;Low-latency path: continuous re-decode with LocalAgreement commits.&quot;&quot;&quot;</span>
+<span class="a">+    dur = cap.blocksize / cap.sr</span>
+<span class="a">+    noise = 1e-4</span>
+<span class="a">+    dec = StreamDecoder(tr, bus, args)</span>
+<span class="a">+    silence = 0.0</span>
+<span class="a">+    last_step = 0.0</span>
+<span class="a">+    log(&quot;streaming mode: committing on agreement every %.1fs&quot; % args.stream_interval)</span>
+<span class="a">+</span>
+<span class="a">+    while not stop.is_set():</span>
+<span class="a">+        drained = 0</span>
+<span class="a">+        while True:</span>
+<span class="a">+            try:</span>
+<span class="a">+                blk = cap.q.get_nowait()</span>
+<span class="a">+            except queue.Empty:</span>
+<span class="a">+                break</span>
+<span class="a">+            drained += 1</span>
+<span class="a">+            rms = float(np.sqrt(np.mean(blk * blk)) + 1e-12)</span>
+<span class="a">+            if rms &lt; noise:</span>
+<span class="a">+                noise = 0.90 * noise + 0.10 * rms</span>
+<span class="a">+            else:</span>
+<span class="a">+                noise = 0.995 * noise + 0.005 * rms</span>
+<span class="a">+            voiced = rms &gt; max(noise * args.vad_ratio, args.vad_floor)</span>
+<span class="a">+            silence = 0.0 if voiced else silence + dur</span>
+<span class="a">+            if voiced or dec.native:</span>
+<span class="a">+                dec.add(blk, voiced, dur)</span>
+<span class="a">+</span>
+<span class="a">+        if not drained:</span>
+<span class="a">+            time.sleep(0.02)</span>
+<span class="a">+</span>
+<span class="a">+        now = time.time()</span>
+<span class="a">+        buffered = dec.buffered_seconds(cap.sr)</span>
+<span class="a">+</span>
+<span class="a">+        # A long pause ends the sentence: commit whatever is left.</span>
+<span class="a">+        if dec.native and silence &gt;= args.pause:</span>
+<span class="a">+            if dec.speech &gt;= args.min_speech:</span>
+<span class="a">+                dec.step(cap.sr)</span>
+<span class="a">+                if dec.prev:</span>
+<span class="a">+                    dec.sentence.extend(dec.prev)</span>
+<span class="a">+                    dec.prev = []</span>
+<span class="a">+            dec.flush(drop_audio=True)</span>
+<span class="a">+            silence = 0.0</span>
+<span class="a">+            last_step = now</span>
+<span class="a">+            continue</span>
+<span class="a">+</span>
+<span class="a">+        if buffered &gt;= args.max_seg:</span>
+<span class="a">+            dec.step(cap.sr)</span>
+<span class="a">+            if dec.prev:</span>
+<span class="a">+                dec.sentence.extend(dec.prev)</span>
+<span class="a">+                dec.prev = []</span>
+<span class="a">+            dec.flush(drop_audio=True)</span>
+<span class="a">+            last_step = now</span>
+<span class="a">+            continue</span>
+<span class="a">+</span>
+<span class="a">+        if (dec.speech &gt;= args.min_speech</span>
+<span class="a">+                and now - last_step &gt;= args.stream_interval):</span>
+<span class="a">+            last_step = now</span>
+<span class="a">+            try:</span>
+<span class="a">+                dec.step(cap.sr)</span>
+<span class="a">+            except Exception as e:</span>
+<span class="a">+                log(&quot;stream decode error:&quot;, repr(e))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def segmenter(cap, tr, jobs, args, stop):
+     dur = cap.blocksize / cap.sr
+     noise = 1e-4
+<span class="h">@@ -663,6 +856,15 @@ def build_parser():</span>
+     g.add_argument(&quot;--no-partials&quot;, dest=&quot;partials&quot;, action=&quot;store_false&quot;,
+                    help=&quot;only show finished sentences (lower CPU)&quot;)
+     g.add_argument(&quot;--partial-every&quot;, type=float, default=0.9)
+<span class="a">+    g.add_argument(&quot;--stream&quot;, action=&quot;store_true&quot;,</span>
+<span class="a">+                   help=&quot;LocalAgreement streaming: words appear while someone is &quot;</span>
+<span class="a">+                        &quot;still talking instead of after they stop. Costs a lot &quot;</span>
+<span class="a">+                        &quot;more CPU - pair it with a smaller --model&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--stream-interval&quot;, type=float, default=0.8,</span>
+<span class="a">+                   help=&quot;how often to re-decode the buffer in --stream mode&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--stream-min-audio&quot;, type=float, default=1.5,</span>
+<span class="a">+                   help=&quot;do not decode until this much audio is buffered; &quot;</span>
+<span class="a">+                        &quot;shorter buffers make Whisper hallucinate&quot;)</span>
+ 
+     g = p.add_argument_group(&quot;output&quot;)
+     g.add_argument(&quot;--ws-port&quot;, type=int, default=8765)
+<span class="h">@@ -712,12 +914,17 @@ def main():</span>
+         loop.run_until_complete(ws_server(bus, args, ctl, ws_stop))
+ 
+     threading.Thread(target=run_loop, daemon=True).start()
+<span class="d">-    threading.Thread(target=tr.worker, args=(jobs, stop_ev, ctl), daemon=True).start()</span>
+<span class="a">+    if not args.stream:</span>
+<span class="a">+        threading.Thread(target=tr.worker, args=(jobs, stop_ev, ctl),</span>
+<span class="a">+                         daemon=True).start()</span>
+ 
+     try:
+         with Capture(dev, args.loopback) as cap:
+             log(&quot;lang=%s  model=%s  -- Ctrl+C to stop&quot; % (args.lang, args.model))
+<span class="d">-            segmenter(cap, tr, jobs, args, stop_ev)</span>
+<span class="a">+            if args.stream:</span>
+<span class="a">+                stream_segmenter(cap, tr, args, stop_ev, bus)</span>
+<span class="a">+            else:</span>
+<span class="a">+                segmenter(cap, tr, jobs, args, stop_ev)</span>
+     except KeyboardInterrupt:
+         print()
+         log(&quot;stopping&quot;)
+diff --git a/reader.html b/reader.html
+new file mode 100644
+index 0000000..77289f5
+--- /dev/null
++++ b/reader.html
+<span class="h">@@ -0,0 +1,232 @@</span>
+<span class="a">+&lt;!doctype html&gt;</span>
+<span class="a">+&lt;html lang=&quot;en&quot;&gt;</span>
+<span class="a">+&lt;head&gt;</span>
+<span class="a">+&lt;meta charset=&quot;utf-8&quot;&gt;</span>
+<span class="a">+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;</span>
+<span class="a">+&lt;title&gt;livecap reader&lt;/title&gt;</span>
+<span class="a">+&lt;style&gt;</span>
+<span class="a">+  :root {</span>
+<span class="a">+    --bg: #0e1116; --panel: #161a21; --line: #252b36;</span>
+<span class="a">+    --fg: #edf1f7; --dim: #8b95a7; --accent: #7dd3fc; --pin: #fbbf24;</span>
+<span class="a">+    --size: 30px;</span>
+<span class="a">+  }</span>
+<span class="a">+  * { box-sizing: border-box; }</span>
+<span class="a">+  html, body { height: 100%; margin: 0; }</span>
+<span class="a">+  body {</span>
+<span class="a">+    background: var(--bg); color: var(--fg);</span>
+<span class="a">+    display: flex; flex-direction: column;</span>
+<span class="a">+    font-family: &quot;Inter&quot;, &quot;Segoe UI&quot;, &quot;Yu Gothic UI&quot;, &quot;Meiryo&quot;,</span>
+<span class="a">+                 &quot;Noto Sans CJK JP&quot;, &quot;Noto Sans&quot;, system-ui, sans-serif;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  header {</span>
+<span class="a">+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;</span>
+<span class="a">+    padding: 10px 16px; background: var(--panel);</span>
+<span class="a">+    border-bottom: 1px solid var(--line); font-size: 13px;</span>
+<span class="a">+  }</span>
+<span class="a">+  header .grow { flex: 1; }</span>
+<span class="a">+  button {</span>
+<span class="a">+    font: inherit; font-size: 13px; color: var(--fg); cursor: pointer;</span>
+<span class="a">+    background: #1f2531; border: 1px solid var(--line);</span>
+<span class="a">+    border-radius: 6px; padding: 6px 11px;</span>
+<span class="a">+  }</span>
+<span class="a">+  button:hover { background: #29313f; }</span>
+<span class="a">+  button.on { background: var(--accent); border-color: var(--accent); color: #06202c; }</span>
+<span class="a">+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }</span>
+<span class="a">+  .dot.up { background: #4ade80; box-shadow: 0 0 7px #4ade80; }</span>
+<span class="a">+  .dot.down { background: #ef4444; box-shadow: 0 0 7px #ef4444; }</span>
+<span class="a">+  .lang { color: var(--dim); }</span>
+<span class="a">+</span>
+<span class="a">+  /* The mining surface. Everything here must stay real, selectable DOM text</span>
+<span class="a">+     so Yomitan can scan it and lift the surrounding sentence. */</span>
+<span class="a">+  #log {</span>
+<span class="a">+    flex: 1; overflow-y: auto; padding: 24px 28px 40vh;</span>
+<span class="a">+    display: flex; flex-direction: column; gap: 14px;</span>
+<span class="a">+  }</span>
+<span class="a">+  .line {</span>
+<span class="a">+    font-size: var(--size); line-height: 1.75;</span>
+<span class="a">+    max-width: 34em; padding: 6px 10px; border-radius: 6px;</span>
+<span class="a">+    border-left: 3px solid transparent;</span>
+<span class="a">+    user-select: text; -webkit-user-select: text;</span>
+<span class="a">+    cursor: text; scroll-margin-bottom: 40vh;</span>
+<span class="a">+  }</span>
+<span class="a">+  .line:hover { background: #151a22; border-left-color: var(--line); }</span>
+<span class="a">+  .line.partial { color: var(--dim); border-left-color: var(--pin); }</span>
+<span class="a">+  .line.pinned { background: #1a1f29; border-left-color: var(--pin); }</span>
+<span class="a">+  /* Rendered from a data attribute so the timestamp is not DOM text -</span>
+<span class="a">+     otherwise Yomitan can absorb it into the sentence it mines. */</span>
+<span class="a">+  .line::before {</span>
+<span class="a">+    content: attr(data-time);</span>
+<span class="a">+    display: block; font-size: 12px; color: var(--dim);</span>
+<span class="a">+    margin-bottom: 2px; user-select: none; font-variant-numeric: tabular-nums;</span>
+<span class="a">+  }</span>
+<span class="a">+  .line .tr {</span>
+<span class="a">+    display: block; font-size: calc(var(--size) * .52);</span>
+<span class="a">+    color: var(--accent); margin-top: 4px; line-height: 1.5;</span>
+<span class="a">+  }</span>
+<span class="a">+  .empty { color: var(--dim); font-size: 15px; padding: 8px 10px; }</span>
+<span class="a">+</span>
+<span class="a">+  #jump {</span>
+<span class="a">+    position: fixed; right: 26px; bottom: 26px; display: none;</span>
+<span class="a">+    background: var(--accent); color: #06202c; border-color: var(--accent);</span>
+<span class="a">+    font-weight: 600; box-shadow: 0 4px 16px rgba(0,0,0,.5);</span>
+<span class="a">+  }</span>
+<span class="a">+  #jump.show { display: block; }</span>
+<span class="a">+&lt;/style&gt;</span>
+<span class="a">+&lt;/head&gt;</span>
+<span class="a">+&lt;body&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;header&gt;</span>
+<span class="a">+  &lt;span id=&quot;conn&quot;&gt;&lt;span class=&quot;dot down&quot;&gt;&lt;/span&gt;&lt;/span&gt;</span>
+<span class="a">+  &lt;span class=&quot;lang&quot; id=&quot;lang&quot;&gt;—&lt;/span&gt;</span>
+<span class="a">+  &lt;span class=&quot;grow&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+  &lt;button id=&quot;smaller&quot; title=&quot;Smaller text&quot;&gt;A−&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;bigger&quot; title=&quot;Larger text&quot;&gt;A+&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;follow&quot; class=&quot;on&quot; title=&quot;Auto-scroll to newest&quot;&gt;Follow&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;copy&quot; title=&quot;Copy the whole transcript&quot;&gt;Copy all&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;clear&quot;&gt;Clear&lt;/button&gt;</span>
+<span class="a">+&lt;/header&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;div id=&quot;log&quot;&gt;&lt;div class=&quot;empty&quot;&gt;Waiting for speech… hover any word with Yomitan to mine it.&lt;/div&gt;&lt;/div&gt;</span>
+<span class="a">+&lt;button id=&quot;jump&quot;&gt;↓ New captions&lt;/button&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;script&gt;</span>
+<span class="a">+(function () {</span>
+<span class="a">+  const q = new URLSearchParams(location.search);</span>
+<span class="a">+  const WS_PORT = parseInt(q.get(&quot;ws&quot;) || &quot;8765&quot;, 10);</span>
+<span class="a">+</span>
+<span class="a">+  const log = document.getElementById(&quot;log&quot;);</span>
+<span class="a">+  const jump = document.getElementById(&quot;jump&quot;);</span>
+<span class="a">+  let follow = true;</span>
+<span class="a">+  let partialEl = null;</span>
+<span class="a">+  let size = parseInt(localStorage.getItem(&quot;livecap.size&quot;) || q.get(&quot;size&quot;) || &quot;30&quot;, 10);</span>
+<span class="a">+</span>
+<span class="a">+  function applySize() {</span>
+<span class="a">+    document.documentElement.style.setProperty(&quot;--size&quot;, size + &quot;px&quot;);</span>
+<span class="a">+    try { localStorage.setItem(&quot;livecap.size&quot;, String(size)); } catch (e) {}</span>
+<span class="a">+  }</span>
+<span class="a">+  applySize();</span>
+<span class="a">+</span>
+<span class="a">+  function atBottom() {</span>
+<span class="a">+    return log.scrollHeight - log.scrollTop - log.clientHeight &lt; 80;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function scrollDown() {</span>
+<span class="a">+    log.scrollTop = log.scrollHeight;</span>
+<span class="a">+    jump.classList.remove(&quot;show&quot;);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  log.addEventListener(&quot;scroll&quot;, () =&gt; {</span>
+<span class="a">+    if (!follow) return;</span>
+<span class="a">+    if (!atBottom()) jump.classList.add(&quot;show&quot;);</span>
+<span class="a">+    else jump.classList.remove(&quot;show&quot;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  function stamp(ts) {</span>
+<span class="a">+    const d = ts ? new Date(ts * 1000) : new Date();</span>
+<span class="a">+    return d.toTimeString().slice(0, 8);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function clearEmpty() {</span>
+<span class="a">+    const e = log.querySelector(&quot;.empty&quot;);</span>
+<span class="a">+    if (e) e.remove();</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function makeLine(m, isPartial) {</span>
+<span class="a">+    const div = document.createElement(&quot;div&quot;);</span>
+<span class="a">+    div.className = &quot;line&quot; + (isPartial ? &quot; partial&quot; : &quot;&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    div.dataset.time = stamp(m.ts) + (isPartial ? &quot; · …&quot; : &quot;&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    // Sentence text as a bare text node: Yomitan reads this directly.</span>
+<span class="a">+    div.appendChild(document.createTextNode(m.text));</span>
+<span class="a">+</span>
+<span class="a">+    if (m.tr) {</span>
+<span class="a">+      const tr = document.createElement(&quot;span&quot;);</span>
+<span class="a">+      tr.className = &quot;tr&quot;;</span>
+<span class="a">+      tr.textContent = m.tr;</span>
+<span class="a">+      div.appendChild(tr);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    div.addEventListener(&quot;dblclick&quot;, () =&gt; {</span>
+<span class="a">+      div.classList.toggle(&quot;pinned&quot;);</span>
+<span class="a">+    });</span>
+<span class="a">+    return div;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function onFinal(m) {</span>
+<span class="a">+    clearEmpty();</span>
+<span class="a">+    if (partialEl) { partialEl.remove(); partialEl = null; }</span>
+<span class="a">+    const wasBottom = atBottom();</span>
+<span class="a">+    log.appendChild(makeLine(m, false));</span>
+<span class="a">+    while (log.children.length &gt; 500) log.removeChild(log.firstChild);</span>
+<span class="a">+    if (follow &amp;&amp; wasBottom) scrollDown();</span>
+<span class="a">+    else if (follow) jump.classList.add(&quot;show&quot;);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function onPartial(m) {</span>
+<span class="a">+    clearEmpty();</span>
+<span class="a">+    const wasBottom = atBottom();</span>
+<span class="a">+    if (partialEl) partialEl.remove();</span>
+<span class="a">+    partialEl = makeLine(m, true);</span>
+<span class="a">+    log.appendChild(partialEl);</span>
+<span class="a">+    if (follow &amp;&amp; wasBottom) scrollDown();</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  document.getElementById(&quot;bigger&quot;).onclick = () =&gt; { size = Math.min(72, size + 3); applySize(); };</span>
+<span class="a">+  document.getElementById(&quot;smaller&quot;).onclick = () =&gt; { size = Math.max(14, size - 3); applySize(); };</span>
+<span class="a">+  document.getElementById(&quot;follow&quot;).onclick = (e) =&gt; {</span>
+<span class="a">+    follow = !follow;</span>
+<span class="a">+    e.target.className = follow ? &quot;on&quot; : &quot;&quot;;</span>
+<span class="a">+    if (follow) scrollDown();</span>
+<span class="a">+  };</span>
+<span class="a">+  document.getElementById(&quot;clear&quot;).onclick = () =&gt; {</span>
+<span class="a">+    log.innerHTML = &#x27;&lt;div class=&quot;empty&quot;&gt;Cleared.&lt;/div&gt;&#x27;;</span>
+<span class="a">+    partialEl = null;</span>
+<span class="a">+  };</span>
+<span class="a">+  document.getElementById(&quot;copy&quot;).onclick = async () =&gt; {</span>
+<span class="a">+    const text = [...log.querySelectorAll(&quot;.line&quot;)]</span>
+<span class="a">+      .filter((n) =&gt; !n.classList.contains(&quot;partial&quot;))</span>
+<span class="a">+      .map((n) =&gt; [...n.childNodes].filter((c) =&gt; c.nodeType === 3)</span>
+<span class="a">+                    .map((c) =&gt; c.textContent).join(&quot;&quot;))</span>
+<span class="a">+      .join(&quot;\n&quot;);</span>
+<span class="a">+    try {</span>
+<span class="a">+      await navigator.clipboard.writeText(text);</span>
+<span class="a">+      const b = document.getElementById(&quot;copy&quot;);</span>
+<span class="a">+      b.textContent = &quot;Copied&quot;;</span>
+<span class="a">+      setTimeout(() =&gt; (b.textContent = &quot;Copy all&quot;), 1200);</span>
+<span class="a">+    } catch (e) {}</span>
+<span class="a">+  };</span>
+<span class="a">+  jump.onclick = scrollDown;</span>
+<span class="a">+</span>
+<span class="a">+  function connect() {</span>
+<span class="a">+    const ws = new WebSocket(&quot;ws://127.0.0.1:&quot; + WS_PORT);</span>
+<span class="a">+    const conn = document.getElementById(&quot;conn&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    ws.onopen = () =&gt; {</span>
+<span class="a">+      conn.innerHTML = &#x27;&lt;span class=&quot;dot up&quot;&gt;&lt;/span&gt;&#x27;;</span>
+<span class="a">+      ws.send(JSON.stringify({ cmd: &quot;status&quot; }));</span>
+<span class="a">+    };</span>
+<span class="a">+    ws.onclose = () =&gt; {</span>
+<span class="a">+      conn.innerHTML = &#x27;&lt;span class=&quot;dot down&quot;&gt;&lt;/span&gt;&#x27;;</span>
+<span class="a">+      setTimeout(connect, 1500);</span>
+<span class="a">+    };</span>
+<span class="a">+    ws.onerror = () =&gt; ws.close();</span>
+<span class="a">+    ws.onmessage = (ev) =&gt; {</span>
+<span class="a">+      let m;</span>
+<span class="a">+      try { m = JSON.parse(ev.data); } catch (e) { return; }</span>
+<span class="a">+      if (m.type === &quot;final&quot;) onFinal(m);</span>
+<span class="a">+      else if (m.type === &quot;partial&quot;) onPartial(m);</span>
+<span class="a">+      else if (m.type === &quot;status&quot;) {</span>
+<span class="a">+        document.getElementById(&quot;lang&quot;).textContent = m.lang + &quot; · &quot; + m.model;</span>
+<span class="a">+      } else if (m.type === &quot;clear&quot;) {</span>
+<span class="a">+        if (partialEl) { partialEl.remove(); partialEl = null; }</span>
+<span class="a">+      }</span>
+<span class="a">+    };</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  connect();</span>
+<span class="a">+})();</span>
+<span class="a">+&lt;/script&gt;</span>
+<span class="a">+&lt;/body&gt;</span>
+<span class="a">+&lt;/html&gt;</span>
+diff --git a/requirements.txt b/requirements.txt
+index 9965d4b..9f5c16e 100644
+--- a/requirements.txt
++++ b/requirements.txt
+<span class="h">@@ -2,4 +2,5 @@ faster-whisper&gt;=1.1.0</span>
+ soundcard&gt;=0.4.3
+ numpy&gt;=1.26
+ scipy&gt;=1.11
+<span class="a">+pillow&gt;=10.0</span>
+ websockets&gt;=12.0
+diff --git a/subtitle.py b/subtitle.py
+new file mode 100644
+index 0000000..91aedb7
+--- /dev/null
++++ b/subtitle.py
+<span class="h">@@ -0,0 +1,816 @@</span>
+<span class="a">+#!/usr/bin/env python3</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+subtitle.py - subtitle recordings and replay-buffer clips.</span>
+<span class="a">+</span>
+<span class="a">+Latency does not matter here, so this uses a much larger model than the live</span>
+<span class="a">+captioner can afford and produces far better text, especially for Finnish,</span>
+<span class="a">+Russian and Japanese.</span>
+<span class="a">+</span>
+<span class="a">+    python subtitle.py clip.mp4</span>
+<span class="a">+    python subtitle.py *.mkv --lang ru</span>
+<span class="a">+    python subtitle.py --watch &quot;C:\\Users\\me\\Videos&quot;      # auto-subtitle new clips</span>
+<span class="a">+    python subtitle.py clip.mp4 --format vtt --translate</span>
+<span class="a">+</span>
+<span class="a">+Writes clip.srt next to clip.mp4. OBS, VLC, YouTube and Premiere all read it.</span>
+<span class="a">+No ffmpeg needed - audio is decoded through PyAV, which ships with</span>
+<span class="a">+faster-whisper.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+import argparse</span>
+<span class="a">+import os</span>
+<span class="a">+import re</span>
+<span class="a">+import sys</span>
+<span class="a">+import threading</span>
+<span class="a">+import time</span>
+<span class="a">+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+VIDEO_EXT = {&quot;.mp4&quot;, &quot;.mkv&quot;, &quot;.mov&quot;, &quot;.flv&quot;, &quot;.webm&quot;, &quot;.avi&quot;, &quot;.ts&quot;,</span>
+<span class="a">+             &quot;.m4a&quot;, &quot;.mp3&quot;, &quot;.wav&quot;, &quot;.opus&quot;, &quot;.flac&quot;, &quot;.ogg&quot;}</span>
+<span class="a">+</span>
+<span class="a">+for _s in (sys.stdout, sys.stderr):</span>
+<span class="a">+    try:</span>
+<span class="a">+        _s.reconfigure(encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;)</span>
+<span class="a">+    except (AttributeError, ValueError):</span>
+<span class="a">+        pass</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def log(*a):</span>
+<span class="a">+    print(&quot;[&quot; + time.strftime(&quot;%H:%M:%S&quot;) + &quot;]&quot;, *a, flush=True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ------------------------------------------------------------------ cues ----</span>
+<span class="a">+</span>
+<span class="a">+def ts(seconds, sep=&quot;,&quot;):</span>
+<span class="a">+    if seconds &lt; 0:</span>
+<span class="a">+        seconds = 0.0</span>
+<span class="a">+    ms = int(round(seconds * 1000))</span>
+<span class="a">+    h, ms = divmod(ms, 3600000)</span>
+<span class="a">+    m, ms = divmod(ms, 60000)</span>
+<span class="a">+    s, ms = divmod(ms, 1000)</span>
+<span class="a">+    return &quot;%02d:%02d:%02d%s%03d&quot; % (h, m, s, sep, ms)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def wrap(text, width):</span>
+<span class="a">+    &quot;&quot;&quot;Split into at most two balanced lines, the way subtitles are normally set.&quot;&quot;&quot;</span>
+<span class="a">+    text = &quot; &quot;.join(text.split())</span>
+<span class="a">+    if len(text) &lt;= width:</span>
+<span class="a">+        return text</span>
+<span class="a">+    words = text.split()</span>
+<span class="a">+    if len(words) &lt; 2:</span>
+<span class="a">+        return text</span>
+<span class="a">+</span>
+<span class="a">+    fits, over = None, None</span>
+<span class="a">+    for i in range(1, len(words)):</span>
+<span class="a">+        a, b = &quot; &quot;.join(words[:i]), &quot; &quot;.join(words[i:])</span>
+<span class="a">+        longest, balance = max(len(a), len(b)), abs(len(a) - len(b))</span>
+<span class="a">+        if longest &lt;= width:</span>
+<span class="a">+            if fits is None or balance &lt; fits[0]:</span>
+<span class="a">+                fits = (balance, a, b)</span>
+<span class="a">+        # Fallback for text with no split that fits: overflow as little as</span>
+<span class="a">+        # possible rather than emitting one very long line.</span>
+<span class="a">+        if over is None or (longest, balance) &lt; (over[0], over[1]):</span>
+<span class="a">+            over = (longest, balance, a, b)</span>
+<span class="a">+</span>
+<span class="a">+    if fits:</span>
+<span class="a">+        return fits[1] + &quot;\n&quot; + fits[2]</span>
+<span class="a">+    return over[2] + &quot;\n&quot; + over[3]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+SENT_END = (&quot;.&quot;, &quot;!&quot;, &quot;?&quot;, &quot;…&quot;, &quot;。&quot;, &quot;！&quot;, &quot;？&quot;, &quot;؟&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class _Word:</span>
+<span class="a">+    &quot;&quot;&quot;Stand-in when Whisper returns a segment without word timings.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, start, end, word):</span>
+<span class="a">+        self.start, self.end, self.word = start, end, word</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def collect_words(segments):</span>
+<span class="a">+    words = []</span>
+<span class="a">+    for seg in segments:</span>
+<span class="a">+        ws = list(getattr(seg, &quot;words&quot;, None) or [])</span>
+<span class="a">+        if ws:</span>
+<span class="a">+            words.extend(ws)</span>
+<span class="a">+        elif seg.text.strip():</span>
+<span class="a">+            words.append(_Word(seg.start, seg.end, seg.text.strip() + &quot; &quot;))</span>
+<span class="a">+    return words</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def group_sentences(words, max_dur, max_gap):</span>
+<span class="a">+    &quot;&quot;&quot;Split on sentence endings first - this is the boundary that matters.</span>
+<span class="a">+</span>
+<span class="a">+    Long pauses and a hard duration cap act only as fallbacks, so a cue never</span>
+<span class="a">+    starts mid-sentence just because a character budget ran out.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    out, cur = [], []</span>
+<span class="a">+    for w in words:</span>
+<span class="a">+        if cur:</span>
+<span class="a">+            gap = w.start - cur[-1].end</span>
+<span class="a">+            dur = w.end - cur[0].start</span>
+<span class="a">+            if gap &gt; max_gap or dur &gt; max_dur * 2.5:</span>
+<span class="a">+                out.append(cur)</span>
+<span class="a">+                cur = []</span>
+<span class="a">+        cur.append(w)</span>
+<span class="a">+        if w.word.strip().endswith(SENT_END):</span>
+<span class="a">+            out.append(cur)</span>
+<span class="a">+            cur = []</span>
+<span class="a">+    if cur:</span>
+<span class="a">+        out.append(cur)</span>
+<span class="a">+    return [g for g in out if &quot;&quot;.join(x.word for x in g).strip()]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def text_of(group):</span>
+<span class="a">+    return &quot; &quot;.join(&quot;&quot;.join(w.word for w in group).split())</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def build_cues(segments, max_chars, max_dur, max_gap):</span>
+<span class="a">+    &quot;&quot;&quot;Sentences first, then subdivide any that are too long to display.&quot;&quot;&quot;</span>
+<span class="a">+    cues = []</span>
+<span class="a">+    for group in group_sentences(collect_words(segments), max_dur, max_gap):</span>
+<span class="a">+        chunks, chunk = [], []</span>
+<span class="a">+        for w in group:</span>
+<span class="a">+            if chunk:</span>
+<span class="a">+                chars = sum(len(x.word) for x in chunk) + len(w.word)</span>
+<span class="a">+                dur = w.end - chunk[0].start</span>
+<span class="a">+                if chars &gt; max_chars or dur &gt; max_dur:</span>
+<span class="a">+                    chunks.append(chunk)</span>
+<span class="a">+                    chunk = []</span>
+<span class="a">+            chunk.append(w)</span>
+<span class="a">+        if chunk:</span>
+<span class="a">+            chunks.append(chunk)</span>
+<span class="a">+</span>
+<span class="a">+        # Greedy filling can strand a word or two on the last line; fold a</span>
+<span class="a">+        # runt back into its predecessor rather than flashing it alone.</span>
+<span class="a">+        if len(chunks) &gt; 1 and len(&quot;&quot;.join(w.word for w in chunks[-1]).strip()) &lt; 16:</span>
+<span class="a">+            chunks[-2].extend(chunks.pop())</span>
+<span class="a">+</span>
+<span class="a">+        for c in chunks:</span>
+<span class="a">+            cues.append((c[0].start, c[-1].end, text_of(c)))</span>
+<span class="a">+    return cues</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def write_srt(cues, path, width):</span>
+<span class="a">+    with open(path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as fh:</span>
+<span class="a">+        for i, (start, end, text) in enumerate(cues, 1):</span>
+<span class="a">+            fh.write(&quot;%d\n%s --&gt; %s\n%s\n\n&quot;</span>
+<span class="a">+                     % (i, ts(start), ts(end), wrap(text, width)))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def write_vtt(cues, path, width):</span>
+<span class="a">+    with open(path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as fh:</span>
+<span class="a">+        fh.write(&quot;WEBVTT\n\n&quot;)</span>
+<span class="a">+        for start, end, text in cues:</span>
+<span class="a">+            fh.write(&quot;%s --&gt; %s\n%s\n\n&quot;</span>
+<span class="a">+                     % (ts(start, &quot;.&quot;), ts(end, &quot;.&quot;), wrap(text, width)))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def write_txt(cues, path, width):</span>
+<span class="a">+    with open(path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as fh:</span>
+<span class="a">+        for _, _, text in cues:</span>
+<span class="a">+            fh.write(text + &quot;\n&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+WRITERS = {&quot;srt&quot;: write_srt, &quot;vtt&quot;: write_vtt, &quot;txt&quot;: write_txt}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ------------------------------------------------------------------ anki ----</span>
+<span class="a">+</span>
+<span class="a">+def anki_media_dir():</span>
+<span class="a">+    &quot;&quot;&quot;Anki&#x27;s collection.media for the default profile, if we can find it.&quot;&quot;&quot;</span>
+<span class="a">+    base = Path(os.environ.get(&quot;APPDATA&quot;, &quot;&quot;)) / &quot;Anki2&quot;</span>
+<span class="a">+    if not base.is_dir():</span>
+<span class="a">+        return None</span>
+<span class="a">+    for profile in sorted(base.iterdir()):</span>
+<span class="a">+        media = profile / &quot;collection.media&quot;</span>
+<span class="a">+        if media.is_dir():</span>
+<span class="a">+            return media</span>
+<span class="a">+    return None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def slice_audio(audio, sr, start, end, pad):</span>
+<span class="a">+    lo = max(0, int((start - pad) * sr))</span>
+<span class="a">+    hi = min(len(audio), int((end + pad) * sr))</span>
+<span class="a">+    return audio[lo:hi]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def write_audio_clip(samples, sr, path):</span>
+<span class="a">+    &quot;&quot;&quot;mp3 when PyAV has an encoder for it, otherwise wav.&quot;&quot;&quot;</span>
+<span class="a">+    import numpy as np</span>
+<span class="a">+</span>
+<span class="a">+    pcm = np.clip(samples, -1.0, 1.0)</span>
+<span class="a">+    if path.suffix == &quot;.mp3&quot;:</span>
+<span class="a">+        try:</span>
+<span class="a">+            import av</span>
+<span class="a">+</span>
+<span class="a">+            with av.open(str(path), &quot;w&quot;) as container:</span>
+<span class="a">+                stream = container.add_stream(&quot;mp3&quot;, rate=sr)</span>
+<span class="a">+                stream.layout = &quot;mono&quot;</span>
+<span class="a">+                frame = av.AudioFrame.from_ndarray(</span>
+<span class="a">+                    (pcm * 32767).astype(np.int16).reshape(1, -1),</span>
+<span class="a">+                    format=&quot;s16&quot;, layout=&quot;mono&quot;)</span>
+<span class="a">+                frame.rate = sr</span>
+<span class="a">+                for packet in stream.encode(frame):</span>
+<span class="a">+                    container.mux(packet)</span>
+<span class="a">+                for packet in stream.encode(None):</span>
+<span class="a">+                    container.mux(packet)</span>
+<span class="a">+            return path</span>
+<span class="a">+        except Exception:</span>
+<span class="a">+            path = path.with_suffix(&quot;.wav&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    import wave</span>
+<span class="a">+</span>
+<span class="a">+    with wave.open(str(path), &quot;wb&quot;) as w:</span>
+<span class="a">+        w.setnchannels(1)</span>
+<span class="a">+        w.setsampwidth(2)</span>
+<span class="a">+        w.setframerate(sr)</span>
+<span class="a">+        w.writeframes((pcm * 32767).astype(np.int16).tobytes())</span>
+<span class="a">+    return path</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def grab_frames(video, times, out_paths, width):</span>
+<span class="a">+    &quot;&quot;&quot;Best-effort screenshots. Returns the paths actually written.&quot;&quot;&quot;</span>
+<span class="a">+    try:</span>
+<span class="a">+        import av</span>
+<span class="a">+    except ImportError:</span>
+<span class="a">+        return {}</span>
+<span class="a">+    written = {}</span>
+<span class="a">+    try:</span>
+<span class="a">+        with av.open(str(video)) as container:</span>
+<span class="a">+            if not container.streams.video:</span>
+<span class="a">+                return {}</span>
+<span class="a">+            vs = container.streams.video[0]</span>
+<span class="a">+            vs.thread_type = &quot;AUTO&quot;</span>
+<span class="a">+            for i, (t, dest) in enumerate(zip(times, out_paths)):</span>
+<span class="a">+                try:</span>
+<span class="a">+                    container.seek(int(t / vs.time_base), stream=vs)</span>
+<span class="a">+                    for frame in container.decode(vs):</span>
+<span class="a">+                        if frame.time is None or frame.time + 0.001 &lt; t:</span>
+<span class="a">+                            continue</span>
+<span class="a">+                        img = frame.to_image()</span>
+<span class="a">+                        if width and img.width &gt; width:</span>
+<span class="a">+                            img = img.resize((width, max(1, round(img.height * width / img.width))))</span>
+<span class="a">+                        img.save(str(dest), quality=82)</span>
+<span class="a">+                        written[i] = dest</span>
+<span class="a">+                        break</span>
+<span class="a">+                except Exception:</span>
+<span class="a">+                    continue</span>
+<span class="a">+    except Exception:</span>
+<span class="a">+        return written</span>
+<span class="a">+    return written</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def esc(text):</span>
+<span class="a">+    return text.replace(&quot;\t&quot;, &quot; &quot;).replace(&quot;\n&quot;, &quot; &quot;).strip()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ----------------------------------------------------------- mining page ----</span>
+<span class="a">+</span>
+<span class="a">+MINE_PAGE = &quot;&quot;&quot;&lt;!doctype html&gt;</span>
+<span class="a">+&lt;html lang=&quot;__LANG__&quot;&gt;</span>
+<span class="a">+&lt;head&gt;</span>
+<span class="a">+&lt;meta charset=&quot;utf-8&quot;&gt;</span>
+<span class="a">+&lt;title&gt;__TITLE__&lt;/title&gt;</span>
+<span class="a">+&lt;style&gt;</span>
+<span class="a">+  :root { --bg:#0e1116; --panel:#161a21; --line:#252b36; --fg:#edf1f7;</span>
+<span class="a">+          --dim:#8b95a7; --accent:#7dd3fc; --size:26px; }</span>
+<span class="a">+  * { box-sizing:border-box; }</span>
+<span class="a">+  html,body { height:100%; margin:0; }</span>
+<span class="a">+  body { background:var(--bg); color:var(--fg); display:flex; flex-direction:column;</span>
+<span class="a">+         font-family:&quot;Inter&quot;,&quot;Segoe UI&quot;,&quot;Yu Gothic UI&quot;,&quot;Meiryo&quot;,&quot;Noto Sans CJK JP&quot;,</span>
+<span class="a">+                     &quot;Noto Sans&quot;,system-ui,sans-serif; }</span>
+<span class="a">+  header { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:10px 16px;</span>
+<span class="a">+           background:var(--panel); border-bottom:1px solid var(--line); font-size:13px; }</span>
+<span class="a">+  header .grow { flex:1; }</span>
+<span class="a">+  button { font:inherit; font-size:13px; color:var(--fg); cursor:pointer; background:#1f2531;</span>
+<span class="a">+           border:1px solid var(--line); border-radius:6px; padding:6px 11px; }</span>
+<span class="a">+  button:hover { background:#29313f; }</span>
+<span class="a">+  button.on { background:var(--accent); border-color:var(--accent); color:#06202c; }</span>
+<span class="a">+  main { flex:1; display:flex; min-height:0; flex-wrap:wrap; }</span>
+<span class="a">+  #left { flex:1 1 460px; min-width:320px; display:flex; flex-direction:column;</span>
+<span class="a">+          border-right:1px solid var(--line); }</span>
+<span class="a">+  video { width:100%; background:#000; max-height:52vh; }</span>
+<span class="a">+  #cur { padding:16px 20px; font-size:var(--size); line-height:1.7; min-height:3em;</span>
+<span class="a">+         user-select:text; border-top:1px solid var(--line); }</span>
+<span class="a">+  #list { flex:1 1 380px; min-width:300px; overflow-y:auto; padding:14px 18px 30vh; }</span>
+<span class="a">+  .cue { padding:8px 11px; border-radius:6px; border-left:3px solid transparent;</span>
+<span class="a">+         font-size:calc(var(--size)*.82); line-height:1.7; user-select:text; margin-bottom:8px; }</span>
+<span class="a">+  .cue::before { content:attr(data-time); display:block; font-size:11px; color:var(--dim);</span>
+<span class="a">+                 user-select:none; margin-bottom:2px; font-variant-numeric:tabular-nums; }</span>
+<span class="a">+  .cue:hover { background:#151a22; }</span>
+<span class="a">+  .cue.active { background:#1a222e; border-left-color:var(--accent); }</span>
+<span class="a">+  .jump { float:right; font-size:11px; color:var(--dim); cursor:pointer; user-select:none; }</span>
+<span class="a">+&lt;/style&gt;</span>
+<span class="a">+&lt;/head&gt;</span>
+<span class="a">+&lt;body&gt;</span>
+<span class="a">+&lt;header&gt;</span>
+<span class="a">+  &lt;b&gt;__TITLE__&lt;/b&gt;</span>
+<span class="a">+  &lt;span class=&quot;grow&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+  &lt;button id=&quot;smaller&quot;&gt;A-&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;bigger&quot;&gt;A+&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;follow&quot; class=&quot;on&quot;&gt;Follow&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;loop&quot;&gt;Loop cue&lt;/button&gt;</span>
+<span class="a">+  &lt;button id=&quot;copy&quot;&gt;Copy all&lt;/button&gt;</span>
+<span class="a">+&lt;/header&gt;</span>
+<span class="a">+&lt;main&gt;</span>
+<span class="a">+  &lt;div id=&quot;left&quot;&gt;</span>
+<span class="a">+    &lt;video id=&quot;v&quot; src=&quot;__VIDEO__&quot; controls preload=&quot;metadata&quot;&gt;&lt;/video&gt;</span>
+<span class="a">+    &lt;div id=&quot;cur&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+  &lt;div id=&quot;list&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+&lt;/main&gt;</span>
+<span class="a">+&lt;script&gt;</span>
+<span class="a">+const CUES = __CUES__;</span>
+<span class="a">+const v = document.getElementById(&quot;v&quot;);</span>
+<span class="a">+const list = document.getElementById(&quot;list&quot;);</span>
+<span class="a">+const cur = document.getElementById(&quot;cur&quot;);</span>
+<span class="a">+let follow = true, looping = false, active = -1;</span>
+<span class="a">+</span>
+<span class="a">+function fmt(t) {</span>
+<span class="a">+  const m = Math.floor(t / 60), s = Math.floor(t % 60);</span>
+<span class="a">+  return (m &lt; 10 ? &quot;0&quot; : &quot;&quot;) + m + &quot;:&quot; + (s &lt; 10 ? &quot;0&quot; : &quot;&quot;) + s;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+CUES.forEach((c, i) =&gt; {</span>
+<span class="a">+  const d = document.createElement(&quot;div&quot;);</span>
+<span class="a">+  d.className = &quot;cue&quot;;</span>
+<span class="a">+  d.dataset.time = fmt(c.start);</span>
+<span class="a">+  const j = document.createElement(&quot;span&quot;);</span>
+<span class="a">+  j.className = &quot;jump&quot;;</span>
+<span class="a">+  j.textContent = &quot;play&quot;;</span>
+<span class="a">+  j.onclick = (e) =&gt; { e.stopPropagation(); v.currentTime = c.start; v.play(); };</span>
+<span class="a">+  d.appendChild(j);</span>
+<span class="a">+  d.appendChild(document.createTextNode(c.text));</span>
+<span class="a">+  d.onclick = () =&gt; { v.currentTime = c.start; };</span>
+<span class="a">+  list.appendChild(d);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+function setActive(i) {</span>
+<span class="a">+  if (i === active) return;</span>
+<span class="a">+  const prev = list.children[active];</span>
+<span class="a">+  if (prev) prev.classList.remove(&quot;active&quot;);</span>
+<span class="a">+  active = i;</span>
+<span class="a">+  const el = list.children[i];</span>
+<span class="a">+  cur.textContent = &quot;&quot;;</span>
+<span class="a">+  if (!el) return;</span>
+<span class="a">+  el.classList.add(&quot;active&quot;);</span>
+<span class="a">+  cur.appendChild(document.createTextNode(CUES[i].text));</span>
+<span class="a">+  if (follow) el.scrollIntoView({ block: &quot;center&quot;, behavior: &quot;smooth&quot; });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function syncNow() {</span>
+<span class="a">+  const t = v.currentTime;</span>
+<span class="a">+  if (looping &amp;&amp; active &gt;= 0 &amp;&amp; !v.paused) {</span>
+<span class="a">+    const c = CUES[active];</span>
+<span class="a">+    if (t &gt; c.end + 0.05) { v.currentTime = c.start; return; }</span>
+<span class="a">+  }</span>
+<span class="a">+  let i = -1;</span>
+<span class="a">+  for (let k = 0; k &lt; CUES.length; k++) {</span>
+<span class="a">+    if (t &gt;= CUES[k].start - 0.05 &amp;&amp; t &lt;= CUES[k].end + 0.35) { i = k; break; }</span>
+<span class="a">+  }</span>
+<span class="a">+  // While scrubbing between cues, keep showing the one just passed.</span>
+<span class="a">+  if (i &lt; 0) {</span>
+<span class="a">+    for (let k = CUES.length - 1; k &gt;= 0; k--) {</span>
+<span class="a">+      if (t &gt;= CUES[k].start) { i = k; break; }</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  if (i &gt;= 0) setActive(i);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// timeupdate only fires during playback; seeked covers scrubbing while paused,</span>
+<span class="a">+// which is most of what mining actually involves.</span>
+<span class="a">+[&quot;timeupdate&quot;, &quot;seeked&quot;, &quot;loadedmetadata&quot;, &quot;play&quot;].forEach(</span>
+<span class="a">+  (ev) =&gt; v.addEventListener(ev, syncNow));</span>
+<span class="a">+</span>
+<span class="a">+document.getElementById(&quot;bigger&quot;).onclick = () =&gt; bump(3);</span>
+<span class="a">+document.getElementById(&quot;smaller&quot;).onclick = () =&gt; bump(-3);</span>
+<span class="a">+function bump(d) {</span>
+<span class="a">+  const s = parseInt(getComputedStyle(document.documentElement)</span>
+<span class="a">+        .getPropertyValue(&quot;--size&quot;), 10) + d;</span>
+<span class="a">+  document.documentElement.style.setProperty(&quot;--size&quot;,</span>
+<span class="a">+        Math.max(14, Math.min(60, s)) + &quot;px&quot;);</span>
+<span class="a">+}</span>
+<span class="a">+document.getElementById(&quot;follow&quot;).onclick = (e) =&gt; {</span>
+<span class="a">+  follow = !follow; e.target.className = follow ? &quot;on&quot; : &quot;&quot;;</span>
+<span class="a">+};</span>
+<span class="a">+document.getElementById(&quot;loop&quot;).onclick = (e) =&gt; {</span>
+<span class="a">+  looping = !looping; e.target.className = looping ? &quot;on&quot; : &quot;&quot;;</span>
+<span class="a">+};</span>
+<span class="a">+document.getElementById(&quot;copy&quot;).onclick = async () =&gt; {</span>
+<span class="a">+  try {</span>
+<span class="a">+    await navigator.clipboard.writeText(CUES.map((c) =&gt; c.text).join(&quot;\\n&quot;));</span>
+<span class="a">+    const b = document.getElementById(&quot;copy&quot;);</span>
+<span class="a">+    b.textContent = &quot;Copied&quot;; setTimeout(() =&gt; b.textContent = &quot;Copy all&quot;, 1200);</span>
+<span class="a">+  } catch (e) {}</span>
+<span class="a">+};</span>
+<span class="a">+document.addEventListener(&quot;keydown&quot;, (e) =&gt; {</span>
+<span class="a">+  if (e.key === &quot; &quot;) { e.preventDefault(); v.paused ? v.play() : v.pause(); }</span>
+<span class="a">+  if (e.key === &quot;ArrowLeft&quot; &amp;&amp; active &gt; 0) v.currentTime = CUES[active - 1].start;</span>
+<span class="a">+  if (e.key === &quot;ArrowRight&quot; &amp;&amp; active &lt; CUES.length - 1) v.currentTime = CUES[active + 1].start;</span>
+<span class="a">+});</span>
+<span class="a">+&lt;/script&gt;</span>
+<span class="a">+&lt;/body&gt;</span>
+<span class="a">+&lt;/html&gt;</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def write_mine_page(path, cues, lang):</span>
+<span class="a">+    &quot;&quot;&quot;A self-contained page: the clip plus selectable, synced subtitles.</span>
+<span class="a">+</span>
+<span class="a">+    Yomitan mines from real DOM text, so the value is in the subtitles being</span>
+<span class="a">+    hoverable HTML rather than pixels burned into the video.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    import json</span>
+<span class="a">+</span>
+<span class="a">+    data = [{&quot;start&quot;: round(s, 3), &quot;end&quot;: round(e, 3), &quot;text&quot;: t} for s, e, t in cues]</span>
+<span class="a">+    html = (MINE_PAGE</span>
+<span class="a">+            .replace(&quot;__CUES__&quot;, json.dumps(data, ensure_ascii=False))</span>
+<span class="a">+            .replace(&quot;__VIDEO__&quot;, path.name.replace(&#x27;&quot;&#x27;, &quot;%22&quot;))</span>
+<span class="a">+            .replace(&quot;__TITLE__&quot;, path.stem.replace(&quot;&lt;&quot;, &quot;&amp;lt;&quot;))</span>
+<span class="a">+            .replace(&quot;__LANG__&quot;, &quot;ja&quot; if lang == &quot;ja&quot; else (lang or &quot;en&quot;)))</span>
+<span class="a">+    out = path.with_suffix(&quot;.html&quot;)</span>
+<span class="a">+    out.write_text(html, encoding=&quot;utf-8&quot;)</span>
+<span class="a">+    return out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def export_anki(path, cues, translations, args, log=log):</span>
+<span class="a">+    &quot;&quot;&quot;One row per sentence: text, translation, audio, screenshot.&quot;&quot;&quot;</span>
+<span class="a">+    from faster_whisper.audio import decode_audio</span>
+<span class="a">+</span>
+<span class="a">+    media = Path(args.anki_media) if args.anki_media else path.parent / (path.stem + &quot;_media&quot;)</span>
+<span class="a">+    media.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+</span>
+<span class="a">+    sr = 24000</span>
+<span class="a">+    try:</span>
+<span class="a">+        audio = decode_audio(str(path), sampling_rate=sr)</span>
+<span class="a">+    except Exception as e:</span>
+<span class="a">+        log(&quot;cannot re-decode audio for cards: %s&quot; % e)</span>
+<span class="a">+        return None</span>
+<span class="a">+</span>
+<span class="a">+    stem = &quot;&quot;.join(c if (c.isalnum() or c in &quot;-_&quot;) else &quot;_&quot; for c in path.stem)[:48]</span>
+<span class="a">+    audio_names, image_names = [], []</span>
+<span class="a">+</span>
+<span class="a">+    for i, (start, end, _) in enumerate(cues, 1):</span>
+<span class="a">+        clip = slice_audio(audio, sr, start, end, args.anki_pad)</span>
+<span class="a">+        dest = write_audio_clip(clip, sr, media / (&quot;%s_%04d.mp3&quot; % (stem, i)))</span>
+<span class="a">+        audio_names.append(dest.name)</span>
+<span class="a">+</span>
+<span class="a">+    if args.anki_images:</span>
+<span class="a">+        mids = [(s + e) / 2 for s, e, _ in cues]</span>
+<span class="a">+        dests = [media / (&quot;%s_%04d.jpg&quot; % (stem, i)) for i in range(1, len(cues) + 1)]</span>
+<span class="a">+        got = grab_frames(path, mids, dests, args.anki_image_width)</span>
+<span class="a">+        image_names = [dests[i].name if i in got else &quot;&quot; for i in range(len(cues))]</span>
+<span class="a">+        if not got:</span>
+<span class="a">+            log(&quot;no screenshots (PyAV/Pillow could not decode video frames)&quot;)</span>
+<span class="a">+    else:</span>
+<span class="a">+        image_names = [&quot;&quot;] * len(cues)</span>
+<span class="a">+</span>
+<span class="a">+    tsv = path.with_suffix(&quot;.anki.tsv&quot;)</span>
+<span class="a">+    with open(tsv, &quot;w&quot;, encoding=&quot;utf-8&quot;, newline=&quot;&quot;) as fh:</span>
+<span class="a">+        for i, (start, end, text) in enumerate(cues):</span>
+<span class="a">+            row = [</span>
+<span class="a">+                esc(text),</span>
+<span class="a">+                esc(translations[i]) if translations else &quot;&quot;,</span>
+<span class="a">+                &quot;[sound:%s]&quot; % audio_names[i],</span>
+<span class="a">+                &#x27;&lt;img src=&quot;%s&quot;&gt;&#x27; % image_names[i] if image_names[i] else &quot;&quot;,</span>
+<span class="a">+                esc(path.name),</span>
+<span class="a">+                ts(start),</span>
+<span class="a">+            ]</span>
+<span class="a">+            fh.write(&quot;\t&quot;.join(row) + &quot;\n&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    log(&quot;%d cards -&gt; %s&quot; % (len(cues), tsv.name))</span>
+<span class="a">+    log(&quot;   media -&gt; %s&quot; % media)</span>
+<span class="a">+    if not args.anki_media:</span>
+<span class="a">+        target = anki_media_dir()</span>
+<span class="a">+        if target:</span>
+<span class="a">+            log(&quot;   copy the media files into: %s&quot; % target)</span>
+<span class="a">+        else:</span>
+<span class="a">+            log(&quot;   copy the media files into your Anki collection.media folder&quot;)</span>
+<span class="a">+    return tsv</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ------------------------------------------------------------ processing ----</span>
+<span class="a">+</span>
+<span class="a">+class Subtitler:</span>
+<span class="a">+    def __init__(self, args):</span>
+<span class="a">+        from faster_whisper import WhisperModel</span>
+<span class="a">+</span>
+<span class="a">+        self.args = args</span>
+<span class="a">+        log(&quot;loading %r on %s/%s ...&quot; % (args.model, args.device, args.compute))</span>
+<span class="a">+        t0 = time.time()</span>
+<span class="a">+        self.model = WhisperModel(args.model, device=args.device,</span>
+<span class="a">+                                  compute_type=args.compute,</span>
+<span class="a">+                                  cpu_threads=args.threads, num_workers=1)</span>
+<span class="a">+        log(&quot;model ready in %.1fs&quot; % (time.time() - t0))</span>
+<span class="a">+</span>
+<span class="a">+    def run(self, path):</span>
+<span class="a">+        from faster_whisper.audio import decode_audio</span>
+<span class="a">+</span>
+<span class="a">+        a = self.args</span>
+<span class="a">+        out = path.with_suffix(&quot;.&quot; + a.format)</span>
+<span class="a">+        if out.exists() and not a.overwrite:</span>
+<span class="a">+            log(&quot;skip (exists): %s&quot; % out.name)</span>
+<span class="a">+            return out</span>
+<span class="a">+</span>
+<span class="a">+        try:</span>
+<span class="a">+            audio = decode_audio(str(path), sampling_rate=16000)</span>
+<span class="a">+        except Exception as e:</span>
+<span class="a">+            log(&quot;cannot decode %s: %s&quot; % (path.name, e))</span>
+<span class="a">+            return None</span>
+<span class="a">+        dur = len(audio) / 16000</span>
+<span class="a">+        if dur &lt; 0.2:</span>
+<span class="a">+            log(&quot;skip (no audio): %s&quot; % path.name)</span>
+<span class="a">+            return None</span>
+<span class="a">+</span>
+<span class="a">+        t0 = time.time()</span>
+<span class="a">+        segments, info = self.model.transcribe(</span>
+<span class="a">+            audio,</span>
+<span class="a">+            language=None if a.lang == &quot;auto&quot; else a.lang,</span>
+<span class="a">+            task=&quot;translate&quot; if a.translate else &quot;transcribe&quot;,</span>
+<span class="a">+            beam_size=a.beam,</span>
+<span class="a">+            temperature=[0.0, 0.2, 0.4, 0.6, 0.8, 1.0],</span>
+<span class="a">+            condition_on_previous_text=True,</span>
+<span class="a">+            vad_filter=True,</span>
+<span class="a">+            word_timestamps=True,</span>
+<span class="a">+            no_speech_threshold=0.6,</span>
+<span class="a">+            log_prob_threshold=-1.0,</span>
+<span class="a">+        )</span>
+<span class="a">+        segments = list(segments)</span>
+<span class="a">+        took = time.time() - t0</span>
+<span class="a">+</span>
+<span class="a">+        if a.anki:</span>
+<span class="a">+            # Cards want whole sentences; subtitles want display-sized chunks.</span>
+<span class="a">+            groups = group_sentences(collect_words(segments), a.max_dur, a.max_gap)</span>
+<span class="a">+            card_cues = [(g[0].start, g[-1].end, text_of(g)) for g in groups]</span>
+<span class="a">+        else:</span>
+<span class="a">+            card_cues = []</span>
+<span class="a">+</span>
+<span class="a">+        cues = build_cues(segments, a.max_chars, a.max_dur, a.max_gap)</span>
+<span class="a">+        if not cues:</span>
+<span class="a">+            log(&quot;no speech found in %s&quot; % path.name)</span>
+<span class="a">+            return None</span>
+<span class="a">+</span>
+<span class="a">+        WRITERS[a.format](cues, out, a.width)</span>
+<span class="a">+        log(&quot;%s  -&gt;  %s  (%d cues, %s, %.0fs audio in %.0fs)&quot;</span>
+<span class="a">+            % (path.name, out.name, len(cues),</span>
+<span class="a">+               getattr(info, &quot;language&quot;, a.lang), dur, took))</span>
+<span class="a">+</span>
+<span class="a">+        if a.mine:</span>
+<span class="a">+            page = write_mine_page(path, cues, getattr(info, &quot;language&quot;, a.lang))</span>
+<span class="a">+            log(&quot;mining page  -&gt;  %s&quot; % page.name)</span>
+<span class="a">+</span>
+<span class="a">+        if a.anki:</span>
+<span class="a">+            translations = self.translate_cues(audio, card_cues) if a.anki_translate else None</span>
+<span class="a">+            export_anki(path, card_cues, translations, a)</span>
+<span class="a">+        return out</span>
+<span class="a">+</span>
+<span class="a">+    def translate_cues(self, audio, cues):</span>
+<span class="a">+        &quot;&quot;&quot;English for the back of each card, translated per sentence.&quot;&quot;&quot;</span>
+<span class="a">+        out = []</span>
+<span class="a">+        log(&quot;translating %d sentences for card backs...&quot; % len(cues))</span>
+<span class="a">+        for start, end, _ in cues:</span>
+<span class="a">+            lo, hi = max(0, int(start * 16000)), min(len(audio), int(end * 16000))</span>
+<span class="a">+            clip = audio[lo:hi]</span>
+<span class="a">+            if len(clip) &lt; 1600:</span>
+<span class="a">+                out.append(&quot;&quot;)</span>
+<span class="a">+                continue</span>
+<span class="a">+            try:</span>
+<span class="a">+                segs, _ = self.model.transcribe(</span>
+<span class="a">+                    clip, language=None if self.args.lang == &quot;auto&quot; else self.args.lang,</span>
+<span class="a">+                    task=&quot;translate&quot;, beam_size=self.args.beam, temperature=0.0,</span>
+<span class="a">+                    condition_on_previous_text=False, vad_filter=False,</span>
+<span class="a">+                    without_timestamps=True)</span>
+<span class="a">+                out.append(&quot; &quot;.join(s.text.strip() for s in segs).strip())</span>
+<span class="a">+            except Exception:</span>
+<span class="a">+                out.append(&quot;&quot;)</span>
+<span class="a">+        return out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class _Limited:</span>
+<span class="a">+    &quot;&quot;&quot;Feeds copyfile only the bytes belonging to the requested range.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, fh, remaining):</span>
+<span class="a">+        self.fh, self.remaining = fh, remaining</span>
+<span class="a">+</span>
+<span class="a">+    def read(self, size=-1):</span>
+<span class="a">+        if self.remaining &lt;= 0:</span>
+<span class="a">+            return b&quot;&quot;</span>
+<span class="a">+        if size is None or size &lt; 0:</span>
+<span class="a">+            size = self.remaining</span>
+<span class="a">+        data = self.fh.read(min(size, self.remaining))</span>
+<span class="a">+        self.remaining -= len(data)</span>
+<span class="a">+        return data</span>
+<span class="a">+</span>
+<span class="a">+    def close(self):</span>
+<span class="a">+        self.fh.close()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class RangeHandler(SimpleHTTPRequestHandler):</span>
+<span class="a">+    &quot;&quot;&quot;Static files with HTTP Range support.</span>
+<span class="a">+</span>
+<span class="a">+    Browsers refuse to seek in a &lt;video&gt; unless the server answers range</span>
+<span class="a">+    requests, and Python&#x27;s stock handler does not - so scrubbing a clip, which</span>
+<span class="a">+    is most of what mining involves, would silently not work.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def log_message(self, *a):</span>
+<span class="a">+        pass</span>
+<span class="a">+</span>
+<span class="a">+    def end_headers(self):</span>
+<span class="a">+        self.send_header(&quot;Accept-Ranges&quot;, &quot;bytes&quot;)</span>
+<span class="a">+        SimpleHTTPRequestHandler.end_headers(self)</span>
+<span class="a">+</span>
+<span class="a">+    def send_head(self):</span>
+<span class="a">+        rng = self.headers.get(&quot;Range&quot;)</span>
+<span class="a">+        if not rng:</span>
+<span class="a">+            return SimpleHTTPRequestHandler.send_head(self)</span>
+<span class="a">+</span>
+<span class="a">+        path = self.translate_path(self.path)</span>
+<span class="a">+        if os.path.isdir(path):</span>
+<span class="a">+            return SimpleHTTPRequestHandler.send_head(self)</span>
+<span class="a">+        try:</span>
+<span class="a">+            fh = open(path, &quot;rb&quot;)</span>
+<span class="a">+        except OSError:</span>
+<span class="a">+            self.send_error(404, &quot;File not found&quot;)</span>
+<span class="a">+            return None</span>
+<span class="a">+</span>
+<span class="a">+        size = os.fstat(fh.fileno()).st_size</span>
+<span class="a">+        m = re.match(r&quot;bytes=(\d*)-(\d*)\s*$&quot;, rng.strip())</span>
+<span class="a">+        if not m or (not m.group(1) and not m.group(2)):</span>
+<span class="a">+            fh.close()</span>
+<span class="a">+            self.send_error(400, &quot;Malformed Range&quot;)</span>
+<span class="a">+            return None</span>
+<span class="a">+</span>
+<span class="a">+        if not m.group(1):                       # bytes=-N  (last N bytes)</span>
+<span class="a">+            start, end = max(0, size - int(m.group(2))), size - 1</span>
+<span class="a">+        else:</span>
+<span class="a">+            start = int(m.group(1))</span>
+<span class="a">+            end = int(m.group(2)) if m.group(2) else size - 1</span>
+<span class="a">+        end = min(end, size - 1)</span>
+<span class="a">+</span>
+<span class="a">+        if start &gt;= size or start &gt; end:</span>
+<span class="a">+            fh.close()</span>
+<span class="a">+            self.send_response(416)</span>
+<span class="a">+            self.send_header(&quot;Content-Range&quot;, &quot;bytes */%d&quot; % size)</span>
+<span class="a">+            self.send_header(&quot;Content-Length&quot;, &quot;0&quot;)</span>
+<span class="a">+            self.end_headers()</span>
+<span class="a">+            return None</span>
+<span class="a">+</span>
+<span class="a">+        self.send_response(206)</span>
+<span class="a">+        self.send_header(&quot;Content-Type&quot;, self.guess_type(path))</span>
+<span class="a">+        self.send_header(&quot;Content-Range&quot;, &quot;bytes %d-%d/%d&quot; % (start, end, size))</span>
+<span class="a">+        self.send_header(&quot;Content-Length&quot;, str(end - start + 1))</span>
+<span class="a">+        self.end_headers()</span>
+<span class="a">+        fh.seek(start)</span>
+<span class="a">+        return _Limited(fh, end - start + 1)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def serve(folder, port):</span>
+<span class="a">+    from functools import partial</span>
+<span class="a">+</span>
+<span class="a">+    handler = partial(RangeHandler, directory=str(folder))</span>
+<span class="a">+    srv = ThreadingHTTPServer((&quot;127.0.0.1&quot;, port), handler)</span>
+<span class="a">+    threading.Thread(target=srv.serve_forever, daemon=True).start()</span>
+<span class="a">+    log(&quot;serving %s at http://127.0.0.1:%d/  (video seeking enabled)&quot; % (folder, port))</span>
+<span class="a">+    pages = sorted(p.name for p in Path(folder).glob(&quot;*.html&quot;))</span>
+<span class="a">+    for name in pages[-10:]:</span>
+<span class="a">+        log(&quot;   http://127.0.0.1:%d/%s&quot; % (port, name))</span>
+<span class="a">+    return srv</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def stable(path, checks=3, delay=1.0):</span>
+<span class="a">+    &quot;&quot;&quot;Wait until a file stops growing, so we do not read a half-written clip.&quot;&quot;&quot;</span>
+<span class="a">+    last = -1</span>
+<span class="a">+    for _ in range(120):</span>
+<span class="a">+        try:</span>
+<span class="a">+            size = path.stat().st_size</span>
+<span class="a">+        except OSError:</span>
+<span class="a">+            return False</span>
+<span class="a">+        if size == last:</span>
+<span class="a">+            checks -= 1</span>
+<span class="a">+            if checks &lt;= 0:</span>
+<span class="a">+                return size &gt; 0</span>
+<span class="a">+        else:</span>
+<span class="a">+            checks = 3</span>
+<span class="a">+            last = size</span>
+<span class="a">+        time.sleep(delay)</span>
+<span class="a">+    return False</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def watch(sub, folder, args):</span>
+<span class="a">+    folder = Path(folder)</span>
+<span class="a">+    if not folder.is_dir():</span>
+<span class="a">+        raise SystemExit(&quot;not a folder: %s&quot; % folder)</span>
+<span class="a">+    seen = {p.resolve() for p in folder.iterdir()</span>
+<span class="a">+            if p.suffix.lower() in VIDEO_EXT}</span>
+<span class="a">+    log(&quot;watching %s for new clips (%d already present) - Ctrl+C to stop&quot;</span>
+<span class="a">+        % (folder, len(seen)))</span>
+<span class="a">+    while True:</span>
+<span class="a">+        try:</span>
+<span class="a">+            for p in sorted(folder.iterdir()):</span>
+<span class="a">+                if p.suffix.lower() not in VIDEO_EXT:</span>
+<span class="a">+                    continue</span>
+<span class="a">+                r = p.resolve()</span>
+<span class="a">+                if r in seen:</span>
+<span class="a">+                    continue</span>
+<span class="a">+                seen.add(r)</span>
+<span class="a">+                log(&quot;new clip: %s&quot; % p.name)</span>
+<span class="a">+                if stable(p):</span>
+<span class="a">+                    sub.run(p)</span>
+<span class="a">+                else:</span>
+<span class="a">+                    log(&quot;gave up waiting for %s to finish writing&quot; % p.name)</span>
+<span class="a">+            time.sleep(args.poll)</span>
+<span class="a">+        except KeyboardInterrupt:</span>
+<span class="a">+            print()</span>
+<span class="a">+            log(&quot;stopped&quot;)</span>
+<span class="a">+            return</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main():</span>
+<span class="a">+    p = argparse.ArgumentParser(</span>
+<span class="a">+        description=&quot;Subtitle recordings and replay clips&quot;,</span>
+<span class="a">+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)</span>
+<span class="a">+    p.add_argument(&quot;files&quot;, nargs=&quot;*&quot;, help=&quot;video/audio files to subtitle&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--watch&quot;, metavar=&quot;FOLDER&quot;,</span>
+<span class="a">+                   help=&quot;watch a folder and subtitle clips as they appear&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--poll&quot;, type=float, default=3.0, help=&quot;watch interval (s)&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    p.add_argument(&quot;--model&quot;, default=&quot;large-v3-turbo&quot;,</span>
+<span class="a">+                   help=&quot;quality matters more than speed here&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--lang&quot;, default=&quot;fi&quot;, help=&quot;language code, or &#x27;auto&#x27;&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--device&quot;, default=&quot;cpu&quot;, choices=[&quot;cpu&quot;, &quot;cuda&quot;])</span>
+<span class="a">+    p.add_argument(&quot;--compute&quot;, default=&quot;int8&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--threads&quot;, type=int, default=max(2, (os.cpu_count() or 8) - 2))</span>
+<span class="a">+    p.add_argument(&quot;--beam&quot;, type=int, default=5)</span>
+<span class="a">+    p.add_argument(&quot;--translate&quot;, action=&quot;store_true&quot;,</span>
+<span class="a">+                   help=&quot;write English subtitles instead of the original language&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    p.add_argument(&quot;--format&quot;, default=&quot;srt&quot;, choices=sorted(WRITERS))</span>
+<span class="a">+    p.add_argument(&quot;--width&quot;, type=int, default=42, help=&quot;max characters per line&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--max-chars&quot;, type=int, default=84, help=&quot;max characters per cue&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--max-dur&quot;, type=float, default=6.0, help=&quot;max seconds per cue&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--max-gap&quot;, type=float, default=0.8,</span>
+<span class="a">+                   help=&quot;silence (s) that forces a new cue&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--overwrite&quot;, action=&quot;store_true&quot;,</span>
+<span class="a">+                   help=&quot;re-subtitle files that already have output&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    g = p.add_argument_group(&quot;mining&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--mine&quot;, dest=&quot;mine&quot;, action=&quot;store_true&quot;, default=True,</span>
+<span class="a">+                   help=&quot;write a browser page with the clip and hoverable subtitles&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--no-mine&quot;, dest=&quot;mine&quot;, action=&quot;store_false&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--serve&quot;, nargs=&quot;?&quot;, type=int, const=8778, default=None,</span>
+<span class="a">+                   metavar=&quot;PORT&quot;,</span>
+<span class="a">+                   help=&quot;serve the mining pages over http with video seeking, &quot;</span>
+<span class="a">+                        &quot;so Yomitan works without file-URL permissions&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    g = p.add_argument_group(&quot;anki cards&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--anki&quot;, action=&quot;store_true&quot;,</span>
+<span class="a">+                   help=&quot;also export one card per sentence, with clipped audio&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--anki-translate&quot;, action=&quot;store_true&quot;,</span>
+<span class="a">+                   help=&quot;add an English translation to each card&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--anki-images&quot;, dest=&quot;anki_images&quot;, action=&quot;store_true&quot;, default=True,</span>
+<span class="a">+                   help=&quot;grab a screenshot per card&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--no-anki-images&quot;, dest=&quot;anki_images&quot;, action=&quot;store_false&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--anki-image-width&quot;, type=int, default=640)</span>
+<span class="a">+    g.add_argument(&quot;--anki-pad&quot;, type=float, default=0.25,</span>
+<span class="a">+                   help=&quot;seconds of padding around each audio clip&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--anki-media&quot;, default=None,</span>
+<span class="a">+                   help=&quot;write media straight into Anki&#x27;s collection.media&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    args = p.parse_args()</span>
+<span class="a">+    if not args.files and not args.watch:</span>
+<span class="a">+        p.error(&quot;give some files, or --watch a folder&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    sub = Subtitler(args)</span>
+<span class="a">+</span>
+<span class="a">+    done = []</span>
+<span class="a">+    for pattern in args.files:</span>
+<span class="a">+        path = Path(pattern)</span>
+<span class="a">+        matches = [path] if path.exists() else sorted(Path().glob(pattern))</span>
+<span class="a">+        if not matches:</span>
+<span class="a">+            log(&quot;no such file: %s&quot; % pattern)</span>
+<span class="a">+        for m in matches:</span>
+<span class="a">+            sub.run(m)</span>
+<span class="a">+            done.append(m)</span>
+<span class="a">+</span>
+<span class="a">+    srv = None</span>
+<span class="a">+    if args.serve:</span>
+<span class="a">+        folder = Path(args.watch) if args.watch else (</span>
+<span class="a">+            done[0].parent if done else Path(&quot;.&quot;))</span>
+<span class="a">+        srv = serve(folder.resolve(), args.serve)</span>
+<span class="a">+</span>
+<span class="a">+    if args.watch:</span>
+<span class="a">+        watch(sub, args.watch, args)</span>
+<span class="a">+    elif srv is not None:</span>
+<span class="a">+        log(&quot;Ctrl+C to stop serving&quot;)</span>
+<span class="a">+        try:</span>
+<span class="a">+            while True:</span>
+<span class="a">+                time.sleep(3600)</span>
+<span class="a">+        except KeyboardInterrupt:</span>
+<span class="a">+            print()</span>
+<span class="a">+    return 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    sys.exit(main())</span>
+diff --git a/tests/test_subtitle.py b/tests/test_subtitle.py
+new file mode 100644
+index 0000000..9e5d1e3
+--- /dev/null
++++ b/tests/test_subtitle.py
+<span class="h">@@ -0,0 +1,202 @@</span>
+<span class="a">+&quot;&quot;&quot;Tests for the offline subtitler. Run with:  python tests\\test_subtitle.py&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+import sys</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))</span>
+<span class="a">+</span>
+<span class="a">+import subtitle</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class W:</span>
+<span class="a">+    &quot;&quot;&quot;Minimal stand-in for a faster-whisper word.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, start, end, word):</span>
+<span class="a">+        self.start, self.end, self.word = start, end, word</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class Seg:</span>
+<span class="a">+    def __init__(self, words, text=None, start=0.0, end=0.0):</span>
+<span class="a">+        self.words = words</span>
+<span class="a">+        self.text = text if text is not None else &quot;&quot;.join(w.word for w in words)</span>
+<span class="a">+        self.start, self.end = start, end</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def words(spec, t0=0.0, step=0.4):</span>
+<span class="a">+    out, t = [], t0</span>
+<span class="a">+    for token in spec.split(&quot; &quot;):</span>
+<span class="a">+        out.append(W(t, t + step, token + &quot; &quot;))</span>
+<span class="a">+        t += step</span>
+<span class="a">+    return out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_timestamp_format():</span>
+<span class="a">+    assert subtitle.ts(0) == &quot;00:00:00,000&quot;</span>
+<span class="a">+    assert subtitle.ts(1.5) == &quot;00:00:01,500&quot;</span>
+<span class="a">+    assert subtitle.ts(3661.25) == &quot;01:01:01,250&quot;</span>
+<span class="a">+    assert subtitle.ts(-5) == &quot;00:00:00,000&quot;</span>
+<span class="a">+    assert subtitle.ts(1.5, &quot;.&quot;) == &quot;00:00:01.500&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_wrap_balances_two_lines():</span>
+<span class="a">+    out = subtitle.wrap(&quot;aaa bbb ccc ddd&quot;, 8)</span>
+<span class="a">+    assert out == &quot;aaa bbb\nccc ddd&quot;, repr(out)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_wrap_leaves_short_text_alone():</span>
+<span class="a">+    assert subtitle.wrap(&quot;short&quot;, 42) == &quot;short&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_wrap_falls_back_when_nothing_fits():</span>
+<span class="a">+    &quot;&quot;&quot;A long sentence with no split under the limit still gets two lines.&quot;&quot;&quot;</span>
+<span class="a">+    text = (&quot;Ollaan taas sen verran syrjaisilla seuduilla ja &quot;</span>
+<span class="a">+            &quot;harvakseltaan kuljetuilla seuduilla.&quot;)</span>
+<span class="a">+    out = subtitle.wrap(text, 42)</span>
+<span class="a">+    lines = out.split(&quot;\n&quot;)</span>
+<span class="a">+    assert len(lines) == 2, out</span>
+<span class="a">+    assert max(len(x) for x in lines) &lt; len(text), out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_wrap_single_word_cannot_split():</span>
+<span class="a">+    assert &quot;\n&quot; not in subtitle.wrap(&quot;Rindfleischetikettierungsgesetz&quot;, 5)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_sentences_split_on_terminators():</span>
+<span class="a">+    ws = words(&quot;Yksi kaksi.&quot;) + words(&quot;Kolme nelja.&quot;, t0=2.0)</span>
+<span class="a">+    groups = subtitle.group_sentences(ws, max_dur=6.0, max_gap=0.8)</span>
+<span class="a">+    assert len(groups) == 2, [subtitle.text_of(g) for g in groups]</span>
+<span class="a">+    assert subtitle.text_of(groups[0]) == &quot;Yksi kaksi.&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_sentences_split_on_long_gap():</span>
+<span class="a">+    ws = words(&quot;yksi kaksi&quot;) + words(&quot;kolme nelja&quot;, t0=9.0)</span>
+<span class="a">+    groups = subtitle.group_sentences(ws, max_dur=6.0, max_gap=0.8)</span>
+<span class="a">+    assert len(groups) == 2</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_cue_never_starts_mid_sentence_orphan():</span>
+<span class="a">+    &quot;&quot;&quot;A trailing runt is folded back rather than shown alone.&quot;&quot;&quot;</span>
+<span class="a">+    ws = words(&quot;aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii jjjj kkkk&quot;)</span>
+<span class="a">+    cues = subtitle.build_cues([Seg(ws)], max_chars=30, max_dur=99, max_gap=9)</span>
+<span class="a">+    assert cues</span>
+<span class="a">+    for _, _, text in cues:</span>
+<span class="a">+        assert len(text) &gt;= 16 or len(cues) == 1, cues</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_segment_without_word_timings_still_produces_a_cue():</span>
+<span class="a">+    seg = Seg([], text=&quot;Ei sanatason aikaleimoja.&quot;, start=1.0, end=3.0)</span>
+<span class="a">+    cues = subtitle.build_cues([seg], 84, 6.0, 0.8)</span>
+<span class="a">+    assert len(cues) == 1</span>
+<span class="a">+    assert cues[0][2] == &quot;Ei sanatason aikaleimoja.&quot;</span>
+<span class="a">+    assert cues[0][0] == 1.0 and cues[0][1] == 3.0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_srt_roundtrip(tmp=None):</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    cues = [(0.0, 1.5, &quot;Ensimmainen.&quot;), (2.0, 3.25, &quot;Toinen rivi tassa.&quot;)]</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        out = Path(d) / &quot;x.srt&quot;</span>
+<span class="a">+        subtitle.write_srt(cues, out, 42)</span>
+<span class="a">+        text = out.read_text(encoding=&quot;utf-8&quot;)</span>
+<span class="a">+    assert &quot;1\n00:00:00,000 --&gt; 00:00:01,500\nEnsimmainen.&quot; in text, text</span>
+<span class="a">+    assert &quot;2\n00:00:02,000 --&gt; 00:00:03,250&quot; in text, text</span>
+<span class="a">+    assert text.endswith(&quot;\n\n&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_vtt_has_header_and_dot_timestamps():</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        out = Path(d) / &quot;x.vtt&quot;</span>
+<span class="a">+        subtitle.write_vtt([(0.0, 1.0, &quot;Moi&quot;)], out, 42)</span>
+<span class="a">+        text = out.read_text(encoding=&quot;utf-8&quot;)</span>
+<span class="a">+    assert text.startswith(&quot;WEBVTT&quot;)</span>
+<span class="a">+    assert &quot;00:00:00.000 --&gt; 00:00:01.000&quot; in text</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_mine_page_embeds_cues_and_escapes_nothing_odd():</span>
+<span class="a">+    import json</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    cues = [(0.0, 1.0, &quot;今日はいい天気ですね。&quot;), (1.0, 2.0, &quot;Kyllä se tästä.&quot;)]</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        video = Path(d) / &quot;clip.mp4&quot;</span>
+<span class="a">+        video.write_bytes(b&quot;&quot;)</span>
+<span class="a">+        page = subtitle.write_mine_page(video, cues, &quot;ja&quot;)</span>
+<span class="a">+        html = page.read_text(encoding=&quot;utf-8&quot;)</span>
+<span class="a">+    assert page.name == &quot;clip.html&quot;</span>
+<span class="a">+    assert &#x27;src=&quot;clip.mp4&quot;&#x27; in html</span>
+<span class="a">+    # Non-Latin text must survive verbatim for Yomitan to scan it.</span>
+<span class="a">+    assert &quot;今日はいい天気ですね。&quot; in html</span>
+<span class="a">+    assert &quot;Kyllä se tästä.&quot; in html</span>
+<span class="a">+    assert &quot;__CUES__&quot; not in html and &quot;__VIDEO__&quot; not in html</span>
+<span class="a">+    start = html.index(&quot;const CUES = &quot;) + len(&quot;const CUES = &quot;)</span>
+<span class="a">+    data = json.loads(html[start:html.index(&quot;\n&quot;, start)].rstrip(&quot;;&quot;))</span>
+<span class="a">+    assert len(data) == 2 and data[0][&quot;text&quot;] == &quot;今日はいい天気ですね。&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_esc_strips_tabs_and_newlines():</span>
+<span class="a">+    assert subtitle.esc(&quot;a\tb\nc &quot;) == &quot;a b c&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_range_requests_are_served():</span>
+<span class="a">+    &quot;&quot;&quot;Without 206 support a browser will not seek in a &lt;video&gt; at all.&quot;&quot;&quot;</span>
+<span class="a">+    import http.client</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    payload = bytes(range(256)) * 8          # 2048 bytes</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        (Path(d) / &quot;clip.mp4&quot;).write_bytes(payload)</span>
+<span class="a">+        srv = subtitle.serve(Path(d), 0)     # port 0 = pick a free one</span>
+<span class="a">+        port = srv.server_address[1]</span>
+<span class="a">+        try:</span>
+<span class="a">+            def req(headers):</span>
+<span class="a">+                c = http.client.HTTPConnection(&quot;127.0.0.1&quot;, port, timeout=5)</span>
+<span class="a">+                c.request(&quot;GET&quot;, &quot;/clip.mp4&quot;, headers=headers)</span>
+<span class="a">+                r = c.getresponse()</span>
+<span class="a">+                body = r.read()</span>
+<span class="a">+                c.close()</span>
+<span class="a">+                return r, body</span>
+<span class="a">+</span>
+<span class="a">+            r, body = req({})</span>
+<span class="a">+            assert r.status == 200, r.status</span>
+<span class="a">+            assert r.getheader(&quot;Accept-Ranges&quot;) == &quot;bytes&quot;</span>
+<span class="a">+            assert body == payload</span>
+<span class="a">+</span>
+<span class="a">+            r, body = req({&quot;Range&quot;: &quot;bytes=10-19&quot;})</span>
+<span class="a">+            assert r.status == 206, r.status</span>
+<span class="a">+            assert r.getheader(&quot;Content-Range&quot;) == &quot;bytes 10-19/2048&quot;</span>
+<span class="a">+            assert body == payload[10:20], body</span>
+<span class="a">+</span>
+<span class="a">+            r, body = req({&quot;Range&quot;: &quot;bytes=2040-&quot;})</span>
+<span class="a">+            assert r.status == 206</span>
+<span class="a">+            assert body == payload[2040:]</span>
+<span class="a">+</span>
+<span class="a">+            r, body = req({&quot;Range&quot;: &quot;bytes=-8&quot;})</span>
+<span class="a">+            assert r.status == 206</span>
+<span class="a">+            assert body == payload[-8:]</span>
+<span class="a">+</span>
+<span class="a">+            r, _ = req({&quot;Range&quot;: &quot;bytes=99999-&quot;})</span>
+<span class="a">+            assert r.status == 416, r.status</span>
+<span class="a">+        finally:</span>
+<span class="a">+            srv.shutdown()</span>
+<span class="a">+            srv.server_close()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main():</span>
+<span class="a">+    tests = [v for k, v in sorted(globals().items()) if k.startswith(&quot;test_&quot;)]</span>
+<span class="a">+    failed = 0</span>
+<span class="a">+    for fn in tests:</span>
+<span class="a">+        try:</span>
+<span class="a">+            fn()</span>
+<span class="a">+            print(&quot;  PASS  %s&quot; % fn.__name__)</span>
+<span class="a">+        except Exception as e:</span>
+<span class="a">+            failed += 1</span>
+<span class="a">+            print(&quot;  FAIL  %s: %r&quot; % (fn.__name__, e))</span>
+<span class="a">+    print(&quot;\n%d passed, %d failed&quot; % (len(tests) - failed, failed))</span>
+<span class="a">+    return 1 if failed else 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    sys.exit(main())</span></pre>
+</div></body></html>

@@ -1,0 +1,683 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay d6ce9c9e - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit d6ce9c9e61990039a2863ed2394c64e3b8b6b424
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 03:20:24 -0700
+
+Switch language and model live, without restarting
+
+Streams change language mid-session, and restarting to do so drops captions
+for the duration of a model load. Language and model are now controlled at
+runtime over the existing WebSocket, with a control panel at /control.html.
+
+Language changes are instant (no reload) and apply to the next sentence;
+1-9 hotkeys cover the configured set, defaulting to fi,ru,ja,es,pt,en,auto.
+Model changes are queued onto the worker thread that owns the model, so the
+websocket thread never loads one, and audio queued for the outgoing model is
+dropped rather than transcribed by the wrong one. A failed load keeps the
+previous model rather than leaving the process without one.
+
+Also fixes two problems this surfaced:
+- Non-Latin captions were mangled in logs, because Windows encodes redirected
+  stdout with the console codepage. Forced to UTF-8, so ru/ja output survives.
+- soundcard warns on every loopback gap, flooding the console when the capture
+  device is idle. Silenced; gaps are irrelevant to speech recognition.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> README.md           |  44 ++++++++++
+ control.html        | 233 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ livecap.py          | 177 +++++++++++++++++++++++++++++++++++++--
+ tests/test_smoke.py |  65 +++++++++++++++
+ 4 files changed, 511 insertions(+), 8 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 77c0775..8f78e18 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -51,6 +51,50 @@ Check your devices first if needed:</span>
+ .\run.ps1 --list-devices
+ ```
+ 
+<span class="a">+## Changing language and model while streaming</span>
+<span class="a">+</span>
+<span class="a">+`run.ps1` also prints a control panel URL. Open it in any browser (a second</span>
+<span class="a">+monitor, a phone on the same machine, or an OBS dock via</span>
+<span class="a">+**Docks → Custom Browser Docks**):</span>
+<span class="a">+</span>
+<span class="a">+```</span>
+<span class="a">+http://127.0.0.1:8777/control.html?ws=8765</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+- **Language** — one click, or press `1`–`9`. Applies to the next sentence.</span>
+<span class="a">+  No restart and no model reload, so it is effectively instant.</span>
+<span class="a">+- **Model** — a dropdown. Swapping reloads the model, which pauses captions for</span>
+<span class="a">+  a few seconds; the panel shows a *loading* state while it happens.</span>
+<span class="a">+- **Toggles** — English translation, live partial text, and clear captions.</span>
+<span class="a">+- A live feed of what is being recognised, so you can sanity-check without</span>
+<span class="a">+  looking at the stream.</span>
+<span class="a">+</span>
+<span class="a">+Choose which languages get buttons:</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+.\run.ps1 --langs fi,ru,ja,es,pt,en,auto --lang fi</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+That default set covers Finnish, Russian, Japanese, Spanish, Portuguese,</span>
+<span class="a">+English and auto-detect. Any [Whisper language code](https://github.com/openai/whisper#available-models-and-languages)</span>
+<span class="a">+works.</span>
+<span class="a">+</span>
+<span class="a">+Two things worth knowing:</span>
+<span class="a">+</span>
+<span class="a">+- **Whisper has no regional variants.** Argentine Spanish is `es` — there is no</span>
+<span class="a">+  `es-AR`. The model handles Rioplatense pronunciation and *voseo* as part of</span>
+<span class="a">+  `es`, but it normalises toward standard orthography and will not reliably</span>
+<span class="a">+  reproduce regional slang. The same applies to Brazilian vs. European</span>
+<span class="a">+  Portuguese: both are `pt`.</span>
+<span class="a">+- **`auto` re-detects per segment**, which sounds ideal for multilingual streams</span>
+<span class="a">+  but flips on short or noisy utterances and can mislabel mid-sentence. For a</span>
+<span class="a">+  stream that switches language deliberately, the `1`–`9` keys are far more</span>
+<span class="a">+  reliable than `auto`.</span>
+<span class="a">+</span>
+<span class="a">+Wider models are better at non-English audio. If you mostly caption Russian or</span>
+<span class="a">+Japanese, `medium` is worth the latency if your CPU can take it — check with</span>
+<span class="a">+`bench.py` first.</span>
+<span class="a">+</span>
+ ## Choosing what gets captioned
+ 
+ **Default (`--loopback`)** captures everything your speakers play — guests,
+diff --git a/control.html b/control.html
+new file mode 100644
+index 0000000..bf7f083
+--- /dev/null
++++ b/control.html
+<span class="h">@@ -0,0 +1,233 @@</span>
+<span class="a">+&lt;!doctype html&gt;</span>
+<span class="a">+&lt;html lang=&quot;en&quot;&gt;</span>
+<span class="a">+&lt;head&gt;</span>
+<span class="a">+&lt;meta charset=&quot;utf-8&quot;&gt;</span>
+<span class="a">+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;</span>
+<span class="a">+&lt;title&gt;livecap control&lt;/title&gt;</span>
+<span class="a">+&lt;style&gt;</span>
+<span class="a">+  :root {</span>
+<span class="a">+    --bg: #0f1115; --panel: #171a21; --line: #262b36;</span>
+<span class="a">+    --fg: #e8ecf3; --dim: #98a2b3; --accent: #7dd3fc; --ok: #4ade80; --warn: #fbbf24;</span>
+<span class="a">+  }</span>
+<span class="a">+  * { box-sizing: border-box; }</span>
+<span class="a">+  body {</span>
+<span class="a">+    margin: 0; padding: 24px; background: var(--bg); color: var(--fg);</span>
+<span class="a">+    font: 15px/1.5 &quot;Inter&quot;, &quot;Segoe UI&quot;, system-ui, sans-serif;</span>
+<span class="a">+  }</span>
+<span class="a">+  .wrap { max-width: 760px; margin: 0 auto; display: grid; gap: 18px; }</span>
+<span class="a">+  h1 { font-size: 18px; margin: 0; font-weight: 650; letter-spacing: .01em; }</span>
+<span class="a">+  h1 span { color: var(--dim); font-weight: 400; font-size: 13px; margin-left: 8px; }</span>
+<span class="a">+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }</span>
+<span class="a">+  .card h2 {</span>
+<span class="a">+    font-size: 11px; text-transform: uppercase; letter-spacing: .09em;</span>
+<span class="a">+    color: var(--dim); margin: 0 0 12px; font-weight: 600;</span>
+<span class="a">+  }</span>
+<span class="a">+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }</span>
+<span class="a">+  button {</span>
+<span class="a">+    font: inherit; font-weight: 550; color: var(--fg); cursor: pointer;</span>
+<span class="a">+    background: #1e2430; border: 1px solid var(--line); border-radius: 7px;</span>
+<span class="a">+    padding: 8px 14px; transition: background .12s, border-color .12s;</span>
+<span class="a">+  }</span>
+<span class="a">+  button:hover:not(:disabled) { background: #273040; border-color: #3a4256; }</span>
+<span class="a">+  button.on { background: var(--accent); border-color: var(--accent); color: #06202c; }</span>
+<span class="a">+  button:disabled { opacity: .45; cursor: not-allowed; }</span>
+<span class="a">+  button .k {</span>
+<span class="a">+    font-size: 11px; color: var(--dim); margin-left: 7px;</span>
+<span class="a">+    font-variant-numeric: tabular-nums;</span>
+<span class="a">+  }</span>
+<span class="a">+  button.on .k { color: #06202c; opacity: .65; }</span>
+<span class="a">+  select {</span>
+<span class="a">+    font: inherit; color: var(--fg); background: #1e2430;</span>
+<span class="a">+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 12px;</span>
+<span class="a">+  }</span>
+<span class="a">+  .status { display: flex; gap: 18px; flex-wrap: wrap; align-items: baseline; }</span>
+<span class="a">+  .status b { font-weight: 600; }</span>
+<span class="a">+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; margin-right: 7px; }</span>
+<span class="a">+  .dot.up { background: var(--ok); box-shadow: 0 0 8px var(--ok); }</span>
+<span class="a">+  .dot.down { background: #ef4444; box-shadow: 0 0 8px #ef4444; }</span>
+<span class="a">+  .dot.busy { background: var(--warn); box-shadow: 0 0 8px var(--warn); }</span>
+<span class="a">+  #feed { display: grid; gap: 7px; min-height: 76px; }</span>
+<span class="a">+  .cap { padding: 8px 11px; background: #12161d; border-left: 2px solid var(--line); border-radius: 4px; }</span>
+<span class="a">+  .cap.partial { color: var(--dim); font-style: italic; border-left-color: var(--warn); }</span>
+<span class="a">+  .cap .tr { display: block; color: var(--accent); font-size: 13px; margin-top: 3px; }</span>
+<span class="a">+  .empty { color: var(--dim); font-size: 13px; }</span>
+<span class="a">+  .hint { color: var(--dim); font-size: 12.5px; margin-top: 10px; }</span>
+<span class="a">+  code { background: #12161d; padding: 2px 6px; border-radius: 4px; font-size: 12.5px; }</span>
+<span class="a">+&lt;/style&gt;</span>
+<span class="a">+&lt;/head&gt;</span>
+<span class="a">+&lt;body&gt;</span>
+<span class="a">+&lt;div class=&quot;wrap&quot;&gt;</span>
+<span class="a">+  &lt;h1&gt;livecap&lt;span id=&quot;conn&quot;&gt;connecting…&lt;/span&gt;&lt;/h1&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;div class=&quot;card&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Language&lt;/h2&gt;</span>
+<span class="a">+    &lt;div class=&quot;row&quot; id=&quot;langs&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+    &lt;div class=&quot;hint&quot;&gt;Press &lt;code&gt;1&lt;/code&gt;–&lt;code&gt;9&lt;/code&gt; to switch instantly. Takes</span>
+<span class="a">+      effect on the next sentence; no restart, no model reload.&lt;/div&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;div class=&quot;card&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Model&lt;/h2&gt;</span>
+<span class="a">+    &lt;div class=&quot;row&quot;&gt;</span>
+<span class="a">+      &lt;select id=&quot;model&quot;&gt;&lt;/select&gt;</span>
+<span class="a">+      &lt;span id=&quot;loading&quot; class=&quot;empty&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+    &lt;div class=&quot;hint&quot;&gt;Switching reloads the model and pauses captions for a few</span>
+<span class="a">+      seconds. Bigger is more accurate but slower.&lt;/div&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;div class=&quot;card&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Options&lt;/h2&gt;</span>
+<span class="a">+    &lt;div class=&quot;row&quot;&gt;</span>
+<span class="a">+      &lt;button id=&quot;translate&quot;&gt;English translation&lt;/button&gt;</span>
+<span class="a">+      &lt;button id=&quot;partials&quot;&gt;Live partial text&lt;/button&gt;</span>
+<span class="a">+      &lt;button id=&quot;clear&quot;&gt;Clear captions&lt;/button&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;div class=&quot;card&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Live output&lt;/h2&gt;</span>
+<span class="a">+    &lt;div id=&quot;feed&quot;&gt;&lt;div class=&quot;empty&quot;&gt;Waiting for speech…&lt;/div&gt;&lt;/div&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+&lt;/div&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;script&gt;</span>
+<span class="a">+(function () {</span>
+<span class="a">+  const q = new URLSearchParams(location.search);</span>
+<span class="a">+  const WS_PORT = parseInt(q.get(&quot;ws&quot;) || &quot;8765&quot;, 10);</span>
+<span class="a">+</span>
+<span class="a">+  // Whisper has no regional variants: Argentine Spanish is served by &quot;es&quot;.</span>
+<span class="a">+  const NAMES = {</span>
+<span class="a">+    fi: &quot;Finnish&quot;, ru: &quot;Russian&quot;, ja: &quot;Japanese&quot;, es: &quot;Spanish&quot;,</span>
+<span class="a">+    pt: &quot;Portuguese&quot;, en: &quot;English&quot;, sv: &quot;Swedish&quot;, de: &quot;German&quot;,</span>
+<span class="a">+    fr: &quot;French&quot;, it: &quot;Italian&quot;, pl: &quot;Polish&quot;, uk: &quot;Ukrainian&quot;,</span>
+<span class="a">+    et: &quot;Estonian&quot;, no: &quot;Norwegian&quot;, da: &quot;Danish&quot;, nl: &quot;Dutch&quot;,</span>
+<span class="a">+    zh: &quot;Chinese&quot;, ko: &quot;Korean&quot;, auto: &quot;Auto-detect&quot;</span>
+<span class="a">+  };</span>
+<span class="a">+</span>
+<span class="a">+  let ws = null, state = null;</span>
+<span class="a">+  const feed = [];</span>
+<span class="a">+</span>
+<span class="a">+  const el = (id) =&gt; document.getElementById(id);</span>
+<span class="a">+  const send = (cmd, value) =&gt; ws &amp;&amp; ws.readyState === 1 &amp;&amp;</span>
+<span class="a">+        ws.send(JSON.stringify({ cmd: cmd, value: value }));</span>
+<span class="a">+</span>
+<span class="a">+  function renderControls() {</span>
+<span class="a">+    if (!state) return;</span>
+<span class="a">+</span>
+<span class="a">+    const langs = el(&quot;langs&quot;);</span>
+<span class="a">+    langs.innerHTML = &quot;&quot;;</span>
+<span class="a">+    state.langs.forEach((code, i) =&gt; {</span>
+<span class="a">+      const b = document.createElement(&quot;button&quot;);</span>
+<span class="a">+      b.className = code === state.lang ? &quot;on&quot; : &quot;&quot;;</span>
+<span class="a">+      b.innerHTML = &quot;&quot;;</span>
+<span class="a">+      b.appendChild(document.createTextNode(NAMES[code] || code));</span>
+<span class="a">+      if (i &lt; 9) {</span>
+<span class="a">+        const k = document.createElement(&quot;span&quot;);</span>
+<span class="a">+        k.className = &quot;k&quot;;</span>
+<span class="a">+        k.textContent = i + 1;</span>
+<span class="a">+        b.appendChild(k);</span>
+<span class="a">+      }</span>
+<span class="a">+      b.onclick = () =&gt; send(&quot;set_lang&quot;, code);</span>
+<span class="a">+      langs.appendChild(b);</span>
+<span class="a">+    });</span>
+<span class="a">+</span>
+<span class="a">+    const sel = el(&quot;model&quot;);</span>
+<span class="a">+    if (sel.dataset.key !== state.models.join(&quot;,&quot;)) {</span>
+<span class="a">+      sel.dataset.key = state.models.join(&quot;,&quot;);</span>
+<span class="a">+      sel.innerHTML = &quot;&quot;;</span>
+<span class="a">+      state.models.forEach((m) =&gt; {</span>
+<span class="a">+        const o = document.createElement(&quot;option&quot;);</span>
+<span class="a">+        o.value = m; o.textContent = m;</span>
+<span class="a">+        sel.appendChild(o);</span>
+<span class="a">+      });</span>
+<span class="a">+    }</span>
+<span class="a">+    sel.value = state.model;</span>
+<span class="a">+    sel.disabled = state.loading;</span>
+<span class="a">+    el(&quot;loading&quot;).textContent = state.loading ? &quot;loading model…&quot; : &quot;&quot;;</span>
+<span class="a">+</span>
+<span class="a">+    el(&quot;translate&quot;).className = state.translate ? &quot;on&quot; : &quot;&quot;;</span>
+<span class="a">+    el(&quot;partials&quot;).className = state.partials ? &quot;on&quot; : &quot;&quot;;</span>
+<span class="a">+</span>
+<span class="a">+    el(&quot;conn&quot;).innerHTML = &quot;&quot;;</span>
+<span class="a">+    const dot = document.createElement(&quot;span&quot;);</span>
+<span class="a">+    dot.className = &quot;dot &quot; + (state.loading ? &quot;busy&quot; : &quot;up&quot;);</span>
+<span class="a">+    el(&quot;conn&quot;).appendChild(dot);</span>
+<span class="a">+    el(&quot;conn&quot;).appendChild(document.createTextNode(</span>
+<span class="a">+      (NAMES[state.lang] || state.lang) + &quot; · &quot; + state.model));</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function renderFeed() {</span>
+<span class="a">+    const box = el(&quot;feed&quot;);</span>
+<span class="a">+    box.innerHTML = &quot;&quot;;</span>
+<span class="a">+    if (!feed.length) {</span>
+<span class="a">+      box.innerHTML = &#x27;&lt;div class=&quot;empty&quot;&gt;Waiting for speech…&lt;/div&gt;&#x27;;</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+<span class="a">+    feed.slice(-6).forEach((m) =&gt; {</span>
+<span class="a">+      const d = document.createElement(&quot;div&quot;);</span>
+<span class="a">+      d.className = &quot;cap&quot; + (m.type === &quot;partial&quot; ? &quot; partial&quot; : &quot;&quot;);</span>
+<span class="a">+      d.textContent = m.text;</span>
+<span class="a">+      if (m.tr) {</span>
+<span class="a">+        const s = document.createElement(&quot;span&quot;);</span>
+<span class="a">+        s.className = &quot;tr&quot;;</span>
+<span class="a">+        s.textContent = m.tr;</span>
+<span class="a">+        d.appendChild(s);</span>
+<span class="a">+      }</span>
+<span class="a">+      box.appendChild(d);</span>
+<span class="a">+    });</span>
+<span class="a">+    box.scrollTop = box.scrollHeight;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function connect() {</span>
+<span class="a">+    ws = new WebSocket(&quot;ws://127.0.0.1:&quot; + WS_PORT);</span>
+<span class="a">+</span>
+<span class="a">+    ws.onopen = () =&gt; send(&quot;status&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    ws.onclose = () =&gt; {</span>
+<span class="a">+      el(&quot;conn&quot;).innerHTML = &#x27;&lt;span class=&quot;dot down&quot;&gt;&lt;/span&gt;disconnected — is run.ps1 still going?&#x27;;</span>
+<span class="a">+      setTimeout(connect, 1500);</span>
+<span class="a">+    };</span>
+<span class="a">+    ws.onerror = () =&gt; ws.close();</span>
+<span class="a">+</span>
+<span class="a">+    ws.onmessage = (ev) =&gt; {</span>
+<span class="a">+      let m;</span>
+<span class="a">+      try { m = JSON.parse(ev.data); } catch (e) { return; }</span>
+<span class="a">+</span>
+<span class="a">+      if (m.type === &quot;status&quot;) {</span>
+<span class="a">+        state = m;</span>
+<span class="a">+        renderControls();</span>
+<span class="a">+      } else if (m.type === &quot;clear&quot;) {</span>
+<span class="a">+        feed.length = 0;</span>
+<span class="a">+        renderFeed();</span>
+<span class="a">+      } else if (m.type === &quot;partial&quot;) {</span>
+<span class="a">+        if (feed.length &amp;&amp; feed[feed.length - 1].type === &quot;partial&quot;) feed.pop();</span>
+<span class="a">+        feed.push(m);</span>
+<span class="a">+        renderFeed();</span>
+<span class="a">+      } else if (m.type === &quot;final&quot;) {</span>
+<span class="a">+        if (feed.length &amp;&amp; feed[feed.length - 1].type === &quot;partial&quot;) feed.pop();</span>
+<span class="a">+        feed.push(m);</span>
+<span class="a">+        if (feed.length &gt; 40) feed.shift();</span>
+<span class="a">+        renderFeed();</span>
+<span class="a">+      }</span>
+<span class="a">+    };</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  el(&quot;model&quot;).onchange = (e) =&gt; send(&quot;set_model&quot;, e.target.value);</span>
+<span class="a">+  el(&quot;translate&quot;).onclick = () =&gt; state &amp;&amp; send(&quot;set_translate&quot;, !state.translate);</span>
+<span class="a">+  el(&quot;partials&quot;).onclick = () =&gt; state &amp;&amp; send(&quot;set_partials&quot;, !state.partials);</span>
+<span class="a">+  el(&quot;clear&quot;).onclick = () =&gt; send(&quot;clear&quot;);</span>
+<span class="a">+</span>
+<span class="a">+  document.addEventListener(&quot;keydown&quot;, (e) =&gt; {</span>
+<span class="a">+    if (e.target.tagName === &quot;SELECT&quot;) return;</span>
+<span class="a">+    const n = parseInt(e.key, 10);</span>
+<span class="a">+    if (state &amp;&amp; n &gt;= 1 &amp;&amp; n &lt;= 9 &amp;&amp; state.langs[n - 1]) {</span>
+<span class="a">+      send(&quot;set_lang&quot;, state.langs[n - 1]);</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  connect();</span>
+<span class="a">+})();</span>
+<span class="a">+&lt;/script&gt;</span>
+<span class="a">+&lt;/body&gt;</span>
+<span class="a">+&lt;/html&gt;</span>
+diff --git a/livecap.py b/livecap.py
+index 930bb9f..0693dce 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -26,10 +26,19 @@ from functools import partial</span>
+ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+ from pathlib import Path
+ 
+<span class="a">+import warnings</span>
+<span class="a">+</span>
+ import numpy as np
+ import soundcard as sc
+ from scipy.signal import resample_poly
+ 
+<span class="a">+# Loopback capture reports gaps whenever the device goes idle. Harmless for</span>
+<span class="a">+# speech recognition, but it otherwise floods the console during quiet moments.</span>
+<span class="a">+try:</span>
+<span class="a">+    warnings.filterwarnings(&quot;ignore&quot;, category=sc.SoundcardRuntimeWarning)</span>
+<span class="a">+except AttributeError:</span>
+<span class="a">+    warnings.filterwarnings(&quot;ignore&quot;, message=&quot;data discontinuity in recording&quot;)</span>
+<span class="a">+</span>
+ HERE = Path(__file__).resolve().parent
+ TARGET_SR = 16000
+ CAPTURE_SR = 48000     # WASAPI shared-mode mix rate on virtually every Windows box
+<span class="h">@@ -50,6 +59,15 @@ HALLUCINATIONS = [</span>
+ HALLUCINATION_RE = [re.compile(p, re.I) for p in HALLUCINATIONS]
+ 
+ 
+<span class="a">+# Captions are frequently non-Latin (ru, ja, ...). Windows otherwise encodes</span>
+<span class="a">+# stdout with the console codepage, which mangles them once output is redirected.</span>
+<span class="a">+for _s in (sys.stdout, sys.stderr):</span>
+<span class="a">+    try:</span>
+<span class="a">+        _s.reconfigure(encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;)</span>
+<span class="a">+    except (AttributeError, ValueError):</span>
+<span class="a">+        pass</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def log(*a):
+     print(&quot;[&quot; + time.strftime(&quot;%H:%M:%S&quot;) + &quot;]&quot;, *a, flush=True)
+ 
+<span class="h">@@ -225,19 +243,23 @@ class Bus:</span>
+             log(&quot;file write failed:&quot;, e)
+ 
+ 
+<span class="d">-async def ws_server(bus, args, stop):</span>
+<span class="a">+async def ws_server(bus, args, ctl, stop):</span>
+     import websockets
+ 
+     async def handler(ws):
+         bus.clients.add(ws)
+<span class="d">-        log(&quot;overlay connected (%d client(s))&quot; % len(bus.clients))</span>
+<span class="a">+        log(&quot;client connected (%d total)&quot; % len(bus.clients))</span>
+         try:
+<span class="a">+            await ws.send(json.dumps(ctl.status(), ensure_ascii=False))</span>
+             for m in list(bus.history)[-4:]:
+                 await ws.send(json.dumps(m, ensure_ascii=False))
+<span class="d">-            await ws.wait_closed()</span>
+<span class="a">+            async for raw in ws:</span>
+<span class="a">+                ctl.handle(raw)</span>
+<span class="a">+        except Exception:</span>
+<span class="a">+            pass</span>
+         finally:
+             bus.clients.discard(ws)
+<span class="d">-            log(&quot;overlay disconnected (%d client(s))&quot; % len(bus.clients))</span>
+<span class="a">+            log(&quot;client disconnected (%d total)&quot; % len(bus.clients))</span>
+ 
+     async with websockets.serve(handler, &quot;127.0.0.1&quot;, args.ws_port, ping_interval=20):
+         log(&quot;websocket  ws://127.0.0.1:%d&quot; % args.ws_port)
+<span class="h">@@ -259,11 +281,92 @@ def http_server(args):</span>
+         url += &quot;&amp;tr=1&quot;
+     log(&quot;OBS Browser Source URL (copy this):&quot;)
+     log(&quot;  &quot; + url)
+<span class="a">+    log(&quot;Control panel (open in any browser):&quot;)</span>
+<span class="a">+    log(&quot;  http://127.0.0.1:%d/control.html?ws=%d&quot; % (args.http_port, args.ws_port))</span>
+     return srv
+ 
+ 
+ # ----------------------------------------------------------- transcription --
+ 
+<span class="a">+class Controller:</span>
+<span class="a">+    &quot;&quot;&quot;Applies live language/model changes coming from the control panel.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, args, bus):</span>
+<span class="a">+        self.args = args</span>
+<span class="a">+        self.bus = bus</span>
+<span class="a">+        self.tr = None                      # set once the Transcriber exists</span>
+<span class="a">+        self.cmds = queue.Queue()           # model swaps run on the worker thread</span>
+<span class="a">+        self.loading = False</span>
+<span class="a">+</span>
+<span class="a">+    def status(self):</span>
+<span class="a">+        return {</span>
+<span class="a">+            &quot;type&quot;: &quot;status&quot;,</span>
+<span class="a">+            &quot;lang&quot;: self.args.lang,</span>
+<span class="a">+            &quot;model&quot;: self.args.model,</span>
+<span class="a">+            &quot;loading&quot;: self.loading,</span>
+<span class="a">+            &quot;translate&quot;: bool(self.args.translate),</span>
+<span class="a">+            &quot;partials&quot;: bool(self.args.partials),</span>
+<span class="a">+            &quot;langs&quot;: self.args.langs,</span>
+<span class="a">+            &quot;models&quot;: self.args.model_choices,</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+    def push_status(self):</span>
+<span class="a">+        self.bus.publish(self.status())</span>
+<span class="a">+</span>
+<span class="a">+    def handle(self, raw):</span>
+<span class="a">+        try:</span>
+<span class="a">+            m = json.loads(raw)</span>
+<span class="a">+        except (ValueError, TypeError):</span>
+<span class="a">+            return</span>
+<span class="a">+        cmd, val = m.get(&quot;cmd&quot;), m.get(&quot;value&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        if cmd == &quot;set_lang&quot;:</span>
+<span class="a">+            if not valid_language(val):</span>
+<span class="a">+                log(&quot;ignoring unknown language %r&quot; % (val,))</span>
+<span class="a">+                return</span>
+<span class="a">+            if val != self.args.lang:</span>
+<span class="a">+                self.args.lang = val</span>
+<span class="a">+                if self.tr is not None:</span>
+<span class="a">+                    self.tr.context = &quot;&quot;        # old-language prompt would poison it</span>
+<span class="a">+                log(&quot;language -&gt; %s&quot; % val)</span>
+<span class="a">+                self.bus.publish({&quot;type&quot;: &quot;clear&quot;})</span>
+<span class="a">+            self.push_status()</span>
+<span class="a">+</span>
+<span class="a">+        elif cmd == &quot;set_model&quot;:</span>
+<span class="a">+            if val and val != self.args.model:</span>
+<span class="a">+                self.cmds.put((&quot;model&quot;, val))</span>
+<span class="a">+            else:</span>
+<span class="a">+                self.push_status()</span>
+<span class="a">+</span>
+<span class="a">+        elif cmd == &quot;set_translate&quot;:</span>
+<span class="a">+            self.args.translate = bool(val)</span>
+<span class="a">+            log(&quot;translate -&gt; %s&quot; % self.args.translate)</span>
+<span class="a">+            self.push_status()</span>
+<span class="a">+</span>
+<span class="a">+        elif cmd == &quot;set_partials&quot;:</span>
+<span class="a">+            self.args.partials = bool(val)</span>
+<span class="a">+            log(&quot;partials -&gt; %s&quot; % self.args.partials)</span>
+<span class="a">+            self.push_status()</span>
+<span class="a">+</span>
+<span class="a">+        elif cmd == &quot;clear&quot;:</span>
+<span class="a">+            self.bus.publish({&quot;type&quot;: &quot;clear&quot;})</span>
+<span class="a">+</span>
+<span class="a">+        elif cmd == &quot;status&quot;:</span>
+<span class="a">+            self.push_status()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def valid_language(code):</span>
+<span class="a">+    if code == &quot;auto&quot;:</span>
+<span class="a">+        return True</span>
+<span class="a">+    if not isinstance(code, str) or not code:</span>
+<span class="a">+        return False</span>
+<span class="a">+    try:</span>
+<span class="a">+        from faster_whisper.tokenizer import _LANGUAGE_CODES</span>
+<span class="a">+        return code in _LANGUAGE_CODES</span>
+<span class="a">+    except Exception:</span>
+<span class="a">+        return bool(re.fullmatch(r&quot;[a-z]{2,3}&quot;, code))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def looks_hallucinated(text):
+     t = text.strip().lower()
+     if len(t) &gt; 40:
+<span class="h">@@ -287,6 +390,31 @@ class Transcriber:</span>
+         self.context = &quot;&quot;
+         self.busy = threading.Event()
+ 
+<span class="a">+    def reload(self, name, ctl):</span>
+<span class="a">+        &quot;&quot;&quot;Swap the model in place. Runs on the worker thread.&quot;&quot;&quot;</span>
+<span class="a">+        from faster_whisper import WhisperModel</span>
+<span class="a">+</span>
+<span class="a">+        a = self.args</span>
+<span class="a">+        ctl.loading = True</span>
+<span class="a">+        ctl.push_status()</span>
+<span class="a">+        log(&quot;loading model %r ...&quot; % name)</span>
+<span class="a">+        t0 = time.time()</span>
+<span class="a">+        try:</span>
+<span class="a">+            new = WhisperModel(name, device=a.compute_device, compute_type=a.compute,</span>
+<span class="a">+                               cpu_threads=a.threads, num_workers=1)</span>
+<span class="a">+        except Exception as e:</span>
+<span class="a">+            log(&quot;model %r failed to load (%s); staying on %r&quot; % (name, e, a.model))</span>
+<span class="a">+            ctl.loading = False</span>
+<span class="a">+            ctl.push_status()</span>
+<span class="a">+            return</span>
+<span class="a">+        old, self.model = self.model, new</span>
+<span class="a">+        del old</span>
+<span class="a">+        a.model = name</span>
+<span class="a">+        self.context = &quot;&quot;</span>
+<span class="a">+        ctl.loading = False</span>
+<span class="a">+        ctl.push_status()</span>
+<span class="a">+        log(&quot;model -&gt; %s (%.1fs)&quot; % (name, time.time() - t0))</span>
+<span class="a">+</span>
+     def run(self, audio, final):
+         a = self.args
+         segs, info = self.model.transcribe(
+<span class="h">@@ -316,8 +444,28 @@ class Transcriber:</span>
+             condition_on_previous_text=False, vad_filter=True, without_timestamps=True)
+         return re.sub(r&quot;\s+&quot;, &quot; &quot;, &quot; &quot;.join(s.text.strip() for s in segs)).strip()
+ 
+<span class="d">-    def worker(self, jobs, stop):</span>
+<span class="a">+    def worker(self, jobs, stop, ctl):</span>
+         while not stop.is_set():
+<span class="a">+            # Model swaps take priority and must happen on this thread.</span>
+<span class="a">+            try:</span>
+<span class="a">+                what, value = ctl.cmds.get_nowait()</span>
+<span class="a">+            except queue.Empty:</span>
+<span class="a">+                pass</span>
+<span class="a">+            else:</span>
+<span class="a">+                if what == &quot;model&quot;:</span>
+<span class="a">+                    self.busy.set()</span>
+<span class="a">+                    try:</span>
+<span class="a">+                        while True:                 # drop audio queued for the old model</span>
+<span class="a">+                            jobs.get_nowait()</span>
+<span class="a">+                            jobs.task_done()</span>
+<span class="a">+                    except queue.Empty:</span>
+<span class="a">+                        pass</span>
+<span class="a">+                    try:</span>
+<span class="a">+                        self.reload(value, ctl)</span>
+<span class="a">+                    finally:</span>
+<span class="a">+                        self.busy.clear()</span>
+<span class="a">+                continue</span>
+<span class="a">+</span>
+             try:
+                 kind, audio, sr = jobs.get(timeout=0.25)
+             except queue.Empty:
+<span class="h">@@ -490,7 +638,12 @@ def build_parser():</span>
+     g = p.add_argument_group(&quot;model&quot;)
+     g.add_argument(&quot;--model&quot;, default=&quot;small&quot;,
+                    help=&quot;tiny|base|small|medium|large-v3|large-v3-turbo, or a local CT2 dir&quot;)
+<span class="d">-    g.add_argument(&quot;--lang&quot;, default=&quot;fi&quot;, help=&quot;fi, en, sv, ... or &#x27;auto&#x27;&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--lang&quot;, default=&quot;fi&quot;, help=&quot;fi, ru, ja, es, pt, ... or &#x27;auto&#x27;&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--langs&quot;, default=&quot;fi,ru,ja,es,pt,en,auto&quot;,</span>
+<span class="a">+                   help=&quot;languages offered as one-click buttons in the control panel&quot;)</span>
+<span class="a">+    g.add_argument(&quot;--model-choices&quot;, dest=&quot;model_choices&quot;,</span>
+<span class="a">+                   default=&quot;tiny,base,small,medium&quot;,</span>
+<span class="a">+                   help=&quot;models offered in the control panel dropdown&quot;)</span>
+     g.add_argument(&quot;--compute-device&quot;, default=&quot;cpu&quot;, choices=[&quot;cpu&quot;, &quot;cuda&quot;])
+     g.add_argument(&quot;--compute&quot;, default=&quot;int8&quot;, help=&quot;int8|int8_float32|float32|float16&quot;)
+     g.add_argument(&quot;--threads&quot;, type=int, default=max(2, (os.cpu_count() or 8) - 2))
+<span class="h">@@ -527,6 +680,12 @@ def build_parser():</span>
+ 
+ def main():
+     args = build_parser().parse_args()
+<span class="a">+    args.langs = [s.strip() for s in args.langs.split(&quot;,&quot;) if s.strip()]</span>
+<span class="a">+    args.model_choices = [s.strip() for s in args.model_choices.split(&quot;,&quot;) if s.strip()]</span>
+<span class="a">+    if args.model not in args.model_choices:</span>
+<span class="a">+        args.model_choices.insert(0, args.model)</span>
+<span class="a">+    if args.lang not in args.langs:</span>
+<span class="a">+        args.langs.insert(0, args.lang)</span>
+ 
+     if args.list_devices:
+         list_devices()
+<span class="h">@@ -538,7 +697,9 @@ def main():</span>
+     stop_ev = threading.Event()
+     jobs = queue.Queue(maxsize=3)
+ 
+<span class="a">+    ctl = Controller(args, bus)</span>
+     tr = Transcriber(args, bus)
+<span class="a">+    ctl.tr = tr</span>
+     dev = resolve_device(args.audio_device, args.loopback)
+ 
+     srv = http_server(args)
+<span class="h">@@ -548,10 +709,10 @@ def main():</span>
+ 
+     def run_loop():
+         asyncio.set_event_loop(loop)
+<span class="d">-        loop.run_until_complete(ws_server(bus, args, ws_stop))</span>
+<span class="a">+        loop.run_until_complete(ws_server(bus, args, ctl, ws_stop))</span>
+ 
+     threading.Thread(target=run_loop, daemon=True).start()
+<span class="d">-    threading.Thread(target=tr.worker, args=(jobs, stop_ev), daemon=True).start()</span>
+<span class="a">+    threading.Thread(target=tr.worker, args=(jobs, stop_ev, ctl), daemon=True).start()</span>
+ 
+     try:
+         with Capture(dev, args.loopback) as cap:
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index e09f76a..d7ed8fe 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+<span class="h">@@ -76,6 +76,71 @@ def test_captions_file_keeps_last_n_lines(tmp_path=None):</span>
+             os.chdir(cwd)
+ 
+ 
+<span class="a">+def _controller():</span>
+<span class="a">+    import argparse</span>
+<span class="a">+</span>
+<span class="a">+    args = argparse.Namespace(</span>
+<span class="a">+        lang=&quot;fi&quot;, model=&quot;small&quot;, translate=False, partials=True,</span>
+<span class="a">+        langs=[&quot;fi&quot;, &quot;ru&quot;, &quot;ja&quot;, &quot;es&quot;, &quot;pt&quot;, &quot;auto&quot;],</span>
+<span class="a">+        model_choices=[&quot;tiny&quot;, &quot;base&quot;, &quot;small&quot;],</span>
+<span class="a">+        txt=&quot;captions.txt&quot;, txt_lines=2)</span>
+<span class="a">+    bus = livecap.Bus(args)</span>
+<span class="a">+    bus.publish = lambda msg: bus.history.append(msg)   # no websocket in tests</span>
+<span class="a">+    return livecap.Controller(args, bus), args</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_language_codes_validated():</span>
+<span class="a">+    for good in (&quot;fi&quot;, &quot;ru&quot;, &quot;ja&quot;, &quot;es&quot;, &quot;pt&quot;, &quot;en&quot;, &quot;auto&quot;):</span>
+<span class="a">+        assert livecap.valid_language(good), good</span>
+<span class="a">+    for bad in (&quot;klingon&quot;, &quot;&quot;, None, &quot;e&quot;, 42):</span>
+<span class="a">+        assert not livecap.valid_language(bad), bad</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_controller_switches_language():</span>
+<span class="a">+    ctl, args = _controller()</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_lang&quot;,&quot;value&quot;:&quot;ja&quot;}&#x27;)</span>
+<span class="a">+    assert args.lang == &quot;ja&quot;</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_lang&quot;,&quot;value&quot;:&quot;ru&quot;}&#x27;)</span>
+<span class="a">+    assert args.lang == &quot;ru&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_controller_rejects_bad_language_and_bad_json():</span>
+<span class="a">+    ctl, args = _controller()</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_lang&quot;,&quot;value&quot;:&quot;klingon&quot;}&#x27;)</span>
+<span class="a">+    assert args.lang == &quot;fi&quot;</span>
+<span class="a">+    ctl.handle(&quot;not json at all&quot;)</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;nonsense&quot;}&#x27;)</span>
+<span class="a">+    assert args.lang == &quot;fi&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_model_change_is_queued_for_the_worker_thread():</span>
+<span class="a">+    &quot;&quot;&quot;Model loading must not happen on the websocket thread.&quot;&quot;&quot;</span>
+<span class="a">+    ctl, args = _controller()</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_model&quot;,&quot;value&quot;:&quot;base&quot;}&#x27;)</span>
+<span class="a">+    assert ctl.cmds.get_nowait() == (&quot;model&quot;, &quot;base&quot;)</span>
+<span class="a">+    assert args.model == &quot;small&quot;, &quot;model must not change until the worker reloads it&quot;</span>
+<span class="a">+</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_model&quot;,&quot;value&quot;:&quot;small&quot;}&#x27;)   # already current</span>
+<span class="a">+    assert ctl.cmds.empty()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_toggles():</span>
+<span class="a">+    ctl, args = _controller()</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_translate&quot;,&quot;value&quot;:true}&#x27;)</span>
+<span class="a">+    assert args.translate is True</span>
+<span class="a">+    ctl.handle(&#x27;{&quot;cmd&quot;:&quot;set_partials&quot;,&quot;value&quot;:false}&#x27;)</span>
+<span class="a">+    assert args.partials is False</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_status_payload_is_complete():</span>
+<span class="a">+    ctl, _ = _controller()</span>
+<span class="a">+    s = ctl.status()</span>
+<span class="a">+    for key in (&quot;type&quot;, &quot;lang&quot;, &quot;model&quot;, &quot;loading&quot;, &quot;translate&quot;,</span>
+<span class="a">+                &quot;partials&quot;, &quot;langs&quot;, &quot;models&quot;):</span>
+<span class="a">+        assert key in s, key</span>
+<span class="a">+    assert s[&quot;type&quot;] == &quot;status&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def main():
+     tests = [v for k, v in sorted(globals().items()) if k.startswith(&quot;test_&quot;)]
+     failed = 0</pre>
+</div></body></html>

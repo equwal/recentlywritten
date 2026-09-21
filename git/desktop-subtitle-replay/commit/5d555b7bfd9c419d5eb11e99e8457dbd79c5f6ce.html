@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay 5d555b7b - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 5d555b7bfd9c419d5eb11e99e8457dbd79c5f6ce
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 17:26:15 -0700
+
+Handle Japanese and Russian properly
+
+Japanese subtitle lines never wrapped. wrap() splits on spaces and Japanese
+has none, so every cue came out as one long line that ran off the screen.
+Added character-level breaking with basic kinsoku shori: closing punctuation,
+small kana and the long-vowel mark cannot begin a line, opening brackets
+cannot end one, and breaks land after 。or 、 where possible.
+
+Whisper&#x27;s silence hallucinations are language-specific, and the stock filter
+only knew Finnish and English ones. Japanese fills silence with
+&quot;ご視聴ありがとうございました&quot; and &quot;チャンネル登録お願いします&quot; constantly;
+Russian with &quot;Субтитры сделал ...&quot; and &quot;Спасибо за просмотр&quot;. Added both,
+plus filler-only utterances. Verified the filter still passes real sentences
+in all three languages.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> livecap.py             | 16 ++++++++++++++++
+ subtitle.py            | 41 ++++++++++++++++++++++++++++++++++++++++-
+ tests/test_subtitle.py | 31 +++++++++++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/livecap.py b/livecap.py
+index 8106225..3e59794 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -46,14 +46,30 @@ BLOCK_MS = 32</span>
+ 
+ # Whisper invents these when fed silence or noise. Only applied to short results.
+ HALLUCINATIONS = [
+<span class="a">+    # Finnish</span>
+     r&quot;^tekstitys&quot;,
+     r&quot;^tekstityksen tuotti&quot;,
+     r&quot;^k[aa]a?nn[oo]s&quot;,
+     r&quot;^kiitos( kun katsoit| paljon| katsomisesta)?[.!]?$&quot;,
+     r&quot;^suomennos&quot;,
+<span class="a">+    # Japanese - Whisper emits these constantly over silence</span>
+<span class="a">+    r&quot;ご(視聴|清聴)(いただき)?ありがとうございま&quot;,</span>
+<span class="a">+    r&quot;チャンネル登録&quot;,</span>
+<span class="a">+    r&quot;^字幕&quot;,</span>
+<span class="a">+    r&quot;^おわり[。]?$&quot;,</span>
+<span class="a">+    r&quot;^(お|ご)?しまい[。]?$&quot;,</span>
+<span class="a">+    r&quot;^ありがとうございま(した|す)[。]?$&quot;,</span>
+<span class="a">+    r&quot;^(えー|あー|ん|う)+[ー。]?$&quot;,</span>
+<span class="a">+    # Russian</span>
+<span class="a">+    r&quot;^субтитры&quot;,</span>
+<span class="a">+    r&quot;^спасибо за просмотр&quot;,</span>
+<span class="a">+    r&quot;^продолжение следует&quot;,</span>
+<span class="a">+    r&quot;^редактор субтитров&quot;,</span>
+<span class="a">+    # English / generic</span>
+     r&quot;^subtitles? by&quot;,
+     r&quot;^amara\.org&quot;,
+     r&quot;^thanks? for watching&quot;,
+<span class="a">+    r&quot;^please subscribe&quot;,</span>
+     r&quot;^\W*$&quot;,
+ ]
+ HALLUCINATION_RE = [re.compile(p, re.I) for p in HALLUCINATIONS]
+diff --git a/subtitle.py b/subtitle.py
+index 298f614..7a062fd 100644
+--- a/subtitle.py
++++ b/subtitle.py
+<span class="h">@@ -51,6 +51,42 @@ def ts(seconds, sep=&quot;,&quot;):</span>
+     return &quot;%02d:%02d:%02d%s%03d&quot; % (h, m, s, sep, ms)
+ 
+ 
+<span class="a">+# Characters that may not begin a line (kinsoku shori). Closing punctuation,</span>
+<span class="a">+# small kana and the long-vowel mark all cling to what precedes them.</span>
+<span class="a">+NO_LINE_START = &quot;、。！？…」』）】〉》・ゃゅょっぁぃぅぇぉーヵヶャュョッァィゥェォ,.!?:;&quot;</span>
+<span class="a">+NO_LINE_END = &quot;「『（【〈《&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def looks_cjk(text):</span>
+<span class="a">+    return any(&quot;぀&quot; &lt;= c &lt;= &quot;ヿ&quot; or &quot;一&quot; &lt;= c &lt;= &quot;鿿&quot;</span>
+<span class="a">+               or &quot;＀&quot; &lt;= c &lt;= &quot;￯&quot; for c in text)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def wrap_cjk(text, width):</span>
+<span class="a">+    &quot;&quot;&quot;Break Japanese/Chinese text, which has no spaces to split on.&quot;&quot;&quot;</span>
+<span class="a">+    if len(text) &lt;= width:</span>
+<span class="a">+        return text</span>
+<span class="a">+    mid = len(text) / 2</span>
+<span class="a">+    best = None</span>
+<span class="a">+    for i in range(1, len(text)):</span>
+<span class="a">+        if text[i] in NO_LINE_START or text[i - 1] in NO_LINE_END:</span>
+<span class="a">+            continue</span>
+<span class="a">+        if max(i, len(text) - i) &gt; width:</span>
+<span class="a">+            continue</span>
+<span class="a">+        score = abs(i - mid)</span>
+<span class="a">+        # Prefer breaking straight after sentence punctuation.</span>
+<span class="a">+        if text[i - 1] in &quot;、。！？&quot;:</span>
+<span class="a">+            score -= width / 2</span>
+<span class="a">+        if best is None or score &lt; best[0]:</span>
+<span class="a">+            best = (score, i)</span>
+<span class="a">+    if best is None:</span>
+<span class="a">+        i = max(1, min(len(text) - 1, int(mid)))</span>
+<span class="a">+        while i &lt; len(text) - 1 and text[i] in NO_LINE_START:</span>
+<span class="a">+            i += 1</span>
+<span class="a">+        return text[:i] + &quot;\n&quot; + text[i:]</span>
+<span class="a">+    return text[:best[1]] + &quot;\n&quot; + text[best[1]:]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def wrap(text, width):
+     &quot;&quot;&quot;Split into at most two balanced lines, the way subtitles are normally set.&quot;&quot;&quot;
+     text = &quot; &quot;.join(text.split())
+<span class="h">@@ -58,7 +94,10 @@ def wrap(text, width):</span>
+         return text
+     words = text.split()
+     if len(words) &lt; 2:
+<span class="d">-        return text</span>
+<span class="a">+        return wrap_cjk(text, width) if looks_cjk(text) else text</span>
+<span class="a">+    if looks_cjk(text) and len(words) &lt; len(text) / 8:</span>
+<span class="a">+        # Mostly CJK with a stray space or two: character breaking reads better.</span>
+<span class="a">+        return wrap_cjk(text, width)</span>
+ 
+     fits, over = None, None
+     for i in range(1, len(words)):
+diff --git a/tests/test_subtitle.py b/tests/test_subtitle.py
+index 65f23f4..b13d3ab 100644
+--- a/tests/test_subtitle.py
++++ b/tests/test_subtitle.py
+<span class="h">@@ -61,6 +61,37 @@ def test_wrap_single_word_cannot_split():</span>
+     assert &quot;\n&quot; not in subtitle.wrap(&quot;Rindfleischetikettierungsgesetz&quot;, 5)
+ 
+ 
+<span class="a">+def test_wrap_japanese_has_no_spaces_to_split_on():</span>
+<span class="a">+    text = &quot;今日はとてもいい天気ですね。散歩に行きましょうか。&quot;</span>
+<span class="a">+    out = subtitle.wrap(text, 16)</span>
+<span class="a">+    lines = out.split(&quot;\n&quot;)</span>
+<span class="a">+    assert len(lines) == 2, out</span>
+<span class="a">+    assert max(len(x) for x in lines) &lt;= 16, out</span>
+<span class="a">+    assert &quot;&quot;.join(lines) == text</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_wrap_japanese_prefers_breaking_after_punctuation():</span>
+<span class="a">+    text = &quot;今日はいい天気。散歩に行こう。&quot;</span>
+<span class="a">+    out = subtitle.wrap(text, 10)</span>
+<span class="a">+    assert out.split(&quot;\n&quot;)[0].endswith(&quot;。&quot;), out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_wrap_japanese_never_starts_a_line_with_closing_marks():</span>
+<span class="a">+    for text in [&quot;これはテストです、そしてこれも試験です。&quot;,</span>
+<span class="a">+                 &quot;彼は「そうだね」と言ったのでした。&quot;,</span>
+<span class="a">+                 &quot;ちょっとまってっていったよね。&quot;]:</span>
+<span class="a">+        out = subtitle.wrap(text, 10)</span>
+<span class="a">+        for line in out.split(&quot;\n&quot;)[1:]:</span>
+<span class="a">+            assert line[0] not in subtitle.NO_LINE_START, (text, out)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_looks_cjk():</span>
+<span class="a">+    assert subtitle.looks_cjk(&quot;今日は&quot;)</span>
+<span class="a">+    assert subtitle.looks_cjk(&quot;テスト&quot;)</span>
+<span class="a">+    assert not subtitle.looks_cjk(&quot;Kyllä se tästä&quot;)</span>
+<span class="a">+    assert not subtitle.looks_cjk(&quot;Привет&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def test_sentences_split_on_terminators():
+     ws = words(&quot;Yksi kaksi.&quot;) + words(&quot;Kolme nelja.&quot;, t0=2.0)
+     groups = subtitle.group_sentences(ws, max_dur=6.0, max_gap=0.8)</pre>
+</div></body></html>

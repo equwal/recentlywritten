@@ -1,0 +1,2659 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm 65906dd8 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm</h1><span class="desc">dmenu bookmarks. Instantly fuzzy search thousands of bookmarks and plumb them</span><p class="url">git clone https://github.com/equwal/sbm</p><p><a href="../../sbm/index.html">Log</a> | <a href="../../sbm/files.html">Files</a> | <a href="../../sbm/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 65906dd853842c8b739b45c0f54f3f07783a4f95
+map588 &lt;map588@pitt.edu&gt;
+2026-09-20 23:25:44 -0400
+
+Split bm into small POSIX tools; browse, preview, web search
+
+bm keeps the bookmark file and the menu: open, copy, add, edit, delete,
+list, merge. The rest are filters over bookmark lines, installed à la
+carte (TOOLS in config.mk):
+
+  bm-import bookmarks.html | bm --merge     was --import
+  bm --list | bm-check -                    was --check
+  bm-html &gt; bookmarks.html                  new: a searchable web page
+  bm-migrate                                was --migrate; never
+                                            overwrites an earlier .bak
+  bm-title, bm-commit                       used by bm when installed
+
+Plain &quot;bm&quot; browses. dmenu cannot bind keys or preview, so a second menu
+shows the chosen bookmark in full and asks what to do; fzf gets a live
+preview. Text that is no bookmark is opened as an address or searched on
+the web, with engine keywords from an engines file.
+
+POSIX sh and POSIX utilities only: noclobber for mktemp, a FIFO of
+tokens for xargs -P, dd for head -c, awk srand() for date +%s.
+make check: shellcheck -s sh and 159 scripted tests.
+
+</pre><pre> Makefile      |  17 +-
+ README        | 204 +++++++++++------
+ TODO          |  16 +-
+ bm            | 700 ++++++++++++++++++++++++----------------------------------
+ bm-check      |  70 ++++++
+ bm-commit     |  36 +++
+ bm-html       | 105 +++++++++
+ bm-import     | 109 +++++++++
+ bm-migrate    | 120 ++++++++++
+ bm-title      |  33 +++
+ config.mk     |  11 +-
+ engines       |   5 +
+ test/fakefzf  |  27 ++-
+ test/fakemenu |   2 +
+ test/run.sh   | 461 +++++++++++++++++++++++++++++++-------
+ 15 files changed, 1327 insertions(+), 589 deletions(-)
+</pre><pre>diff --git a/Makefile b/Makefile
+index bb5bfff..42449fb 100644
+--- a/Makefile
++++ b/Makefile
+<span class="h">@@ -1,11 +1,14 @@</span>
+ include config.mk
+ 
+<span class="a">+SCRIPTS = bm bm-migrate bm-import bm-check bm-html bm-title bm-commit</span>
+<span class="a">+TESTS = test/run.sh test/fakemenu test/fakefzf</span>
+<span class="a">+</span>
+ all:
+ 	@echo Nothing to build: use make install, make uninstall, make check, or make dist.
+ 
+ check:
+ 	@if command -v shellcheck &gt;/dev/null 2&gt;&amp;1; then \
+<span class="d">-		shellcheck -s sh bm test/run.sh test/fakemenu test/fakefzf; \</span>
+<span class="a">+		shellcheck -s sh ${SCRIPTS} ${TESTS}; \</span>
+ 	else \
+ 		echo shellcheck not found: skipping lint; \
+ 	fi
+<span class="h">@@ -14,20 +17,22 @@ check:</span>
+ dist:
+ 	@echo creating dist tarball
+ 	@mkdir -p sbm-${VERSION}-temp
+<span class="d">-	@cp -R Makefile config.mk README TODO bm usertags test sbm-${VERSION}-temp</span>
+<span class="a">+	@cp -R Makefile config.mk README TODO ${SCRIPTS} usertags engines test sbm-${VERSION}-temp</span>
+ 	@mv sbm-${VERSION}-temp sbm-${VERSION}
+ 	@tar -cf sbm-${VERSION}.tar sbm-${VERSION}
+ 	@gzip sbm-${VERSION}.tar
+ 	@rm -rf sbm-${VERSION}
+ 
+ install:
+<span class="d">-	@echo installing scripts to ${DESTDIR}${PREFIX}/bin</span>
+<span class="a">+	@echo installing ${TOOLS} to ${DESTDIR}${PREFIX}/bin</span>
+ 	@mkdir -p ${DESTDIR}${PREFIX}/bin
+<span class="d">-	@cp bm ${DESTDIR}${PREFIX}/bin</span>
+<span class="d">-	@chmod 755 ${DESTDIR}${PREFIX}/bin/bm</span>
+<span class="a">+	@for tool in ${TOOLS}; do \</span>
+<span class="a">+		cp $$tool ${DESTDIR}${PREFIX}/bin/ &amp;&amp; \</span>
+<span class="a">+		chmod 755 ${DESTDIR}${PREFIX}/bin/$$tool || exit 1; \</span>
+<span class="a">+	done</span>
+ 
+ uninstall:
+ 	@echo removing scripts
+<span class="d">-	rm -f ${DESTDIR}${PREFIX}/bin/bm</span>
+<span class="a">+	@for tool in ${SCRIPTS}; do rm -f ${DESTDIR}${PREFIX}/bin/$$tool; done</span>
+ 
+ .PHONY: all check dist install uninstall
+diff --git a/README b/README
+index cfe1197..30f3842 100644
+--- a/README
++++ b/README
+<span class="h">@@ -1,4 +1,4 @@</span>
+<span class="d">-Manage bookmarks with a menu program and a basic file.</span>
+<span class="a">+Manage bookmarks with dmenu and a basic file.</span>
+ 
+ The file is Tab Separated Values, one bookmark per line:
+ 
+<span class="h">@@ -8,25 +8,48 @@ For example:</span>
+ 
+     https://equwal.com	Spenser Truex&#x27;s website.	users
+ 
+<span class="d">-Lines starting with # are ignored. Interact with the file using the bm</span>
+<span class="d">-script, or any other tool: cut, grep, awk and your editor all work.</span>
+<span class="a">+Lines starting with # are ignored. bm is one way to work with the file;</span>
+<span class="a">+cut, grep, awk and your editor are others.</span>
+<span class="a">+</span>
+<span class="a">+== Design ==</span>
+<span class="a">+bm owns the bookmark file and talks to the menu. Everything else is a small</span>
+<span class="a">+filter that reads or writes bookmark lines, so the pieces combine like any</span>
+<span class="a">+other Unix tools, and you install only the ones you use:</span>
+<span class="a">+</span>
+<span class="a">+    bm          pick, open, copy, add, edit, delete, list, merge</span>
+<span class="a">+    bm-import   browser bookmarks        -&gt; bookmark lines</span>
+<span class="a">+    bm-check    bookmark lines           -&gt; the dead links among them</span>
+<span class="a">+    bm-html     bookmark lines           -&gt; a searchable web page</span>
+<span class="a">+    bm-migrate  the old sbm file format  -&gt; bookmark lines</span>
+<span class="a">+    bm-title    a URL                    -&gt; the page&#x27;s title</span>
+<span class="a">+    bm-commit   commit the bookmark file to git</span>
+<span class="a">+</span>
+<span class="a">+    bm-import bookmarks.html | bm --merge</span>
+<span class="a">+    bm --tag code --list | bm-check -</span>
+<span class="a">+    bm --list | grep -i wiki | bm-html -t Wikis - &gt; wikis.html</span>
+<span class="a">+</span>
+<span class="a">+Everything is POSIX sh and POSIX utilities: no bash, no mktemp, no GNU</span>
+<span class="a">+options. make check runs shellcheck -s sh over all of it. Where the usual</span>
+<span class="a">+tool is not in POSIX, the script says what stands in for it: noclobber for</span>
+<span class="a">+mktemp, a FIFO of tokens for xargs -P, dd for head -c, awk&#x27;s srand() for</span>
+<span class="a">+date +%s.</span>
+ 
+ == Requirements ==
+<span class="d">-dmenu (or fzf), one of xclip, xsel or wl-clipboard, a POSIX sh, awk, make.</span>
+<span class="d">-Optional: curl (page titles, --check), jq (--import of Chromium files), git.</span>
+<span class="a">+dmenu (or fzf), one of xclip, xsel or wl-clipboard, sh, awk, make.</span>
+<span class="a">+curl for bm-title and bm-check, jq for bm-import of Chromium files, git for</span>
+<span class="a">+bm-commit.</span>
+ 
+ == Install ==
+<span class="d">-    make install</span>
+<span class="d">-</span>
+<span class="d">-installs bm to /usr/local/bin. To install somewhere you own instead:</span>
+<span class="a">+Edit TOOLS in config.mk to choose what gets installed, then</span>
+ 
+<span class="a">+    make install                        # to /usr/local/bin</span>
+     make PREFIX=&quot;$HOME/.local&quot; install
+ 
+ == Setup ==
+ Nothing is required. Bookmarks are kept in ~/.local/share/sbm/bookmarks
+ ($XDG_DATA_HOME is honoured) and the file is created on first use.
+ 
+<span class="d">-Tag choices are read from ~/.local/share/sbm/usertags. The file syntax is:</span>
+<span class="a">+Tag choices are read from ~/.local/share/sbm/usertags:</span>
+ 
+     &lt;tag&gt;&lt;space&gt;|&lt;space&gt;&lt;description&gt;&lt;newline&gt;
+ 
+<span class="h">@@ -34,59 +57,75 @@ Start from the included example, or from nothing: a tag typed into the tag</span>
+ menu that is not in the file yet is added to it.
+ 
+     mkdir -p ~/.local/share/sbm
+<span class="d">-    cp usertags ~/.local/share/sbm/</span>
+<span class="d">-</span>
+<span class="d">-To keep the files somewhere else, export their locations from your shell&#x27;s</span>
+<span class="d">-startup file. Use $HOME here: a ~ inside quotes is not expanded.</span>
+<span class="d">-</span>
+<span class="d">-    export BOOKMARKS=&quot;$HOME/notes/bookmarks&quot;</span>
+<span class="d">-    export USERTAGS=&quot;$HOME/notes/usertags&quot;</span>
+<span class="a">+    cp usertags engines ~/.local/share/sbm/</span>
+ 
+ == Usage ==
+<span class="d">-    bm                   dmenu: prompt for an action. fzf: browse (see below)</span>
+<span class="d">-    bm -c, --copy        copy a bookmark&#x27;s URL to the clipboard</span>
+<span class="d">-    bm -o, --open        open a bookmark in the default browser</span>
+<span class="a">+    bm                   browse (see below)</span>
+<span class="a">+    bm -o, --open        open a bookmark, an address, or a web search</span>
+                          (-p, --plumb is the same)
+<span class="a">+    bm -c, --copy        copy a bookmark&#x27;s URL to the clipboard</span>
+<span class="a">+    bm --print           print a bookmark&#x27;s URL</span>
+     bm -a, --add [url]   add a bookmark
+<span class="d">-    bm -e, --edit        open the bookmark file in $VISUAL/$EDITOR at a bookmark</span>
+<span class="a">+    bm -e, --edit        open the file in $VISUAL/$EDITOR at a bookmark</span>
+     bm -d, --delete      delete a bookmark
+     bm -l, --list        print the bookmarks
+<span class="d">-    bm -s, --search ERE  print the bookmarks matching an extended regex</span>
+<span class="d">-    bm --import SRC      import bookmarks from a browser (see below)</span>
+<span class="d">-    bm --check           report dead and permanently moved links</span>
+<span class="d">-    bm --migrate         convert a file from the old format (see below)</span>
+<span class="d">-    bm -h, --help</span>
+<span class="d">-</span>
+<span class="a">+    bm -m, --merge       add the bookmark lines on stdin, skipping known ones</span>
+     -t, --tag TAG        restrict any of the above to one tag
+<span class="d">-    -S, --sort MODE      used (default), recent, url, desc or tag</span>
+<span class="d">-    --print              with --copy or --open, print the URL instead</span>
+<span class="a">+    -S, --sort ORDER     used (default), recent, url, desc or tag</span>
+<span class="a">+</span>
+<span class="a">+Bind &quot;bm&quot; and &quot;bm -a&quot; to keys in your window manager.</span>
+<span class="a">+</span>
+<span class="a">+== Browsing ==</span>
+<span class="a">+Plain &quot;bm&quot; lists the bookmarks. Pick one and a second menu shows it in full</span>
+<span class="a">+(dmenu cannot preview while you scroll, so this is its preview) and asks what</span>
+<span class="a">+to do:</span>
+ 
+<span class="d">-== The menu ==</span>
+<span class="d">-With a display bm uses dmenu, as it always has; fzf is only used when dmenu</span>
+<span class="d">-is missing or there is no X11 or Wayland display. SBM_MENU=dmenu or</span>
+<span class="d">-SBM_MENU=fzf settles it either way.</span>
+<span class="a">+    open</span>
+<span class="a">+    copy</span>
+<span class="a">+    edit</span>
+<span class="a">+    delete</span>
+<span class="a">+      https://suckless.org/</span>
+<span class="a">+      software that sucks less</span>
+<span class="a">+      tags: code org</span>
+<span class="a">+      used: 12</span>
+ 
+<span class="d">-With dmenu, tags are chosen one at a time until &quot;done&quot; is picked or the menu</span>
+<span class="d">-is closed. With fzf they are chosen all at once: TAB marks a tag, ENTER</span>
+<span class="d">-confirms. In both, typing a tag that does not exist creates it.</span>
+<span class="a">+Closing the second menu goes back to the list, closing the list leaves.</span>
+<span class="a">+[add] at the top of the list adds a bookmark.</span>
+ 
+<span class="d">-With fzf, plain &quot;bm&quot; is one screen for everything:</span>
+<span class="a">+With fzf (no display, or SBM_MENU=fzf) it is one screen: the bookmark under</span>
+<span class="a">+the cursor is previewed live, and keys do the rest.</span>
+ 
+     ENTER   open            ctrl-a  add            ctrl-t  filter by tag
+     ctrl-y  copy            ctrl-d  delete (asks)  ctrl-s  next sort order
+     ESC     leave           ctrl-e  edit
+ 
+<span class="a">+== Web search ==</span>
+<span class="a">+In the list, and in &quot;bm -o&quot;, text that is not a bookmark is not wasted:</span>
+<span class="a">+</span>
+<span class="a">+    suckless.org/dwm          one word with a dot or &quot;://&quot;: opened as an address</span>
+<span class="a">+    posix sh printf           anything else: searched for on the web</span>
+<span class="a">+    w dynamic menu            first word is a keyword: that engine is used</span>
+<span class="a">+</span>
+<span class="a">+So one key gives you bookmarks first and the web behind them. The default</span>
+<span class="a">+engine is DuckDuckGo; set another with SBM_SEARCH=&#x27;https://.../?q=%s&#x27;.</span>
+<span class="a">+Keywords are read from ~/.local/share/sbm/engines:</span>
+<span class="a">+</span>
+<span class="a">+    &lt;keyword&gt;&lt;space&gt;|&lt;space&gt;&lt;url with %s&gt;&lt;newline&gt;</span>
+<span class="a">+</span>
+<span class="a">+See the included engines file.</span>
+<span class="a">+</span>
+ == Adding ==
+<span class="d">-Without a url, bm offers one: the X11 primary selection, or the clipboard,</span>
+<span class="d">-when it holds a URL.</span>
+<span class="a">+Without a url, bm offers the X11 primary selection, or the clipboard, when</span>
+<span class="a">+it holds a URL. With bm-title installed the description defaults to the</span>
+<span class="a">+page&#x27;s title (curl, 3 second limit; SBM_FETCH=0 turns it off). In dmenu the</span>
+<span class="a">+default is the one entry in the menu: Return accepts it, Shift-Return sends</span>
+<span class="a">+exactly what you typed.</span>
+ 
+<span class="d">-The description defaults to the page&#x27;s &lt;title&gt;, fetched with curl (3 second limit; SBM_FETCH=0 turns this off). With fzf,</span>
+<span class="d">-ENTER accepts the default. With dmenu the default is the one entry in the</span>
+<span class="d">-menu: Return accepts it, and Shift-Return sends exactly what you typed.</span>
+<span class="a">+Tags are chosen one at a time until &quot;done&quot; is picked or the menu is closed</span>
+<span class="a">+(fzf: TAB marks, ENTER confirms). Typing a tag that does not exist creates it.</span>
+ 
+<span class="d">-Adding refuses a URL that is already bookmarked. URLs are compared without</span>
+<span class="d">-their scheme, a leading www. and trailing slashes, so http://www.example.com/</span>
+<span class="d">-and https://example.com are the same bookmark.</span>
+<span class="a">+A URL that is already bookmarked is refused (exit status 3). URLs are</span>
+<span class="a">+compared without their scheme, a leading www. and trailing slashes.</span>
+ 
+ == Sorting ==
+     used     most opened or copied first, then by url (the default)
+<span class="h">@@ -96,24 +135,53 @@ and https://example.com are the same bookmark.</span>
+ Set a default with SBM_SORT. Use counts live in &quot;$BOOKMARKS.usage&quot;, so the
+ bookmark file itself stays a plain list.
+ 
+<span class="a">+== A web page of your bookmarks ==</span>
+<span class="a">+    bm-html &gt; ~/public_html/bookmarks.html</span>
+<span class="a">+</span>
+<span class="a">+One self-contained file: no server side, nothing loaded from elsewhere.</span>
+<span class="a">+Bookmarks are listed under each of their tags, with the tags linked at the</span>
+<span class="a">+top. A dozen lines of inline script add a filter box; without script the page</span>
+<span class="a">+is still the complete list, and Ctrl-F works. page.html?q=words starts out</span>
+<span class="a">+filtered, so the page can be a search keyword in your browser, or in bm:</span>
+<span class="a">+</span>
+<span class="a">+    b | https://example.org/bookmarks.html?q=%s</span>
+<span class="a">+</span>
+<span class="a">+Links that would run script (javascript:, data:) are never written.</span>
+<span class="a">+</span>
+ == Importing ==
+<span class="d">-    bm --import bookmarks.html      # the HTML export of any browser</span>
+<span class="d">-    bm --import vivaldi             # or chrome, brave, edge, chromium</span>
+<span class="d">-    bm --import path/to/Bookmarks   # a Chromium JSON file (needs jq)</span>
+<span class="a">+    bm-import bookmarks.html | bm --merge     # the HTML export of any browser</span>
+<span class="a">+    bm-import vivaldi | bm --merge            # or chrome, brave, edge, chromium</span>
+<span class="a">+    bm-import path/to/Bookmarks | bm --merge  # a Chromium JSON file (needs jq)</span>
+<span class="a">+</span>
+<span class="a">+Folder names become tags (&quot;Dev Tools&quot; becomes dev-tools). bm --merge skips</span>
+<span class="a">+what you already have, so importing twice adds nothing. Look before you</span>
+<span class="a">+merge: bm-import prints plain bookmark lines.</span>
+ 
+<span class="d">-Folder names become tags (&quot;Dev Tools&quot; becomes dev-tools), bookmarks you</span>
+<span class="d">-already have are skipped, and anything that is not a web, ftp or file URL is</span>
+<span class="d">-dropped. Importing twice adds nothing.</span>
+<span class="a">+== Dead links ==</span>
+<span class="a">+    bm-check</span>
+<span class="a">+</span>
+<span class="a">+prints status&lt;tab&gt;url for links that fail, and status&lt;tab&gt;url&lt;tab&gt;new-url for</span>
+<span class="a">+ones that moved for good. It exits 1 if it printed anything.</span>
+ 
+ == History and sync with git ==
+<span class="d">-If the directory holding the bookmark file is itself a git repository, every</span>
+<span class="d">-add, delete, edit, import and migrate is committed. bm never pushes or pulls.</span>
+<span class="a">+With bm-commit installed, every change bm makes is committed, provided the</span>
+<span class="a">+directory holding the bookmark file is a git repository of its own. It never</span>
+<span class="a">+pushes or pulls.</span>
+ 
+     cd ~/.local/share/sbm &amp;&amp; git init
+<span class="d">-    printf &#x27;%s\n&#x27; &#x27;*.usage&#x27; &#x27;*.bak&#x27; &gt; .gitignore</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &#x27;*.usage&#x27; &#x27;*.bak*&#x27; &gt; .gitignore</span>
+<span class="a">+</span>
+<span class="a">+A file that merely sits inside a bigger repository (your dotfiles) is left</span>
+<span class="a">+alone unless SBM_GIT=1. SBM_GIT=0 turns commits off.</span>
+ 
+<span class="d">-A bookmark file that merely sits somewhere inside a bigger repository (your</span>
+<span class="d">-dotfiles, say) is left alone unless SBM_GIT=1. SBM_GIT=0 turns commits off.</span>
+<span class="a">+== Migrating from the old format ==</span>
+<span class="a">+Earlier versions wrote &quot;URL description | tag tag&quot;.</span>
+<span class="a">+</span>
+<span class="a">+    bm-migrate                  # $BOOKMARKS, or the default file</span>
+<span class="a">+    bm-migrate -n file          # only show what it would become</span>
+<span class="a">+    bm-migrate - &lt; old &gt; new    # as a filter</span>
+<span class="a">+</span>
+<span class="a">+The original is kept as .bak, and an existing .bak is never overwritten.</span>
+ 
+ == Configuration ==
+ All through the environment, all optional.
+<span class="h">@@ -124,36 +192,28 @@ All through the environment, all optional.</span>
+     SBM_MENU      dmenu, fzf, or a custom command
+     SBM_FZF_OPTS  extra options for every fzf call
+     SBM_SORT      default sort order
+<span class="a">+    SBM_SEARCH    default search engine, with %s for the query</span>
+<span class="a">+    SBM_ENGINES   search keywords file</span>
+     SBM_COPY      command that reads the new clipboard contents from stdin
+     SBM_PASTE     command that writes the clipboard contents to stdout
+     SBM_OPEN      command that opens the URL given as its argument
+<span class="d">-    SBM_FETCH     0 to never download a page for its title</span>
+<span class="d">-    SBM_GIT       0 never commit, 1 commit even inside a bigger repository</span>
+<span class="d">-</span>
+<span class="d">-The clipboard is the first of wl-copy, xclip and xsel that exists, and URLs</span>
+<span class="d">-are opened with xdg-open.</span>
+ 
+<span class="d">-A custom SBM_MENU is called with the choices on stdin as one of:</span>
+<span class="a">+With a display bm uses dmenu; fzf is only used when dmenu is missing or</span>
+<span class="a">+there is no X11 or Wayland display. A custom SBM_MENU is called with the</span>
+<span class="a">+choices on stdin as one of:</span>
+ 
+<span class="d">-    &lt;command&gt; pick  &lt;prompt&gt;     print the chosen line</span>
+<span class="a">+    &lt;command&gt; pick  &lt;prompt&gt;     print the chosen line, or the typed text</span>
+     &lt;command&gt; multi &lt;prompt&gt;     print every chosen line
+     &lt;command&gt; ask   &lt;prompt&gt;     print free text; stdin holds a default, if any
+ 
+ Printing nothing means the user cancelled. test/fakemenu is a small example.
+ 
+<span class="d">-== Migrating from the old format ==</span>
+<span class="d">-Earlier versions wrote &quot;URL description | tag tag&quot;. Convert such a file with</span>
+<span class="d">-</span>
+<span class="d">-    bm --migrate</span>
+<span class="d">-</span>
+<span class="d">-The original is kept next to it with a .bak suffix, and lines that are</span>
+<span class="d">-already tab separated are left alone.</span>
+<span class="d">-</span>
+ == Tests ==
+     make check
+ 
+<span class="d">-runs shellcheck, when installed, and test/run.sh. The tests script dmenu,</span>
+<span class="d">-fzf and curl, so they need no display and no network.</span>
+<span class="a">+runs shellcheck, when installed, and test/run.sh, under sh. Run the tests</span>
+<span class="a">+under another shell with SBM_SH=dash sh test/run.sh. They script dmenu, fzf</span>
+<span class="a">+and curl, so they need no display and no network.</span>
+ 
+ == Credits ==
+ Some ideas taken from Karl Voit:
+diff --git a/TODO b/TODO
+index bfcc436..cc69375 100644
+--- a/TODO
++++ b/TODO
+<span class="h">@@ -1,17 +1,19 @@</span>
+ - [X] Don&#x27;t copy comments, just the bookmark.
+ - [X] Be able to add bookmarks with a prompter that shows the other bookmarks.
+<span class="d">-      (fzf: ctrl-a from the list; dmenu still asks for the action first)</span>
+ 
+ PREVENT DUPLICATES
+ - [X] prevent duplicates via http(s) difference
+ - [X] prevent duplicates via www subdomain
+ - [X] Allow any whitespace as a separator (except newline)
+<span class="d">-      (the file is now tab separated; bm --migrate converts old files)</span>
+<span class="a">+      (the file is now tab separated; bm-migrate converts old files)</span>
+ 
+ - [X] User-defined tags, and new ones typed into the tag menu
+ - [X] make the use of xclip configurable (other programs exist)
+<span class="d">-- [X] fzf as a second menu, wl-clipboard and xsel as clipboards</span>
+<span class="d">-- [X] open, edit, delete, list, search, filter by tag, sort</span>
+<span class="d">-- [X] import from browsers, dead link check, git history</span>
+<span class="d">-- figure out a dmenu websearch that utilizes bookmarks too</span>
+<span class="d">-- one-screen browsing for dmenu (it cannot bind keys; maybe a second menu)</span>
+<span class="a">+- [X] a dmenu websearch that utilizes bookmarks too</span>
+<span class="a">+      (text that is no bookmark is an address or a web search; engines file)</span>
+<span class="a">+- [X] one-screen browsing for dmenu (a second menu: details and actions)</span>
+<span class="a">+- [X] bookmark preview (fzf: live; dmenu: the second menu)</span>
+<span class="a">+- [X] a personal web page of the bookmarks, with search (bm-html)</span>
+<span class="a">+- [X] split into small tools; POSIX sh and POSIX utilities only</span>
+<span class="a">+- tag filter and sort order from inside the dmenu list</span>
+<span class="a">+- man pages</span>
+diff --git a/bm b/bm
+index 33e248d..52c7718 100755
+--- a/bm
++++ b/bm
+<span class="h">@@ -1,29 +1,23 @@</span>
+ #!/bin/sh
+ 
+<span class="d">-# sbm: manage bookmarks with a menu program and a basic TSV file.</span>
+<span class="d">-# Bookmark lines are: URL&lt;tab&gt;description&lt;tab&gt;tag tag tag</span>
+<span class="a">+# bm: bookmarks in a plain file, picked with dmenu (or fzf).</span>
+ #
+<span class="d">-# Everything below is optional configuration through the environment:</span>
+<span class="d">-#   BOOKMARKS    bookmark file    (default: $XDG_DATA_HOME/sbm/bookmarks)</span>
+<span class="d">-#   USERTAGS     tag choices file (default: $XDG_DATA_HOME/sbm/usertags)</span>
+<span class="d">-#   SBM_MENU     fzf, dmenu, or a custom command (see README)</span>
+<span class="d">-#   SBM_FZF_OPTS extra options for every fzf call</span>
+<span class="d">-#   SBM_SORT     default sort: used, recent, url, desc or tag</span>
+<span class="d">-#   SBM_COPY     command reading the clipboard contents from stdin</span>
+<span class="d">-#   SBM_PASTE    command writing the clipboard contents to stdout</span>
+<span class="d">-#   SBM_OPEN     command opening a URL given as its argument</span>
+<span class="d">-#   SBM_FETCH    0 to never download a page for its title</span>
+<span class="d">-#   SBM_GIT      0 to never commit, 1 to commit even in a shared repository</span>
+<span class="a">+#     URL&lt;tab&gt;description&lt;tab&gt;tag tag tag</span>
+<span class="a">+#</span>
+<span class="a">+# bm owns that file and nothing else. Importing, link checking, the web page</span>
+<span class="a">+# and so on are separate bm-* filters; see README.</span>
+ 
+ DMENULINES=${DMENULINES:-15}
+ DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/sbm
+ BOOKMARKS=${BOOKMARKS:-$DATADIR/bookmarks}
+ USERTAGS=${USERTAGS:-$DATADIR/usertags}
+<span class="a">+ENGINES=${SBM_ENGINES:-$DATADIR/engines}</span>
+<span class="a">+SEARCH=${SBM_SEARCH:-https://duckduckgo.com/?q=%s}</span>
+ USAGE=$BOOKMARKS.usage
+ TAB=$(printf &#x27;\t&#x27;)
+ 
+<span class="d">-# awk function shared by everything that compares URLs: drops the scheme, a</span>
+<span class="d">-# leading www. and trailing slashes, and lowercases the host.</span>
+<span class="a">+# Two URLs are the same bookmark when they differ only in scheme, a leading</span>
+<span class="a">+# www., trailing slashes or the case of the host.</span>
+ AWK_NORM=&#x27;
+ function norm(u,    host, rest, i) {
+     sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, &quot;&quot;, u)
+<span class="h">@@ -36,21 +30,6 @@ function norm(u,    host, rest, i) {</span>
+     return host rest
+ }&#x27;
+ 
+<span class="d">-# awk functions for text taken out of HTML.</span>
+<span class="d">-AWK_HTML=&#x27;</span>
+<span class="d">-function decode(s) {</span>
+<span class="d">-    gsub(/&amp;lt;/, &quot;&lt;&quot;, s); gsub(/&amp;gt;/, &quot;&gt;&quot;, s); gsub(/&amp;quot;/, &quot;\&quot;&quot;, s)</span>
+<span class="d">-    gsub(/&amp;#39;|&amp;#x27;|&amp;apos;/, &quot;\047&quot;, s); gsub(/&amp;nbsp;/, &quot; &quot;, s)</span>
+<span class="d">-    gsub(/&amp;amp;/, &quot;\\&amp;&quot;, s)</span>
+<span class="d">-    gsub(/[ \t\r]+/, &quot; &quot;, s); sub(/^ /, &quot;&quot;, s); sub(/ $/, &quot;&quot;, s)</span>
+<span class="d">-    return s</span>
+<span class="d">-}</span>
+<span class="d">-function slug(s) {</span>
+<span class="d">-    s = tolower(s)</span>
+<span class="d">-    gsub(/[^a-z0-9]+/, &quot;-&quot;, s); sub(/^-/, &quot;&quot;, s); sub(/-$/, &quot;&quot;, s)</span>
+<span class="d">-    return s</span>
+<span class="d">-}&#x27;</span>
+<span class="d">-</span>
+ die () {
+     printf &#x27;bm: %s\n&#x27; &quot;$*&quot; &gt;&amp;2
+     exit 1
+<span class="h">@@ -62,33 +41,28 @@ have () {</span>
+ 
+ usage () {
+     cat &lt;&lt;&#x27;EOF&#x27;
+<span class="d">-usage: bm [options] [action]</span>
+<span class="d">-Without an action: browse the bookmarks (fzf), or be prompted for an action.</span>
+<span class="d">-Actions:</span>
+<span class="d">-  -c, --copy          copy a bookmark&#x27;s URL to the clipboard</span>
+<span class="d">-  -o, --open          open a bookmark (-p, --plumb is an alias)</span>
+<span class="d">-  -a, --add [url]     add a bookmark; the url defaults to the selection or</span>
+<span class="d">-                      the clipboard</span>
+<span class="d">-  -e, --edit          open $BOOKMARKS in $EDITOR at a bookmark</span>
+<span class="d">-  -d, --delete        delete a bookmark</span>
+<span class="d">-  -l, --list          print bookmarks</span>
+<span class="d">-  -s, --search &lt;ere&gt;  print bookmarks matching an extended regex</span>
+<span class="d">-      --import &lt;src&gt;  import a browser export: a Netscape HTML or Chromium</span>
+<span class="d">-                      JSON file, or one of vivaldi chrome brave edge chromium</span>
+<span class="d">-      --check         report dead and permanently moved links</span>
+<span class="d">-      --migrate       convert an old &quot;url desc | tags&quot; file to TSV</span>
+<span class="d">-  -h, --help          show this help</span>
+<span class="d">-Options:</span>
+<span class="d">-  -t, --tag &lt;tag&gt;     only consider bookmarks with this tag</span>
+<span class="d">-  -S, --sort &lt;mode&gt;   used (default), recent, url, desc or tag</span>
+<span class="d">-      --print         with --copy or --open: print the URL instead</span>
+<span class="a">+usage: bm [-t tag] [-S order] [action]</span>
+<span class="a">+Without an action: browse. Pick a bookmark, then what to do with it. Text</span>
+<span class="a">+that is no bookmark is opened as an address, or searched for on the web.</span>
+<span class="a">+  -o, --open        open a bookmark, an address or a web search</span>
+<span class="a">+                    (-p, --plumb is the same)</span>
+<span class="a">+  -c, --copy        copy a bookmark&#x27;s URL to the clipboard</span>
+<span class="a">+      --print       print a bookmark&#x27;s URL</span>
+<span class="a">+  -a, --add [url]   add a bookmark; the url defaults to the selection</span>
+<span class="a">+  -e, --edit        open the bookmark file in $EDITOR at a bookmark</span>
+<span class="a">+  -d, --delete      delete a bookmark</span>
+<span class="a">+  -l, --list        print the bookmarks</span>
+<span class="a">+  -m, --merge       add the bookmarks on stdin, skipping the known ones</span>
+<span class="a">+  -t, --tag &lt;tag&gt;   only consider bookmarks with this tag</span>
+<span class="a">+  -S, --sort &lt;o&gt;    used (default), recent, url, desc or tag</span>
+<span class="a">+  -h, --help</span>
+ EOF
+ }
+ 
+ # ---- external programs: menu, clipboard, opener ----
+ 
+<span class="d">-# dmenu whenever there is a display to draw it on, as always. fzf stands in</span>
+<span class="d">-# on a bare terminal, or when dmenu is not installed.</span>
+<span class="a">+# dmenu whenever there is a display to draw it on. fzf stands in on a bare</span>
+<span class="a">+# terminal, or when dmenu is not installed.</span>
+ pickmenu () {
+     [ -n &quot;$SBM_MENU&quot; ] &amp;&amp; return
+     if [ -n &quot;$DISPLAY$WAYLAND_DISPLAY&quot; ]; then
+<span class="h">@@ -117,36 +91,42 @@ fzfcmd () {</span>
+     fzf -i --reverse --height=40% $SBM_FZF_OPTS &quot;$@&quot;
+ }
+ 
+<span class="d">-# pick &lt;prompt&gt;: choices on stdin, the chosen line on stdout.</span>
+<span class="a">+# fzfpick &lt;fzf options&gt;: the chosen line, or else what was typed, which is</span>
+<span class="a">+# what dmenu gives by itself.</span>
+<span class="a">+fzfpick () {</span>
+<span class="a">+    out=$(fzfcmd --print-query &quot;$@&quot;)</span>
+<span class="a">+    chosen=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p)</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;${chosen:-$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)}&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# pick &lt;prompt&gt;: choices on stdin; the chosen line, or the typed text.</span>
+ pick () {
+     case $SBM_MENU in
+<span class="d">-        fzf)   fzfcmd --prompt=&quot;$1 &quot; ;;</span>
+<span class="a">+        fzf)   fzfpick --prompt=&quot;$1 &quot; ;;</span>
+         dmenu) dmenu -i -l &quot;$DMENULINES&quot; -p &quot;$1&quot; ;;
+         *)     custommenu pick &quot;$1&quot; ;;
+     esac
+ }
+ 
+<span class="d">-# pickmulti &lt;prompt&gt;: like pick, but any number of lines can be chosen. Text</span>
+<span class="d">-# that is not among the choices may come back too: that is a new tag.</span>
+<span class="a">+# pickmulti &lt;prompt&gt;: like pick, for any number of lines.</span>
+ pickmulti () {
+<span class="a">+    choices=$(cat)</span>
+     case $SBM_MENU in
+         fzf)
+<span class="d">-            choices=$(cat)</span>
+             while :; do
+                 out=$(printf &#x27;%s\n&#x27; &quot;$choices&quot; | fzfcmd --multi --print-query \
+                       --prompt=&quot;$1 &quot; --header=&#x27;TAB marks, ENTER confirms. No match: ENTER creates the typed tag, ESC finishes.&#x27;)
+<span class="d">-                query=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)</span>
+                 chosen=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed 1d)
+                 if [ -n &quot;$chosen&quot; ]; then
+                     printf &#x27;%s\n&#x27; &quot;$chosen&quot;
+                     break
+                 fi
+<span class="d">-                [ -n &quot;$query&quot; ] || break</span>
+<span class="d">-                printf &#x27;%s\n&#x27; &quot;$query&quot;</span>
+<span class="a">+                typed=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)</span>
+<span class="a">+                [ -n &quot;$typed&quot; ] || break</span>
+<span class="a">+                printf &#x27;%s\n&#x27; &quot;$typed&quot;</span>
+             done
+             ;;
+         dmenu)
+<span class="d">-            choices=$(cat)</span>
+             while :; do
+                 one=$(printf &#x27;done | (choose when done)\n%s\n&#x27; &quot;$choices&quot; \
+                       | dmenu -i -l &quot;$DMENULINES&quot; -p &quot;$1&quot;)
+<span class="h">@@ -155,7 +135,7 @@ pickmulti () {</span>
+                 printf &#x27;%s\n&#x27; &quot;$one&quot;
+             done
+             ;;
+<span class="d">-        *)  custommenu multi &quot;$1&quot; ;;</span>
+<span class="a">+        *)  printf &#x27;%s\n&#x27; &quot;$choices&quot; | custommenu multi &quot;$1&quot; ;;</span>
+     esac
+ }
+ 
+<span class="h">@@ -163,11 +143,7 @@ pickmulti () {</span>
+ ask () {
+     case $SBM_MENU in
+         fzf)
+<span class="d">-            if [ -n &quot;$2&quot; ]; then</span>
+<span class="d">-                printf &#x27;%s [%s]: &#x27; &quot;$1&quot; &quot;$2&quot; &gt;&amp;2</span>
+<span class="d">-            else</span>
+<span class="d">-                printf &#x27;%s: &#x27; &quot;$1&quot; &gt;&amp;2</span>
+<span class="d">-            fi</span>
+<span class="a">+            printf &#x27;%s%s: &#x27; &quot;$1&quot; &quot;${2:+ [$2]}&quot; &gt;&amp;2</span>
+             IFS= read -r reply || reply=
+             printf &#x27;%s\n&#x27; &quot;${reply:-$2}&quot;
+             ;;
+<span class="h">@@ -190,9 +166,8 @@ clip_out () {</span>
+     fi
+ }
+ 
+<span class="d">-# Never fatal: an unreadable clipboard only means there is no default URL.</span>
+<span class="d">-# Under X11 the primary selection comes first, as it always has, and the</span>
+<span class="d">-# clipboard second; add takes the first line that looks like a URL.</span>
+<span class="a">+# The primary selection first, then the clipboard. Never fatal: without</span>
+<span class="a">+# either there is just no URL to suggest.</span>
+ clip_in () {
+     # shellcheck disable=SC2086
+     if   [ -n &quot;$SBM_PASTE&quot; ]; then $SBM_PASTE
+<span class="h">@@ -213,34 +188,18 @@ opener () {</span>
+     fi
+ }
+ 
+<span class="d">-# fetch_title &lt;url&gt;: print the page&#x27;s &lt;title&gt;, or nothing.</span>
+<span class="d">-fetch_title () {</span>
+<span class="d">-    [ &quot;${SBM_FETCH:-1}&quot; != 0 ] &amp;&amp; have curl || return 0</span>
+<span class="d">-    curl -sL --max-time 3 -A &#x27;Mozilla/5.0&#x27; -- &quot;$1&quot; 2&gt;/dev/null \</span>
+<span class="d">-        | head -c 65536 | LC_ALL=C tr &#x27;\r\n\t&#x27; &#x27;   &#x27; | LC_ALL=C awk &quot;$AWK_HTML&quot;&#x27;</span>
+<span class="d">-        {</span>
+<span class="d">-            start = index(tolower($0), &quot;&lt;title&quot;)</span>
+<span class="d">-            if (!start) exit</span>
+<span class="d">-            rest = substr($0, start)</span>
+<span class="d">-            rest = substr(rest, index(rest, &quot;&gt;&quot;) + 1)</span>
+<span class="d">-            end = index(tolower(rest), &quot;&lt;/title&quot;)</span>
+<span class="d">-            if (end) rest = substr(rest, 1, end - 1)</span>
+<span class="d">-            print decode(rest)</span>
+<span class="d">-            exit</span>
+<span class="d">-        }&#x27;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-# ---- bookmark file helpers ----</span>
+<span class="a">+# ---- the bookmark file ----</span>
+ 
+<span class="d">-# Bookmarks restricted to $tagfilter and ordered by $sortmode.</span>
+<span class="a">+# Bookmarks restricted to $tagfilter and ordered by $sortorder, each followed</span>
+<span class="a">+# by a fourth field: how often it was used.</span>
+ rows () {
+<span class="d">-    SBM_TAG=$tagfilter SBM_MODE=$sortmode SBM_USAGE=$USAGE awk -F&#x27;\t&#x27; &#x27;</span>
+<span class="a">+    SBM_TAG=$tagfilter SBM_ORDER=$sortorder SBM_USAGE=$USAGE awk -F&#x27;\t&#x27; &#x27;</span>
+         BEGIN {
+             while ((getline line &lt; ENVIRON[&quot;SBM_USAGE&quot;]) &gt; 0) {
+                 split(line, f, &quot;\t&quot;)
+                 used[f[1]] = f[2]
+             }
+<span class="d">-            mode = ENVIRON[&quot;SBM_MODE&quot;]</span>
+<span class="a">+            order = ENVIRON[&quot;SBM_ORDER&quot;]</span>
+         }
+         NF == 0 || /^#/ { next }
+         ENVIRON[&quot;SBM_TAG&quot;] != &quot;&quot; {
+<span class="h">@@ -251,37 +210,64 @@ rows () {</span>
+             if (!hit) next
+         }
+         {
+<span class="d">-            if (mode == &quot;used&quot;)        key = sprintf(&quot;%09d&quot;, 999999999 - used[$1])</span>
+<span class="d">-            else if (mode == &quot;recent&quot;) key = sprintf(&quot;%09d&quot;, 999999999 - NR)</span>
+<span class="d">-            else if (mode == &quot;desc&quot;)   key = tolower($2)</span>
+<span class="d">-            else if (mode == &quot;tag&quot;)    key = tolower($3)</span>
+<span class="d">-            else                       key = &quot;&quot;</span>
+<span class="d">-            printf &quot;%s\t%s\t%s\n&quot;, key, tolower($1), $0</span>
+<span class="a">+            if (order == &quot;used&quot;)        key = sprintf(&quot;%09d&quot;, 999999999 - used[$1])</span>
+<span class="a">+            else if (order == &quot;recent&quot;) key = sprintf(&quot;%09d&quot;, 999999999 - NR)</span>
+<span class="a">+            else if (order == &quot;desc&quot;)   key = tolower($2)</span>
+<span class="a">+            else if (order == &quot;tag&quot;)    key = tolower($3)</span>
+<span class="a">+            else                        key = &quot;&quot;</span>
+<span class="a">+            printf &quot;%s\t%s\t%s\t%s\t%s\t%d\n&quot;, key, tolower($1), $1, $2, $3, used[$1]</span>
+         }&#x27; &quot;$BOOKMARKS&quot; | LC_ALL=C sort -t&quot;$TAB&quot; -k1,1 -k2,2 | cut -f3-
+ }
+ 
+<span class="d">-# display: turn rows into url&lt;tab&gt;aligned text, for fzf --with-nth=2..</span>
+<span class="d">-display () {</span>
+<span class="d">-    awk -F&#x27;\t&#x27; &#x27;{</span>
+<span class="a">+# details &lt;url&gt;: a bookmark in full, one field per line.</span>
+<span class="a">+details () {</span>
+<span class="a">+    rows | SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] {</span>
+<span class="a">+        printf &quot;%s\n%s\ntags: %s\nused: %d\n&quot;, $1, $2, $3, $4</span>
+<span class="a">+        exit</span>
+<span class="a">+    }&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+is_bookmark () {</span>
+<span class="a">+    SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { found = 1; exit }</span>
+<span class="a">+        END { exit !found }&#x27; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# For fzf a fifth field is added, and it is all that is listed. The first</span>
+<span class="a">+# four feed the preview, which follows the cursor.</span>
+<span class="a">+PREVIEW=&quot;printf &#x27;%s\n%s\ntags: %s\nused: %s\n&#x27; {1} {2} {3} {4}&quot;</span>
+<span class="a">+fzfrows () {</span>
+<span class="a">+    awk -F&#x27;\t&#x27; &#x27;NF {</span>
+         desc = $2
+         if (length(desc) &gt; 44) desc = substr(desc, 1, 42) &quot;..&quot;
+<span class="d">-        printf &quot;%s\t%-44s  %-18s  %s\n&quot;, $1, desc, $3, $1</span>
+<span class="a">+        printf &quot;%s\t%-44s  %-18s  %s\n&quot;, $0, desc, $3, $1</span>
+     }&#x27;
+ }
+ 
+<span class="d">-# choose_url &lt;prompt&gt;: let the user pick a bookmark, print its URL.</span>
+<span class="a">+# withpreview &lt;fzf command and options&gt;: for the output of fzfrows.</span>
+<span class="a">+withpreview () {</span>
+<span class="a">+    &quot;$@&quot; --delimiter=&quot;$TAB&quot; --with-nth=5.. \</span>
+<span class="a">+         --preview-window=down:5:wrap --preview=&quot;$PREVIEW&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# choose &lt;prompt&gt;: a bookmark&#x27;s URL, or whatever else the user typed.</span>
+<span class="a">+choose () {</span>
+<span class="a">+    if [ &quot;$SBM_MENU&quot; = fzf ]; then</span>
+<span class="a">+        rows | fzfrows | withpreview fzfpick --prompt=&quot;$1 &quot;</span>
+<span class="a">+    else</span>
+<span class="a">+        rows | cut -f1-3 | pick &quot;$1&quot;</span>
+<span class="a">+    fi | cut -f1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# choose_url &lt;prompt&gt;: like choose, but only a bookmark will do.</span>
+ choose_url () {
+<span class="d">-    list=$(rows)</span>
+<span class="d">-    if [ -z &quot;$list&quot; ]; then</span>
+<span class="a">+    if [ -z &quot;$(rows)&quot; ]; then</span>
+         [ -n &quot;$tagfilter&quot; ] &amp;&amp; die &quot;no bookmarks tagged &#x27;$tagfilter&#x27;&quot;
+         die &#x27;no bookmarks yet; add one with: bm --add&#x27;
+     fi
+<span class="d">-    if [ &quot;$SBM_MENU&quot; = fzf ]; then</span>
+<span class="d">-        printf &#x27;%s\n&#x27; &quot;$list&quot; | display \</span>
+<span class="d">-            | fzfcmd --delimiter=&quot;$TAB&quot; --with-nth=2.. --prompt=&quot;$1 &quot;</span>
+<span class="d">-    else</span>
+<span class="d">-        printf &#x27;%s\n&#x27; &quot;$list&quot; | pick &quot;$1&quot;</span>
+<span class="d">-    fi | cut -f1</span>
+<span class="a">+    url=$(choose &quot;$1&quot;)</span>
+<span class="a">+    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="a">+    is_bookmark &quot;$url&quot; || die &quot;not a bookmark: $url&quot;</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;$url&quot;</span>
+ }
+ 
+ # find_dup &lt;url&gt;: print the bookmark that is the same page as &lt;url&gt;, if any.
+<span class="h">@@ -291,29 +277,47 @@ find_dup () {</span>
+         NF &amp;&amp; !/^#/ &amp;&amp; norm($1) == want { print; exit }&#x27; &quot;$BOOKMARKS&quot;
+ }
+ 
+<span class="d">-# rewrite &lt;file&gt;: replace &lt;file&gt; with stdin, keeping its permissions and any</span>
+<span class="d">-# symlink pointing at it.</span>
+<span class="a">+# tmpfile &lt;file&gt;: create an empty temporary file and print its name. Beside</span>
+<span class="a">+# &lt;file&gt; if that directory can be written to, else in $TMPDIR. noclobber makes</span>
+<span class="a">+# the shell create it with O_EXCL, so a file or symlink planted under that</span>
+<span class="a">+# name in a shared /tmp is refused rather than followed: mktemp, in POSIX.</span>
+<span class="a">+tmpfile () {</span>
+<span class="a">+    for candidate in &quot;$1.tmp.$$&quot; &quot;${TMPDIR:-/tmp}/sbm.$$.${1##*/}&quot;; do</span>
+<span class="a">+        if (umask 077; set -C; : &gt; &quot;$candidate&quot;) 2&gt;/dev/null; then</span>
+<span class="a">+            printf &#x27;%s\n&#x27; &quot;$candidate&quot;</span>
+<span class="a">+            return 0</span>
+<span class="a">+        fi</span>
+<span class="a">+    done</span>
+<span class="a">+    return 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# rewrite &lt;file&gt;: replace &lt;file&gt; with stdin. Through cat, not mv, so that a</span>
+<span class="a">+# symlinked file stays a symlink and keeps its mode.</span>
+ rewrite () {
+<span class="d">-    tmp=$(mktemp &quot;${TMPDIR:-/tmp}/sbm.XXXXXX&quot;) || die &#x27;mktemp failed&#x27;</span>
+<span class="a">+    tmp=$(tmpfile &quot;$1&quot;) || die &quot;cannot create a temporary file for $1&quot;</span>
+     cat &gt; &quot;$tmp&quot; &amp;&amp; cat &quot;$tmp&quot; &gt; &quot;$1&quot;
+     rc=$?
+     rm -f &quot;$tmp&quot;
+     return $rc
+ }
+ 
+<span class="d">-# bump &lt;url&gt;: count a use, for the &quot;used&quot; sort order.</span>
+<span class="a">+# bump &lt;url&gt;: count a use, for the &quot;used&quot; order. The counts live beside the</span>
+<span class="a">+# bookmark file, which stays a plain list: url, count, time of last use.</span>
+<span class="a">+# srand() returns the previous seed, and the first seed is the time of day:</span>
+<span class="a">+# that is &quot;date +%s&quot; for a POSIX that has no %s.</span>
+ bump () {
+     [ -e &quot;$USAGE&quot; ] || : &gt; &quot;$USAGE&quot; || return 0
+<span class="d">-    SBM_URL=$1 SBM_NOW=$(date +%s) awk -F&#x27;\t&#x27; &#x27;</span>
+<span class="d">-        BEGIN { OFS = &quot;\t&quot; }</span>
+<span class="d">-        $1 == ENVIRON[&quot;SBM_URL&quot;] { $2 = $2 + 1; $3 = ENVIRON[&quot;SBM_NOW&quot;]; seen = 1 }</span>
+<span class="a">+    SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;</span>
+<span class="a">+        BEGIN { OFS = &quot;\t&quot;; srand(); now = srand() }</span>
+<span class="a">+        $1 == ENVIRON[&quot;SBM_URL&quot;] { $2 = $2 + 1; $3 = now; seen = 1 }</span>
+         { print }
+<span class="d">-        END { if (!seen) print ENVIRON[&quot;SBM_URL&quot;], 1, ENVIRON[&quot;SBM_NOW&quot;] }</span>
+<span class="a">+        END { if (!seen) print ENVIRON[&quot;SBM_URL&quot;], 1, now }</span>
+     &#x27; &quot;$USAGE&quot; | rewrite &quot;$USAGE&quot;
+ }
+ 
+ # learn_tags: tag names on stdin; the ones $USERTAGS lacks are appended to it.
+ learn_tags () {
+<span class="a">+    [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;</span>
+     while IFS= read -r name; do
+         [ -n &quot;$name&quot; ] || continue
+         sed &#x27;s/[ |].*//&#x27; &quot;$USERTAGS&quot; | grep -Fxq -- &quot;$name&quot; \
+<span class="h">@@ -321,88 +325,85 @@ learn_tags () {</span>
+     done
+ }
+ 
+<span class="d">-# autocommit &lt;message&gt;: record a change when the bookmarks live in their own</span>
+<span class="d">-# git repository. Never pushes.</span>
+<span class="d">-autocommit () {</span>
+<span class="d">-    [ &quot;${SBM_GIT:-auto}&quot; != 0 ] &amp;&amp; have git || return 0</span>
+<span class="d">-    dir=$(cd &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; &amp;&amp; pwd -P) || return 0</span>
+<span class="d">-    top=$(git -C &quot;$dir&quot; rev-parse --show-toplevel 2&gt;/dev/null) || return 0</span>
+<span class="d">-    if [ &quot;${SBM_GIT:-auto}&quot; != 1 ] &amp;&amp; [ &quot;$top&quot; != &quot;$dir&quot; ]; then</span>
+<span class="d">-        return 0</span>
+<span class="d">-    fi</span>
+<span class="d">-    set -- &quot;$1&quot; &quot;$BOOKMARKS&quot;</span>
+<span class="d">-    [ &quot;$(cd &quot;$(dirname &quot;$USERTAGS&quot;)&quot; 2&gt;/dev/null &amp;&amp; pwd -P)&quot; = &quot;$dir&quot; ] \</span>
+<span class="d">-        &amp;&amp; [ -e &quot;$USERTAGS&quot; ] &amp;&amp; set -- &quot;$@&quot; &quot;$USERTAGS&quot;</span>
+<span class="d">-    message=$1</span>
+<span class="d">-    shift</span>
+<span class="d">-    git -C &quot;$dir&quot; add -- &quot;$@&quot; 2&gt;/dev/null || return 0</span>
+<span class="d">-    git -C &quot;$dir&quot; diff --cached --quiet -- &quot;$@&quot; &amp;&amp; return 0</span>
+<span class="d">-    git -C &quot;$dir&quot; commit -q -m &quot;$message&quot; -- &quot;$@&quot; &gt;/dev/null 2&gt;&amp;1 \</span>
+<span class="d">-        || printf &#x27;bm: git commit failed in %s\n&#x27; &quot;$dir&quot; &gt;&amp;2</span>
+<span class="a">+# changed &lt;message&gt;: the file was written. bm-commit, where installed, keeps</span>
+<span class="a">+# its history in git.</span>
+<span class="a">+changed () {</span>
+<span class="a">+    if have bm-commit; then bm-commit &quot;$1&quot;; fi</span>
+ }
+ 
+ # ---- actions ----
+ 
+ copy_url () {
+     bump &quot;$1&quot;
+<span class="d">-    if [ -n &quot;$printurl&quot; ]; then</span>
+<span class="d">-        printf &#x27;%s\n&#x27; &quot;$1&quot;</span>
+<span class="d">-    else</span>
+<span class="d">-        printf &#x27;%s&#x27; &quot;$1&quot; | clip_out</span>
+<span class="d">-    fi</span>
+<span class="a">+    printf &#x27;%s&#x27; &quot;$1&quot; | clip_out</span>
+ }
+ 
+ open_url () {
+     bump &quot;$1&quot;
+<span class="d">-    if [ -n &quot;$printurl&quot; ]; then</span>
+<span class="d">-        printf &#x27;%s\n&#x27; &quot;$1&quot;</span>
+<span class="d">-    else</span>
+<span class="d">-        opener &quot;$1&quot;</span>
+<span class="d">-    fi</span>
+<span class="a">+    opener &quot;$1&quot;</span>
+ }
+ 
+ edit_url () {
+     line=$(SBM_URL=$1 awk -F&#x27;\t&#x27; \
+            &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { print NR; exit }&#x27; &quot;$BOOKMARKS&quot;)
+     ${VISUAL:-${EDITOR:-vi}} &quot;+${line:-1}&quot; &quot;$BOOKMARKS&quot;
+<span class="d">-    autocommit &#x27;bm: edit&#x27;</span>
+<span class="a">+    changed &#x27;bm: edit&#x27;</span>
+ }
+ 
+ delete_url () {
+<span class="d">-    SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 != ENVIRON[&quot;SBM_URL&quot;]&#x27; &quot;$BOOKMARKS&quot; \</span>
+<span class="d">-        | rewrite &quot;$BOOKMARKS&quot; || die &quot;could not rewrite $BOOKMARKS&quot;</span>
+<span class="d">-    if [ -e &quot;$USAGE&quot; ]; then</span>
+<span class="d">-        SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 != ENVIRON[&quot;SBM_URL&quot;]&#x27; &quot;$USAGE&quot; \</span>
+<span class="d">-            | rewrite &quot;$USAGE&quot;</span>
+<span class="d">-    fi</span>
+<span class="d">-    autocommit &quot;bm: delete $1&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-copy () {</span>
+<span class="d">-    url=$(choose_url &#x27;copy:&#x27;)</span>
+<span class="d">-    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="d">-    copy_url &quot;$url&quot;</span>
+<span class="a">+    for file in &quot;$BOOKMARKS&quot; &quot;$USAGE&quot;; do</span>
+<span class="a">+        [ -e &quot;$file&quot; ] || continue</span>
+<span class="a">+        SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 != ENVIRON[&quot;SBM_URL&quot;]&#x27; &quot;$file&quot; \</span>
+<span class="a">+            | rewrite &quot;$file&quot; || die &quot;could not rewrite $file&quot;</span>
+<span class="a">+    done</span>
+<span class="a">+    changed &quot;bm: delete $1&quot;</span>
+ }
+ 
+<span class="d">-plumb () {</span>
+<span class="d">-    url=$(choose_url &#x27;open:&#x27;)</span>
+<span class="d">-    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="d">-    open_url &quot;$url&quot;</span>
+<span class="a">+# urlencode &lt;text&gt;: for a query string. awk has no ord(), hence the table.</span>
+<span class="a">+urlencode () {</span>
+<span class="a">+    printf &#x27;%s&#x27; &quot;$1&quot; | LC_ALL=C awk &#x27;</span>
+<span class="a">+        BEGIN { for (i = 1; i &lt; 256; i++) ord[sprintf(&quot;%c&quot;, i)] = i }</span>
+<span class="a">+        {</span>
+<span class="a">+            for (i = 1; i &lt;= length($0); i++) {</span>
+<span class="a">+                c = substr($0, i, 1)</span>
+<span class="a">+                if (c ~ /[A-Za-z0-9._~-]/) out = out c</span>
+<span class="a">+                else if (c == &quot; &quot;)         out = out &quot;+&quot;</span>
+<span class="a">+                else                       out = out sprintf(&quot;%%%02X&quot;, ord[c])</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        END { printf &quot;%s&quot;, out }&#x27;</span>
+ }
+ 
+<span class="d">-edit () {</span>
+<span class="d">-    url=$(choose_url &#x27;edit:&#x27;)</span>
+<span class="d">-    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="d">-    edit_url &quot;$url&quot;</span>
+<span class="a">+# go &lt;text&gt;: open text that is not a bookmark. One word with &quot;://&quot; or a dot</span>
+<span class="a">+# in it is an address. Anything else is a web search: by the engine whose</span>
+<span class="a">+# keyword is the first word ($ENGINES holds &quot;keyword | url with %s&quot; lines),</span>
+<span class="a">+# or else by $SEARCH.</span>
+<span class="a">+go () {</span>
+<span class="a">+    case $1 in</span>
+<span class="a">+        *&#x27; &#x27;*) ;;</span>
+<span class="a">+        *://*) opener &quot;$1&quot;; return ;;</span>
+<span class="a">+        *.*)   opener &quot;https://$1&quot;; return ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    engine=$SEARCH</span>
+<span class="a">+    query=$1</span>
+<span class="a">+    if [ &quot;${1%% *}&quot; != &quot;$1&quot; ] &amp;&amp; [ -r &quot;$ENGINES&quot; ]; then</span>
+<span class="a">+        found=$(SBM_KEY=${1%% *} awk -F&#x27; *[|] *&#x27; \</span>
+<span class="a">+                &#x27;$1 == ENVIRON[&quot;SBM_KEY&quot;] { print $2; exit }&#x27; &quot;$ENGINES&quot;)</span>
+<span class="a">+        if [ -n &quot;$found&quot; ]; then</span>
+<span class="a">+            engine=$found</span>
+<span class="a">+            query=${1#* }</span>
+<span class="a">+        fi</span>
+<span class="a">+    fi</span>
+<span class="a">+    opener &quot;$(printf &#x27;%s\n&#x27; &quot;$engine&quot; | sed &quot;s|%s|$(urlencode &quot;$query&quot;)|&quot;)&quot;</span>
+ }
+ 
+<span class="d">-delete () {</span>
+<span class="d">-    url=$(choose_url &#x27;delete:&#x27;)</span>
+<span class="a">+plumb () {</span>
+<span class="a">+    url=$(choose &#x27;open:&#x27;)</span>
+     [ -n &quot;$url&quot; ] || exit 1
+<span class="d">-    delete_url &quot;$url&quot;</span>
+<span class="d">-    printf &#x27;deleted %s\n&#x27; &quot;$url&quot;</span>
+<span class="a">+    if is_bookmark &quot;$url&quot;; then open_url &quot;$url&quot;; else go &quot;$url&quot;; fi</span>
+ }
+ 
+<span class="a">+# Exit status 3 means &quot;already bookmarked&quot;.</span>
+ add () {
+     url=$1
+     if [ -z &quot;$url&quot; ]; then
+<span class="h">@@ -414,10 +415,13 @@ add () {</span>
+     dup=$(find_dup &quot;$url&quot;)
+     if [ -n &quot;$dup&quot; ]; then
+         printf &#x27;bm: already bookmarked:\n%s\n&#x27; &quot;$dup&quot; &gt;&amp;2
+<span class="d">-        exit 1</span>
+<span class="a">+        exit 3</span>
+     fi
+ 
+<span class="d">-    desc=$(ask &#x27;description&#x27; &quot;$(fetch_title &quot;$url&quot;)&quot; | tr &#x27;\t&#x27; &#x27; &#x27;)</span>
+<span class="a">+    # bm-title, where installed, fetches the page&#x27;s title.</span>
+<span class="a">+    title=</span>
+<span class="a">+    if have bm-title; then title=$(bm-title &quot;$url&quot;); fi</span>
+<span class="a">+    desc=$(ask &#x27;description&#x27; &quot;$title&quot; | tr &#x27;\t&#x27; &#x27; &#x27;)</span>
+ 
+     [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;
+     names=$(pickmulti &#x27;tags:&#x27; &lt; &quot;$USERTAGS&quot; | sed &#x27;s/[ |].*//&#x27; | sed &#x27;/^$/d&#x27; \
+<span class="h">@@ -426,222 +430,83 @@ add () {</span>
+     tags=$(printf &#x27;%s\n&#x27; &quot;$names&quot; | paste -sd &#x27; &#x27; -)
+ 
+     printf &#x27;%s\t%s\t%s\n&#x27; &quot;$url&quot; &quot;$desc&quot; &quot;$tags&quot; &gt;&gt; &quot;$BOOKMARKS&quot;
+<span class="d">-    autocommit &quot;bm: add $url&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-list () {</span>
+<span class="d">-    rows</span>
+<span class="a">+    changed &quot;bm: add $url&quot;</span>
+ }
+ 
+<span class="d">-search () {</span>
+<span class="d">-    rows | grep -Ei -- &quot;$1&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-# browser_file &lt;name&gt;: where a Chromium style browser keeps its bookmarks.</span>
+<span class="d">-browser_file () {</span>
+<span class="d">-    case $1 in</span>
+<span class="d">-        vivaldi)  dir=&#x27;vivaldi&#x27; ;;</span>
+<span class="d">-        chrome)   dir=&#x27;google-chrome&#x27; ;;</span>
+<span class="d">-        brave)    dir=&#x27;BraveSoftware/Brave-Browser&#x27; ;;</span>
+<span class="d">-        edge)     dir=&#x27;microsoft-edge&#x27; ;;</span>
+<span class="d">-        chromium) dir=&#x27;chromium&#x27; ;;</span>
+<span class="d">-    esac</span>
+<span class="d">-    printf &#x27;%s\n&#x27; &quot;${XDG_CONFIG_HOME:-$HOME/.config}/$dir/Default/Bookmarks&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-# Chromium JSON to rows. Folder names become tags; the trash is left out.</span>
+<span class="d">-import_json () {</span>
+<span class="d">-    have jq || die &#x27;importing a Chromium bookmark file needs jq&#x27;</span>
+<span class="d">-    jq -r &#x27;</span>
+<span class="d">-        def slug: ascii_downcase | gsub(&quot;[^a-z0-9]+&quot;; &quot;-&quot;)</span>
+<span class="d">-                  | sub(&quot;^-&quot;; &quot;&quot;) | sub(&quot;-$&quot;; &quot;&quot;);</span>
+<span class="d">-        def emit(path):</span>
+<span class="d">-            if .type == &quot;url&quot; then</span>
+<span class="d">-                [.url, (.name | gsub(&quot;[\t\r\n]+&quot;; &quot; &quot;)),</span>
+<span class="d">-                 (path | unique | join(&quot; &quot;))] | join(&quot;\t&quot;)</span>
+<span class="d">-            elif (.children? | type) == &quot;array&quot; then</span>
+<span class="d">-                (path + ([.name | slug] | map(select(. != &quot;&quot;)))) as $sub</span>
+<span class="d">-                | .children[] | emit($sub)</span>
+<span class="d">-            else empty end;</span>
+<span class="d">-        .roots | to_entries[]</span>
+<span class="d">-        | select(.key != &quot;trash&quot; and (.value | type) == &quot;object&quot;)</span>
+<span class="d">-        | .value.children[]? | emit([])&#x27; &quot;$1&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-# Netscape bookmark HTML to rows. &lt;H3&gt; opens a folder, &lt;/DL&gt; closes it.</span>
+<span class="d">-import_html () {</span>
+<span class="d">-    awk &quot;$AWK_HTML&quot;&#x27;</span>
+<span class="d">-    {</span>
+<span class="d">-        upper = toupper($0)</span>
+<span class="d">-        if ((at = index(upper, &quot;&lt;H3&quot;)) &gt; 0) {</span>
+<span class="d">-            name = substr($0, at)</span>
+<span class="d">-            name = substr(name, index(name, &quot;&gt;&quot;) + 1)</span>
+<span class="d">-            end = index(toupper(name), &quot;&lt;/H3&quot;)</span>
+<span class="d">-            if (end) name = substr(name, 1, end - 1)</span>
+<span class="d">-            folder[++depth] = slug(decode(name))</span>
+<span class="d">-        }</span>
+<span class="d">-        if ((at = index(upper, &quot;HREF=\&quot;&quot;)) &gt; 0) {</span>
+<span class="d">-            url = substr($0, at + 6)</span>
+<span class="d">-            rest = substr(url, index(url, &quot;\&quot;&quot;) + 1)</span>
+<span class="d">-            url = decode(substr(url, 1, index(url, &quot;\&quot;&quot;) - 1))</span>
+<span class="d">-            name = substr(rest, index(rest, &quot;&gt;&quot;) + 1)</span>
+<span class="d">-            end = index(toupper(name), &quot;&lt;/A&quot;)</span>
+<span class="d">-            if (end) name = substr(name, 1, end - 1)</span>
+<span class="d">-            tags = &quot;&quot;</span>
+<span class="d">-            for (i = 1; i &lt;= depth; i++)</span>
+<span class="d">-                if (folder[i] != &quot;&quot; &amp;&amp; index(&quot; &quot; tags &quot; &quot;, &quot; &quot; folder[i] &quot; &quot;) == 0)</span>
+<span class="d">-                    tags = tags (tags == &quot;&quot; ? &quot;&quot; : &quot; &quot;) folder[i]</span>
+<span class="d">-            printf &quot;%s\t%s\t%s\n&quot;, url, decode(name), tags</span>
+<span class="d">-        }</span>
+<span class="d">-        if (index(upper, &quot;&lt;/DL&gt;&quot;) &gt; 0 &amp;&amp; depth &gt; 0) depth--</span>
+<span class="d">-    }&#x27; &quot;$1&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-import () {</span>
+<span class="d">-    src=$1</span>
+<span class="d">-    case $src in</span>
+<span class="d">-        vivaldi|chrome|brave|edge|chromium) src=$(browser_file &quot;$src&quot;) ;;</span>
+<span class="d">-    esac</span>
+<span class="d">-    [ -r &quot;$src&quot; ] || die &quot;cannot read $src&quot;</span>
+<span class="d">-</span>
+<span class="d">-    new=$(mktemp &quot;${TMPDIR:-/tmp}/sbm.XXXXXX&quot;) || die &#x27;mktemp failed&#x27;</span>
+<span class="d">-    case $(LC_ALL=C tr -d &#x27; \t\r\n&#x27; &lt; &quot;$src&quot; | head -c 1) in</span>
+<span class="d">-        &#x27;{&#x27;) import_json &quot;$src&quot; ;;</span>
+<span class="d">-        *)   import_html &quot;$src&quot; ;;</span>
+<span class="d">-    esac | SBM_FILE=$BOOKMARKS SBM_NEW=$new awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;</span>
+<span class="a">+# merge: bookmark lines on stdin (a bare URL per line will do); the ones not</span>
+<span class="a">+# known yet are appended. This is how the output of bm-import gets in.</span>
+<span class="a">+merge () {</span>
+<span class="a">+    new=$(tmpfile &quot;$BOOKMARKS&quot;) || die &#x27;cannot create a temporary file&#x27;</span>
+<span class="a">+    SBM_FILE=$BOOKMARKS SBM_NEW=$new awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;</span>
+         BEGIN {
+             while ((getline line &lt; ENVIRON[&quot;SBM_FILE&quot;]) &gt; 0) {
+                 split(line, f, &quot;\t&quot;)
+                 seen[norm(f[1])] = 1
+             }
+         }
+<span class="d">-        $1 !~ /^(https?|ftp|file):\/\// { next }</span>
+<span class="a">+        NF == 0 || /^#/ { next }</span>
+         seen[norm($1)]++ { skipped++; next }
+<span class="d">-        { print &gt; ENVIRON[&quot;SBM_NEW&quot;]; added++ }</span>
+<span class="d">-        END { printf &quot;imported %d, skipped %d duplicates\n&quot;, added, skipped }&#x27;</span>
+<span class="d">-</span>
+<span class="d">-    [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;</span>
+<span class="a">+        { printf &quot;%s\t%s\t%s\n&quot;, $1, $2, $3 &gt; ENVIRON[&quot;SBM_NEW&quot;]; added++ }</span>
+<span class="a">+        END { printf &quot;added %d, skipped %d duplicates\n&quot;, added, skipped }&#x27;</span>
+     cut -f3 &quot;$new&quot; | tr &#x27; &#x27; &#x27;\n&#x27; | sort -u | learn_tags
+     cat &quot;$new&quot; &gt;&gt; &quot;$BOOKMARKS&quot;
+     rm -f &quot;$new&quot;
+<span class="d">-    autocommit &quot;bm: import $(basename &quot;$src&quot;)&quot;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-# check_one &lt;url&gt;: print a line when the link is dead or has moved for good.</span>
+<span class="d">-check_one () {</span>
+<span class="d">-    probe=&#x27;%{http_code} %{redirect_url}&#x27;</span>
+<span class="d">-    res=$(curl -sI --max-time 10 -A &#x27;Mozilla/5.0&#x27; -o /dev/null -w &quot;$probe&quot; \</span>
+<span class="d">-          -- &quot;$1&quot; 2&gt;/dev/null)</span>
+<span class="d">-    case ${res%% *} in</span>
+<span class="d">-        403|405|000|&#x27;&#x27;)</span>
+<span class="d">-            # Some servers refuse HEAD; ask for the first byte instead.</span>
+<span class="d">-            res=$(curl -s -r 0-0 --max-time 10 -A &#x27;Mozilla/5.0&#x27; -o /dev/null \</span>
+<span class="d">-                  -w &quot;$probe&quot; -- &quot;$1&quot; 2&gt;/dev/null)</span>
+<span class="d">-            ;;</span>
+<span class="d">-    esac</span>
+<span class="d">-    code=${res%% *}</span>
+<span class="d">-    case $code in</span>
+<span class="d">-        301|308) printf &#x27;%s\t%s\t%s\n&#x27; &quot;$code&quot; &quot;$1&quot; &quot;${res#* }&quot; ;;</span>
+<span class="d">-        2*|3*)   ;;</span>
+<span class="d">-        *)       printf &#x27;%s\t%s\n&#x27; &quot;${code:-000}&quot; &quot;$1&quot; ;;</span>
+<span class="d">-    esac</span>
+<span class="a">+    changed &#x27;bm: merge&#x27;</span>
+ }
+ 
+<span class="d">-check () {</span>
+<span class="d">-    have curl || die &#x27;checking links needs curl&#x27;</span>
+<span class="d">-    self=$(command -v -- &quot;$0&quot;) || self=$0</span>
+<span class="d">-    bad=$(rows | cut -f1 | tr &#x27;\n&#x27; &#x27;\0&#x27; \</span>
+<span class="d">-          | xargs -0 -P 8 -n 1 sh &quot;$self&quot; --check-one)</span>
+<span class="d">-    if [ -z &quot;$bad&quot; ]; then</span>
+<span class="d">-        printf &#x27;all links ok\n&#x27;</span>
+<span class="d">-        return 0</span>
+<span class="d">-    fi</span>
+<span class="d">-    printf &#x27;%s\n&#x27; &quot;$bad&quot;</span>
+<span class="d">-    return 1</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-# Old lines look like &quot;url description | tag tag&quot;. Lines that already have a</span>
+<span class="d">-# tab are left alone, so running this twice is harmless.</span>
+<span class="d">-migrate () {</span>
+<span class="d">-    cp &quot;$BOOKMARKS&quot; &quot;$BOOKMARKS.bak&quot; || die &quot;could not back up $BOOKMARKS&quot;</span>
+<span class="d">-    awk &#x27;</span>
+<span class="d">-        /\t/ || /^#/ || NF == 0 { print; next }</span>
+<span class="d">-        {</span>
+<span class="d">-            url = $1</span>
+<span class="d">-            desc = $0</span>
+<span class="d">-            sub(/^[ ]*[^ ]+[ ]*/, &quot;&quot;, desc)</span>
+<span class="d">-            tags = &quot;&quot;</span>
+<span class="d">-            if (match(desc, / \|[^|]*$/)) {</span>
+<span class="d">-                tags = substr(desc, RSTART + 2)</span>
+<span class="d">-                desc = substr(desc, 1, RSTART - 1)</span>
+<span class="d">-            }</span>
+<span class="d">-            gsub(/^ +| +$/, &quot;&quot;, desc)</span>
+<span class="d">-            gsub(/^ +| +$/, &quot;&quot;, tags)</span>
+<span class="d">-            printf &quot;%s\t%s\t%s\n&quot;, url, desc, tags</span>
+<span class="d">-        }&#x27; &quot;$BOOKMARKS.bak&quot; | rewrite &quot;$BOOKMARKS&quot; \</span>
+<span class="d">-        || die &quot;could not rewrite $BOOKMARKS&quot;</span>
+<span class="d">-    printf &#x27;migrated %s (backup in %s.bak)\n&#x27; &quot;$BOOKMARKS&quot; &quot;$BOOKMARKS&quot;</span>
+<span class="d">-    autocommit &#x27;bm: migrate to TSV&#x27;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-needs_migration () {</span>
+<span class="d">-    awk &#x27;!/\t/ &amp;&amp; !/^#/ &amp;&amp; NF { found = 1; exit } END { exit !found }&#x27; \</span>
+<span class="d">-        &quot;$BOOKMARKS&quot;</span>
+<span class="a">+nextorder () {</span>
+<span class="a">+    case $sortorder in</span>
+<span class="a">+        used)   sortorder=recent ;;</span>
+<span class="a">+        recent) sortorder=url ;;</span>
+<span class="a">+        url)    sortorder=desc ;;</span>
+<span class="a">+        desc)   sortorder=tag ;;</span>
+<span class="a">+        *)      sortorder=used ;;</span>
+<span class="a">+    esac</span>
+ }
+ 
+<span class="d">-promptaction () {</span>
+<span class="d">-    action=$(printf &#x27;copy\nopen\nadd\nedit\ndelete\n&#x27; | pick &#x27;action:&#x27;)</span>
+<span class="d">-    [ -n &quot;$action&quot; ] || exit 1</span>
+<span class="a">+picktag () {</span>
+<span class="a">+    tag=$( { printf &#x27;(all)\n&#x27;; cut -f3 &quot;$BOOKMARKS&quot; | tr &#x27; &#x27; &#x27;\n&#x27; \</span>
+<span class="a">+             | sed &#x27;/^$/d&#x27; | sort -u; } | pick &#x27;tag:&#x27;)</span>
+<span class="a">+    case $tag in</span>
+<span class="a">+        &#x27;&#x27;)      ;;</span>
+<span class="a">+        &#x27;(all)&#x27;) tagfilter= ;;</span>
+<span class="a">+        *)       tagfilter=$tag ;;</span>
+<span class="a">+    esac</span>
+ }
+ 
+<span class="d">-nextsort () {</span>
+<span class="d">-    case $sortmode in</span>
+<span class="d">-        used)   sortmode=recent ;;</span>
+<span class="d">-        recent) sortmode=url ;;</span>
+<span class="d">-        url)    sortmode=desc ;;</span>
+<span class="d">-        desc)   sortmode=tag ;;</span>
+<span class="d">-        *)      sortmode=used ;;</span>
+<span class="d">-    esac</span>
+<span class="a">+# add exits, which must not end a browsing session; and when it refuses a</span>
+<span class="a">+# duplicate the user has to get to see that before the list comes back.</span>
+<span class="a">+add_inside () {</span>
+<span class="a">+    ( add &#x27;&#x27; )</span>
+<span class="a">+    if [ $? -eq 3 ]; then</span>
+<span class="a">+        ask &#x27;already bookmarked; press ENTER&#x27; &gt;/dev/null</span>
+<span class="a">+    fi</span>
+ }
+ 
+<span class="d">-# browse: everything from one fzf screen. Opening and copying leave it, the</span>
+<span class="d">-# other keys come back to it.</span>
+<span class="d">-browse () {</span>
+<span class="a">+# browse_fzf: fzf can bind keys, so one list does everything. Opening and</span>
+<span class="a">+# copying leave it, the other keys come back to it.</span>
+<span class="a">+browse_fzf () {</span>
+     while :; do
+<span class="d">-        list=$(rows)</span>
+<span class="d">-        header=&quot;ENTER open  ^Y copy  ^A add  ^D delete  ^E edit  ^T tag [${tagfilter:-all}]  ^S sort [$sortmode]&quot;</span>
+<span class="d">-        out=$(if [ -n &quot;$list&quot; ]; then printf &#x27;%s\n&#x27; &quot;$list&quot; | display; fi \</span>
+<span class="d">-              | fzfcmd --expect=ctrl-y,ctrl-a,ctrl-d,ctrl-e,ctrl-t,ctrl-s \</span>
+<span class="d">-                       --delimiter=&quot;$TAB&quot; --with-nth=2.. \</span>
+<span class="d">-                       --header=&quot;$header&quot; --prompt=&#x27;bookmark: &#x27;)</span>
+<span class="a">+        header=&quot;ENTER open  ^Y copy  ^A add  ^D delete  ^E edit  ^T tag [${tagfilter:-all}]  ^S sort [$sortorder]&quot;</span>
+<span class="a">+        out=$(rows | fzfrows | withpreview fzfcmd --print-query \</span>
+<span class="a">+              --expect=ctrl-y,ctrl-a,ctrl-d,ctrl-e,ctrl-t,ctrl-s \</span>
+<span class="a">+              --header=&quot;$header&quot; --prompt=&#x27;bookmark: &#x27;)</span>
+         [ -n &quot;$out&quot; ] || exit 1
+<span class="d">-        key=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)</span>
+<span class="d">-        url=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p | cut -f1)</span>
+<span class="a">+        typed=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)</span>
+<span class="a">+        key=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p)</span>
+<span class="a">+        url=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 3p | cut -f1)</span>
+ 
+         case $key in
+<span class="d">-            ctrl-a)</span>
+<span class="d">-                # add exits on a cancelled prompt or a duplicate; keep that</span>
+<span class="d">-                # from ending the browser, and leave its message readable.</span>
+<span class="d">-                ( add &#x27;&#x27; ) || ask &#x27;press ENTER to continue&#x27; &gt;/dev/null</span>
+<span class="d">-                continue</span>
+<span class="d">-                ;;</span>
+<span class="d">-            ctrl-t)</span>
+<span class="d">-                tag=$( { printf &#x27;(all)\n&#x27;; cut -f3 &quot;$BOOKMARKS&quot; | tr &#x27; &#x27; &#x27;\n&#x27; \</span>
+<span class="d">-                         | sed &#x27;/^$/d&#x27; | sort -u; } | pick &#x27;tag:&#x27;)</span>
+<span class="d">-                case $tag in</span>
+<span class="d">-                    &#x27;&#x27;)      ;;</span>
+<span class="d">-                    &#x27;(all)&#x27;) tagfilter= ;;</span>
+<span class="d">-                    *)       tagfilter=$tag ;;</span>
+<span class="d">-                esac</span>
+<span class="d">-                continue</span>
+<span class="d">-                ;;</span>
+<span class="d">-            ctrl-s)</span>
+<span class="d">-                nextsort</span>
+<span class="d">-                continue</span>
+<span class="d">-                ;;</span>
+<span class="a">+            ctrl-a) add_inside; continue ;;</span>
+<span class="a">+            ctrl-t) picktag; continue ;;</span>
+<span class="a">+            ctrl-s) nextorder; continue ;;</span>
+         esac
+<span class="d">-</span>
+<span class="d">-        [ -n &quot;$url&quot; ] || { [ -n &quot;$key&quot; ] &amp;&amp; continue; exit 1; }</span>
+<span class="a">+        if [ -z &quot;$url&quot; ]; then</span>
+<span class="a">+            [ -n &quot;$key&quot; ] &amp;&amp; continue</span>
+<span class="a">+            [ -n &quot;$typed&quot; ] || exit 1</span>
+<span class="a">+            go &quot;$typed&quot;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+        fi</span>
+         case $key in
+             ctrl-y) copy_url &quot;$url&quot;; exit 0 ;;
+             ctrl-e) edit_url &quot;$url&quot; ;;
+<span class="h">@@ -655,6 +520,33 @@ browse () {</span>
+     done
+ }
+ 
+<span class="a">+# browse_menu: dmenu can neither bind keys nor preview, so a second menu does</span>
+<span class="a">+# both: it shows the bookmark in full and asks what to do with it. Closing it</span>
+<span class="a">+# goes back to the list; closing the list leaves.</span>
+<span class="a">+browse_menu () {</span>
+<span class="a">+    while :; do</span>
+<span class="a">+        chosen=$( { printf &#x27;[add]\n&#x27;; rows | cut -f1-3; } | pick &#x27;bookmark:&#x27;)</span>
+<span class="a">+        [ -n &quot;$chosen&quot; ] || exit 1</span>
+<span class="a">+        if [ &quot;$chosen&quot; = &#x27;[add]&#x27; ]; then</span>
+<span class="a">+            add_inside</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        url=$(printf &#x27;%s\n&#x27; &quot;$chosen&quot; | cut -f1)</span>
+<span class="a">+        if ! is_bookmark &quot;$url&quot;; then</span>
+<span class="a">+            go &quot;$chosen&quot;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+        fi</span>
+<span class="a">+        action=$( { printf &#x27;open\ncopy\nedit\ndelete\n&#x27;</span>
+<span class="a">+                    details &quot;$url&quot; | sed &#x27;s/^/  /&#x27;; } | pick &#x27;do:&#x27;)</span>
+<span class="a">+        case $action in</span>
+<span class="a">+            open)   open_url &quot;$url&quot;; exit 0 ;;</span>
+<span class="a">+            copy)   copy_url &quot;$url&quot;; exit 0 ;;</span>
+<span class="a">+            edit)   edit_url &quot;$url&quot; ;;</span>
+<span class="a">+            delete) delete_url &quot;$url&quot; ;;</span>
+<span class="a">+        esac</span>
+<span class="a">+    done</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ # ---- main ----
+ 
+ setaction () {
+<span class="h">@@ -674,38 +566,26 @@ needarg () {</span>
+ }
+ 
+ action=
+<span class="d">-actionarg=</span>
+<span class="a">+addurl=</span>
+ tagfilter=
+<span class="d">-printurl=</span>
+<span class="d">-sortmode=${SBM_SORT:-used}</span>
+<span class="a">+sortorder=${SBM_SORT:-used}</span>
+ while [ $# -gt 0 ]; do
+     case $1 in
+         -h|--help)   setaction help ;;
+         -c|--copy)   setaction copy ;;
+<span class="a">+        --print)     setaction print ;;</span>
+         -o|--open|-p|--plumb) setaction open ;;
+         -e|--edit)   setaction edit ;;
+         -d|--delete) setaction delete ;;
+         -l|--list)   setaction list ;;
+<span class="d">-        --migrate)   setaction migrate ;;</span>
+<span class="d">-        --check)     setaction check ;;</span>
+<span class="d">-        --print)     printurl=1 ;;</span>
+<span class="a">+        -m|--merge)  setaction merge ;;</span>
+         -a|--add)
+             setaction add
+             case ${2-} in
+                 &#x27;&#x27;|-*) ;;
+<span class="d">-                *) actionarg=$2; shift ;;</span>
+<span class="a">+                *) addurl=$2; shift ;;</span>
+             esac
+             ;;
+<span class="d">-        -s|--search|--import|--check-one)</span>
+<span class="d">-            needarg &quot;$1&quot; $# &quot;${2-}&quot;</span>
+<span class="d">-            case $1 in</span>
+<span class="d">-                --import)    setaction import ;;</span>
+<span class="d">-                --check-one) setaction check-one ;;</span>
+<span class="d">-                *)           setaction search ;;</span>
+<span class="d">-            esac</span>
+<span class="d">-            actionarg=$2</span>
+<span class="d">-            shift</span>
+<span class="d">-            ;;</span>
+         -t|--tag)
+             needarg &quot;$1&quot; $# &quot;${2-}&quot;
+             tagfilter=$2
+<span class="h">@@ -713,7 +593,7 @@ while [ $# -gt 0 ]; do</span>
+             ;;
+         -S|--sort)
+             needarg &quot;$1&quot; $# &quot;${2-}&quot;
+<span class="d">-            sortmode=$2</span>
+<span class="a">+            sortorder=$2</span>
+             shift
+             ;;
+         *)
+<span class="h">@@ -725,53 +605,43 @@ while [ $# -gt 0 ]; do</span>
+     shift
+ done
+ 
+<span class="d">-case $sortmode in</span>
+<span class="a">+case $sortorder in</span>
+     used|recent|url|desc|tag) ;;
+     *)
+<span class="d">-        printf &#x27;bm: unknown sort order: %s\n&#x27; &quot;$sortmode&quot; &gt;&amp;2</span>
+<span class="a">+        printf &#x27;bm: unknown sort order: %s\n&#x27; &quot;$sortorder&quot; &gt;&amp;2</span>
+         exit 2
+         ;;
+ esac
+ 
+<span class="d">-case $action in</span>
+<span class="d">-    help)      usage; exit 0 ;;</span>
+<span class="d">-    check-one) check_one &quot;$actionarg&quot;; exit 0 ;;</span>
+<span class="d">-esac</span>
+<span class="a">+if [ &quot;$action&quot; = help ]; then</span>
+<span class="a">+    usage</span>
+<span class="a">+    exit 0</span>
+<span class="a">+fi</span>
+ 
+ mkdir -p &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; || die &quot;cannot create directory for $BOOKMARKS&quot;
+ [ -e &quot;$BOOKMARKS&quot; ] || : &gt; &quot;$BOOKMARKS&quot; || die &quot;cannot create $BOOKMARKS&quot;
+ 
+<span class="d">-if [ &quot;$action&quot; != migrate ] &amp;&amp; needs_migration; then</span>
+<span class="d">-    printf &#x27;bm: %s has lines in the old format; run: bm --migrate\n&#x27; \</span>
+<span class="d">-        &quot;$BOOKMARKS&quot; &gt;&amp;2</span>
+<span class="a">+if awk &#x27;!/\t/ &amp;&amp; !/^#/ &amp;&amp; NF { found = 1; exit } END { exit !found }&#x27; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+then</span>
+<span class="a">+    printf &#x27;bm: %s has lines in the old format; run: bm-migrate\n&#x27; &quot;$BOOKMARKS&quot; &gt;&amp;2</span>
+ fi
+ 
+ case $action in
+<span class="d">-    list|search|import|check|migrate) ;;</span>
+<span class="a">+    list|merge) ;;</span>
+     *) pickmenu ;;
+ esac
+ 
+<span class="d">-if [ -z &quot;$action&quot; ]; then</span>
+<span class="d">-    if [ &quot;$SBM_MENU&quot; = fzf ]; then</span>
+<span class="d">-        action=browse</span>
+<span class="d">-    elif [ -n &quot;$tagfilter&quot; ]; then</span>
+<span class="d">-        action=copy</span>
+<span class="d">-    else</span>
+<span class="d">-        promptaction</span>
+<span class="d">-    fi</span>
+<span class="d">-fi</span>
+<span class="d">-</span>
+ case $action in
+<span class="d">-    browse)  browse ;;</span>
+<span class="d">-    copy)    copy ;;</span>
+<span class="d">-    open)    plumb ;;</span>
+<span class="d">-    add)     add &quot;$actionarg&quot; ;;</span>
+<span class="d">-    edit)    edit ;;</span>
+<span class="d">-    delete)  delete ;;</span>
+<span class="d">-    list)    list ;;</span>
+<span class="d">-    search)  search &quot;$actionarg&quot; ;;</span>
+<span class="d">-    import)  import &quot;$actionarg&quot; ;;</span>
+<span class="d">-    check)   check ;;</span>
+<span class="d">-    migrate) migrate ;;</span>
+<span class="d">-    *)       die &quot;unknown action: $action&quot; ;;</span>
+<span class="a">+    &#x27;&#x27;)</span>
+<span class="a">+        if [ &quot;$SBM_MENU&quot; = fzf ]; then browse_fzf; else browse_menu; fi</span>
+<span class="a">+        ;;</span>
+<span class="a">+    open)   plumb ;;</span>
+<span class="a">+    copy)   url=$(choose_url &#x27;copy:&#x27;)   &amp;&amp; copy_url &quot;$url&quot; ;;</span>
+<span class="a">+    print)  url=$(choose_url &#x27;print:&#x27;)  &amp;&amp; bump &quot;$url&quot; &amp;&amp; printf &#x27;%s\n&#x27; &quot;$url&quot; ;;</span>
+<span class="a">+    edit)   url=$(choose_url &#x27;edit:&#x27;)   &amp;&amp; edit_url &quot;$url&quot; ;;</span>
+<span class="a">+    delete) url=$(choose_url &#x27;delete:&#x27;) &amp;&amp; delete_url &quot;$url&quot; \</span>
+<span class="a">+                &amp;&amp; printf &#x27;deleted %s\n&#x27; &quot;$url&quot; ;;</span>
+<span class="a">+    add)    add &quot;$addurl&quot; ;;</span>
+<span class="a">+    list)   rows | cut -f1-3 ;;</span>
+<span class="a">+    merge)  merge ;;</span>
+ esac
+diff --git a/bm-check b/bm-check
+new file mode 100755
+index 0000000..c54781b
+--- /dev/null
++++ b/bm-check
+<span class="h">@@ -0,0 +1,70 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-check: report dead and permanently moved links.</span>
+<span class="a">+#</span>
+<span class="a">+#     bm-check                    the default bookmark file</span>
+<span class="a">+#     bm-check file ...           these files (&quot;-&quot; is stdin)</span>
+<span class="a">+#     bm --tag code --list | bm-check -</span>
+<span class="a">+#</span>
+<span class="a">+# Reads bookmark lines (only the first field matters, so a plain list of URLs</span>
+<span class="a">+# works too) and prints, for each link that is in trouble,</span>
+<span class="a">+#</span>
+<span class="a">+#     status&lt;tab&gt;url[&lt;tab&gt;new location]</span>
+<span class="a">+#</span>
+<span class="a">+# where status is the HTTP status, or 000 when there was no answer. 301 and</span>
+<span class="a">+# 308 are reported because the bookmark should be updated. Exits 1 when it</span>
+<span class="a">+# printed anything.</span>
+<span class="a">+</span>
+<span class="a">+probe=&#x27;%{http_code} %{redirect_url}&#x27;</span>
+<span class="a">+</span>
+<span class="a">+check () {</span>
+<span class="a">+    res=$(curl -sI --max-time 10 -A &#x27;Mozilla/5.0&#x27; -o /dev/null -w &quot;$probe&quot; \</span>
+<span class="a">+          -- &quot;$1&quot; 2&gt;/dev/null)</span>
+<span class="a">+    case ${res%% *} in</span>
+<span class="a">+        403|405|000|&#x27;&#x27;)</span>
+<span class="a">+            # Some servers refuse HEAD; ask for the first byte instead.</span>
+<span class="a">+            res=$(curl -s -r 0-0 --max-time 10 -A &#x27;Mozilla/5.0&#x27; -o /dev/null \</span>
+<span class="a">+                  -w &quot;$probe&quot; -- &quot;$1&quot; 2&gt;/dev/null)</span>
+<span class="a">+            ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    code=${res%% *}</span>
+<span class="a">+    case $code in</span>
+<span class="a">+        301|308) printf &#x27;%s\t%s\t%s\n&#x27; &quot;$code&quot; &quot;$1&quot; &quot;${res#* }&quot; ;;</span>
+<span class="a">+        2*|3*)   ;;</span>
+<span class="a">+        *)       printf &#x27;%s\t%s\n&#x27; &quot;${code:-000}&quot; &quot;$1&quot; ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+case ${1-} in</span>
+<span class="a">+    -h|--help) sed -n &#x27;3,16s/^# \{0,1\}//p&#x27; &quot;$0&quot;; exit 0 ;;</span>
+<span class="a">+esac</span>
+<span class="a">+</span>
+<span class="a">+command -v curl &gt;/dev/null 2&gt;&amp;1 || { printf &#x27;bm-check: needs curl\n&#x27; &gt;&amp;2; exit 1; }</span>
+<span class="a">+[ $# -gt 0 ] || set -- &quot;${BOOKMARKS:-${XDG_DATA_HOME:-$HOME/.local/share}/sbm/bookmarks}&quot;</span>
+<span class="a">+</span>
+<span class="a">+# Eight probes in flight until the list runs out, like xargs -P 8, with a</span>
+<span class="a">+# FIFO as the semaphore: it starts out holding eight tokens, a probe takes one</span>
+<span class="a">+# before it starts and puts it back when it is done. Opening a FIFO blocks</span>
+<span class="a">+# until the other end is opened too, hence the helper that opens it for</span>
+<span class="a">+# writing while we open it for reading. Every report is one short line from</span>
+<span class="a">+# one printf, so concurrent probes do not garble each other.</span>
+<span class="a">+fifo=${TMPDIR:-/tmp}/bm-check.$$</span>
+<span class="a">+mkfifo -m 600 &quot;$fifo&quot; || { printf &#x27;bm-check: cannot create %s\n&#x27; &quot;$fifo&quot; &gt;&amp;2; exit 1; }</span>
+<span class="a">+trap &#x27;rm -f &quot;$fifo&quot;&#x27; EXIT INT TERM</span>
+<span class="a">+: &gt; &quot;$fifo&quot; &amp;</span>
+<span class="a">+# shellcheck disable=SC2094  # both ends of the FIFO, on purpose</span>
+<span class="a">+exec 3&lt; &quot;$fifo&quot; 4&gt; &quot;$fifo&quot;</span>
+<span class="a">+rm -f &quot;$fifo&quot;</span>
+<span class="a">+printf &#x27;\n\n\n\n\n\n\n\n&#x27; &gt;&amp;4</span>
+<span class="a">+</span>
+<span class="a">+bad=$(cat -- &quot;$@&quot; | awk -F&#x27;\t&#x27; &#x27;NF &amp;&amp; !/^#/ { print $1 }&#x27; | {</span>
+<span class="a">+    while IFS= read -r url; do</span>
+<span class="a">+        # shellcheck disable=SC2034  # the token is only waited for</span>
+<span class="a">+        read -r token &lt;&amp;3</span>
+<span class="a">+        { check &quot;$url&quot;; echo &gt;&amp;4; } &amp;</span>
+<span class="a">+    done</span>
+<span class="a">+    wait</span>
+<span class="a">+})</span>
+<span class="a">+[ -z &quot;$bad&quot; ] &amp;&amp; exit 0</span>
+<span class="a">+printf &#x27;%s\n&#x27; &quot;$bad&quot;</span>
+<span class="a">+exit 1</span>
+diff --git a/bm-commit b/bm-commit
+new file mode 100755
+index 0000000..fbefcca
+--- /dev/null
++++ b/bm-commit
+<span class="h">@@ -0,0 +1,36 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-commit [message]: commit the bookmark file, and the tag file beside it,</span>
+<span class="a">+# when their directory is a git repository of its own. bm runs it after every</span>
+<span class="a">+# change when it is installed. It never pushes or pulls.</span>
+<span class="a">+#</span>
+<span class="a">+#     cd ~/.local/share/sbm &amp;&amp; git init</span>
+<span class="a">+#     printf &#x27;%s\n&#x27; &#x27;*.usage&#x27; &#x27;*.bak*&#x27; &gt; .gitignore</span>
+<span class="a">+#</span>
+<span class="a">+# A file that merely sits somewhere inside a bigger repository (your dotfiles,</span>
+<span class="a">+# say) is left alone, unless SBM_GIT=1. SBM_GIT=0 turns commits off.</span>
+<span class="a">+</span>
+<span class="a">+DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/sbm</span>
+<span class="a">+BOOKMARKS=${BOOKMARKS:-$DATADIR/bookmarks}</span>
+<span class="a">+USERTAGS=${USERTAGS:-$DATADIR/usertags}</span>
+<span class="a">+</span>
+<span class="a">+[ &quot;${SBM_GIT:-auto}&quot; != 0 ] || exit 0</span>
+<span class="a">+dir=$(cd &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; 2&gt;/dev/null &amp;&amp; pwd -P) || exit 0</span>
+<span class="a">+top=$(git -C &quot;$dir&quot; rev-parse --show-toplevel 2&gt;/dev/null) || exit 0</span>
+<span class="a">+[ &quot;${SBM_GIT:-auto}&quot; = 1 ] || [ &quot;$top&quot; = &quot;$dir&quot; ] || exit 0</span>
+<span class="a">+</span>
+<span class="a">+set -- &quot;${1:-bm: update}&quot; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+if [ -e &quot;$USERTAGS&quot; ] \</span>
+<span class="a">+    &amp;&amp; [ &quot;$(cd &quot;$(dirname &quot;$USERTAGS&quot;)&quot; 2&gt;/dev/null &amp;&amp; pwd -P)&quot; = &quot;$dir&quot; ]</span>
+<span class="a">+then</span>
+<span class="a">+    set -- &quot;$@&quot; &quot;$USERTAGS&quot;</span>
+<span class="a">+fi</span>
+<span class="a">+message=$1</span>
+<span class="a">+shift</span>
+<span class="a">+</span>
+<span class="a">+git -C &quot;$dir&quot; add -- &quot;$@&quot; 2&gt;/dev/null || exit 0</span>
+<span class="a">+git -C &quot;$dir&quot; diff --cached --quiet -- &quot;$@&quot; &amp;&amp; exit 0</span>
+<span class="a">+if ! git -C &quot;$dir&quot; commit -q -m &quot;$message&quot; -- &quot;$@&quot; &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+    printf &#x27;bm-commit: git commit failed in %s\n&#x27; &quot;$dir&quot; &gt;&amp;2</span>
+<span class="a">+    exit 1</span>
+<span class="a">+fi</span>
+diff --git a/bm-html b/bm-html
+new file mode 100755
+index 0000000..4031c5f
+--- /dev/null
++++ b/bm-html
+<span class="h">@@ -0,0 +1,105 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-html: print the bookmarks as one self-contained web page.</span>
+<span class="a">+#</span>
+<span class="a">+#     bm-html &gt; ~/public_html/bookmarks.html</span>
+<span class="a">+#     bm --tag code --list | bm-html -t &#x27;Code&#x27; - &gt; code.html</span>
+<span class="a">+#</span>
+<span class="a">+# Without a file the default bookmark file is read; &quot;-&quot; is stdin.</span>
+<span class="a">+#</span>
+<span class="a">+# The page lists the bookmarks under each of their tags, with links to the</span>
+<span class="a">+# tags at the top. A few lines of script add a filter box; without script the</span>
+<span class="a">+# page is still the complete list. page.html?q=words starts out filtered, so</span>
+<span class="a">+# the page can serve as a search engine keyword in a browser, or in bm&#x27;s own</span>
+<span class="a">+# engines file:    b | https://example.org/bookmarks.html?q=%s</span>
+<span class="a">+</span>
+<span class="a">+usage () {</span>
+<span class="a">+    printf &#x27;usage: bm-html [-t title] [file | -] ...\n&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+title=Bookmarks</span>
+<span class="a">+while [ $# -gt 0 ]; do</span>
+<span class="a">+    case $1 in</span>
+<span class="a">+        -h|--help) usage; exit 0 ;;</span>
+<span class="a">+        -t)</span>
+<span class="a">+            [ $# -ge 2 ] || { usage &gt;&amp;2; exit 2; }</span>
+<span class="a">+            title=$2</span>
+<span class="a">+            shift</span>
+<span class="a">+            ;;</span>
+<span class="a">+        --) shift; break ;;</span>
+<span class="a">+        -) break ;;</span>
+<span class="a">+        -?*) usage &gt;&amp;2; exit 2 ;;</span>
+<span class="a">+        *) break ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    shift</span>
+<span class="a">+done</span>
+<span class="a">+[ $# -gt 0 ] || set -- &quot;${BOOKMARKS:-${XDG_DATA_HOME:-$HOME/.local/share}/sbm/bookmarks}&quot;</span>
+<span class="a">+</span>
+<span class="a">+cat -- &quot;$@&quot; | LC_ALL=C sort -f -t&#x27;	&#x27; -k2,2 -k1,1 | SBM_TITLE=$title awk -F&#x27;\t&#x27; &#x27;</span>
+<span class="a">+function esc(s) {</span>
+<span class="a">+    gsub(/&amp;/, &quot;\\&amp;amp;&quot;, s); gsub(/&lt;/, &quot;\\&amp;lt;&quot;, s); gsub(/&gt;/, &quot;\\&amp;gt;&quot;, s)</span>
+<span class="a">+    gsub(/&quot;/, &quot;\\&amp;quot;&quot;, s)</span>
+<span class="a">+    return s</span>
+<span class="a">+}</span>
+<span class="a">+function host(u) {</span>
+<span class="a">+    sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, &quot;&quot;, u)</span>
+<span class="a">+    sub(/[\/?#].*/, &quot;&quot;, u)</span>
+<span class="a">+    return u</span>
+<span class="a">+}</span>
+<span class="a">+NF == 0 || /^#/ { next }</span>
+<span class="a">+# Never publish a link that would run script.</span>
+<span class="a">+tolower($1) ~ /^[ \t]*(javascript|data|vbscript):/ { next }</span>
+<span class="a">+{</span>
+<span class="a">+    total++</span>
+<span class="a">+    item = sprintf(&quot;&lt;li&gt;&lt;a href=\&quot;%s\&quot;&gt;%s&lt;/a&gt; &lt;small&gt;%s&lt;/small&gt;&quot;, esc($1), \</span>
+<span class="a">+                   esc($2 == &quot;&quot; ? $1 : $2), esc(host($1)))</span>
+<span class="a">+    n = split($3, tag, &quot; &quot;)</span>
+<span class="a">+    for (i = 1; i &lt;= n; i++)</span>
+<span class="a">+        item = item sprintf(&quot; &lt;a class=t href=\&quot;#%s\&quot;&gt;%s&lt;/a&gt;&quot;, esc(tag[i]), esc(tag[i]))</span>
+<span class="a">+    if (n == 0) { n = 1; tag[1] = &quot;&quot; }</span>
+<span class="a">+    for (i = 1; i &lt;= n; i++) {</span>
+<span class="a">+        if (!(tag[i] in items)) names[++count] = tag[i]</span>
+<span class="a">+        items[tag[i]] = items[tag[i]] item &quot;\n&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+END {</span>
+<span class="a">+    # Insertion sort: tags by name, the untagged last.</span>
+<span class="a">+    for (i = 2; i &lt;= count; i++) {</span>
+<span class="a">+        name = names[i]</span>
+<span class="a">+        for (j = i - 1; j &gt; 0 &amp;&amp; (names[j] == &quot;&quot; || (name != &quot;&quot; &amp;&amp; names[j] &gt; name)); j--)</span>
+<span class="a">+            names[j + 1] = names[j]</span>
+<span class="a">+        names[j + 1] = name</span>
+<span class="a">+    }</span>
+<span class="a">+    t = esc(ENVIRON[&quot;SBM_TITLE&quot;])</span>
+<span class="a">+    print &quot;&lt;!doctype html&gt;&quot;</span>
+<span class="a">+    print &quot;&lt;meta charset=utf-8&gt;&quot;</span>
+<span class="a">+    print &quot;&lt;meta name=viewport content=\&quot;width=device-width, initial-scale=1\&quot;&gt;&quot;</span>
+<span class="a">+    print &quot;&lt;title&gt;&quot; t &quot;&lt;/title&gt;&quot;</span>
+<span class="a">+    print &quot;&lt;style&gt;&quot;</span>
+<span class="a">+    print &quot;body{max-width:50em;margin:1em auto;padding:0 1em;font:1em/1.5 sans-serif}&quot;</span>
+<span class="a">+    print &quot;#q{width:100%;box-sizing:border-box;font:inherit;padding:.3em}&quot;</span>
+<span class="a">+    print &quot;ul{padding-left:1.2em}small,.t{color:#777;font-size:.85em}.t{margin-left:.3em}&quot;</span>
+<span class="a">+    print &quot;&lt;/style&gt;&quot;</span>
+<span class="a">+    print &quot;&lt;h1&gt;&quot; t &quot;&lt;/h1&gt;&quot;</span>
+<span class="a">+    print &quot;&lt;input id=q type=search placeholder=\&quot;filter &quot; total &quot; bookmarks\&quot; hidden&gt;&quot;</span>
+<span class="a">+    printf &quot;&lt;p&gt;&quot;</span>
+<span class="a">+    for (i = 1; i &lt;= count; i++)</span>
+<span class="a">+        if (names[i] != &quot;&quot;)</span>
+<span class="a">+            printf &quot;&lt;a href=\&quot;#%s\&quot;&gt;%s&lt;/a&gt; &quot;, esc(names[i]), esc(names[i])</span>
+<span class="a">+    print &quot;&lt;/p&gt;&quot;</span>
+<span class="a">+    for (i = 1; i &lt;= count; i++) {</span>
+<span class="a">+        name = names[i] == &quot;&quot; ? &quot;untagged&quot; : names[i]</span>
+<span class="a">+        printf &quot;&lt;section&gt;&lt;h2 id=\&quot;%s\&quot;&gt;%s&lt;/h2&gt;\n&lt;ul&gt;\n%s&lt;/ul&gt;&lt;/section&gt;\n&quot;, \</span>
+<span class="a">+               esc(name), esc(name), items[names[i]]</span>
+<span class="a">+    }</span>
+<span class="a">+    print &quot;&lt;script&gt;&quot;</span>
+<span class="a">+    print &quot;var q=document.getElementById(\&quot;q\&quot;);q.hidden=false;&quot;</span>
+<span class="a">+    print &quot;function f(){var w=q.value.toLowerCase().split(/\\s+/);&quot;</span>
+<span class="a">+    print &quot;document.querySelectorAll(\&quot;section\&quot;).forEach(function(s){var n=0;&quot;</span>
+<span class="a">+    print &quot;s.querySelectorAll(\&quot;li\&quot;).forEach(function(l){&quot;</span>
+<span class="a">+    print &quot;var t=(l.textContent+\&quot; \&quot;+l.firstChild.href).toLowerCase();&quot;</span>
+<span class="a">+    print &quot;var ok=w.every(function(x){return t.indexOf(x)&gt;=0});l.hidden=!ok;if(ok)n++});&quot;</span>
+<span class="a">+    print &quot;s.hidden=!n})}&quot;</span>
+<span class="a">+    print &quot;q.oninput=f;q.value=new URLSearchParams(location.search).get(\&quot;q\&quot;)||\&quot;\&quot;;f();&quot;</span>
+<span class="a">+    print &quot;&lt;/script&gt;&quot;</span>
+<span class="a">+}&#x27;</span>
+diff --git a/bm-import b/bm-import
+new file mode 100755
+index 0000000..bea348d
+--- /dev/null
++++ b/bm-import
+<span class="h">@@ -0,0 +1,109 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-import: turn a browser&#x27;s bookmarks into bm&#x27;s format, on stdout.</span>
+<span class="a">+#</span>
+<span class="a">+#     bm-import bookmarks.html | bm --merge</span>
+<span class="a">+#</span>
+<span class="a">+# Reads the Netscape HTML that every browser exports, or the JSON file that</span>
+<span class="a">+# Chromium style browsers keep (this needs jq). Folder names become tags:</span>
+<span class="a">+# &quot;Dev Tools&quot; is dev-tools. Only http, https, ftp and file URLs are kept.</span>
+<span class="a">+</span>
+<span class="a">+usage () {</span>
+<span class="a">+    cat &lt;&lt;&#x27;EOF2&#x27;</span>
+<span class="a">+usage: bm-import &lt;file&gt; | vivaldi | chrome | brave | edge | chromium</span>
+<span class="a">+EOF2</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+die () {</span>
+<span class="a">+    printf &#x27;bm-import: %s\n&#x27; &quot;$*&quot; &gt;&amp;2</span>
+<span class="a">+    exit 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+if [ $# -ne 1 ]; then</span>
+<span class="a">+    usage &gt;&amp;2</span>
+<span class="a">+    exit 2</span>
+<span class="a">+fi</span>
+<span class="a">+case $1 in</span>
+<span class="a">+    -h|--help) usage; exit 0 ;;</span>
+<span class="a">+esac</span>
+<span class="a">+</span>
+<span class="a">+src=$1</span>
+<span class="a">+case $src in</span>
+<span class="a">+    vivaldi)  src=vivaldi ;;</span>
+<span class="a">+    chrome)   src=google-chrome ;;</span>
+<span class="a">+    brave)    src=BraveSoftware/Brave-Browser ;;</span>
+<span class="a">+    edge)     src=microsoft-edge ;;</span>
+<span class="a">+    chromium) src=chromium ;;</span>
+<span class="a">+    *)        src= ;;</span>
+<span class="a">+esac</span>
+<span class="a">+if [ -n &quot;$src&quot; ]; then</span>
+<span class="a">+    src=${XDG_CONFIG_HOME:-$HOME/.config}/$src/Default/Bookmarks</span>
+<span class="a">+else</span>
+<span class="a">+    src=$1</span>
+<span class="a">+fi</span>
+<span class="a">+[ -r &quot;$src&quot; ] || die &quot;cannot read $src&quot;</span>
+<span class="a">+</span>
+<span class="a">+# Chromium JSON. The trash (Vivaldi has one) is left out.</span>
+<span class="a">+from_json () {</span>
+<span class="a">+    command -v jq &gt;/dev/null 2&gt;&amp;1 || die &#x27;a Chromium bookmark file needs jq&#x27;</span>
+<span class="a">+    jq -r &#x27;</span>
+<span class="a">+        def slug: ascii_downcase | gsub(&quot;[^a-z0-9]+&quot;; &quot;-&quot;)</span>
+<span class="a">+                  | sub(&quot;^-&quot;; &quot;&quot;) | sub(&quot;-$&quot;; &quot;&quot;);</span>
+<span class="a">+        def emit(path):</span>
+<span class="a">+            if .type == &quot;url&quot; then</span>
+<span class="a">+                [.url, (.name | gsub(&quot;[\t\r\n]+&quot;; &quot; &quot;)),</span>
+<span class="a">+                 (path | unique | join(&quot; &quot;))] | join(&quot;\t&quot;)</span>
+<span class="a">+            elif (.children? | type) == &quot;array&quot; then</span>
+<span class="a">+                (path + ([.name | slug] | map(select(. != &quot;&quot;)))) as $sub</span>
+<span class="a">+                | .children[] | emit($sub)</span>
+<span class="a">+            else empty end;</span>
+<span class="a">+        .roots | to_entries[]</span>
+<span class="a">+        | select(.key != &quot;trash&quot; and (.value | type) == &quot;object&quot;)</span>
+<span class="a">+        | .value.children[]? | emit([])&#x27; &quot;$1&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# Netscape HTML. &lt;H3&gt; opens a folder, &lt;/DL&gt; closes it.</span>
+<span class="a">+from_html () {</span>
+<span class="a">+    awk &#x27;</span>
+<span class="a">+    function decode(s) {</span>
+<span class="a">+        gsub(/&amp;lt;/, &quot;&lt;&quot;, s); gsub(/&amp;gt;/, &quot;&gt;&quot;, s); gsub(/&amp;quot;/, &quot;\&quot;&quot;, s)</span>
+<span class="a">+        gsub(/&amp;#39;|&amp;#x27;|&amp;apos;/, &quot;\047&quot;, s); gsub(/&amp;nbsp;/, &quot; &quot;, s)</span>
+<span class="a">+        gsub(/&amp;amp;/, &quot;\\&amp;&quot;, s)</span>
+<span class="a">+        gsub(/[ \t\r]+/, &quot; &quot;, s); sub(/^ /, &quot;&quot;, s); sub(/ $/, &quot;&quot;, s)</span>
+<span class="a">+        return s</span>
+<span class="a">+    }</span>
+<span class="a">+    function slug(s) {</span>
+<span class="a">+        s = tolower(s)</span>
+<span class="a">+        gsub(/[^a-z0-9]+/, &quot;-&quot;, s); sub(/^-/, &quot;&quot;, s); sub(/-$/, &quot;&quot;, s)</span>
+<span class="a">+        return s</span>
+<span class="a">+    }</span>
+<span class="a">+    {</span>
+<span class="a">+        upper = toupper($0)</span>
+<span class="a">+        if ((at = index(upper, &quot;&lt;H3&quot;)) &gt; 0) {</span>
+<span class="a">+            name = substr($0, at)</span>
+<span class="a">+            name = substr(name, index(name, &quot;&gt;&quot;) + 1)</span>
+<span class="a">+            end = index(toupper(name), &quot;&lt;/H3&quot;)</span>
+<span class="a">+            if (end) name = substr(name, 1, end - 1)</span>
+<span class="a">+            folder[++depth] = slug(decode(name))</span>
+<span class="a">+        }</span>
+<span class="a">+        if ((at = index(upper, &quot;HREF=\&quot;&quot;)) &gt; 0) {</span>
+<span class="a">+            url = substr($0, at + 6)</span>
+<span class="a">+            rest = substr(url, index(url, &quot;\&quot;&quot;) + 1)</span>
+<span class="a">+            url = decode(substr(url, 1, index(url, &quot;\&quot;&quot;) - 1))</span>
+<span class="a">+            name = substr(rest, index(rest, &quot;&gt;&quot;) + 1)</span>
+<span class="a">+            end = index(toupper(name), &quot;&lt;/A&quot;)</span>
+<span class="a">+            if (end) name = substr(name, 1, end - 1)</span>
+<span class="a">+            tags = &quot;&quot;</span>
+<span class="a">+            for (i = 1; i &lt;= depth; i++)</span>
+<span class="a">+                if (folder[i] != &quot;&quot; &amp;&amp; index(&quot; &quot; tags &quot; &quot;, &quot; &quot; folder[i] &quot; &quot;) == 0)</span>
+<span class="a">+                    tags = tags (tags == &quot;&quot; ? &quot;&quot; : &quot; &quot;) folder[i]</span>
+<span class="a">+            printf &quot;%s\t%s\t%s\n&quot;, url, decode(name), tags</span>
+<span class="a">+        }</span>
+<span class="a">+        if (index(upper, &quot;&lt;/DL&gt;&quot;) &gt; 0 &amp;&amp; depth &gt; 0) depth--</span>
+<span class="a">+    }&#x27; &quot;$1&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+case $(LC_ALL=C tr -d &#x27; \t\r\n&#x27; &lt; &quot;$src&quot; | dd bs=1 count=1 2&gt;/dev/null) in</span>
+<span class="a">+    &#x27;{&#x27;) from_json &quot;$src&quot; ;;</span>
+<span class="a">+    *)   from_html &quot;$src&quot; ;;</span>
+<span class="a">+esac | awk -F&#x27;\t&#x27; &#x27;$1 ~ /^(https?|ftp|file):\/\//&#x27;</span>
+diff --git a/bm-migrate b/bm-migrate
+new file mode 100755
+index 0000000..60166e4
+--- /dev/null
++++ b/bm-migrate
+<span class="h">@@ -0,0 +1,120 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-migrate: convert a bookmark file from the old sbm format</span>
+<span class="a">+#</span>
+<span class="a">+#     URL description | tag tag</span>
+<span class="a">+#</span>
+<span class="a">+# to the tab separated one bm uses now</span>
+<span class="a">+#</span>
+<span class="a">+#     URL&lt;tab&gt;description&lt;tab&gt;tag tag</span>
+<span class="a">+#</span>
+<span class="a">+# The URL is the first word, the tags are whatever follows the last &quot; | &quot;, and</span>
+<span class="a">+# a line without &quot; | &quot; has no tags. Comments, blank lines and lines that already</span>
+<span class="a">+# contain a tab are passed through, so converting twice changes nothing.</span>
+<span class="a">+</span>
+<span class="a">+usage () {</span>
+<span class="a">+    cat &lt;&lt;&#x27;EOF&#x27;</span>
+<span class="a">+usage: bm-migrate [-n] [file]</span>
+<span class="a">+  file   the bookmark file; defaults to $BOOKMARKS, then to</span>
+<span class="a">+         $XDG_DATA_HOME/sbm/bookmarks. &quot;-&quot; converts stdin to stdout.</span>
+<span class="a">+  -n     print the converted file instead of replacing it</span>
+<span class="a">+The original is kept as &lt;file&gt;.bak (or .bak.1, .bak.2, ... if that exists).</span>
+<span class="a">+EOF</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+die () {</span>
+<span class="a">+    printf &#x27;bm-migrate: %s\n&#x27; &quot;$*&quot; &gt;&amp;2</span>
+<span class="a">+    exit 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+convert () {</span>
+<span class="a">+    awk &#x27;</span>
+<span class="a">+        /\t/ || /^#/ || NF == 0 { print; next }</span>
+<span class="a">+        {</span>
+<span class="a">+            url = $1</span>
+<span class="a">+            desc = $0</span>
+<span class="a">+            sub(/^[ ]*[^ ]+[ ]*/, &quot;&quot;, desc)</span>
+<span class="a">+            tags = &quot;&quot;</span>
+<span class="a">+            if (match(desc, / \|[^|]*$/)) {</span>
+<span class="a">+                tags = substr(desc, RSTART + 2)</span>
+<span class="a">+                desc = substr(desc, 1, RSTART - 1)</span>
+<span class="a">+            }</span>
+<span class="a">+            gsub(/^ +| +$/, &quot;&quot;, desc)</span>
+<span class="a">+            gsub(/^ +| +$/, &quot;&quot;, tags)</span>
+<span class="a">+            printf &quot;%s\t%s\t%s\n&quot;, url, desc, tags</span>
+<span class="a">+        }&#x27; &quot;$@&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# oldlines &lt;file&gt;: how many lines are still in the old format.</span>
+<span class="a">+oldlines () {</span>
+<span class="a">+    awk &#x27;!/\t/ &amp;&amp; !/^#/ &amp;&amp; NF { n++ } END { print n + 0 }&#x27; &quot;$1&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+dryrun=</span>
+<span class="a">+while [ $# -gt 0 ]; do</span>
+<span class="a">+    case $1 in</span>
+<span class="a">+        -h|--help) usage; exit 0 ;;</span>
+<span class="a">+        -n|--dry-run) dryrun=1 ;;</span>
+<span class="a">+        -) break ;;</span>
+<span class="a">+        -*)</span>
+<span class="a">+            printf &#x27;bm-migrate: unknown option: %s\n&#x27; &quot;$1&quot; &gt;&amp;2</span>
+<span class="a">+            usage &gt;&amp;2</span>
+<span class="a">+            exit 2</span>
+<span class="a">+            ;;</span>
+<span class="a">+        *) break ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    shift</span>
+<span class="a">+done</span>
+<span class="a">+if [ $# -gt 1 ]; then</span>
+<span class="a">+    printf &#x27;bm-migrate: one file at a time\n&#x27; &gt;&amp;2</span>
+<span class="a">+    exit 2</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+file=${1:-${BOOKMARKS:-${XDG_DATA_HOME:-$HOME/.local/share}/sbm/bookmarks}}</span>
+<span class="a">+</span>
+<span class="a">+if [ &quot;$file&quot; = - ]; then</span>
+<span class="a">+    convert</span>
+<span class="a">+    exit</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+[ -f &quot;$file&quot; ] || die &quot;no such file: $file&quot;</span>
+<span class="a">+[ -r &quot;$file&quot; ] || die &quot;cannot read $file&quot;</span>
+<span class="a">+</span>
+<span class="a">+if [ -n &quot;$dryrun&quot; ]; then</span>
+<span class="a">+    convert &quot;$file&quot;</span>
+<span class="a">+    exit</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+count=$(oldlines &quot;$file&quot;)</span>
+<span class="a">+if [ &quot;$count&quot; -eq 0 ]; then</span>
+<span class="a">+    printf &#x27;nothing to migrate in %s\n&#x27; &quot;$file&quot;</span>
+<span class="a">+    exit 0</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+# Never overwrite an earlier backup: it may be the only copy of the original.</span>
+<span class="a">+backup=$file.bak</span>
+<span class="a">+n=0</span>
+<span class="a">+while [ -e &quot;$backup&quot; ]; do</span>
+<span class="a">+    n=$((n + 1))</span>
+<span class="a">+    backup=$file.bak.$n</span>
+<span class="a">+done</span>
+<span class="a">+cp -p &quot;$file&quot; &quot;$backup&quot; || die &quot;could not back up to $backup&quot;</span>
+<span class="a">+</span>
+<span class="a">+# Through cat rather than mv, so that a symlinked bookmark file stays a symlink</span>
+<span class="a">+# and keeps its permissions.</span>
+<span class="a">+# Beside the file if that directory can be written to, else in $TMPDIR;</span>
+<span class="a">+# noclobber (O_EXCL) keeps a planted file or symlink from being followed.</span>
+<span class="a">+tmp=</span>
+<span class="a">+for candidate in &quot;$file.tmp.$$&quot; &quot;${TMPDIR:-/tmp}/sbm.$$.${file##*/}&quot;; do</span>
+<span class="a">+    if (umask 077; set -C; : &gt; &quot;$candidate&quot;) 2&gt;/dev/null; then</span>
+<span class="a">+        tmp=$candidate</span>
+<span class="a">+        break</span>
+<span class="a">+    fi</span>
+<span class="a">+done</span>
+<span class="a">+[ -n &quot;$tmp&quot; ] || die &#x27;cannot create a temporary file&#x27;</span>
+<span class="a">+trap &#x27;rm -f &quot;$tmp&quot;&#x27; EXIT INT TERM</span>
+<span class="a">+if ! convert &quot;$backup&quot; &gt; &quot;$tmp&quot; || ! cat &quot;$tmp&quot; &gt; &quot;$file&quot;; then</span>
+<span class="a">+    die &quot;could not rewrite $file; the original is in $backup&quot;</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+printf &#x27;migrated %d lines in %s (original kept as %s)\n&#x27; &quot;$count&quot; &quot;$file&quot; &quot;$backup&quot;</span>
+diff --git a/bm-title b/bm-title
+new file mode 100755
+index 0000000..84a17ba
+--- /dev/null
++++ b/bm-title
+<span class="h">@@ -0,0 +1,33 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-title: print the &lt;title&gt; of a web page, or nothing.</span>
+<span class="a">+# When it is installed, &quot;bm --add&quot; offers the title as the description.</span>
+<span class="a">+# SBM_FETCH=0 keeps it off the network.</span>
+<span class="a">+</span>
+<span class="a">+if [ $# -ne 1 ]; then</span>
+<span class="a">+    printf &#x27;usage: bm-title &lt;url&gt;\n&#x27; &gt;&amp;2</span>
+<span class="a">+    exit 2</span>
+<span class="a">+fi</span>
+<span class="a">+[ &quot;${SBM_FETCH:-1}&quot; != 0 ] || exit 0</span>
+<span class="a">+</span>
+<span class="a">+# Lines are gathered until the title has been closed; awk then leaves, and</span>
+<span class="a">+# curl stops downloading. dd caps it at 64k for pages that are one long line</span>
+<span class="a">+# (it may pass a little less when its reads come up short; never more).</span>
+<span class="a">+curl -sL --max-time 3 -A &#x27;Mozilla/5.0&#x27; -- &quot;$1&quot; 2&gt;/dev/null \</span>
+<span class="a">+    | dd bs=1024 count=64 2&gt;/dev/null | LC_ALL=C awk &#x27;</span>
+<span class="a">+    function title(s,    start, end) {</span>
+<span class="a">+        start = index(tolower(s), &quot;&lt;title&quot;)</span>
+<span class="a">+        if (!start) return</span>
+<span class="a">+        s = substr(s, start)</span>
+<span class="a">+        s = substr(s, index(s, &quot;&gt;&quot;) + 1)</span>
+<span class="a">+        end = index(tolower(s), &quot;&lt;/title&quot;)</span>
+<span class="a">+        if (end) s = substr(s, 1, end - 1)</span>
+<span class="a">+        gsub(/&amp;lt;/, &quot;&lt;&quot;, s); gsub(/&amp;gt;/, &quot;&gt;&quot;, s); gsub(/&amp;quot;/, &quot;\&quot;&quot;, s)</span>
+<span class="a">+        gsub(/&amp;#39;|&amp;#x27;|&amp;apos;/, &quot;\047&quot;, s); gsub(/&amp;nbsp;/, &quot; &quot;, s)</span>
+<span class="a">+        gsub(/&amp;amp;/, &quot;\\&amp;&quot;, s)</span>
+<span class="a">+        gsub(/[ \t\r]+/, &quot; &quot;, s); sub(/^ /, &quot;&quot;, s); sub(/ $/, &quot;&quot;, s)</span>
+<span class="a">+        print s</span>
+<span class="a">+    }</span>
+<span class="a">+    { page = page &quot; &quot; $0 }</span>
+<span class="a">+    index(tolower($0), &quot;&lt;/title&quot;) || NR &gt;= 500 { exit }</span>
+<span class="a">+    END { title(page) }&#x27;</span>
+diff --git a/config.mk b/config.mk
+index 1706bdb..28ad308 100644
+--- a/config.mk
++++ b/config.mk
+<span class="h">@@ -1,5 +1,14 @@</span>
+<span class="d">-VERSION=0.2</span>
+<span class="a">+VERSION=0.3</span>
+ SHELL = /bin/sh
+ 
+ PREFIX=/usr/local
+ MANPREFIX=${PREFIX}/share/man
+<span class="a">+</span>
+<span class="a">+# What make install installs. bm is all you need; delete what you do not use.</span>
+<span class="a">+#   bm-migrate  convert a file from the old &quot;url desc | tags&quot; format</span>
+<span class="a">+#   bm-import   browser bookmarks to bm&#x27;s format (Chromium files need jq)</span>
+<span class="a">+#   bm-check    report dead links (curl)</span>
+<span class="a">+#   bm-html     the bookmarks as a searchable web page</span>
+<span class="a">+#   bm-title    lets bm --add suggest the page title as description (curl)</span>
+<span class="a">+#   bm-commit   lets bm keep the file&#x27;s history in git</span>
+<span class="a">+TOOLS = bm bm-migrate bm-import bm-check bm-html bm-title bm-commit</span>
+diff --git a/engines b/engines
+new file mode 100644
+index 0000000..76dfe23
+--- /dev/null
++++ b/engines
+<span class="h">@@ -0,0 +1,5 @@</span>
+<span class="a">+w    | https://en.wikipedia.org/w/index.php?search=%s</span>
+<span class="a">+gh   | https://github.com/search?q=%s</span>
+<span class="a">+aw   | https://wiki.archlinux.org/index.php?search=%s</span>
+<span class="a">+man  | https://man.archlinux.org/search?q=%s</span>
+<span class="a">+yt   | https://www.youtube.com/results?search_query=%s</span>
+diff --git a/test/fakefzf b/test/fakefzf
+index 66b5e01..62d8979 100755
+--- a/test/fakefzf
++++ b/test/fakefzf
+<span class="h">@@ -1,13 +1,17 @@</span>
+ #!/bin/sh
+ 
+ # Scripted stand-in for fzf, installed as &quot;fzf&quot; on the test PATH. Consumes one
+<span class="d">-# line of $SBM_TEST_ANSWERS per call, like test/fakemenu:</span>
+<span class="a">+# line of $SBM_TEST_ANSWERS per call, like test/fakemenu. What it prints</span>
+<span class="a">+# depends on the options it was given, as with the real thing:</span>
+ #
+<span class="d">-#   with --expect       key:text    prints the key, then the first row</span>
+<span class="d">-#                                   containing text (&quot;enter&quot; is the empty key)</span>
+<span class="d">-#   with --print-query  query:words prints the query, then the choices starting</span>
+<span class="d">-#                                   with each word</span>
+<span class="d">-#   otherwise           text        prints the first row containing text</span>
+<span class="a">+#   --expect             answer key:text   the typed text, the key (&quot;enter&quot;</span>
+<span class="a">+#                                          is the empty key), then the first</span>
+<span class="a">+#                                          row containing text, if any</span>
+<span class="a">+#   --multi              answer text:words the typed text, then the choices</span>
+<span class="a">+#                                          that start with each word</span>
+<span class="a">+#   --print-query alone  answer text       the typed text, then the first row</span>
+<span class="a">+#                                          containing it, if any</span>
+<span class="a">+#   none of these        answer text       the first row containing text</span>
+ #
+ # An empty answer is ESC: no output, exit 130.
+ 
+<span class="h">@@ -16,8 +20,9 @@</span>
+ mode=pick
+ for arg in &quot;$@&quot;; do
+     case $arg in
+<span class="a">+        --print-query) [ &quot;$mode&quot; = pick ] &amp;&amp; mode=query ;;</span>
+<span class="a">+        --multi)       [ &quot;$mode&quot; = expect ] || mode=multi ;;</span>
+         --expect=*)    mode=expect ;;
+<span class="d">-        --print-query) mode=query ;;</span>
+     esac
+ done
+ 
+<span class="h">@@ -37,15 +42,19 @@ case $mode in</span>
+     expect)
+         key=${answer%%:*}
+         [ &quot;$key&quot; = enter ] &amp;&amp; key=
+<span class="d">-        printf &#x27;%s\n&#x27; &quot;$key&quot;</span>
+<span class="a">+        printf &#x27;%s\n%s\n&#x27; &quot;${answer#*:}&quot; &quot;$key&quot;</span>
+         row &quot;${answer#*:}&quot;
+         ;;
+<span class="d">-    query)</span>
+<span class="a">+    multi)</span>
+         printf &#x27;%s\n&#x27; &quot;${answer%%:*}&quot;
+         for word in ${answer#*:}; do
+             printf &#x27;%s\n&#x27; &quot;$choices&quot; | grep -- &quot;^$word &quot; | head -n 1
+         done
+         ;;
+<span class="a">+    query)</span>
+<span class="a">+        printf &#x27;%s\n&#x27; &quot;$answer&quot;</span>
+<span class="a">+        row &quot;$answer&quot;</span>
+<span class="a">+        ;;</span>
+     *)
+         row &quot;$answer&quot;
+         ;;
+diff --git a/test/fakemenu b/test/fakemenu
+index 1027928..828b16b 100755
+--- a/test/fakemenu
++++ b/test/fakemenu
+<span class="h">@@ -18,6 +18,8 @@ case $name in</span>
+ esac
+ 
+ choices=$(cat)
+<span class="a">+# With $SBM_TEST_SEEN set, what each menu offered is appended to that file.</span>
+<span class="a">+[ -z &quot;$SBM_TEST_SEEN&quot; ] || printf -- &#x27;--- %s\n%s\n&#x27; &quot;$*&quot; &quot;$choices&quot; &gt;&gt; &quot;$SBM_TEST_SEEN&quot;</span>
+ answer=$(sed -n 1p &quot;$SBM_TEST_ANSWERS&quot;)
+ sed 1d &quot;$SBM_TEST_ANSWERS&quot; &gt; &quot;$SBM_TEST_ANSWERS.next&quot;
+ mv &quot;$SBM_TEST_ANSWERS.next&quot; &quot;$SBM_TEST_ANSWERS&quot;
+diff --git a/test/run.sh b/test/run.sh
+index 0772188..d3755b4 100755
+--- a/test/run.sh
++++ b/test/run.sh
+<span class="h">@@ -1,17 +1,25 @@</span>
+ #!/bin/sh
+ 
+<span class="d">-# Non-interactive tests for bm. Menus are scripted through test/fakemenu, and</span>
+<span class="d">-# the clipboard and opener are stubs that write to files.</span>
+<span class="a">+# Non-interactive tests for bm and the bm-* tools. Menus are scripted through</span>
+<span class="a">+# test/fakemenu and test/fakefzf, and the clipboard and opener are stubs that</span>
+<span class="a">+# write to files.</span>
+ # usage: sh test/run.sh        (SBM_SH=dash sh test/run.sh to pick the shell)
+ 
+ # Several groups point BOOKMARKS somewhere else inside a subshell on purpose.
+ # shellcheck disable=SC2030,SC2031
+ 
+ here=$(cd &quot;$(dirname &quot;$0&quot;)&quot; &amp;&amp; pwd)
+<span class="d">-BM=&quot;${SBM_SH:-sh} $here/../bm&quot;</span>
+<span class="a">+top=$(cd &quot;$here/..&quot; &amp;&amp; pwd)</span>
+<span class="a">+BM=&quot;${SBM_SH:-sh} $top/bm&quot;</span>
+<span class="a">+MIGRATE=&quot;${SBM_SH:-sh} $top/bm-migrate&quot;</span>
+<span class="a">+IMPORT=&quot;${SBM_SH:-sh} $top/bm-import&quot;</span>
+<span class="a">+CHECK=&quot;${SBM_SH:-sh} $top/bm-check&quot;</span>
+<span class="a">+HTML=&quot;${SBM_SH:-sh} $top/bm-html&quot;</span>
+<span class="a">+TITLE=&quot;${SBM_SH:-sh} $top/bm-title&quot;</span>
+ TAB=$(printf &#x27;\t&#x27;)
+ 
+<span class="d">-work=$(mktemp -d &quot;${TMPDIR:-/tmp}/sbmtest.XXXXXX&quot;) || exit 1</span>
+<span class="a">+work=${TMPDIR:-/tmp}/sbmtest.$$</span>
+<span class="a">+mkdir -m 700 &quot;$work&quot; || exit 1</span>
+ trap &#x27;rm -rf &quot;$work&quot;&#x27; EXIT INT TERM
+ 
+ export BOOKMARKS=&quot;$work/bookmarks&quot;
+<span class="h">@@ -114,7 +122,7 @@ for dup in http://example.com/docs https://example.com/docs/ \</span>
+     answers &#x27;Second&#x27; &#x27;code&#x27;
+     $BM -a &quot;$dup&quot; 2&gt;/dev/null
+     rc=$?
+<span class="d">-    eq &quot;add rejects duplicate $dup&quot; &quot;$rc $(wc -l &lt; &quot;$BOOKMARKS&quot; | tr -d &#x27; &#x27;)&quot; &#x27;1 1&#x27;</span>
+<span class="a">+    eq &quot;add rejects duplicate $dup with status 3&quot; &quot;$rc $(wc -l &lt; &quot;$BOOKMARKS&quot; | tr -d &#x27; &#x27;)&quot; &#x27;3 1&#x27;</span>
+ done
+ answers &#x27;Other path&#x27; &#x27;code&#x27;
+ $BM -a https://example.com/Docs 2&gt;/dev/null
+<span class="h">@@ -154,19 +162,25 @@ eq &#x27;list honours the tag filter&#x27; &quot;$($BM -t code -l | cut -f1 | paste -sd &#x27; &#x27; -)&quot;</span>
+ 
+ eq &#x27;tag filter matches whole tags only&#x27; &quot;$($BM -t cod -l)&quot; &#x27;&#x27;
+ 
+<span class="d">-answers &#x27;example&#x27;</span>
+<span class="a">+answers &#x27;example&#x27; &#x27;copy&#x27;</span>
+ $BM -t sec
+<span class="d">-eq &#x27;a tag filter alone implies copy&#x27; \</span>
+<span class="a">+eq &#x27;a tag filter narrows the browser&#x27; \</span>
+     &quot;$(cat &quot;$work/clipboard&quot;)&quot; &#x27;https://a.example&#x27;
+ 
+ $BM -t nosuchtag -c 2&gt;/dev/null
+ eq &#x27;copy with an unused tag fails&#x27; &quot;$?&quot; &#x27;1&#x27;
+ 
+<span class="d">-answers &#x27;copy&#x27; &#x27;Sea&#x27;</span>
+<span class="a">+answers &#x27;Sea&#x27; &#x27;copy&#x27;</span>
+ $BM
+<span class="d">-eq &#x27;no arguments prompts for the action&#x27; \</span>
+<span class="a">+eq &#x27;no arguments: pick the bookmark, then what to do&#x27; \</span>
+     &quot;$(cat &quot;$work/clipboard&quot;)&quot; &#x27;https://c.example&#x27;
+ 
+<span class="a">+answers &#x27;Ay&#x27;</span>
+<span class="a">+eq &#x27;--print prints the url&#x27; &quot;$($BM --print)&quot; &#x27;https://a.example&#x27;</span>
+<span class="a">+answers &#x27;no such bookmark&#x27;</span>
+<span class="a">+$BM -c 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;copy refuses text that is not a bookmark&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="a">+</span>
+ answers &#x27;Bee&#x27;
+ $BM -d &gt;/dev/null
+ eq &#x27;delete removes only the chosen row&#x27; &quot;$(cut -f1 &quot;$BOOKMARKS&quot; | paste -sd &#x27; &#x27; -)&quot; \
+<span class="h">@@ -187,28 +201,86 @@ kill &quot;$watchdog&quot; 2&gt;/dev/null</span>
+ eq &#x27;dmenu tag loop ends when the menu is closed&#x27; \
+     &quot;$(cat &quot;$BOOKMARKS&quot;)&quot; &quot;https://dmenu.example${TAB}Escaped${TAB}sec&quot;
+ 
+<span class="d">-# ---- migrate ----</span>
+<span class="a">+# ---- bm-migrate ----</span>
+ 
+ reset
+<span class="d">-printf &#x27;%s\n&#x27; \</span>
+<span class="d">-    &#x27;https://old.example Old style | code sec&#x27; \</span>
+<span class="d">-    &#x27;https://equwal.com  Spenser Truex&#x27;&quot;&#x27;&quot;&#x27;s website.&#x27; \</span>
+<span class="d">-    &#x27;https://pipe.example a | b | lib&#x27; \</span>
+<span class="d">-    &quot;https://new.example${TAB}Already TSV${TAB}org&quot; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="d">-expected=$(printf &#x27;%s\n&#x27; \</span>
+<span class="a">+printf &#x27;%s\n&#x27; &#x27;https://old.example Old style | code sec&#x27; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+eq &#x27;bm warns about an old format file and names the tool&#x27; \</span>
+<span class="a">+    &quot;$($BM -l 2&gt;&amp;1 &gt;/dev/null | grep -c &#x27;bm-migrate&#x27;)&quot; &#x27;1&#x27;</span>
+<span class="a">+</span>
+<span class="a">+# backups: how many backups sit beside the bookmark file.</span>
+<span class="a">+backups () {</span>
+<span class="a">+    set -- &quot;$BOOKMARKS&quot;.bak*</span>
+<span class="a">+    if [ -e &quot;$1&quot; ]; then echo $#; else echo 0; fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+old_file () {</span>
+<span class="a">+    rm -f &quot;$BOOKMARKS&quot;.bak*</span>
+<span class="a">+    printf &#x27;%s\n&#x27; \</span>
+<span class="a">+        &#x27;# my bookmarks&#x27; \</span>
+<span class="a">+        &#x27;&#x27; \</span>
+<span class="a">+        &#x27;https://old.example Old style | code sec&#x27; \</span>
+<span class="a">+        &#x27;https://equwal.com  Spenser Truex&#x27;&quot;&#x27;&quot;&#x27;s website.&#x27; \</span>
+<span class="a">+        &#x27;https://pipe.example a | b | lib&#x27; \</span>
+<span class="a">+        &#x27;  https://indented.example   spaced   out  |  org  &#x27; \</span>
+<span class="a">+        &#x27;https://bare.example&#x27; \</span>
+<span class="a">+        &#x27;https://100.example 100%s done \n | lib&#x27; \</span>
+<span class="a">+        &quot;https://new.example${TAB}Already TSV${TAB}org&quot; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+}</span>
+<span class="a">+migrated=$(printf &#x27;%s\n&#x27; \</span>
+<span class="a">+    &#x27;# my bookmarks&#x27; \</span>
+<span class="a">+    &#x27;&#x27; \</span>
+     &quot;https://old.example${TAB}Old style${TAB}code sec&quot; \
+     &quot;https://equwal.com${TAB}Spenser Truex&#x27;s website.${TAB}&quot; \
+     &quot;https://pipe.example${TAB}a | b${TAB}lib&quot; \
+<span class="a">+    &quot;https://indented.example${TAB}spaced   out${TAB}org&quot; \</span>
+<span class="a">+    &quot;https://bare.example${TAB}${TAB}&quot; \</span>
+<span class="a">+    &quot;https://100.example${TAB}100%s done \\n${TAB}lib&quot; \</span>
+     &quot;https://new.example${TAB}Already TSV${TAB}org&quot;)
+ 
+<span class="d">-eq &#x27;old format triggers a warning&#x27; \</span>
+<span class="d">-    &quot;$($BM -l 2&gt;&amp;1 &gt;/dev/null | grep -c -- &#x27;--migrate&#x27;)&quot; &#x27;1&#x27;</span>
+<span class="d">-$BM --migrate &gt;/dev/null</span>
+<span class="d">-eq &#x27;migrate converts old lines to TSV&#x27; &quot;$(cat &quot;$BOOKMARKS&quot;)&quot; &quot;$expected&quot;</span>
+<span class="d">-eq &#x27;migrate leaves a backup&#x27; &quot;$(grep -c . &quot;$BOOKMARKS.bak&quot;)&quot; &#x27;4&#x27;</span>
+<span class="d">-$BM --migrate &gt;/dev/null</span>
+<span class="d">-eq &#x27;migrate is idempotent&#x27; &quot;$(cat &quot;$BOOKMARKS&quot;)&quot; &quot;$expected&quot;</span>
+<span class="d">-eq &#x27;no warning after migrating&#x27; &quot;$($BM -l 2&gt;&amp;1 &gt;/dev/null)&quot; &#x27;&#x27;</span>
+<span class="a">+old_file</span>
+<span class="a">+original=$(cat &quot;$BOOKMARKS&quot;)</span>
+<span class="a">+eq &#x27;bm-migrate -n prints the converted file&#x27; &quot;$($MIGRATE -n &quot;$BOOKMARKS&quot;)&quot; &quot;$migrated&quot;</span>
+<span class="a">+eq &#x27;bm-migrate -n changes nothing&#x27; \</span>
+<span class="a">+    &quot;$(cat &quot;$BOOKMARKS&quot;)|$(backups)&quot; &quot;$original|0&quot;</span>
+<span class="a">+eq &#x27;bm-migrate - is a filter&#x27; &quot;$($MIGRATE - &lt; &quot;$BOOKMARKS&quot;)&quot; &quot;$migrated&quot;</span>
+<span class="a">+eq &#x27;bm-migrate reports what it did&#x27; &quot;$($MIGRATE &quot;$BOOKMARKS&quot;)&quot; \</span>
+<span class="a">+    &quot;migrated 6 lines in $BOOKMARKS (original kept as $BOOKMARKS.bak)&quot;</span>
+<span class="a">+eq &#x27;bm-migrate converts in place&#x27; &quot;$(cat &quot;$BOOKMARKS&quot;)&quot; &quot;$migrated&quot;</span>
+<span class="a">+eq &#x27;bm-migrate keeps the original as .bak&#x27; &quot;$(cat &quot;$BOOKMARKS.bak&quot;)&quot; &quot;$original&quot;</span>
+<span class="a">+eq &#x27;bm-migrate has nothing to do the second time&#x27; &quot;$($MIGRATE &quot;$BOOKMARKS&quot;)&quot; \</span>
+<span class="a">+    &quot;nothing to migrate in $BOOKMARKS&quot;</span>
+<span class="a">+eq &#x27;bm-migrate then leaves file and backup alone&#x27; \</span>
+<span class="a">+    &quot;$(cat &quot;$BOOKMARKS&quot;)|$(cat &quot;$BOOKMARKS.bak&quot;)|$(backups)&quot; \</span>
+<span class="a">+    &quot;$migrated|$original|1&quot;</span>
+<span class="a">+</span>
+<span class="a">+printf &#x27;%s\n&#x27; &#x27;https://late.example Added by hand | org&#x27; &gt;&gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+$MIGRATE &quot;$BOOKMARKS&quot; &gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-migrate never overwrites an earlier backup&#x27; \</span>
+<span class="a">+    &quot;$(cat &quot;$BOOKMARKS.bak&quot;)|$(grep -c late.example &quot;$BOOKMARKS.bak.1&quot;)&quot; &quot;$original|1&quot;</span>
+<span class="a">+</span>
+<span class="a">+old_file</span>
+<span class="a">+eq &#x27;bm-migrate defaults to the BOOKMARKS variable&#x27; &quot;$($MIGRATE &gt;/dev/null; cat &quot;$BOOKMARKS&quot;)&quot; &quot;$migrated&quot;</span>
+<span class="a">+</span>
+<span class="a">+eq &#x27;bm is quiet once the file is migrated&#x27; &quot;$($BM -l 2&gt;&amp;1 &gt;/dev/null)&quot; &#x27;&#x27;</span>
+<span class="a">+</span>
+<span class="a">+old_file</span>
+<span class="a">+ln -s &quot;$BOOKMARKS&quot; &quot;$work/link&quot;</span>
+<span class="a">+chmod 600 &quot;$BOOKMARKS&quot;</span>
+<span class="a">+$MIGRATE &quot;$work/link&quot; &gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-migrate keeps a symlinked file a symlink, and its mode&#x27; \</span>
+<span class="a">+    &quot;$([ -L &quot;$work/link&quot; ] &amp;&amp; echo link) $(find &quot;$BOOKMARKS&quot; -perm 600 | wc -l | tr -d &#x27; &#x27;) $(grep -c &quot;$TAB&quot; &quot;$BOOKMARKS&quot;)&quot; \</span>
+<span class="a">+    &#x27;link 1 7&#x27;</span>
+<span class="a">+chmod 644 &quot;$BOOKMARKS&quot;</span>
+<span class="a">+</span>
+<span class="a">+$MIGRATE &quot;$work/nosuchfile&quot; 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-migrate fails on a missing file&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="a">+$MIGRATE --bogus 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-migrate rejects unknown options&#x27; &quot;$?&quot; &#x27;2&#x27;</span>
+<span class="a">+$MIGRATE a b 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-migrate takes one file&#x27; &quot;$?&quot; &#x27;2&#x27;</span>
+<span class="a">+rm -f &quot;$BOOKMARKS&quot;.bak* &quot;$work/link&quot; &quot;$work/link&quot;.bak*</span>
+ 
+ # ---- argument handling ----
+ 
+<span class="h">@@ -224,11 +296,23 @@ $BM -t 2&gt;/dev/null</span>
+ eq &#x27;-t without a tag exits 2&#x27; &quot;$?&quot; &#x27;2&#x27;
+ 
+ missing=
+<span class="d">-for flag in --copy --open --plumb --add --edit --delete --list --migrate --tag; do</span>
+<span class="a">+for flag in --copy --open --plumb --print --add --edit --delete --list --merge --tag --sort; do</span>
+     $BM -h | grep -q -e &quot;$flag&quot; || missing=&quot;$missing $flag&quot;
+ done
+ eq &#x27;help mentions every flag&#x27; &quot;$missing&quot; &#x27;&#x27;
+ 
+<span class="a">+for gone in &#x27;--import x&#x27; --check --migrate &#x27;-s x&#x27;; do</span>
+<span class="a">+    # shellcheck disable=SC2086</span>
+<span class="a">+    $BM $gone 2&gt;/dev/null</span>
+<span class="a">+    eq &quot;bm no longer does $gone itself&quot; &quot;$?&quot; &#x27;2&#x27;</span>
+<span class="a">+done</span>
+<span class="a">+</span>
+<span class="a">+bad=</span>
+<span class="a">+for script in bm bm-migrate bm-import bm-check bm-html bm-title bm-commit; do</span>
+<span class="a">+    [ &quot;$(sed -n 1p &quot;$top/$script&quot;)&quot; = &#x27;#!/bin/sh&#x27; ] || bad=&quot;$bad $script&quot;</span>
+<span class="a">+done</span>
+<span class="a">+eq &#x27;every script asks for /bin/sh&#x27; &quot;$bad&quot; &#x27;&#x27;</span>
+<span class="a">+</span>
+ # ---- sorting and use counts ----
+ 
+ seed () {
+<span class="h">@@ -260,23 +344,39 @@ answers &#x27;Alpha&#x27;; $BM -o</span>
+ answers &#x27;Zed&#x27;;   $BM -c
+ eq &#x27;sort used puts the most used first&#x27; &quot;$(order -S used)&quot; &#x27;c b a&#x27;
+ eq &#x27;use counts are kept beside the bookmarks&#x27; \
+<span class="d">-    &quot;$(grep -c &quot;^https://c.example${TAB}2${TAB}&quot; &quot;$BOOKMARKS.usage&quot;)&quot; &#x27;1&#x27;</span>
+<span class="a">+    &quot;$(grep -c &quot;^https://c.example${TAB}2${TAB}[0-9]\{10,\}\$&quot; &quot;$BOOKMARKS.usage&quot;)&quot; &#x27;1&#x27;</span>
+ answers &#x27;Alpha&#x27;; $BM -d &gt;/dev/null
+ eq &#x27;delete forgets the use count&#x27; &quot;$(grep -c &#x27;c.example&#x27; &quot;$BOOKMARKS.usage&quot;)&quot; &#x27;0&#x27;
+ 
+<span class="d">-# ---- search and --print ----</span>
+<span class="d">-</span>
+<span class="d">-seed</span>
+<span class="d">-eq &#x27;search matches any field, ignoring case&#x27; \</span>
+<span class="d">-    &quot;$($BM -s &#x27;ZED|sec&#x27; | cut -f1 | paste -sd &#x27; &#x27; -)&quot; &#x27;https://a.example https://b.example&#x27;</span>
+<span class="d">-$BM -s nothinglikethis &gt;/dev/null</span>
+<span class="d">-eq &#x27;search without a match exits 1&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="d">-eq &#x27;search honours the tag filter&#x27; &quot;$($BM -t code -s example | wc -l | tr -d &#x27; &#x27;)&quot; &#x27;2&#x27;</span>
+<span class="d">-answers &#x27;Mid&#x27;</span>
+<span class="d">-eq &#x27;--print writes the url to stdout&#x27; &quot;$($BM -c --print)&quot; &#x27;https://a.example&#x27;</span>
+<span class="d">-eq &#x27;--print leaves the clipboard alone&#x27; &quot;$([ -e &quot;$work/clipboard&quot; ] || echo untouched)&quot; &#x27;untouched&#x27;</span>
+<span class="a">+# A writable file in a directory that is not: temporary files go to $TMPDIR.</span>
+<span class="a">+if [ &quot;$(id -u)&quot; -ne 0 ]; then</span>
+<span class="a">+    mkdir &quot;$work/locked&quot; &quot;$work/tmp&quot;</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;https://keep.example${TAB}Keep${TAB}&quot; &quot;https://drop.example${TAB}Drop${TAB}&quot; \</span>
+<span class="a">+        &gt; &quot;$work/locked/bookmarks&quot;</span>
+<span class="a">+    : &gt; &quot;$work/locked/bookmarks.usage&quot;</span>
+<span class="a">+    chmod 555 &quot;$work/locked&quot;</span>
+<span class="a">+    (</span>
+<span class="a">+        BOOKMARKS=&quot;$work/locked/bookmarks&quot; TMPDIR=&quot;$work/tmp&quot;</span>
+<span class="a">+        export BOOKMARKS TMPDIR</span>
+<span class="a">+        answers &#x27;Drop&#x27;; $BM -d &gt;/dev/null</span>
+<span class="a">+        answers &#x27;Keep&#x27;; $BM -c</span>
+<span class="a">+        printf &#x27;https://merged.example\n&#x27; | $BM -m &gt;/dev/null</span>
+<span class="a">+    )</span>
+<span class="a">+    eq &#x27;a read-only directory does not stop delete, merge or use counts&#x27; \</span>
+<span class="a">+        &quot;$(cut -f1 &quot;$work/locked/bookmarks&quot; | paste -sd &#x27; &#x27; -) $(cut -f1,2 &quot;$work/locked/bookmarks.usage&quot;)&quot; \</span>
+<span class="a">+        &quot;https://keep.example https://merged.example https://keep.example${TAB}1&quot;</span>
+<span class="a">+    eq &#x27;and no temporary file is left behind&#x27; &quot;$(find &quot;$work/tmp&quot; &quot;$work/locked&quot; -name &#x27;*sbm*&#x27; -o -name &#x27;*.tmp.*&#x27; | wc -l | tr -d &#x27; &#x27;)&quot; &#x27;0&#x27;</span>
+<span class="a">+    ln -s &quot;$work/locked/bookmarks&quot; &quot;$work/tmp/sbm.planted&quot;</span>
+<span class="a">+    # tmpfile relies on this: with noclobber, &quot;&gt;&quot; refuses a name that exists,</span>
+<span class="a">+    # a symlink included, instead of writing through it.</span>
+<span class="a">+    # shellcheck disable=SC2016</span>
+<span class="a">+    eq &#x27;a name planted in the temporary directory is refused, not written through&#x27; \</span>
+<span class="a">+        &quot;$( if ${SBM_SH:-sh} -c &#x27;set -C; : &gt; &quot;$1&quot;&#x27; sh &quot;$work/tmp/sbm.planted&quot; 2&gt;/dev/null</span>
+<span class="a">+            then echo written; else echo refused; fi) $(grep -c . &quot;$work/locked/bookmarks&quot;)&quot; &#x27;refused 2&#x27;</span>
+<span class="a">+    chmod 755 &quot;$work/locked&quot;</span>
+<span class="a">+fi</span>
+ 
+<span class="d">-# ---- add: fetched titles, new tags ----</span>
+<span class="a">+# ---- bm-title, and add with it installed ----</span>
+ 
+ mkdir &quot;$work/net&quot;
+ cat &gt; &quot;$work/net/curl&quot; &lt;&lt;&#x27;FAKE&#x27;
+<span class="h">@@ -291,6 +391,17 @@ for arg in &quot;$@&quot;; do</span>
+     url=$arg
+ done
+ if [ -z &quot;$probe&quot; ]; then
+<span class="a">+    case $url in</span>
+<span class="a">+        *oneline*)</span>
+<span class="a">+            # A minified page: one line, the title beyond the first 64k.</span>
+<span class="a">+            awk &#x27;BEGIN { for (i = 0; i &lt; 70000; i++) printf &quot;x&quot;; print &quot;&lt;title&gt;too far&lt;/title&gt;&quot; }&#x27;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+            ;;</span>
+<span class="a">+        *nearline*)</span>
+<span class="a">+            awk &#x27;BEGIN { for (i = 0; i &lt; 60000; i++) printf &quot;x&quot;; print &quot;&lt;title&gt;near enough&lt;/title&gt;&quot; }&#x27;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+            ;;</span>
+<span class="a">+    esac</span>
+     printf &#x27;&lt;html&gt;&lt;head&gt;\n&lt;meta charset=&quot;utf-8&quot;&gt;&lt;TITLE lang=&quot;en&quot;&gt;\n  Fetched &amp;amp; decoded\n  &amp;#39;title&amp;#39; &lt;/Title&gt;&lt;/head&gt;&lt;body&gt;&lt;title&gt;no&lt;/title&gt;&#x27;
+     exit 0
+ fi
+<span class="h">@@ -305,23 +416,31 @@ FAKE</span>
+ chmod +x &quot;$work/net/curl&quot;
+ export SBM_TEST_CURLLOG=&quot;$work/curllog&quot;
+ 
+<span class="a">+eq &#x27;bm-title prints a decoded, squeezed title&#x27; \</span>
+<span class="a">+    &quot;$(PATH=&quot;$work/net:$PATH&quot; SBM_FETCH=1 $TITLE https://fetch.example)&quot; &quot;Fetched &amp; decoded &#x27;title&#x27;&quot;</span>
+<span class="a">+eq &#x27;bm-title stops reading a one-line page at 64k&#x27; \</span>
+<span class="a">+    &quot;$(PATH=&quot;$work/net:$PATH&quot; SBM_FETCH=1 $TITLE https://oneline.example)|$(PATH=&quot;$work/net:$PATH&quot; SBM_FETCH=1 $TITLE https://nearline.example)&quot; \</span>
+<span class="a">+    &#x27;|near enough&#x27;</span>
+<span class="a">+$TITLE 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-title wants exactly one url&#x27; &quot;$?&quot; &#x27;2&#x27;</span>
+<span class="a">+</span>
+ reset
+ : &gt; &quot;$SBM_TEST_CURLLOG&quot;
+ answers &#x27;&lt;default&gt;&#x27; &#x27;code&#x27;
+<span class="d">-PATH=&quot;$work/net:$PATH&quot; SBM_FETCH=1 $BM -a https://fetch.example 2&gt;/dev/null</span>
+<span class="a">+PATH=&quot;$top:$work/net:$PATH&quot; SBM_FETCH=1 $BM -a https://fetch.example 2&gt;/dev/null</span>
+ eq &#x27;add offers the fetched &lt;title&gt; as the description&#x27; \
+     &quot;$(cut -f2 &quot;$BOOKMARKS&quot;)&quot; &quot;Fetched &amp; decoded &#x27;title&#x27;&quot;
+ 
+ reset
+ : &gt; &quot;$SBM_TEST_CURLLOG&quot;
+ answers &#x27;Mine&#x27; &#x27;code&#x27;
+<span class="d">-PATH=&quot;$work/net:$PATH&quot; SBM_FETCH=1 $BM -a https://fetch.example 2&gt;/dev/null</span>
+<span class="a">+PATH=&quot;$top:$work/net:$PATH&quot; SBM_FETCH=1 $BM -a https://fetch.example 2&gt;/dev/null</span>
+ eq &#x27;a typed description beats the fetched title&#x27; &quot;$(cut -f2 &quot;$BOOKMARKS&quot;)&quot; &#x27;Mine&#x27;
+ 
+ reset
+ : &gt; &quot;$SBM_TEST_CURLLOG&quot;
+ answers &#x27;Offline&#x27; &#x27;code&#x27;
+<span class="d">-PATH=&quot;$work/net:$PATH&quot; SBM_FETCH=0 $BM -a https://fetch.example 2&gt;/dev/null</span>
+<span class="a">+PATH=&quot;$top:$work/net:$PATH&quot; SBM_FETCH=0 $BM -a https://fetch.example 2&gt;/dev/null</span>
+ eq &#x27;SBM_FETCH=0 never runs curl&#x27; &quot;$(cat &quot;$SBM_TEST_CURLLOG&quot;)&quot; &#x27;&#x27;
+ 
+ reset
+<span class="h">@@ -341,39 +460,46 @@ eq &#x27;a missing tag file is created from the first new tag&#x27; \</span>
+     &quot;$(cat &quot;$USERTAGS&quot;)|$(cut -f3 &quot;$BOOKMARKS&quot;)&quot; &#x27;first | |first&#x27;
+ cp &quot;$here/../usertags&quot; &quot;$USERTAGS&quot;
+ 
+<span class="d">-# ---- import ----</span>
+<span class="a">+# ---- bm-import and bm --merge ----</span>
+ 
+ reset
+ printf &#x27;%s\n&#x27; &quot;https://old.example${TAB}Kept${TAB}org&quot; &gt; &quot;$BOOKMARKS&quot;
+<span class="d">-eq &#x27;import html reports its counts&#x27; \</span>
+<span class="d">-    &quot;$($BM --import &quot;$here/fixtures/netscape.html&quot;)&quot; &#x27;imported 3, skipped 1 duplicates&#x27;</span>
+<span class="d">-eq &#x27;import html appends, keeps entities decoded and folders as tags&#x27; \</span>
+<span class="d">-    &quot;$(cat &quot;$BOOKMARKS&quot;)&quot; &quot;$(printf &#x27;%s\n&#x27; \</span>
+<span class="d">-        &quot;https://old.example${TAB}Kept${TAB}org&quot; \</span>
+<span class="a">+eq &#x27;bm-import html prints rows: entities decoded, folders as tags, web urls only&#x27; \</span>
+<span class="a">+    &quot;$($IMPORT &quot;$here/fixtures/netscape.html&quot;)&quot; &quot;$(printf &#x27;%s\n&#x27; \</span>
+         &quot;https://top.example/${TAB}Top level${TAB}&quot; \
+         &quot;https://git.example/?a=1&amp;b=2${TAB}Git &amp; friends${TAB}dev-tools&quot; \
+<span class="d">-        &quot;https://sh.example/posix${TAB}POSIX sh${TAB}dev-tools shell&quot;)&quot;</span>
+<span class="d">-eq &#x27;import teaches the folder tags&#x27; &quot;$(grep -c -e &#x27;^dev-tools | $&#x27; -e &#x27;^shell | $&#x27; &quot;$USERTAGS&quot;)&quot; &#x27;2&#x27;</span>
+<span class="d">-eq &#x27;importing twice adds nothing&#x27; \</span>
+<span class="d">-    &quot;$($BM --import &quot;$here/fixtures/netscape.html&quot;)&quot; &#x27;imported 0, skipped 4 duplicates&#x27;</span>
+<span class="d">-$BM --import &quot;$work/nosuchfile&quot; 2&gt;/dev/null</span>
+<span class="d">-eq &#x27;import of a missing file fails&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="a">+        &quot;https://sh.example/posix${TAB}POSIX sh${TAB}dev-tools shell&quot; \</span>
+<span class="a">+        &quot;http://www.top.example${TAB}Top level again${TAB}&quot;)&quot;</span>
+<span class="a">+eq &#x27;bm-import leaves the bookmark file alone&#x27; &quot;$(grep -c . &quot;$BOOKMARKS&quot;)&quot; &#x27;1&#x27;</span>
+<span class="a">+eq &#x27;merge reports its counts&#x27; \</span>
+<span class="a">+    &quot;$($IMPORT &quot;$here/fixtures/netscape.html&quot; | $BM --merge)&quot; &#x27;added 3, skipped 1 duplicates&#x27;</span>
+<span class="a">+eq &#x27;merge appends only what is new&#x27; &quot;$(cut -f1 &quot;$BOOKMARKS&quot; | paste -sd &#x27; &#x27; -)&quot; \</span>
+<span class="a">+    &#x27;https://old.example https://top.example/ https://git.example/?a=1&amp;b=2 https://sh.example/posix&#x27;</span>
+<span class="a">+eq &#x27;merge teaches the tags&#x27; &quot;$(grep -c -e &#x27;^dev-tools | $&#x27; -e &#x27;^shell | $&#x27; &quot;$USERTAGS&quot;)&quot; &#x27;2&#x27;</span>
+<span class="a">+eq &#x27;merging twice adds nothing&#x27; \</span>
+<span class="a">+    &quot;$($IMPORT &quot;$here/fixtures/netscape.html&quot; | $BM -m)&quot; &#x27;added 0, skipped 4 duplicates&#x27;</span>
+<span class="a">+eq &#x27;merge takes a bare list of urls&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;https://bare.example\n\n# note\n&#x27; | $BM -m; tail -n 1 &quot;$BOOKMARKS&quot;)&quot; \</span>
+<span class="a">+    &quot;$(printf &#x27;added 1, skipped 0 duplicates\nhttps://bare.example\t\t&#x27;)&quot;</span>
+<span class="a">+$IMPORT &quot;$work/nosuchfile&quot; 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-import fails on a missing file&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="a">+$IMPORT 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-import wants one source&#x27; &quot;$?&quot; &#x27;2&#x27;</span>
+ 
+ if command -v jq &gt;/dev/null 2&gt;&amp;1; then
+<span class="d">-    reset</span>
+<span class="d">-    eq &#x27;import json reports its counts&#x27; \</span>
+<span class="d">-        &quot;$($BM --import &quot;$here/fixtures/chromium.json&quot;)&quot; &#x27;imported 3, skipped 1 duplicates&#x27;</span>
+<span class="d">-    eq &#x27;import json skips the trash and non-web urls, tags by folder&#x27; \</span>
+<span class="d">-        &quot;$(cat &quot;$BOOKMARKS&quot;)&quot; &quot;$(printf &#x27;%s\n&#x27; \</span>
+<span class="a">+    eq &#x27;bm-import json skips the trash and non-web urls, tags by folder&#x27; \</span>
+<span class="a">+        &quot;$($IMPORT &quot;$here/fixtures/chromium.json&quot;)&quot; &quot;$(printf &#x27;%s\n&#x27; \</span>
+             &quot;https://bar.example/${TAB}Bar site${TAB}&quot; \
+             &quot;https://blog.example/feed${TAB}A blog${TAB}news-blogs&quot; \
+<span class="d">-            &quot;https://deep.example/${TAB}Deep${TAB}news-blogs tech&quot;)&quot;</span>
+<span class="a">+            &quot;https://deep.example/${TAB}Deep${TAB}news-blogs tech&quot; \</span>
+<span class="a">+            &quot;http://www.bar.example${TAB}Bar dupe${TAB}&quot;)&quot;</span>
+ else
+<span class="d">-    printf &#x27;skip import json: no jq\n&#x27;</span>
+<span class="a">+    printf &#x27;skip bm-import json: no jq\n&#x27;</span>
+ fi
+ cp &quot;$here/../usertags&quot; &quot;$USERTAGS&quot;
+ 
+<span class="d">-# ---- check ----</span>
+<span class="a">+# ---- bm-check ----</span>
+<span class="a">+</span>
+ 
+ reset
+ printf &#x27;%s\n&#x27; \
+<span class="h">@@ -382,19 +508,27 @@ printf &#x27;%s\n&#x27; \</span>
+     &quot;https://moved.example${TAB}Moved${TAB}&quot; \
+     &quot;https://nohead.example${TAB}Refuses HEAD${TAB}&quot; \
+     &quot;https://gone.example${TAB}No answer${TAB}&quot; &gt; &quot;$BOOKMARKS&quot;
+<span class="d">-out=$(PATH=&quot;$work/net:$PATH&quot; $BM --check | sort)</span>
+<span class="d">-rc=$?</span>
+<span class="d">-eq &#x27;check lists dead and moved links only&#x27; &quot;$out&quot; &quot;$(printf &#x27;%s\n&#x27; \</span>
+<span class="a">+out=$(PATH=&quot;$work/net:$PATH&quot; $CHECK &quot;$BOOKMARKS&quot; | sort)</span>
+<span class="a">+eq &#x27;bm-check lists dead and moved links only&#x27; &quot;$out&quot; &quot;$(printf &#x27;%s\n&#x27; \</span>
+     &quot;000${TAB}https://gone.example&quot; \
+     &quot;301${TAB}https://moved.example${TAB}https://new.example/&quot; \
+     &quot;404${TAB}https://dead.example&quot;)&quot;
+<span class="d">-PATH=&quot;$work/net:$PATH&quot; $BM --check &gt;/dev/null</span>
+<span class="d">-eq &#x27;check exits 1 when something is wrong&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="d">-printf &#x27;%s\n&#x27; &quot;https://ok.example${TAB}Fine${TAB}&quot; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="d">-eq &#x27;check is quiet about healthy links&#x27; &quot;$(PATH=&quot;$work/net:$PATH&quot; $BM --check; echo $?)&quot; \</span>
+<span class="d">-    &quot;$(printf &#x27;all links ok\n0&#x27;)&quot;</span>
+<span class="d">-</span>
+<span class="d">-# ---- git ----</span>
+<span class="a">+PATH=&quot;$work/net:$PATH&quot; $CHECK &quot;$BOOKMARKS&quot; &gt;/dev/null</span>
+<span class="a">+eq &#x27;bm-check exits 1 when something is wrong&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="a">+eq &#x27;bm-check is a filter&#x27; \</span>
+<span class="a">+    &quot;$($BM -l | PATH=&quot;$work/net:$PATH&quot; $CHECK - | cut -f2 | sort | paste -sd &#x27; &#x27; -)&quot; \</span>
+<span class="a">+    &#x27;https://dead.example https://gone.example https://moved.example&#x27;</span>
+<span class="a">+eq &#x27;bm-check takes a plain list of urls&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;https://dead.example\nhttps://ok.example\n&#x27; | PATH=&quot;$work/net:$PATH&quot; $CHECK -)&quot; \</span>
+<span class="a">+    &quot;404${TAB}https://dead.example&quot;</span>
+<span class="a">+many=$(i=0; while [ $i -lt 40 ]; do printf &#x27;https://dead%d.example\n&#x27; $i; i=$((i + 1)); done)</span>
+<span class="a">+eq &#x27;bm-check reports every link of a long list exactly once&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$many&quot; | PATH=&quot;$work/net:$PATH&quot; $CHECK - | cut -f2 | sort -u | wc -l | tr -d &#x27; &#x27;)&quot; &#x27;40&#x27;</span>
+<span class="a">+eq &#x27;bm-check copes with an empty list&#x27; &quot;$(: | PATH=&quot;$work/net:$PATH&quot; $CHECK -; echo $?)&quot; &#x27;0&#x27;</span>
+<span class="a">+eq &#x27;bm-check says nothing about healthy links&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;https://ok.example\n&#x27; | PATH=&quot;$work/net:$PATH&quot; $CHECK -; echo $?)&quot; &#x27;0&#x27;</span>
+<span class="a">+</span>
+<span class="a">+# ---- bm-commit ----</span>
+ 
+ if command -v git &gt;/dev/null 2&gt;&amp;1; then
+     export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+<span class="h">@@ -403,6 +537,8 @@ if command -v git &gt;/dev/null 2&gt;&amp;1; then</span>
+     git init -q &quot;$repo&quot;
+     mkdir &quot;$repo/nested&quot;
+     commits () { git -C &quot;$repo&quot; rev-list --count HEAD 2&gt;/dev/null || echo 0; }
+<span class="a">+    PATH_WAS=$PATH</span>
+<span class="a">+    PATH=&quot;$top:$PATH&quot;</span>
+ 
+     (
+         BOOKMARKS=&quot;$repo/bookmarks&quot; USERTAGS=&quot;$repo/usertags&quot;
+<span class="h">@@ -439,6 +575,13 @@ if command -v git &gt;/dev/null 2&gt;&amp;1; then</span>
+         SBM_GIT=0 $BM -a https://git4.example 2&gt;/dev/null
+     )
+     eq &#x27;SBM_GIT=0 never commits&#x27; &quot;$(commits)&quot; &#x27;3&#x27;
+<span class="a">+    PATH=$PATH_WAS</span>
+<span class="a">+    (</span>
+<span class="a">+        BOOKMARKS=&quot;$repo/bookmarks&quot;</span>
+<span class="a">+        answers &#x27;Not installed&#x27; &#x27;code&#x27;</span>
+<span class="a">+        $BM -a https://git5.example 2&gt;/dev/null</span>
+<span class="a">+    )</span>
+<span class="a">+    eq &#x27;without bm-commit on PATH bm does not touch git&#x27; &quot;$(commits)&quot; &#x27;3&#x27;</span>
+ else
+     printf &#x27;skip git: no git\n&#x27;
+ fi
+<span class="h">@@ -493,14 +636,29 @@ printf &#x27;https://added.example\nAdded here\n&#x27; | fz 2&gt;/dev/null</span>
+ eq &#x27;browse: ctrl-a adds, fzf tag picker creates typed tags&#x27; \
+     &quot;$(grep added.example &quot;$BOOKMARKS&quot;)&quot; &quot;https://added.example${TAB}Added here${TAB}code fresh&quot;
+ 
+<span class="d">-answers &#x27;ctrl-a:&#x27; &#x27;&#x27; &#x27;enter:Mid&#x27;</span>
+<span class="d">-printf &#x27;https://a.example\n\n&#x27; | fz 2&gt;/dev/null</span>
+<span class="d">-eq &#x27;browse: a refused duplicate returns to the list&#x27; &quot;$(cat &quot;$work/opened&quot;)&quot; &#x27;https://a.example&#x27;</span>
+<span class="a">+answers &#x27;ctrl-a:&#x27; &#x27;enter:Mid&#x27;</span>
+<span class="a">+out=$(printf &#x27;https://a.example\n\n&#x27; | fz 2&gt;&amp;1)</span>
+<span class="a">+eq &#x27;browse: a refused duplicate is shown, then the list comes back&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$out&quot; | grep -c &#x27;already bookmarked; press ENTER&#x27;) $(cat &quot;$work/opened&quot;)&quot; \</span>
+<span class="a">+    &#x27;1 https://a.example&#x27;</span>
+<span class="a">+</span>
+<span class="a">+rm -f &quot;$work/opened&quot;</span>
+<span class="a">+answers &#x27;enter:posix sh printf&#x27;</span>
+<span class="a">+fz &lt;/dev/null</span>
+<span class="a">+eq &#x27;browse: text that matches nothing is searched for on the web&#x27; \</span>
+<span class="a">+    &quot;$(cat &quot;$work/opened&quot;)&quot; &#x27;https://duckduckgo.com/?q=posix+sh+printf&#x27;</span>
+<span class="a">+</span>
+<span class="a">+: &gt; &quot;$SBM_TEST_LOG&quot;</span>
+<span class="a">+answers &#x27;ctrl-s:&#x27; &#x27;&#x27;</span>
+<span class="a">+fz &lt;/dev/null</span>
+<span class="a">+eq &#x27;browse: the preview follows the cursor&#x27; \</span>
+<span class="a">+    &quot;$(grep -c -e &quot;--preview=printf &#x27;%s.n%s.ntags: %s.nused: %s.n&#x27; {1} {2} {3} {4}&quot; &quot;$SBM_TEST_LOG&quot;)&quot; &#x27;2&#x27;</span>
+ 
+ : &gt; &quot;$SBM_TEST_LOG&quot;
+ answers &#x27;Mid&#x27;
+ fz -c &lt;/dev/null
+<span class="d">-eq &#x27;fzf: pickers hide the raw url column&#x27; &quot;$(grep -c -e &#x27;--with-nth=2..&#x27; &quot;$SBM_TEST_LOG&quot;)&quot; &#x27;1&#x27;</span>
+<span class="a">+eq &#x27;fzf: rows are listed by their display column, with a live preview&#x27; \</span>
+<span class="a">+    &quot;$(grep -c -e &quot;--with-nth=5.. --preview-window=down:5:wrap --preview=printf &#x27;%s&quot; &quot;$SBM_TEST_LOG&quot;)&quot; &#x27;1&#x27;</span>
+ : &gt; &quot;$SBM_TEST_LOG&quot;
+ answers &#x27;Mid&#x27;
+ SBM_FZF_OPTS=&#x27;--height=100%&#x27; fz -c &lt;/dev/null
+<span class="h">@@ -516,10 +674,11 @@ dm () {</span>
+ 
+ seed
+ : &gt; &quot;$SBM_TEST_LOG&quot;
+<span class="d">-answers &#x27;copy&#x27; &#x27;Zed&#x27;</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;copy&#x27;</span>
+ dm
+<span class="d">-eq &#x27;dmenu: no arguments asks for the action, then the bookmark&#x27; \</span>
+<span class="a">+eq &#x27;dmenu: no arguments asks for the bookmark, then what to do&#x27; \</span>
+     &quot;$(cat &quot;$work/clipboard&quot;)&quot; &#x27;https://b.example&#x27;
+<span class="a">+eq &#x27;dmenu: the two menus&#x27; &quot;$(sed &#x27;s/.* -p //&#x27; &quot;$SBM_TEST_LOG&quot; | paste -sd &#x27; &#x27; -)&quot; &#x27;bookmark: do:&#x27;</span>
+ eq &#x27;dmenu: is called with its usual flags&#x27; &quot;$(sed &#x27;s/ -p .*//&#x27; &quot;$SBM_TEST_LOG&quot; | sort -u)&quot; \
+     &#x27;dmenu -i -l 15&#x27;
+ eq &#x27;dmenu: DMENULINES is honoured&#x27; \
+<span class="h">@@ -557,13 +716,13 @@ cp &quot;$here/../usertags&quot; &quot;$USERTAGS&quot;</span>
+ seed
+ both=&quot;$work/bin:$work/fzfbin&quot;
+ : &gt; &quot;$SBM_TEST_LOG&quot;
+<span class="d">-answers &#x27;copy&#x27; &#x27;Zed&#x27;</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;copy&#x27;</span>
+ ( unset SBM_MENU WAYLAND_DISPLAY; PATH=&quot;$both:$PATH&quot; DISPLAY=:0 $BM &lt;/dev/null )
+ eq &#x27;a display means dmenu even when fzf exists&#x27; \
+     &quot;$(cut -d&#x27; &#x27; -f1 &quot;$SBM_TEST_LOG&quot; | sort -u)&quot; &#x27;dmenu&#x27;
+ 
+ : &gt; &quot;$SBM_TEST_LOG&quot;
+<span class="d">-answers &#x27;copy&#x27; &#x27;Zed&#x27;</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;copy&#x27;</span>
+ ( unset SBM_MENU DISPLAY; PATH=&quot;$both:$PATH&quot; WAYLAND_DISPLAY=wayland-0 $BM &lt;/dev/null )
+ eq &#x27;Wayland means dmenu too&#x27; &quot;$(cut -d&#x27; &#x27; -f1 &quot;$SBM_TEST_LOG&quot; | sort -u)&quot; &#x27;dmenu&#x27;
+ 
+<span class="h">@@ -574,6 +733,150 @@ eq &#x27;no display falls back to fzf&#x27; &quot;$(cut -d&#x27; &#x27; -f1 &quot;$SBM_TEST_LOG&quot; | sort -u)&quot; &#x27;</span>
+ 
+ unset SBM_TEST_LOG
+ 
+<span class="a">+# ---- one-screen browsing without key bindings (dmenu, custom menus) ----</span>
+<span class="a">+</span>
+<span class="a">+seed</span>
+<span class="a">+export SBM_TEST_SEEN=&quot;$work/seen&quot;</span>
+<span class="a">+</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;open&#x27;</span>
+<span class="a">+$BM</span>
+<span class="a">+eq &#x27;browse: pick, then open&#x27; &quot;$(cat &quot;$work/opened&quot;)&quot; &#x27;https://b.example&#x27;</span>
+<span class="a">+</span>
+<span class="a">+: &gt; &quot;$SBM_TEST_SEEN&quot;</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;copy&#x27;</span>
+<span class="a">+$BM</span>
+<span class="a">+eq &#x27;browse: the second menu shows the bookmark in full, below the actions&#x27; \</span>
+<span class="a">+    &quot;$(sed -n &#x27;/^--- pick do:/,$p&#x27; &quot;$SBM_TEST_SEEN&quot; | sed 1d | paste -sd &#x27;|&#x27; -)&quot; \</span>
+<span class="a">+    &#x27;open|copy|edit|delete|  https://b.example|  Zed|  tags: code lib|  used: 1&#x27;</span>
+<span class="a">+eq &#x27;browse: the list starts with [add] and hides the use counts&#x27; \</span>
+<span class="a">+    &quot;$(sed -n &#x27;2,3p&#x27; &quot;$SBM_TEST_SEEN&quot; | paste -sd &#x27;|&#x27; -)&quot; \</span>
+<span class="a">+    &quot;[add]|https://b.example${TAB}Zed${TAB}code lib&quot;</span>
+<span class="a">+</span>
+<span class="a">+rm -f &quot;$work/opened&quot;</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;&#x27; &#x27;Mid&#x27; &#x27;open&#x27;</span>
+<span class="a">+$BM</span>
+<span class="a">+eq &#x27;browse: closing the second menu goes back to the list&#x27; \</span>
+<span class="a">+    &quot;$(cat &quot;$work/opened&quot;)&quot; &#x27;https://a.example&#x27;</span>
+<span class="a">+</span>
+<span class="a">+answers &#x27;Zed&#x27; &#x27;  tags: code lib&#x27; &#x27;Mid&#x27; &#x27;open&#x27;</span>
+<span class="a">+$BM</span>
+<span class="a">+eq &#x27;browse: picking a detail line does nothing&#x27; &quot;$(cat &quot;$work/opened&quot;)&quot; &#x27;https://a.example&#x27;</span>
+<span class="a">+</span>
+<span class="a">+answers &#x27;Alpha&#x27; &#x27;delete&#x27; &#x27;&#x27;</span>
+<span class="a">+$BM</span>
+<span class="a">+eq &#x27;browse: delete comes back to the list, closing the list leaves&#x27; \</span>
+<span class="a">+    &quot;$? $(cut -f1 &quot;$BOOKMARKS&quot; | paste -sd &#x27; &#x27; -)&quot; &#x27;1 https://b.example https://a.example&#x27;</span>
+<span class="a">+</span>
+<span class="a">+answers &#x27;[add]&#x27; &#x27;https://viamenu.example&#x27; &#x27;Via menu&#x27; &#x27;code&#x27; &#x27;&#x27;</span>
+<span class="a">+$BM 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;browse: [add] adds and comes back&#x27; &quot;$(grep -c &quot;^https://viamenu.example${TAB}Via menu${TAB}code$&quot; &quot;$BOOKMARKS&quot;)&quot; &#x27;1&#x27;</span>
+<span class="a">+</span>
+<span class="a">+: &gt; &quot;$SBM_TEST_SEEN&quot;</span>
+<span class="a">+answers &#x27;[add]&#x27; &#x27;https://www.a.example/&#x27; &#x27;seen&#x27; &#x27;&#x27;</span>
+<span class="a">+$BM 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;browse: a refused duplicate is announced in a menu&#x27; \</span>
+<span class="a">+    &quot;$(grep -c &#x27;^--- ask already bookmarked; press ENTER&#x27; &quot;$SBM_TEST_SEEN&quot;)&quot; &#x27;1&#x27;</span>
+<span class="a">+</span>
+<span class="a">+: &gt; &quot;$SBM_TEST_SEEN&quot;</span>
+<span class="a">+answers &#x27;[add]&#x27; &#x27;&#x27; &#x27;&#x27;</span>
+<span class="a">+$BM 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;browse: a cancelled add just comes back&#x27; \</span>
+<span class="a">+    &quot;$(grep -c &#x27;already bookmarked&#x27; &quot;$SBM_TEST_SEEN&quot;) $(grep -c &#x27;^--- pick bookmark:&#x27; &quot;$SBM_TEST_SEEN&quot;)&quot; &#x27;0 2&#x27;</span>
+<span class="a">+unset SBM_TEST_SEEN</span>
+<span class="a">+</span>
+<span class="a">+# ---- web search from the bookmark menu ----</span>
+<span class="a">+</span>
+<span class="a">+seed</span>
+<span class="a">+rm -f &quot;$work/opened&quot; &quot;$BOOKMARKS.usage&quot;</span>
+<span class="a">+printf &#x27;%s\n&#x27; &#x27;w   | https://en.wikipedia.org/w/index.php?search=%s&#x27; \</span>
+<span class="a">+              &#x27;gh | https://github.com/search?q=%s&amp;type=repositories&#x27; &gt; &quot;$work/engines&quot;</span>
+<span class="a">+export SBM_ENGINES=&quot;$work/engines&quot;</span>
+<span class="a">+</span>
+<span class="a">+# went &lt;typed text&gt; [bm arguments]: where typing that into the menu leads.</span>
+<span class="a">+went () {</span>
+<span class="a">+    typed=$1</span>
+<span class="a">+    shift</span>
+<span class="a">+    rm -f &quot;$work/opened&quot;</span>
+<span class="a">+    answers &quot;$typed&quot;</span>
+<span class="a">+    $BM &quot;$@&quot; 2&gt;/dev/null</span>
+<span class="a">+    cat &quot;$work/opened&quot; 2&gt;/dev/null</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+eq &#x27;open: a bookmark is opened&#x27; &quot;$(went Zed -o)&quot; &#x27;https://b.example&#x27;</span>
+<span class="a">+eq &#x27;open: other words are searched for&#x27; &quot;$(went &#x27;posix sh printf&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://duckduckgo.com/?q=posix+sh+printf&#x27;</span>
+<span class="a">+eq &#x27;open: the query is url-encoded, byte by byte&#x27; &quot;$(went &#x27;c++ &amp; más?&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://duckduckgo.com/?q=c%2B%2B+%26+m%C3%A1s%3F&#x27;</span>
+<span class="a">+eq &#x27;open: one word is searched for too&#x27; &quot;$(went suckless -o)&quot; \</span>
+<span class="a">+    &#x27;https://duckduckgo.com/?q=suckless&#x27;</span>
+<span class="a">+eq &#x27;open: something with a dot is an address&#x27; &quot;$(went &#x27;example.org/a?b=c&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://example.org/a?b=c&#x27;</span>
+<span class="a">+eq &#x27;open: a url is opened as it is&#x27; &quot;$(went &#x27;ftp://files.example/x&#x27; -o)&quot; &#x27;ftp://files.example/x&#x27;</span>
+<span class="a">+eq &#x27;open: an engine keyword picks the engine&#x27; &quot;$(went &#x27;w dynamic menu&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://en.wikipedia.org/w/index.php?search=dynamic+menu&#x27;</span>
+<span class="a">+eq &#x27;open: an engine url may go on after the query&#x27; &quot;$(went &#x27;gh dmenu&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://github.com/search?q=dmenu&amp;type=repositories&#x27;</span>
+<span class="a">+eq &#x27;open: a keyword alone is just a word&#x27; &quot;$(went w -o)&quot; &#x27;https://duckduckgo.com/?q=w&#x27;</span>
+<span class="a">+eq &#x27;open: an unknown keyword is part of the query&#x27; &quot;$(went &#x27;zz top&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://duckduckgo.com/?q=zz+top&#x27;</span>
+<span class="a">+eq &#x27;open: SBM_SEARCH sets the default engine&#x27; \</span>
+<span class="a">+    &quot;$(SBM_SEARCH=&#x27;https://search.example/?s=%s&#x27; went &#x27;two words&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://search.example/?s=two+words&#x27;</span>
+<span class="a">+eq &#x27;open: works without an engines file&#x27; &quot;$(SBM_ENGINES=&quot;$work/none&quot; went &#x27;w dynamic menu&#x27; -o)&quot; \</span>
+<span class="a">+    &#x27;https://duckduckgo.com/?q=w+dynamic+menu&#x27;</span>
+<span class="a">+eq &#x27;browse: typed text is searched for as well&#x27; &quot;$(went &#x27;w dmenu&#x27;)&quot; \</span>
+<span class="a">+    &#x27;https://en.wikipedia.org/w/index.php?search=dmenu&#x27;</span>
+<span class="a">+eq &#x27;only bookmarks are counted as used&#x27; &quot;$(cut -f1 &quot;$BOOKMARKS.usage&quot;)&quot; &#x27;https://b.example&#x27;</span>
+<span class="a">+went &#x27;&#x27; -o &gt;/dev/null</span>
+<span class="a">+eq &#x27;open: closing the menu exits 1&#x27; &quot;$?&quot; &#x27;1&#x27;</span>
+<span class="a">+unset SBM_ENGINES</span>
+<span class="a">+</span>
+<span class="a">+# ---- bm-html ----</span>
+<span class="a">+</span>
+<span class="a">+reset</span>
+<span class="a">+printf &#x27;%s\n&#x27; \</span>
+<span class="a">+    &quot;https://b.example/?a=1&amp;b=2${TAB}B &lt;b&gt;bold&lt;/b&gt; &amp; \&quot;quoted\&quot;${TAB}code lib&quot; \</span>
+<span class="a">+    &quot;https://a.example${TAB}${TAB}&quot; \</span>
+<span class="a">+    &#x27;# a comment&#x27; \</span>
+<span class="a">+    &quot;javascript:alert(1)${TAB}Bookmarklet${TAB}code&quot; \</span>
+<span class="a">+    &quot;https://c.example/x${TAB}see${TAB}code&quot; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+page=$($HTML -t &#x27;My &lt;marks&gt;&#x27; &quot;$BOOKMARKS&quot;)</span>
+<span class="a">+eq &#x27;bm-html lists a bookmark under each of its tags, and the untagged&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;^&lt;li&gt;&#x27;) $(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep &#x27;&lt;h2&#x27; | sed &#x27;s/.*id=&quot;\([^&quot;]*\)&quot;.*/\1/&#x27; | paste -sd &#x27; &#x27; -)&quot; \</span>
+<span class="a">+    &#x27;4 code lib untagged&#x27;</span>
+<span class="a">+eq &#x27;bm-html escapes text and attributes&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;&lt;li&gt;&lt;a href=&quot;https://b.example/?a=1&amp;amp;b=2&quot;&gt;B &amp;lt;b&amp;gt;bold&amp;lt;/b&amp;gt; &amp;amp; &amp;quot;quoted&amp;quot;&lt;/a&gt; &lt;small&gt;b.example&lt;/small&gt;&#x27;)&quot; &#x27;2&#x27;</span>
+<span class="a">+eq &#x27;bm-html escapes the title&#x27; &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;&lt;title&gt;My &amp;lt;marks&amp;gt;&lt;/title&gt;&#x27;)&quot; &#x27;1&#x27;</span>
+<span class="a">+eq &#x27;bm-html never links to script&#x27; &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -ci &#x27;javascript:&#x27;)&quot; &#x27;0&#x27;</span>
+<span class="a">+eq &#x27;bm-html shows the url when there is no description&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;&lt;a href=&quot;https://a.example&quot;&gt;https://a.example&lt;/a&gt;&#x27;)&quot; &#x27;1&#x27;</span>
+<span class="a">+eq &#x27;bm-html sorts by description within a tag&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | sed -n &#x27;/id=&quot;code&quot;/,/&lt;\/ul&gt;/p&#x27; | grep -c .) $(printf &#x27;%s\n&#x27; &quot;$page&quot; | sed -n &#x27;/id=&quot;code&quot;/,/&lt;\/ul&gt;/p&#x27; | sed -n 3p | grep -c &#x27;B &amp;lt;b&#x27;)&quot; &#x27;5 1&#x27;</span>
+<span class="a">+eq &#x27;bm-html has one inline script, a filter box hidden without it, and ?q=&#x27; \</span>
+<span class="a">+    &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;&lt;script&gt;&#x27;) $(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;&lt;input id=q type=search placeholder=&quot;filter 3 bookmarks&quot; hidden&gt;&#x27;) $(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c &#x27;URLSearchParams(location.search).get(&quot;q&quot;)&#x27;)&quot; \</span>
+<span class="a">+    &#x27;1 1 1&#x27;</span>
+<span class="a">+eq &#x27;bm-html loads nothing from elsewhere&#x27; &quot;$(printf &#x27;%s\n&#x27; &quot;$page&quot; | grep -c -e &#x27; src=&#x27; -e &#x27;&lt;link&#x27; -e &#x27;@import&#x27;)&quot; &#x27;0&#x27;</span>
+<span class="a">+eq &#x27;bm-html is a filter&#x27; &quot;$($BM -t lib -l | $HTML - | grep -c &#x27;^&lt;li&gt;&#x27;)&quot; &#x27;2&#x27;</span>
+<span class="a">+eq &#x27;bm-html reads the bookmark file by default, whatever stdin is&#x27; \</span>
+<span class="a">+    &quot;$($HTML &lt;/dev/null | grep -c &#x27;^&lt;li&gt;&#x27;)&quot; &#x27;4&#x27;</span>
+<span class="a">+eq &#x27;bm-check reads the bookmark file by default too&#x27; \</span>
+<span class="a">+    &quot;$(PATH=&quot;$work/net:$PATH&quot; $CHECK &lt;/dev/null; echo $?)&quot; &#x27;0&#x27;</span>
+<span class="a">+$HTML --bogus 2&gt;/dev/null &lt;/dev/null</span>
+<span class="a">+eq &#x27;bm-html rejects unknown options&#x27; &quot;$?&quot; &#x27;2&#x27;</span>
+<span class="a">+if command -v node &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;$page&quot; | sed -n &#x27;/&lt;script&gt;/,/&lt;\/script&gt;/p&#x27; | sed &#x27;1d;$d&#x27; &gt; &quot;$work/page.js&quot;</span>
+<span class="a">+    node --check &quot;$work/page.js&quot; 2&gt;/dev/null</span>
+<span class="a">+    eq &#x27;bm-html: the script parses&#x27; &quot;$?&quot; &#x27;0&#x27;</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+# ---- make install ----</span>
+<span class="a">+</span>
+<span class="a">+if command -v make &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+    make -s -C &quot;$top&quot; install DESTDIR=&quot;$work/dest&quot; PREFIX=/usr TOOLS=&#x27;bm bm-html&#x27; &gt;/dev/null</span>
+<span class="a">+    eq &#x27;make install installs what TOOLS names, and only that&#x27; \</span>
+<span class="a">+        &quot;$(cd &quot;$work/dest/usr/bin&quot; &amp;&amp; for f in *; do [ -x &quot;$f&quot; ] &amp;&amp; printf &#x27;%s &#x27; &quot;$f&quot;; done)&quot; &#x27;bm bm-html &#x27;</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+ # ---- defaults ----
+ 
+ (</pre>
+</div></body></html>

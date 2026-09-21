@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay c0e9dedd - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c0e9deddc82ccf23d36b9f9d4e8308ddafe4c58c
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 03:53:50 -0700
+
+Restore session scrollback in the reader after a reload
+
+Mining means going back to something said minutes ago, and a page refresh
+previously threw the whole session away. The reader now replays this session&#x27;s
+lines from captions.log, which livecap marks with a session header on startup
+so earlier sessions are not dragged in.
+
+The log is written with CRLF, so splitting it on \n left a trailing carriage
+return on every line. That broke de-duplication against the server&#x27;s replay
+buffer - the last few lines appeared twice - and, worse, put an invisible \r
+inside the text Yomitan would mine. Split on /\r?\n/ and trim fields.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> livecap.py  |  9 +++++++++
+ reader.html | 47 ++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/livecap.py b/livecap.py
+index 2b4201b..96303c7 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -215,6 +215,14 @@ class Bus:</span>
+     def attach(self, loop):
+         self.loop = loop
+ 
+<span class="a">+    def mark_session(self):</span>
+<span class="a">+        &quot;&quot;&quot;A marker so the reader can show this session&#x27;s history after a reload.&quot;&quot;&quot;</span>
+<span class="a">+        try:</span>
+<span class="a">+            with self.logf.open(&quot;a&quot;, encoding=&quot;utf-8&quot;) as fh:</span>
+<span class="a">+                fh.write(&quot;=== session %s ===\n&quot; % time.strftime(&quot;%Y-%m-%d %H:%M:%S&quot;))</span>
+<span class="a">+        except OSError as e:</span>
+<span class="a">+            log(&quot;could not write captions.log:&quot;, e)</span>
+<span class="a">+</span>
+     def publish(self, msg):
+         if msg[&quot;type&quot;] == &quot;final&quot;:
+             self.history.append(msg)
+<span class="h">@@ -899,6 +907,7 @@ def main():</span>
+     stop_ev = threading.Event()
+     jobs = queue.Queue(maxsize=3)
+ 
+<span class="a">+    bus.mark_session()</span>
+     ctl = Controller(args, bus)
+     tr = Transcriber(args, bus)
+     ctl.tr = tr
+diff --git a/reader.html b/reader.html
+index 77289f5..5930cfa 100644
+--- a/reader.html
++++ b/reader.html
+<span class="h">@@ -99,6 +99,7 @@</span>
+   const jump = document.getElementById(&quot;jump&quot;);
+   let follow = true;
+   let partialEl = null;
+<span class="a">+  const historyTail = new Set();</span>
+   let size = parseInt(localStorage.getItem(&quot;livecap.size&quot;) || q.get(&quot;size&quot;) || &quot;30&quot;, 10);
+ 
+   function applySize() {
+<span class="h">@@ -155,6 +156,12 @@</span>
+   }
+ 
+   function onFinal(m) {
+<span class="a">+    // The server replays its last few finals on connect; those may already be</span>
+<span class="a">+    // on screen from captions.log. Drop only that overlap, once.</span>
+<span class="a">+    if (historyTail.has(m.text)) {</span>
+<span class="a">+      historyTail.delete(m.text);</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+     clearEmpty();
+     if (partialEl) { partialEl.remove(); partialEl = null; }
+     const wasBottom = atBottom();
+<span class="h">@@ -199,6 +206,44 @@</span>
+   };
+   jump.onclick = scrollDown;
+ 
+<span class="a">+  // Reloading the page would otherwise lose the session&#x27;s scrollback, which is</span>
+<span class="a">+  // exactly what you want when going back to something said minutes ago.</span>
+<span class="a">+  async function loadHistory() {</span>
+<span class="a">+    try {</span>
+<span class="a">+      const res = await fetch(&quot;captions.log&quot;, { cache: &quot;no-store&quot; });</span>
+<span class="a">+      if (!res.ok) return;</span>
+<span class="a">+      // The log is written with CRLF on Windows; a stray \r would both break</span>
+<span class="a">+      // the de-duplication below and end up inside mined sentences.</span>
+<span class="a">+      const lines = (await res.text()).split(/\r?\n/);</span>
+<span class="a">+      let from = 0;</span>
+<span class="a">+      for (let i = lines.length - 1; i &gt;= 0; i--) {</span>
+<span class="a">+        if (lines[i].startsWith(&quot;=== session &quot;)) { from = i + 1; break; }</span>
+<span class="a">+      }</span>
+<span class="a">+      const rows = lines.slice(from).filter((l) =&gt; l.trim() &amp;&amp; !l.startsWith(&quot;===&quot;));</span>
+<span class="a">+      if (!rows.length) return;</span>
+<span class="a">+      clearEmpty();</span>
+<span class="a">+      for (const row of rows.slice(-400)) {</span>
+<span class="a">+        const parts = row.split(&quot;\t&quot;).map((p) =&gt; p.trim());</span>
+<span class="a">+        if (parts.length &lt; 2 || !parts[1]) continue;</span>
+<span class="a">+        const trIdx = parts.findIndex((p) =&gt; p.startsWith(&quot;|| &quot;));</span>
+<span class="a">+        const m = {</span>
+<span class="a">+          text: parts[1],</span>
+<span class="a">+          tr: trIdx &gt; 0 ? parts[trIdx].slice(3) : &quot;&quot;,</span>
+<span class="a">+          ts: null</span>
+<span class="a">+        };</span>
+<span class="a">+        const el = makeLine(m, false);</span>
+<span class="a">+        el.dataset.time = (parts[0].split(&quot; &quot;)[1] || parts[0]);</span>
+<span class="a">+        log.appendChild(el);</span>
+<span class="a">+        historyTail.add(m.text);</span>
+<span class="a">+      }</span>
+<span class="a">+      // Only the newest few can collide with the server&#x27;s replay buffer.</span>
+<span class="a">+      const keep = [...historyTail].slice(-6);</span>
+<span class="a">+      historyTail.clear();</span>
+<span class="a">+      keep.forEach((t) =&gt; historyTail.add(t));</span>
+<span class="a">+      scrollDown();</span>
+<span class="a">+    } catch (e) { /* history is a nicety, never block the live feed */ }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+   function connect() {
+     const ws = new WebSocket(&quot;ws://127.0.0.1:&quot; + WS_PORT);
+     const conn = document.getElementById(&quot;conn&quot;);
+<span class="h">@@ -225,7 +270,7 @@</span>
+     };
+   }
+ 
+<span class="d">-  connect();</span>
+<span class="a">+  loadHistory().then(connect);</span>
+ })();
+ &lt;/script&gt;
+ &lt;/body&gt;</pre>
+</div></body></html>

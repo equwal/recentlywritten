@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>desktop-subtitle-replay 503b41a3 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>desktop-subtitle-replay</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/desktop-subtitle-replay</p><p><a href="../../desktop-subtitle-replay/index.html">Log</a> | <a href="../../desktop-subtitle-replay/files.html">Files</a> | <a href="../../desktop-subtitle-replay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 503b41a38f1df97f78c4182243aaf85ec347300e
+equwal &lt;truex@equwal.com&gt;
+2026-08-26 12:20:34 -0700
+
+Use the Finnish fine-tune for live captions when it is built
+
+Built and measured it on the 17.6s clip: stock small transcribes
+&quot;harvokseltaan&quot;, the fine-tune and large-v3-turbo both get &quot;harvakseltaan&quot;,
+but the fine-tune runs at RTF 0.21 against turbo&#x27;s 0.57. Turbo-level accuracy
+at small&#x27;s speed, so livecap now prefers it automatically for --lang fi when
+present.
+
+--model therefore defaults to None and resolves in main(), because the old
+check compared against the literal &quot;small&quot; and so could not tell an explicit
+--model small from no flag at all - the override silently did nothing. Logic
+is extracted to resolve_model() and covered by tests.
+
+Turbo stays the offline default: the fine-tune punctuates less reliably and
+runs sentences together, which matters where cues are split on sentence
+boundaries for subtitles and Anki cards, but not live where the VAD segments.
+
+get-finnish-model.ps1 could not actually complete before this. Windows
+PowerShell turns native stderr into a terminating error under
+ErrorActionPreference = Stop, and the HF Hub always warns about unauthenticated
+requests, so the script aborted after conversion and never wrote tokenizer.json
+- leaving faster-whisper to fall back to the stock whisper-tiny tokenizer.
+Native calls are now judged by exit code, and the output is verified.
+
+Co-Authored-By: Claude Opus 5 &lt;noreply@anthropic.com&gt;
+
+</pre><pre> README.md             | 28 ++++++++++++++++++++++------
+ get-finnish-model.ps1 | 34 +++++++++++++++++++++++++---------
+ livecap.py            | 33 +++++++++++++++++++++++++++++++--
+ tests/test_smoke.py   | 28 ++++++++++++++++++++++++++++
+ 4 files changed, 106 insertions(+), 17 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 01cb8a5..94205bd 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -232,12 +232,28 @@ the same speed, but markedly better at Finnish:</span>
+ .\get-finnish-model.ps1
+ ```
+ 
+<span class="d">-```bash</span>
+<span class="d">-.\run.ps1 --model .\build\models\fi-small-ct2</span>
+<span class="d">-```</span>
+<span class="a">+Once built, `run.ps1` picks it up automatically whenever `--lang fi` and no</span>
+<span class="a">+`--model` is given. `--model small` overrides it; other languages ignore it.</span>
+<span class="a">+</span>
+<span class="a">+Measured on the same 17.6 s Finnish clip:</span>
+<span class="a">+</span>
+<span class="a">+| model | transcription | RTF |</span>
+<span class="a">+|---|---|---|</span>
+<span class="a">+| `small` stock | &quot;harv**o**kseltaan kuljetuilla&quot; ✗ | 0.20 |</span>
+<span class="a">+| **`fi-small-ct2`** | &quot;harv**a**kseltaan kuljetuilla&quot; ✓ | **0.21** |</span>
+<span class="a">+| `large-v3-turbo` | &quot;harvakseltaan kuljetuilla&quot; ✓ | 0.57 |</span>
+<span class="a">+</span>
+<span class="a">+Turbo-level accuracy at stock-`small` speed — 2.7× faster than turbo for the</span>
+<span class="a">+same correct word. That is why it is the live default when present.</span>
+<span class="a">+</span>
+<span class="a">+**Keep turbo for replay clips, though.** The fine-tune punctuates less</span>
+<span class="a">+reliably, running sentences together, and the offline path splits cues on</span>
+<span class="a">+sentence boundaries — so turbo yields cleaner subtitle cues and better Anki</span>
+<span class="a">+card boundaries. Live, the VAD does the segmenting, so this costs nothing.</span>
+ 
+<span class="d">-Needs ~8 GB free and pulls torch for the one-off conversion; use</span>
+<span class="d">-`-BuildRoot D:\somewhere` to build elsewhere, then delete `.venv-convert`.</span>
+<span class="a">+The conversion needs ~8 GB free and pulls torch, used only for that one step.</span>
+<span class="a">+`-BuildRoot D:\somewhere` builds elsewhere; delete `.venv-convert` under the</span>
+<span class="a">+build root afterwards to reclaim about 5 GB.</span>
+ 
+ ## Syncing captions to the picture
+ 
+<span class="h">@@ -258,7 +274,7 @@ If you already run a replay buffer, this costs you nothing.</span>
+ | flag | default | effect |
+ |---|---|---|
+ | `--lang` / `--langs` | `fi` / `fi,ru,ja,es,pt,en,auto` | active language, and the panel&#x27;s buttons |
+<span class="d">-| `--model` | `small` | model name or local CTranslate2 directory |</span>
+<span class="a">+| `--model` | `small`, or the Finnish fine-tune if built | model name or local CTranslate2 directory |</span>
+ | `--mic` / `--audio-device` | loopback / auto | capture an input device instead |
+ | `--pause` | `0.65` | silence that closes a caption; lower is snappier |
+ | `--min-speech` | `0.45` | ignore bursts shorter than this |
+diff --git a/get-finnish-model.ps1 b/get-finnish-model.ps1
+index 8501791..cee7140 100644
+--- a/get-finnish-model.ps1
++++ b/get-finnish-model.ps1
+<span class="h">@@ -59,31 +59,47 @@ if ($freeGB) {</span>
+ 
+ if (-not (Test-Path &quot;$venv\Scripts\python.exe&quot;)) {
+     Write-Host &quot;Creating conversion venv (one-time, ~2.5 GB of torch)...&quot; -ForegroundColor Cyan
+<span class="a">+    # pip and venv both write progress to stderr, which would otherwise abort</span>
+<span class="a">+    # this script under ErrorActionPreference = Stop. Check exit codes instead.</span>
+<span class="a">+    $ErrorActionPreference = &quot;Continue&quot;</span>
+     &amp; py -3.11 -m venv $venv
+<span class="a">+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = &quot;Stop&quot;; throw &quot;could not create venv at $venv&quot; }</span>
+     &amp; &quot;$venv\Scripts\python.exe&quot; -m pip install --upgrade pip --quiet
+     &amp; &quot;$venv\Scripts\python.exe&quot; -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+<span class="d">-    if ($LASTEXITCODE -ne 0) { throw &quot;torch install failed&quot; }</span>
+<span class="a">+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = &quot;Stop&quot;; throw &quot;torch install failed&quot; }</span>
+     &amp; &quot;$venv\Scripts\python.exe&quot; -m pip install transformers ctranslate2 &quot;numpy&lt;3&quot;
+<span class="d">-    if ($LASTEXITCODE -ne 0) { throw &quot;transformers/ctranslate2 install failed&quot; }</span>
+<span class="a">+    if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = &quot;Stop&quot;; throw &quot;transformers/ctranslate2 install failed&quot; }</span>
+<span class="a">+    $ErrorActionPreference = &quot;Stop&quot;</span>
+ }
+ 
+ Write-Host &quot;Downloading + converting $src ...&quot; -ForegroundColor Cyan
+<span class="a">+</span>
+<span class="a">+# Windows PowerShell turns any native stderr output into a terminating error</span>
+<span class="a">+# while ErrorActionPreference is Stop, and the HF Hub always warns about</span>
+<span class="a">+# unauthenticated requests. Judge these calls by their exit code instead.</span>
+<span class="a">+$ErrorActionPreference = &quot;Continue&quot;</span>
+<span class="a">+</span>
+ &amp; &quot;$venv\Scripts\ct2-transformers-converter.exe&quot; `
+     --model $src `
+     --output_dir $out `
+     --quantization int8 `
+     --copy_files preprocessor_config.json tokenizer_config.json special_tokens_map.json `
+                  vocab.json merges.txt normalizer.json added_tokens.json
+<span class="d">-if ($LASTEXITCODE -ne 0) { throw &quot;conversion failed&quot; }</span>
+<span class="a">+if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = &quot;Stop&quot;; throw &quot;conversion failed&quot; }</span>
+ 
+ # faster-whisper wants a real tokenizer.json, otherwise it quietly falls back to
+<span class="d">-# the stock openai/whisper-tiny tokenizer.</span>
+<span class="d">-$py = @&quot;</span>
+<span class="d">-from transformers import WhisperTokenizerFast</span>
+<span class="d">-WhisperTokenizerFast.from_pretrained(r&#x27;$src&#x27;).save_pretrained(r&#x27;$out&#x27;)</span>
+<span class="d">-print(&#x27;tokenizer.json written&#x27;)</span>
+<span class="d">-&quot;@</span>
+<span class="a">+# the stock openai/whisper-tiny tokenizer and mis-decodes.</span>
+<span class="a">+$py = &quot;from transformers import WhisperTokenizerFast&quot; + &quot;`n&quot; +</span>
+<span class="a">+      &quot;WhisperTokenizerFast.from_pretrained(r&#x27;$src&#x27;).save_pretrained(r&#x27;$out&#x27;)&quot; + &quot;`n&quot; +</span>
+<span class="a">+      &quot;print(&#x27;tokenizer.json written&#x27;)&quot;</span>
+ $py | &amp; &quot;$venv\Scripts\python.exe&quot; -
+<span class="a">+if ($LASTEXITCODE -ne 0) { $ErrorActionPreference = &quot;Stop&quot;; throw &quot;tokenizer export failed&quot; }</span>
+<span class="a">+</span>
+<span class="a">+$ErrorActionPreference = &quot;Stop&quot;</span>
+<span class="a">+if (-not (Test-Path (Join-Path $out &quot;model.bin&quot;))) { throw &quot;no model.bin in $out&quot; }</span>
+<span class="a">+if (-not (Test-Path (Join-Path $out &quot;tokenizer.json&quot;))) {</span>
+<span class="a">+    Write-Host &quot;WARNING: tokenizer.json missing; faster-whisper will fall back &quot; -ForegroundColor Yellow</span>
+<span class="a">+}</span>
+ 
+ Write-Host &quot;&quot;
+ Write-Host &quot;Done -&gt; $out&quot; -ForegroundColor Green
+diff --git a/livecap.py b/livecap.py
+index 96303c7..8106225 100644
+--- a/livecap.py
++++ b/livecap.py
+<span class="h">@@ -821,6 +821,26 @@ def selftest(args, seconds):</span>
+ 
+ # ------------------------------------------------------------------ main ----
+ 
+<span class="a">+DEFAULT_MODEL = &quot;small&quot;</span>
+<span class="a">+FI_MODEL_DIR = Path(&quot;build&quot;) / &quot;models&quot; / &quot;fi-small-ct2&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def resolve_model(requested, lang, here):</span>
+<span class="a">+    &quot;&quot;&quot;Pick the model, returning (name, message-to-log-or-None).</span>
+<span class="a">+</span>
+<span class="a">+    With nothing requested, prefer the Finnish fine-tune when it has been built</span>
+<span class="a">+    and Finnish is what we are transcribing: same size and speed as small, but</span>
+<span class="a">+    better Finnish. An explicit --model always wins, which is why the flag</span>
+<span class="a">+    defaults to None rather than to &quot;small&quot;.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if requested is not None:</span>
+<span class="a">+        return requested, None</span>
+<span class="a">+    local = Path(here) / FI_MODEL_DIR</span>
+<span class="a">+    if lang == &quot;fi&quot; and (local / &quot;model.bin&quot;).is_file():</span>
+<span class="a">+        return str(local), &quot;using the Finnish fine-tune (override with --model small)&quot;</span>
+<span class="a">+    return DEFAULT_MODEL, None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def build_parser():
+     p = argparse.ArgumentParser(
+         description=&quot;Live captions for OBS&quot;,
+<span class="h">@@ -837,8 +857,11 @@ def build_parser():</span>
+     g.add_argument(&quot;--verbose&quot;, action=&quot;store_true&quot;, help=&quot;log VAD segment decisions&quot;)
+ 
+     g = p.add_argument_group(&quot;model&quot;)
+<span class="d">-    g.add_argument(&quot;--model&quot;, default=&quot;small&quot;,</span>
+<span class="d">-                   help=&quot;tiny|base|small|medium|large-v3|large-v3-turbo, or a local CT2 dir&quot;)</span>
+<span class="a">+    # Default is resolved in main() so an explicit --model small is</span>
+<span class="a">+    # distinguishable from not passing --model at all.</span>
+<span class="a">+    g.add_argument(&quot;--model&quot;, default=None,</span>
+<span class="a">+                   help=&quot;tiny|base|small|medium|large-v3|large-v3-turbo, or a local &quot;</span>
+<span class="a">+                        &quot;CT2 dir (default: small, or the Finnish fine-tune if built)&quot;)</span>
+     g.add_argument(&quot;--lang&quot;, default=&quot;fi&quot;, help=&quot;fi, ru, ja, es, pt, ... or &#x27;auto&#x27;&quot;)
+     g.add_argument(&quot;--langs&quot;, default=&quot;fi,ru,ja,es,pt,en,auto&quot;,
+                    help=&quot;languages offered as one-click buttons in the control panel&quot;)
+<span class="h">@@ -890,6 +913,12 @@ def build_parser():</span>
+ 
+ def main():
+     args = build_parser().parse_args()
+<span class="a">+</span>
+<span class="a">+    chosen, why = resolve_model(args.model, args.lang, HERE)</span>
+<span class="a">+    args.model = chosen</span>
+<span class="a">+    if why:</span>
+<span class="a">+        log(why)</span>
+<span class="a">+</span>
+     args.langs = [s.strip() for s in args.langs.split(&quot;,&quot;) if s.strip()]
+     args.model_choices = [s.strip() for s in args.model_choices.split(&quot;,&quot;) if s.strip()]
+     if args.model not in args.model_choices:
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index d7ed8fe..7b2ccb0 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+<span class="h">@@ -76,6 +76,34 @@ def test_captions_file_keeps_last_n_lines(tmp_path=None):</span>
+             os.chdir(cwd)
+ 
+ 
+<span class="a">+def test_model_resolution():</span>
+<span class="a">+    &quot;&quot;&quot;An explicit --model must win, even when it equals the default.&quot;&quot;&quot;</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as d:</span>
+<span class="a">+        here = Path(d)</span>
+<span class="a">+</span>
+<span class="a">+        # nothing built yet</span>
+<span class="a">+        assert livecap.resolve_model(None, &quot;fi&quot;, here)[0] == &quot;small&quot;</span>
+<span class="a">+        assert livecap.resolve_model(None, &quot;ru&quot;, here)[0] == &quot;small&quot;</span>
+<span class="a">+</span>
+<span class="a">+        built = here / livecap.FI_MODEL_DIR</span>
+<span class="a">+        built.mkdir(parents=True)</span>
+<span class="a">+        (built / &quot;model.bin&quot;).write_bytes(b&quot;x&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        name, why = livecap.resolve_model(None, &quot;fi&quot;, here)</span>
+<span class="a">+        assert name == str(built), name</span>
+<span class="a">+        assert why and &quot;fine-tune&quot; in why</span>
+<span class="a">+</span>
+<span class="a">+        # the fine-tune is Finnish-only</span>
+<span class="a">+        assert livecap.resolve_model(None, &quot;ru&quot;, here)[0] == &quot;small&quot;</span>
+<span class="a">+        assert livecap.resolve_model(None, &quot;ja&quot;, here)[0] == &quot;small&quot;</span>
+<span class="a">+</span>
+<span class="a">+        # explicit wins, including the string that happens to be the default</span>
+<span class="a">+        assert livecap.resolve_model(&quot;small&quot;, &quot;fi&quot;, here) == (&quot;small&quot;, None)</span>
+<span class="a">+        assert livecap.resolve_model(&quot;large-v3&quot;, &quot;fi&quot;, here)[0] == &quot;large-v3&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def _controller():
+     import argparse
+ </pre>
+</div></body></html>
