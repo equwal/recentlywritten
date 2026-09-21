@@ -1,20 +1,38 @@
 #!/bin/sh
-# build.sh — converts posts/*.md to site/ using pandoc
-# Usage: sh build.sh
+# build.sh — converts posts/*.md and pages/*.md to site/ using pandoc
+# Usage: sh build.sh [--no-deploy]
 
 set -e
 
 POSTS_DIR="posts"
+PAGES_DIR="pages"
 SITE_DIR="site"
-CSS="../style.css"   # relative path from inside site/
+STATIC_DIR="static"
+SITE_URL="https://recentlywritten.com"
+DEPLOY_HOST="root@recentlywritten.com"
+DEPLOY_PATH="/var/www/recentlywritten/"
+FEED_SIZE=10
+
+DEPLOY=yes
+[ "$1" = "--no-deploy" ] && DEPLOY=no
+
+WORK="${TMPDIR:-/tmp}/rw-build.$$"
+mkdir -p "$WORK"
+trap 'rm -rf "$WORK"' EXIT INT TERM
 
 # ── setup ──────────────────────────────────────────────────
 rm -rf "$SITE_DIR"
 mkdir -p "$SITE_DIR"
 cp style.css "$SITE_DIR/style.css"
+# Images and downloads the recovered posts link to as static/...
+[ -d "$STATIC_DIR" ] && cp -R "$STATIC_DIR" "$SITE_DIR/$STATIC_DIR"
 
-# pandoc HTML template for individual posts
-TEMPLATE="template.html"
+# pandoc HTML template for individual posts.
+# Kept as a relative path in the working directory on purpose: under cygwin
+# the pandoc on PATH is the native Windows build, which cannot resolve a
+# POSIX path like /tmp/..., but does resolve a path relative to the cwd.
+TEMPLATE=".build-template.html"
+trap 'rm -rf "$WORK" "$TEMPLATE"' EXIT INT TERM
 cat > "$TEMPLATE" << 'TMPL'
 <!DOCTYPE html>
 <html lang="en">
@@ -23,6 +41,7 @@ cat > "$TEMPLATE" << 'TMPL'
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>$title$ — Recently Written</title>
   <link rel="stylesheet" href="style.css" />
+  <link rel="alternate" type="application/rss+xml" title="Recently Written" href="rss.xml" />
 </head>
 <body>
 <div id="container">
@@ -31,17 +50,20 @@ cat > "$TEMPLATE" << 'TMPL'
     <a class="site-title" href="index.html">Recently Written</a>
     <nav>
       <a href="index.html">Home</a>
+      <a href="lair.html">code</a>
+      <a href="esperanto.html">esperanto</a>
+      <a href="call.html">contact</a>
+      <a href="rss.xml">rss</a>
     </nav>
   </div>
 
-  <h1>$title$</h1>
-  <div class="post-meta">$date$</div>
+  <h1 class="post-title">$title$</h1>
 
   $body$
 
   <div id="footer">
     <a href="index.html">← Home</a> ·
-    Powered by <a href="https://neuron.zettel.page">Neuron</a>
+    <a href="https://github.com/equwal">Github</a>
   </div>
 
 </div>
@@ -49,46 +71,149 @@ cat > "$TEMPLATE" << 'TMPL'
 </html>
 TMPL
 
-# ── build each post ─────────────────────────────────────────
-LIST=""   # accumulate post-list items (newest first)
+# Read one `key: value` line out of a file's front matter, dropping the
+# surrounding quotes that titles containing a colon have to be written with.
+meta() {
+    sed -n "s/^$2: *//p" "$1" | head -1 | sed -e 's/^"//' -e 's/"$//' -e 's/\\"/"/g'
+}
 
-# collect posts and sort by date descending
-for md in "$POSTS_DIR"/*.md; do
-    slug=$(basename "$md" .md)
-    title=$(grep '^title:' "$md" | sed 's/title: *//')
-    date=$(grep '^date:'  "$md" | sed 's/date: *//')
+# Escape the characters that must not appear raw in generated HTML.
+esc() {
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
 
+# render <markdown> <output> <title>
+render() {
     pandoc \
         --from markdown \
         --to html5 \
         --template "$TEMPLATE" \
-        --metadata title="$title" \
-        --metadata date="$date" \
-        --output "$SITE_DIR/${slug}.html" \
-        "$md"
+        --metadata title="$3" \
+        --output "$2" \
+        "$1"
+}
 
-    # prepend to list so newest-first after sort
-    LIST="$(printf '%s\n' "${date}|${slug}|${title}")\n${LIST}"
+# ── build each post ─────────────────────────────────────────
+: > "$WORK/posts.tsv"
+for md in "$POSTS_DIR"/*.md; do
+    [ -e "$md" ] || continue
+    slug=$(basename "$md" .md)
+    title=$(meta "$md" title)
+    date=$(meta "$md" date)
+    # Recovered posts carry `order`: their position on the old front page,
+    # the only surviving record of their sequence. Everything else sorts by
+    # date. The two never interleave, since an order is three digits ("051")
+    # and a date leads with its year ("2026-..."), so new posts land on top.
+    order=$(meta "$md" order)
+    [ -z "$order" ] && order="$date"
+    render "$md" "$SITE_DIR/${slug}.html" "$title"
+    printf '%s\t%s\t%s\t%s\n' "$order" "$date" "$slug" "$title" >> "$WORK/posts.tsv"
 done
 
-# ── build index ─────────────────────────────────────────────
-# sort descending by date, emit list items
-POST_ITEMS=""
-printf '%b' "$LIST" | sort -r | while IFS='|' read -r date slug title; do
+# Dates order the posts but are never shown on the site: most recovered ones
+# are approximations taken from archive crawls, good enough to sort by and
+# not good enough to publish. C collation keeps the sort independent of the
+# system language.
+LC_ALL=C sort -r "$WORK/posts.tsv" > "$WORK/sorted.tsv"
+
+# ── build each standalone page ──────────────────────────────
+# Pages are dateless and stay out of the chronological list; these are the
+# hub pages the old site linked from its nav (lair, esperanto, call, ...).
+: > "$WORK/pages.tsv"
+for md in "$PAGES_DIR"/*.md; do
+    [ -e "$md" ] || continue
+    slug=$(basename "$md" .md)
+    title=$(meta "$md" title)
+    render "$md" "$SITE_DIR/${slug}.html" "$title"
+    printf '%s\t%s\n' "$slug" "$title" >> "$WORK/pages.tsv"
+done
+
+# ── list fragments for the index ────────────────────────────
+TAB=$(printf '\t')
+
+while IFS="$TAB" read -r order date slug title; do
     [ -z "$slug" ] && continue
-    printf '<li><span class="post-date">%s</span><a href="%s.html">%s</a></li>\n' \
-        "$date" "$slug" "$title"
-done > /tmp/rw-items.txt
+    printf '<li><a href="%s.html">%s</a></li>\n' \
+        "$slug" "$(printf '%s' "$title" | esc)"
+done < "$WORK/sorted.tsv" > "$WORK/post-items.html"
 
-ITEMS=$(cat /tmp/rw-items.txt)
+LC_ALL=C sort -f "$WORK/pages.tsv" | while IFS="$TAB" read -r slug title; do
+    [ -z "$slug" ] && continue
+    printf '<li><a href="%s.html">%s</a></li>\n' \
+        "$slug" "$(printf '%s' "$title" | esc)"
+done > "$WORK/page-items.html"
 
-# inject post list into index.html using awk
-awk -v items="<ul class=\"post-list\">$(cat /tmp/rw-items.txt)</ul>" \
-    '{ gsub(/<!-- POST_LIST -->/, items); print }' \
-    index.html > "$SITE_DIR/index.html"
+# ── build index ─────────────────────────────────────────────
+# The fragments are read from disk rather than substituted into an awk
+# variable, so titles containing & or \ survive intact.
+awk -v postfile="$WORK/post-items.html" -v pagefile="$WORK/page-items.html" '
+    /<!-- POST_LIST -->/ {
+        print "<ul class=\"post-list\">"
+        while ((getline line < postfile) > 0) print line
+        close(postfile)
+        print "</ul>"
+        next
+    }
+    /<!-- PAGE_LIST -->/ {
+        print "<ul class=\"page-list\">"
+        while ((getline line < pagefile) > 0) print line
+        close(pagefile)
+        print "</ul>"
+        next
+    }
+    { print }
+' index.html > "$SITE_DIR/index.html"
 
-# ── cleanup ──────────────────────────────────────────────────
-rm -f "$TEMPLATE" /tmp/rw-items.txt
+# ── feed ─────────────────────────────────────────────────────
+# Only the newest FEED_SIZE posts go in, and that is deliberate as well as
+# conventional: a feed reader shows each item's date, and the newest posts are
+# the ones whose dates are exact rather than recovered from a crawl.
+
+# RFC 822, as RSS requires. The C locale matters: without it the day and
+# month names come out in the system language. `date -d` is GNU; where it is
+# missing the item simply goes out without a pubDate.
+feed_date() {
+    LC_ALL=C date -u -d "$1" '+%a, %d %b %Y 00:00:00 +0000' 2>/dev/null
+}
+
+# A feed reader shows the HTML away from the site, so links relative to it
+# need the site put in front of them.
+absolute() {
+    sed -E \
+        -e 's@(href|src)="/([^/"][^"]*)"@\1="'"$SITE_URL"'/\2"@g' \
+        -e 's@(href|src)="([^"/#][^":]*)"@\1="'"$SITE_URL"'/\2"@g'
+}
+
+{
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">\n<channel>\n'
+    printf '  <title>Recently Written</title>\n'
+    printf '  <link>%s/</link>\n' "$SITE_URL"
+    printf '  <description>A site full of things which I have recently written.</description>\n'
+    printf '  <language>en-us</language>\n'
+    printf '  <atom:link href="%s/rss.xml" rel="self" type="application/rss+xml" />\n' "$SITE_URL"
+    head -n "$FEED_SIZE" "$WORK/sorted.tsv" | while IFS="$TAB" read -r order date slug title; do
+        url="$SITE_URL/$slug.html"
+        printf '  <item>\n'
+        printf '    <title>%s</title>\n' "$(printf '%s' "$title" | esc)"
+        printf '    <link>%s</link>\n' "$url"
+        printf '    <guid isPermaLink="true">%s</guid>\n' "$url"
+        pub=$(feed_date "$date") && [ -n "$pub" ] &&
+            printf '    <pubDate>%s</pubDate>\n' "$pub"
+        printf '    <description><![CDATA['
+        pandoc --from markdown --to html5 "$POSTS_DIR/$slug.md" |
+            absolute | sed 's/]]>/]]]]><![CDATA[>/g'
+        printf ']]></description>\n'
+        printf '  </item>\n'
+    done
+    printf '</channel>\n</rss>\n'
+} > "$SITE_DIR/rss.xml"
 
 echo "Built $(ls "$SITE_DIR"/*.html | wc -l | tr -d ' ') pages → $SITE_DIR/"
-rsync -avzP --delete site/ root@honjimaku.com:/var/www/recentlywritten/
+echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WORK/pages.tsv" | tr -d ' ')   feed: $(grep -c '<item>' "$SITE_DIR/rss.xml") items"
+
+# ── deploy ───────────────────────────────────────────────────
+if [ "$DEPLOY" = yes ]; then
+    rsync -avzP --delete "$SITE_DIR/" "$DEPLOY_HOST:$DEPLOY_PATH"
+    ssh "$DEPLOY_HOST" "chmod -R a+rX $DEPLOY_PATH"
+fi

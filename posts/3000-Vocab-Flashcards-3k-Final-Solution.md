@@ -1,0 +1,53 @@
+---
+title: 3000 Vocab Flashcards (3k Final Solution)
+date: 2025-08-09
+order: 022
+tags: articles
+source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+---
+
+## Why make 3,000 vocabulary flashcards?
+
+Regardless of one's starting point or goal, 3,000 flashcards can go a long way to improving one's language ability:
+
+Some people have made 40,000 flashcards. This seems excessive. Surely there is much to be gained from making a smaller amount, and less to be gained from such a vast amount. There is also the "anki burnout" phenomenon, where flashcard users get into such flashcard overkill that they "quit anki". The "3k final solution" is my response to this.
+
+## What is the 3k Final Solution?
+
+You make 3,000 flashcards covering vocabulary. For basic language aquisition, these would probably be sentence cards with a vocabulary woYrd. A better strategy, which isn't really for "language acquisition" but just for learning, is to save pieces of language because of their actual content (eg. quotes or proverbs from books), and learn words incidentally from them. I call these "Guarinian quotes" named after Guarino Guarini, a midieval Latin teacher who recommended this method. He didn't recommend flashcards, instead, he recommended saving excerpts in a notebook from books, in order to remember important things once the book was gone. Guarnini:
+
+If then, in the course of the reading, saying, a wise and noble action, a quick a a gracious way of living, it seems to me t at hand a little notebook like a faithful make notes of points in the text; in this to your favourite parts without having to if copying things in the notebook causes a reading, you should \[not do it\].
+
+3,000 is presumed to be just large enough to notice a qualitative difference from any starting point. Any additional learning can be done more easily thanks to this little step up. And it only takes a few months or less, keeping the goal achievable on a reasonable timeline. After 3k, I suggest sticking only to making cards when "convenient," "easy," or for "ideas" rather than vocabulary. Consider these "vocabulary levels".
+
+- ### &gt;40,000 words, someone who has read 100s of books in the past decade in said language
+
+  3,000 cards can help to gain a foothold in the vocabulary of a new field. Examples could be biology, chemistry, computing, or medicine. These fields have a lot of nomenclature to learn, which can be a real drag for beginners. Some medical students use Anki to make tons of cards for their studies. Each card surely contains multiple pieces of vocabulary that only a medical person would know, making them far to difficult for beginners. Some vocab study could close that gap, and allow one to focus on the ideas that need to be learnt rather than the words. Anyone looking to change careers could certainly benefit from this. The next step is to read more in that area.
+
+  For someone with this much vocabulary, only specialised materials will have enough unknown vocabulary to make this a profitable activity.
+
+  Sentence cards seem too basic for this, so I recommend only doing "Guarinian quotes" and "proverbs" instead.
+
+- ### ~20,000 words, ie. a native speaker of a language who hasn't read daily during the past decade
+
+  Here, 3,000 cards would be a 10% increase in vocabulary, which would certainly be noticeable. This would likely result in a feeling that reading was "a bit easier", or that books that were previously "boring" are now more interesting. One's ability to understand complex descriptions might go up a bit. The next step would be to read more, of course.
+
+  For someone with this small vocabulary, even everyday materials like movies and low-brow books will have enough vocabulary to quickly find unknown words. TV shows are not recommended.
+
+- ### ~10,000 words someone who actually can't read, or someone who is learning a language and hasn't read any books
+
+  A 30% increase in vocabulary would lead to seeing cards from the deck on every page of reading, and be a massive boost to understanding. It would open up whole new kinds of material that are now more interesting, perhaps even books.
+
+  For someone with this much vocabulary, even basic materials like the newspaper will have lots of unknown words. Movies are recommendable, TV shows are not.
+
+- ### ~3,000 words a near beginner, can struggle to understand basic material
+
+  At this level, the goal is to go from "struggling to understand anything" to "being able to enjoy basic materials" like the news. 3,000 vocab words will fix this. TV shows can be a good source of a massive volume of basic language. Attempting to read anything at this level as an adult is sure to be super boring. For kids, "graded readers" have been invented to get them reading.
+
+- ### ~0 words Absolute beginner in a language: knows about 0 words
+
+  At this level, even the way words are pronounced and go together grammatically is not known. So it is recommended to focus on making cards with a native speaker's pronunciation in addition to the writing, eg., from television. In principle, audiobook+book should be able to provide lots of quality sentences, but I've struggled to find an efficient way to make cards like that, since it would involve manually lining up timings. Instead, I take advantage of subtitle timings to make instant flashcards. At this level, it's not even worth putting any definition on the back, since choosing the correct definition for the context is too difficult. Instead, just making a card with a full sentence on the front and "passing" it if it "makes sense" and failing it/deleting it if it "is too hard" should work for the first 1,000 or so cards.
+
+  Some people like to study "common words" because the top 100 words make up 50% of langauage (etc.). This is fine, but doesn't really matter, since those words will be learnt anyway due to being insanely common. It makes more sense to attempt to learn actual concrete vocabulary instead and learn those incidentally, at least with this method.
+
+  Ultimately, at this level, the focus should be on trying to find material where it's possible to "undestand" some parts of what was said, despite not knowing all of the actual language, and the brain will slowly acquire the language through this experience.
