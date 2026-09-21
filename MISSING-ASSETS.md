@@ -24,7 +24,7 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - intervjuoj-de-aejk.html
 - noveloj-de-la-ondo.html
 
-## Attachments referenced by the posts and pages (124)
+## Attachments referenced by the posts and pages (119)
 
 - 25-noveloj/25-noveloj.epub  — used by 25-noveloj.html
 - 25-noveloj/25-noveloj.mobi  — used by 25-noveloj.html
@@ -69,8 +69,6 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - static/book/null-hyp.pdf  — used by books.html
 - static/book/unabomber.pdf  — used by books.html
 - static/book/zhuagzi.pdf  — used by books.html
-- static/channel.png  — used by IRC-Bouncer.html
-- static/channels.png  — used by IRC-Bouncer.html
 - static/createfiltereddeck.png  — used by Learn-Kanji-in-a-Fortnight.html
 - static/dbc  — used by dmenu-scripts-repo-released.html
 - static/dbrowsel  — used by dmenu-scripts-repo-released.html
@@ -99,7 +97,6 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - static/git-update-worker.sh.webp  — used by A-new-way-to-release-code.html
 - static/glider-catb.png  — used by glider.html
 - static/glosbe-bird.svg  — used by esperantaj-vortaroj.html
-- static/hexchat.png  — used by IRC-Bouncer.html
 - static/hilda-dresen.jpg  — used by norda-naturo.html
 - static/ircchat.webp  — used by iilchat-setup-too-easy.html
 - static/johansson.jpg  — used by sten-johansson.html
@@ -123,7 +120,6 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - static/language-podcast/BUYNOW.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
 - static/language-podcast/How to Use the Internet Library Only.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
 - static/language-podcast/Quixotic Self-Awareness.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/networks.png  — used by IRC-Bouncer.html
 - static/norda-naturo/norda-naturo.epub  — used by norda-naturo.html
 - static/norda-naturo/norda-naturo.mobi  — used by norda-naturo.html
 - static/norda-naturo/norda-naturo.txt  — used by norda-naturo.html
@@ -145,7 +141,6 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - static/unnazitheworld.jpg  — used by Unanglo-your-literacy-materials-and-your-life.html
 - static/vortaro.png  — used by esperantaj-vortaroj.html
 - static/y-or-n  — used by dmenu-scripts-repo-released.html
-- static/yoursettings.png  — used by IRC-Bouncer.html
 - sten-johansson/sten-johansson.epub  — used by sten-johansson.html
 - sten-johansson/sten-johansson.mobi  — used by sten-johansson.html
 - sten-johansson/sten-johansson.pdf  — used by sten-johansson.html
