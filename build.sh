@@ -51,6 +51,7 @@ cat > "$TEMPLATE" << 'TMPL'
     <nav>
       <a href="index.html">Home</a>
       <a href="lair.html">code</a>
+      <a href="git/index.html">git</a>
       <a href="esperanto.html">esperanto</a>
       <a href="call.html">contact</a>
       <a href="rss.xml">rss</a>
