@@ -213,7 +213,11 @@ echo "Built $(ls "$SITE_DIR"/*.html | wc -l | tr -d ' ') pages → $SITE_DIR/"
 echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WORK/pages.tsv" | tr -d ' ')   feed: $(grep -c '<item>' "$SITE_DIR/rss.xml") items"
 
 # ── deploy ───────────────────────────────────────────────────
+# git/ and git.html share this web root but are published by deploy-git.sh,
+# not built here. Excluding them keeps --delete from treating them as stale:
+# rsync never deletes an excluded path on the receiving side.
 if [ "$DEPLOY" = yes ]; then
-    rsync -avzP --delete "$SITE_DIR/" "$DEPLOY_HOST:$DEPLOY_PATH"
+    rsync -avzP --delete --exclude=/git/ --exclude=/git.html \
+        "$SITE_DIR/" "$DEPLOY_HOST:$DEPLOY_PATH"
     ssh "$DEPLOY_HOST" "chmod -R a+rX $DEPLOY_PATH"
 fi
