@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android e690e1b4 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../subread-android/index.html">Log</a> | <a href="../../subread-android/files.html">Files</a> | <a href="../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit e690e1b4a03f40e9d46a1d760bcba531fa12732f
+equwal &lt;truex@equwal.com&gt;
+2026-09-21 05:11:26 -0700
+
+Let another app ask SubRead for the subtitles of a book
+
+MainActivity takes the ALIGN action of docs/intent-api.md. It reads the two
+Uris, shows which app asked and for which files, runs the job at once, and
+sends the .srt back as a content Uri of the FileProvider, with the number of
+cues, the match rate and the language. A job that fails answers with the error
+and the screen stays, so the user can read it.
+
+The ask gives the picks of that one run. What the user picked by hand stays in
+the preferences.
+
+AlignRequests holds the decisions and uses no Android type, so a JVM test
+covers them. It refuses an ask with a missing file, with a Uri that is not a
+content Uri, with a word that is not a language code, or an ask that arrives
+while a job runs. A file Uri is refused because SubRead would then read its own
+private files for the caller; the document said the opposite and is corrected.
+
+</pre><pre> README.md                                          |   8 +
+ app/build.gradle.kts                               |   2 +
+ .../kotlin/space/subread/app/AlignIntentTest.kt    | 143 +++++++++++++++
+ app/src/main/AndroidManifest.xml                   |   6 +
+ .../main/kotlin/space/subread/app/MainActivity.kt  | 194 ++++++++++++++++++++-
+ .../space/subread/app/intent/AlignRequest.kt       |  81 +++++++++
+ .../space/subread/app/intent/AlignRequestsTest.kt  |  72 ++++++++
+ docs/intent-api.md                                 |   8 +-
+ 8 files changed, 504 insertions(+), 10 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 2547343..74c22ed 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -18,6 +18,14 @@ It is the same method as [subread.space](https://subread.space) and</span>
+ the audio, roughly; the transcript is aligned against the book; the subtitles
+ take their *timing* from the transcript and their *words* from the book.
+ 
+<span class="a">+## Other apps</span>
+<span class="a">+</span>
+<span class="a">+A reader or an audiobook player can ask SubRead for the `.srt` of a book and get</span>
+<span class="a">+the file back: it starts SubRead with `space.subread.app.action.ALIGN`, the two</span>
+<span class="a">+files as extras, and reads the subtitles from the result. The other app needs no</span>
+<span class="a">+code of SubRead and no speech model of its own. The contract, with the extras</span>
+<span class="a">+and the answer, is in [docs/intent-api.md](docs/intent-api.md).</span>
+<span class="a">+</span>
+ ## Layout
+ 
+ | Path | What |
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index b14cfc0..6e69e58 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+<span class="h">@@ -101,6 +101,8 @@ dependencies {</span>
+     implementation(libs.androidx.lifecycle.runtime.ktx)
+     implementation(libs.androidx.lifecycle.runtime.compose)
+     implementation(libs.kotlinx.coroutines.android)
+<span class="a">+    // The intent API decides on plain strings, so JUnit alone tests it on a laptop.</span>
+<span class="a">+    testImplementation(libs.junit)</span>
+     androidTestImplementation(libs.androidx.test.runner)
+     androidTestImplementation(libs.androidx.test.junit)
+     androidTestImplementation(platform(libs.androidx.compose.bom))
+diff --git a/app/src/androidTest/kotlin/space/subread/app/AlignIntentTest.kt b/app/src/androidTest/kotlin/space/subread/app/AlignIntentTest.kt
+new file mode 100644
+index 0000000..d751524
+--- /dev/null
++++ b/app/src/androidTest/kotlin/space/subread/app/AlignIntentTest.kt
+<span class="h">@@ -0,0 +1,143 @@</span>
+<span class="a">+package space.subread.app</span>
+<span class="a">+</span>
+<span class="a">+import android.app.Activity</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.content.Intent</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import androidx.compose.ui.test.assertIsNotEnabled</span>
+<span class="a">+import androidx.compose.ui.test.junit4.createEmptyComposeRule</span>
+<span class="a">+import androidx.compose.ui.test.onAllNodesWithText</span>
+<span class="a">+import androidx.compose.ui.test.onNodeWithText</span>
+<span class="a">+import androidx.core.content.FileProvider</span>
+<span class="a">+import androidx.core.net.toUri</span>
+<span class="a">+import androidx.test.core.app.ActivityScenario</span>
+<span class="a">+import androidx.test.ext.junit.runners.AndroidJUnit4</span>
+<span class="a">+import androidx.test.platform.app.InstrumentationRegistry</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertFalse</span>
+<span class="a">+import org.junit.Assert.assertNotNull</span>
+<span class="a">+import org.junit.Assert.assertTrue</span>
+<span class="a">+import org.junit.Assume.assumeTrue</span>
+<span class="a">+import org.junit.Rule</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+import org.junit.runner.RunWith</span>
+<span class="a">+import space.subread.app.intent.AlignContract</span>
+<span class="a">+import space.subread.app.job.Job</span>
+<span class="a">+import space.subread.app.job.Phase</span>
+<span class="a">+import space.subread.app.job.TranscriptStore</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Another app asks for the subtitles of a book and gets the file back.</span>
+<span class="a">+ * See docs/intent-api.md.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The media is not in the repository. Put an audio file and its book in</span>
+<span class="a">+ * app/src/androidTest/assets/local/ (gitignored); the test skips without them.</span>
+<span class="a">+ */</span>
+<span class="a">+@RunWith(AndroidJUnit4::class)</span>
+<span class="a">+class AlignIntentTest {</span>
+<span class="a">+</span>
+<span class="a">+    @get:Rule</span>
+<span class="a">+    val compose = createEmptyComposeRule()</span>
+<span class="a">+</span>
+<span class="a">+    private val instrumentation get() = InstrumentationRegistry.getInstrumentation()</span>
+<span class="a">+    private val app: Context get() = instrumentation.targetContext</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun anotherAppAsksForSubtitlesAndGetsTheFileBack() {</span>
+<span class="a">+        val names = instrumentation.context.assets.list(&quot;local&quot;).orEmpty()</span>
+<span class="a">+        val audioName = names.firstOrNull { it.endsWith(&quot;.mp3&quot;) || it.endsWith(&quot;.m4b&quot;) || it.endsWith(&quot;.m4a&quot;) }</span>
+<span class="a">+        val bookName = names.firstOrNull { it.endsWith(&quot;.epub&quot;) || it.endsWith(&quot;.txt&quot;) }</span>
+<span class="a">+        assumeTrue(&quot;no local test media&quot;, audioName != null &amp;&amp; bookName != null)</span>
+<span class="a">+</span>
+<span class="a">+        val audio = stage(audioName!!)</span>
+<span class="a">+        val book = stage(bookName!!)</span>
+<span class="a">+        TranscriptStore.forAudio(app, audio).reset()</span>
+<span class="a">+        val picks = savePicks()</span>
+<span class="a">+</span>
+<span class="a">+        ActivityScenario.launchActivityForResult&lt;MainActivity&gt;(ask(audio, book, &quot;auto&quot;)).use { scenario -&gt;</span>
+<span class="a">+            // The job starts by itself, and the screen says who asked for it.</span>
+<span class="a">+            compose.waitUntil(30_000) { Job.status.value.running }</span>
+<span class="a">+            compose.onNodeWithText(&quot;asked for subtitles&quot;, substring = true).assertExists()</span>
+<span class="a">+            // The files belong to the ask: the user cannot change them under it.</span>
+<span class="a">+            compose.onAllNodesWithText(&quot;Change&quot;)[0].assertIsNotEnabled()</span>
+<span class="a">+</span>
+<span class="a">+            compose.waitUntil(1_800_000) {</span>
+<span class="a">+                Job.status.value.phase == Phase.DONE || Job.status.value.phase == Phase.FAILED</span>
+<span class="a">+            }</span>
+<span class="a">+            val result = scenario.result</span>
+<span class="a">+            assertEquals(Job.status.value.detail, Activity.RESULT_OK, result.resultCode)</span>
+<span class="a">+</span>
+<span class="a">+            val answer = result.resultData</span>
+<span class="a">+            val srt = answer.data</span>
+<span class="a">+            assertNotNull(&quot;no Uri in the answer&quot;, srt)</span>
+<span class="a">+            assertEquals(&quot;content&quot;, srt!!.scheme)</span>
+<span class="a">+            assertEquals(</span>
+<span class="a">+                Intent.FLAG_GRANT_READ_URI_PERMISSION,</span>
+<span class="a">+                answer.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION,</span>
+<span class="a">+            )</span>
+<span class="a">+</span>
+<span class="a">+            val text = app.contentResolver.openInputStream(srt)!!.use { it.readBytes().decodeToString() }</span>
+<span class="a">+            assertTrue(text.take(20), text.startsWith(&quot;1\n00:00:&quot;))</span>
+<span class="a">+            assertEquals(text.trim().split(&quot;\n\n&quot;).size, answer.getIntExtra(AlignContract.EXTRA_CUES, 0))</span>
+<span class="a">+            assertTrue(</span>
+<span class="a">+                &quot;match rate ${answer.getDoubleExtra(AlignContract.EXTRA_MATCH_RATE, 0.0)}&quot;,</span>
+<span class="a">+                answer.getDoubleExtra(AlignContract.EXTRA_MATCH_RATE, 0.0) &gt; 0.8,</span>
+<span class="a">+            )</span>
+<span class="a">+            val language = answer.getStringExtra(AlignContract.EXTRA_LANGUAGE)</span>
+<span class="a">+            assertTrue(&quot;language $language&quot;, language != null &amp;&amp; language.matches(Regex(&quot;[a-z]{2,3}&quot;)))</span>
+<span class="a">+        }</span>
+<span class="a">+        assertEquals(&quot;the ask must not change what the user picked&quot;, picks, savePicks())</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun anAskWithoutABookIsRefusedAndNoJobRuns() {</span>
+<span class="a">+        assumeTrue(&quot;another job runs&quot;, !Job.status.value.running)</span>
+<span class="a">+        val audio = &quot;content://${app.packageName}.files/subtitles/none.m4b&quot;.toUri()</span>
+<span class="a">+        val incomplete = Intent(AlignContract.ACTION)</span>
+<span class="a">+            .setClass(app, MainActivity::class.java)</span>
+<span class="a">+            .putExtra(AlignContract.EXTRA_AUDIO, audio)</span>
+<span class="a">+</span>
+<span class="a">+        ActivityScenario.launchActivityForResult&lt;MainActivity&gt;(incomplete).use { scenario -&gt;</span>
+<span class="a">+            compose.onNodeWithText(&quot;cannot do it&quot;, substring = true).assertExists()</span>
+<span class="a">+            assertFalse(&quot;a job started on a bad ask&quot;, Job.status.value.running)</span>
+<span class="a">+</span>
+<span class="a">+            scenario.onActivity { it.finish() }</span>
+<span class="a">+            val result = scenario.result</span>
+<span class="a">+            assertEquals(Activity.RESULT_CANCELED, result.resultCode)</span>
+<span class="a">+            val error = result.resultData.getStringExtra(AlignContract.EXTRA_ERROR)</span>
+<span class="a">+            assertNotNull(&quot;no error in the answer&quot;, error)</span>
+<span class="a">+            assertTrue(error!!, error.contains(AlignContract.EXTRA_BOOK))</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun ask(audio: Uri, book: Uri, language: String) =</span>
+<span class="a">+        Intent(AlignContract.ACTION)</span>
+<span class="a">+            .setClass(app, MainActivity::class.java)</span>
+<span class="a">+            .putExtra(AlignContract.EXTRA_AUDIO, audio)</span>
+<span class="a">+            .putExtra(AlignContract.EXTRA_BOOK, book)</span>
+<span class="a">+            .putExtra(AlignContract.EXTRA_LANGUAGE, language)</span>
+<span class="a">+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * A content Uri of the test media, as the Uri of another app would be.</span>
+<span class="a">+     * The files go where the FileProvider serves from (see res/xml/file_paths.xml).</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun stage(name: String): Uri {</span>
+<span class="a">+        val out = File(app.filesDir, &quot;subtitles/asked&quot;).apply { mkdirs() }.resolve(name)</span>
+<span class="a">+        instrumentation.context.assets.open(&quot;local/$name&quot;).use { src -&gt;</span>
+<span class="a">+            out.outputStream().use { src.copyTo(it) }</span>
+<span class="a">+        }</span>
+<span class="a">+        return FileProvider.getUriForFile(app, &quot;${app.packageName}.files&quot;, out)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** What the user picked by hand. The ask of another app must leave it alone. */</span>
+<span class="a">+    private fun savePicks(): Map&lt;String, Any?&gt; {</span>
+<span class="a">+        val prefs = app.getSharedPreferences(&quot;picks&quot;, Context.MODE_PRIVATE)</span>
+<span class="a">+        if (!prefs.contains(&quot;audio&quot;)) {</span>
+<span class="a">+            prefs.edit().putString(&quot;audio&quot;, &quot;content://user/audio&quot;)</span>
+<span class="a">+                .putString(&quot;book&quot;, &quot;content://user/book&quot;).putString(&quot;language&quot;, &quot;en&quot;).commit()</span>
+<span class="a">+        }</span>
+<span class="a">+        return HashMap(prefs.all)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index c3ae19a..c5abb29 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+<span class="h">@@ -17,6 +17,12 @@</span>
+                 &lt;action android:name=&quot;android.intent.action.MAIN&quot; /&gt;
+                 &lt;category android:name=&quot;android.intent.category.LAUNCHER&quot; /&gt;
+             &lt;/intent-filter&gt;
+<span class="a">+</span>
+<span class="a">+            &lt;!-- Another app asks for the subtitles of a book. See docs/intent-api.md. --&gt;</span>
+<span class="a">+            &lt;intent-filter&gt;</span>
+<span class="a">+                &lt;action android:name=&quot;space.subread.app.action.ALIGN&quot; /&gt;</span>
+<span class="a">+                &lt;category android:name=&quot;android.intent.category.DEFAULT&quot; /&gt;</span>
+<span class="a">+            &lt;/intent-filter&gt;</span>
+         &lt;/activity&gt;
+ 
+         &lt;provider
+diff --git a/app/src/main/kotlin/space/subread/app/MainActivity.kt b/app/src/main/kotlin/space/subread/app/MainActivity.kt
+index 09d1632..60f0da4 100644
+--- a/app/src/main/kotlin/space/subread/app/MainActivity.kt
++++ b/app/src/main/kotlin/space/subread/app/MainActivity.kt
+<span class="h">@@ -2,7 +2,9 @@ package space.subread.app</span>
+ 
+ import android.content.Context
+ import android.content.Intent
+<span class="a">+import android.content.pm.PackageManager</span>
+ import android.net.Uri
+<span class="a">+import android.os.Build</span>
+ import android.os.Bundle
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.rememberLauncherForActivityResult
+<span class="h">@@ -30,6 +32,7 @@ import androidx.compose.material3.Text</span>
+ import androidx.compose.material3.lightColorScheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+<span class="a">+import androidx.compose.runtime.LaunchedEffect</span>
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+<span class="h">@@ -41,9 +44,13 @@ import androidx.compose.ui.platform.LocalView</span>
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+ import androidx.core.content.FileProvider
+<span class="a">+import androidx.core.content.IntentCompat</span>
+ import androidx.core.content.edit
+ import androidx.core.net.toUri
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+<span class="a">+import space.subread.app.intent.AlignContract</span>
+<span class="a">+import space.subread.app.intent.AlignRequest</span>
+<span class="a">+import space.subread.app.intent.AlignRequests</span>
+ import space.subread.app.job.Job
+ import space.subread.app.job.JobStatus
+ import space.subread.app.job.Phase
+<span class="h">@@ -55,9 +62,127 @@ import java.io.File</span>
+ import kotlin.concurrent.thread
+ 
+ class MainActivity : ComponentActivity() {
+<span class="a">+</span>
+<span class="a">+    /** The ask of another app, when one started this screen. Null on a normal start. */</span>
+<span class="a">+    private var ask by mutableStateOf&lt;AlignRequest?&gt;(null)</span>
+<span class="a">+</span>
+<span class="a">+    /** A word to the user about a second ask that arrived while a job runs. */</span>
+<span class="a">+    private var notice by mutableStateOf&lt;String?&gt;(null)</span>
+<span class="a">+</span>
+<span class="a">+    /** True when this screen started the job for [ask]. It survives a rotation. */</span>
+<span class="a">+    private var started = false</span>
+<span class="a">+</span>
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+<span class="d">-        setContent { App() }</span>
+<span class="a">+        started = savedInstanceState?.getBoolean(STARTED) == true</span>
+<span class="a">+        val refused = savedInstanceState?.getString(REFUSED)</span>
+<span class="a">+        // A rotation must not turn a refusal into a second try.</span>
+<span class="a">+        if (refused != null) refuse(refused) else take(intent)</span>
+<span class="a">+        val asker = asker()</span>
+<span class="a">+        setContent { App(ask, notice, asker, ::answer) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The screen is singleTop, so a second ask arrives here, not in a new screen. */</span>
+<span class="a">+    override fun onNewIntent(intent: Intent) {</span>
+<span class="a">+        super.onNewIntent(intent)</span>
+<span class="a">+        if (Job.status.value.running) {</span>
+<span class="a">+            // Refuse politely and keep the job. The job belongs to the ask before this one.</span>
+<span class="a">+            notice = &quot;SubRead is busy with the job it runs now. The new ask was not taken.&quot;</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        setIntent(intent)</span>
+<span class="a">+        started = false</span>
+<span class="a">+        notice = null</span>
+<span class="a">+        take(intent)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun onSaveInstanceState(outState: Bundle) {</span>
+<span class="a">+        super.onSaveInstanceState(outState)</span>
+<span class="a">+        outState.putBoolean(STARTED, started)</span>
+<span class="a">+        (ask as? AlignRequest.Refused)?.let { outState.putString(REFUSED, it.error) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Read the ask of another app and, if it is good, run the job for it. */</span>
+<span class="a">+    private fun take(from: Intent) {</span>
+<span class="a">+        if (from.action != AlignContract.ACTION) return</span>
+<span class="a">+        val audio = IntentCompat.getParcelableExtra(from, AlignContract.EXTRA_AUDIO, Uri::class.java)</span>
+<span class="a">+        val book = IntentCompat.getParcelableExtra(from, AlignContract.EXTRA_BOOK, Uri::class.java)</span>
+<span class="a">+        val state = Job.status.value</span>
+<span class="a">+        val read = AlignRequests.read(</span>
+<span class="a">+            audio?.toString(), book?.toString(), from.getStringExtra(AlignContract.EXTRA_LANGUAGE),</span>
+<span class="a">+            busy = !started &amp;&amp; state.running,</span>
+<span class="a">+        )</span>
+<span class="a">+        if (read !is AlignRequest.Accepted) {</span>
+<span class="a">+            refuse((read as AlignRequest.Refused).error)</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        ask = read</span>
+<span class="a">+        keep(from, audio!!)</span>
+<span class="a">+        keep(from, book!!)</span>
+<span class="a">+        // Start at once: the other app sent the user here for this one job, the</span>
+<span class="a">+        // screen names the asker and the two files, and Stop is on it. After a</span>
+<span class="a">+        // rotation the job is already there, so do not start a second one.</span>
+<span class="a">+        if (!state.running &amp;&amp; (!started || state.phase == Phase.IDLE)) {</span>
+<span class="a">+            started = true</span>
+<span class="a">+            Job.clear()</span>
+<span class="a">+            val app = applicationContext</span>
+<span class="a">+            val language = read.language</span>
+<span class="a">+            thread(name = &quot;subread-job&quot;) { Job.run(app, audio, book, language) }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Say no, now, and stay on the screen so that the user can read why. */</span>
+<span class="a">+    private fun refuse(error: String) {</span>
+<span class="a">+        ask = AlignRequest.Refused(error)</span>
+<span class="a">+        setResult(RESULT_CANCELED, Intent().putExtra(AlignContract.EXTRA_ERROR, error))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Hold the permission when the caller offers it, so that a killed job can start again. */</span>
+<span class="a">+    private fun keep(from: Intent, uri: Uri) {</span>
+<span class="a">+        if (from.flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION == 0) return</span>
+<span class="a">+        runCatching {</span>
+<span class="a">+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Give the asking app its answer. [asked] is the language it asked for. */</span>
+<span class="a">+    private fun answer(status: JobStatus, asked: String) {</span>
+<span class="a">+        val srt = status.srt</span>
+<span class="a">+        if (status.phase != Phase.DONE || srt == null) {</span>
+<span class="a">+            // Back sends this. The screen stays, so the user can read the error.</span>
+<span class="a">+            val error = status.detail.ifEmpty { &quot;The job failed.&quot; }</span>
+<span class="a">+            setResult(RESULT_CANCELED, Intent().putExtra(AlignContract.EXTRA_ERROR, error))</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        val uri = FileProvider.getUriForFile(this, &quot;$packageName.files&quot;, srt)</span>
+<span class="a">+        setResult(</span>
+<span class="a">+            RESULT_OK,</span>
+<span class="a">+            Intent().setData(uri)</span>
+<span class="a">+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)</span>
+<span class="a">+                .putExtra(AlignContract.EXTRA_CUES, status.cues)</span>
+<span class="a">+                .putExtra(AlignContract.EXTRA_MATCH_RATE, status.matchRate ?: 0.0)</span>
+<span class="a">+                .putExtra(AlignContract.EXTRA_LANGUAGE, AlignRequests.languageOf(srt.name, asked)),</span>
+<span class="a">+        )</span>
+<span class="a">+        finish()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The name of the app that asked, for the screen. */</span>
+<span class="a">+    private fun asker(): String {</span>
+<span class="a">+        val who = callingPackage ?: return &quot;Another app&quot;</span>
+<span class="a">+        return runCatching {</span>
+<span class="a">+            val info = if (Build.VERSION.SDK_INT &gt;= Build.VERSION_CODES.TIRAMISU) {</span>
+<span class="a">+                packageManager.getApplicationInfo(who, PackageManager.ApplicationInfoFlags.of(0))</span>
+<span class="a">+            } else {</span>
+<span class="a">+                @Suppress(&quot;DEPRECATION&quot;) // The flags class is Android 13 and later.</span>
+<span class="a">+                packageManager.getApplicationInfo(who, 0)</span>
+<span class="a">+            }</span>
+<span class="a">+            packageManager.getApplicationLabel(info).toString()</span>
+<span class="a">+        }.getOrDefault(who)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private companion object {</span>
+<span class="a">+        const val STARTED = &quot;ask_started&quot;</span>
+<span class="a">+        const val REFUSED = &quot;ask_refused&quot;</span>
+     }
+ }
+ 
+<span class="h">@@ -84,14 +209,33 @@ private val LANGUAGES = listOf(</span>
+ )
+ 
+ @Composable
+<span class="d">-private fun App() {</span>
+<span class="a">+private fun App(</span>
+<span class="a">+    ask: AlignRequest? = null,</span>
+<span class="a">+    notice: String? = null,</span>
+<span class="a">+    asker: String = &quot;&quot;,</span>
+<span class="a">+    onAnswer: (JobStatus, String) -&gt; Unit = { _, _ -&gt; },</span>
+<span class="a">+) {</span>
+     val context = LocalContext.current
+     val prefs = remember { context.getSharedPreferences(&quot;picks&quot;, Context.MODE_PRIVATE) }
+     val status by Job.status.collectAsStateWithLifecycle()
+ 
+<span class="d">-    var audio by remember { mutableStateOf(prefs.getString(&quot;audio&quot;, null)?.let(Uri::parse)) }</span>
+<span class="d">-    var book by remember { mutableStateOf(prefs.getString(&quot;book&quot;, null)?.let(Uri::parse)) }</span>
+<span class="d">-    var language by remember { mutableStateOf(prefs.getString(&quot;language&quot;, &quot;auto&quot;)!!) }</span>
+<span class="a">+    // An ask of another app gives the picks of this run only. What the user</span>
+<span class="a">+    // picked by hand stays in the preferences, untouched.</span>
+<span class="a">+    val accepted = ask as? AlignRequest.Accepted</span>
+<span class="a">+    var audio by remember(accepted) {</span>
+<span class="a">+        mutableStateOf(accepted?.audio?.toUri() ?: prefs.getString(&quot;audio&quot;, null)?.let(Uri::parse))</span>
+<span class="a">+    }</span>
+<span class="a">+    var book by remember(accepted) {</span>
+<span class="a">+        mutableStateOf(accepted?.book?.toUri() ?: prefs.getString(&quot;book&quot;, null)?.let(Uri::parse))</span>
+<span class="a">+    }</span>
+<span class="a">+    var language by remember(accepted) {</span>
+<span class="a">+        mutableStateOf(accepted?.language ?: prefs.getString(&quot;language&quot;, &quot;auto&quot;)!!)</span>
+<span class="a">+    }</span>
+<span class="a">+    if (accepted != null) {</span>
+<span class="a">+        LaunchedEffect(accepted, status.phase) {</span>
+<span class="a">+            if (status.phase == Phase.DONE || status.phase == Phase.FAILED) onAnswer(status, accepted.language)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+ 
+     fun keep(key: String, uri: Uri) {
+         // So the pick survives the process being killed mid-job and can resume.
+<span class="h">@@ -149,17 +293,26 @@ private fun App() {</span>
+                         &quot;that any video player plays.&quot;,
+                     style = MaterialTheme.typography.bodyMedium,
+                 )
+<span class="d">-                if (status.phase == Phase.IDLE) Capabilities()</span>
+<span class="a">+                if (status.phase == Phase.IDLE &amp;&amp; ask == null) Capabilities()</span>
+<span class="a">+                if (ask != null) {</span>
+<span class="a">+                    HorizontalDivider(color = Color.Black)</span>
+<span class="a">+                    Asked(asker, ask, notice,</span>
+<span class="a">+                        audio?.let { TranscriptStore.describe(context, it).first },</span>
+<span class="a">+                        book?.let { TranscriptStore.describe(context, it).first })</span>
+<span class="a">+                }</span>
+                 HorizontalDivider(color = Color.Black)
+ 
+<span class="d">-                Pick(&quot;Audiobook&quot;, audio?.let { TranscriptStore.describe(context, it).first }, !status.running) {</span>
+<span class="a">+                // The two files of an ask belong to the app that asked. The user</span>
+<span class="a">+                // must not change them under it, so the buttons are off.</span>
+<span class="a">+                val canPick = !status.running &amp;&amp; accepted == null</span>
+<span class="a">+                Pick(&quot;Audiobook&quot;, audio?.let { TranscriptStore.describe(context, it).first }, canPick) {</span>
+                     pickAudio.launch(arrayOf(&quot;audio/*&quot;, &quot;video/mp4&quot;, &quot;application/ogg&quot;, &quot;application/octet-stream&quot;))
+                 }
+<span class="d">-                Pick(&quot;Book&quot;, book?.let { TranscriptStore.describe(context, it).first }, !status.running) {</span>
+<span class="a">+                Pick(&quot;Book&quot;, book?.let { TranscriptStore.describe(context, it).first }, canPick) {</span>
+                     pickBook.launch(arrayOf(&quot;application/epub+zip&quot;, &quot;text/plain&quot;, &quot;application/zip&quot;,
+                         &quot;application/octet-stream&quot;))
+                 }
+<span class="d">-                LanguagePick(language, !status.running) {</span>
+<span class="a">+                LanguagePick(language, canPick) {</span>
+                     language = it
+                     prefs.edit().putString(&quot;language&quot;, it).apply()
+                 }
+<span class="h">@@ -214,6 +367,29 @@ private fun App() {</span>
+     }
+ }
+ 
+<span class="a">+/** Who asked for subtitles, for which files, and what SubRead does with the ask. */</span>
+<span class="a">+@Composable</span>
+<span class="a">+private fun Asked(asker: String, ask: AlignRequest, notice: String?, audio: String?, book: String?) {</span>
+<span class="a">+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {</span>
+<span class="a">+        when (ask) {</span>
+<span class="a">+            is AlignRequest.Accepted -&gt; {</span>
+<span class="a">+                Text(&quot;$asker asked for subtitles&quot;, fontWeight = FontWeight.Bold)</span>
+<span class="a">+                Text(&quot;Audio: ${audio ?: ask.audio}&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+                Text(&quot;Book: ${book ?: ask.book}&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+                Text(&quot;Language: ${ask.language}&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+                Text(&quot;SubRead sends the .srt back to $asker when the job is done. &quot; +</span>
+<span class="a">+                    &quot;Stop, or Back, sends nothing.&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            }</span>
+<span class="a">+            is AlignRequest.Refused -&gt; {</span>
+<span class="a">+                Text(&quot;$asker asked for subtitles, and SubRead cannot do it&quot;, fontWeight = FontWeight.Bold)</span>
+<span class="a">+                Text(ask.error, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+                Text(&quot;Back returns to $asker with this error.&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        if (notice != null) Text(notice, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ @Composable
+ private fun Capabilities() {
+     val named = LANGUAGES.drop(1).take(5).joinToString(&quot;, &quot;) { it.second }
+diff --git a/app/src/main/kotlin/space/subread/app/intent/AlignRequest.kt b/app/src/main/kotlin/space/subread/app/intent/AlignRequest.kt
+new file mode 100644
+index 0000000..1e00a39
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/intent/AlignRequest.kt
+<span class="h">@@ -0,0 +1,81 @@</span>
+<span class="a">+package space.subread.app.intent</span>
+<span class="a">+</span>
+<span class="a">+/** The names another app uses to ask for subtitles. See docs/intent-api.md. */</span>
+<span class="a">+object AlignContract {</span>
+<span class="a">+    const val ACTION = &quot;space.subread.app.action.ALIGN&quot;</span>
+<span class="a">+    const val EXTRA_AUDIO = &quot;space.subread.extra.AUDIO&quot;</span>
+<span class="a">+    const val EXTRA_BOOK = &quot;space.subread.extra.BOOK&quot;</span>
+<span class="a">+</span>
+<span class="a">+    /** The language to use, in the ask; the language that was used, in the answer. */</span>
+<span class="a">+    const val EXTRA_LANGUAGE = &quot;space.subread.extra.LANGUAGE&quot;</span>
+<span class="a">+    const val EXTRA_CUES = &quot;space.subread.extra.CUES&quot;</span>
+<span class="a">+    const val EXTRA_MATCH_RATE = &quot;space.subread.extra.MATCH_RATE&quot;</span>
+<span class="a">+    const val EXTRA_ERROR = &quot;space.subread.extra.ERROR&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** What the screen does with the ask of another app. */</span>
+<span class="a">+sealed interface AlignRequest {</span>
+<span class="a">+    /** The ask is good. Run the job on these two files. */</span>
+<span class="a">+    data class Accepted(val audio: String, val book: String, val language: String) : AlignRequest</span>
+<span class="a">+</span>
+<span class="a">+    /** SubRead cannot do the ask. [error] goes on the screen and back to the caller. */</span>
+<span class="a">+    data class Refused(val error: String) : AlignRequest</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The decisions of the intent API, with no Android type in them, so that a JVM</span>
+<span class="a">+ * test covers them without a device.</span>
+<span class="a">+ */</span>
+<span class="a">+object AlignRequests {</span>
+<span class="a">+    /** A Whisper language code is two or three lower-case letters, as in &quot;ja&quot; or &quot;yue&quot;. */</span>
+<span class="a">+    private val CODE = Regex(&quot;[a-z]{2,3}&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    /** The default language: the speech model listens and decides. */</span>
+<span class="a">+    const val AUTO = &quot;auto&quot;</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Read the ask. [audio] and [book] are the Uris of the two extras, as text.</span>
+<span class="a">+     * [busy] is true when a job already runs, because SubRead runs one job at a</span>
+<span class="a">+     * time and must not stop that job for a new ask.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun read(audio: String?, book: String?, language: String?, busy: Boolean): AlignRequest {</span>
+<span class="a">+        if (busy) {</span>
+<span class="a">+            return AlignRequest.Refused(</span>
+<span class="a">+                &quot;SubRead is busy with another job. Ask again when that job is done.&quot;,</span>
+<span class="a">+            )</span>
+<span class="a">+        }</span>
+<span class="a">+        val code = language?.trim().orEmpty().ifEmpty { AUTO }</span>
+<span class="a">+        val problem = badUri(&quot;audio file&quot;, AlignContract.EXTRA_AUDIO, audio)</span>
+<span class="a">+            ?: badUri(&quot;book&quot;, AlignContract.EXTRA_BOOK, book)</span>
+<span class="a">+            ?: badLanguage(code)</span>
+<span class="a">+        return if (problem != null) AlignRequest.Refused(problem)</span>
+<span class="a">+        else AlignRequest.Accepted(audio!!.trim(), book!!.trim(), code)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The language the job used, read from the name of the file it wrote</span>
+<span class="a">+     * (&quot;book.ja.srt&quot; gives &quot;ja&quot;). [asked] is the answer when the name holds no</span>
+<span class="a">+     * code, which happens only if the naming changes.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun languageOf(srtName: String, asked: String): String {</span>
+<span class="a">+        val code = srtName.removeSuffix(&quot;.srt&quot;).substringAfterLast(&#x27;.&#x27;, &quot;&quot;)</span>
+<span class="a">+        return if (CODE.matches(code)) code else asked</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun badUri(what: String, extra: String, uri: String?): String? {</span>
+<span class="a">+        val text = uri?.trim().orEmpty()</span>
+<span class="a">+        return when {</span>
+<span class="a">+            text.isEmpty() -&gt; &quot;The ask gives no $what. Put its Uri in $extra.&quot;</span>
+<span class="a">+            // Only a content Uri is granted by the caller. A file Uri would make</span>
+<span class="a">+            // SubRead read its own private files for a stranger.</span>
+<span class="a">+            !text.startsWith(&quot;content://&quot;) -&gt;</span>
+<span class="a">+                &quot;The $what must be a content:// Uri that the asking app grants, not $text.&quot;</span>
+<span class="a">+</span>
+<span class="a">+            else -&gt; null</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun badLanguage(code: String): String? =</span>
+<span class="a">+        if (code == AUTO || CODE.matches(code)) null</span>
+<span class="a">+        else &quot;$code is not a language. Use a Whisper code such as ja, or $AUTO.&quot;</span>
+<span class="a">+}</span>
+diff --git a/app/src/test/kotlin/space/subread/app/intent/AlignRequestsTest.kt b/app/src/test/kotlin/space/subread/app/intent/AlignRequestsTest.kt
+new file mode 100644
+index 0000000..b723cbb
+--- /dev/null
++++ b/app/src/test/kotlin/space/subread/app/intent/AlignRequestsTest.kt
+<span class="h">@@ -0,0 +1,72 @@</span>
+<span class="a">+package space.subread.app.intent</span>
+<span class="a">+</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertTrue</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+</span>
+<span class="a">+/** The decisions of the intent API. No Android, so this runs on a laptop. */</span>
+<span class="a">+class AlignRequestsTest {</span>
+<span class="a">+</span>
+<span class="a">+    private val audio = &quot;content://other.app.files/audio/book.m4b&quot;</span>
+<span class="a">+    private val book = &quot;content://other.app.files/books/book.epub&quot;</span>
+<span class="a">+</span>
+<span class="a">+    private fun refusal(ask: AlignRequest): String {</span>
+<span class="a">+        assertTrue(&quot;expected a refusal, got $ask&quot;, ask is AlignRequest.Refused)</span>
+<span class="a">+        return (ask as AlignRequest.Refused).error</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aGoodAskIsAccepted() {</span>
+<span class="a">+        val ask = AlignRequests.read(audio, book, &quot;ja&quot;, busy = false)</span>
+<span class="a">+        assertEquals(AlignRequest.Accepted(audio, book, &quot;ja&quot;), ask)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun noLanguageMeansAuto() {</span>
+<span class="a">+        assertEquals(AlignRequest.Accepted(audio, book, &quot;auto&quot;), AlignRequests.read(audio, book, null, false))</span>
+<span class="a">+        assertEquals(AlignRequest.Accepted(audio, book, &quot;auto&quot;), AlignRequests.read(audio, book, &quot;  &quot;, false))</span>
+<span class="a">+        assertEquals(AlignRequest.Accepted(audio, book, &quot;auto&quot;), AlignRequests.read(audio, book, &quot;auto&quot;, false))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aThreeLetterCodeIsALanguageToo() {</span>
+<span class="a">+        assertEquals(AlignRequest.Accepted(audio, book, &quot;yue&quot;), AlignRequests.read(audio, book, &quot;yue&quot;, false))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aMissingFileIsRefusedAndTheErrorNamesTheExtra() {</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(null, book, &quot;ja&quot;, false)).contains(AlignContract.EXTRA_AUDIO))</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(&quot;&quot;, book, &quot;ja&quot;, false)).contains(AlignContract.EXTRA_AUDIO))</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(audio, null, &quot;ja&quot;, false)).contains(AlignContract.EXTRA_BOOK))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun onlyAContentUriIsTaken() {</span>
+<span class="a">+        // A file Uri would make SubRead read its own private files for a stranger.</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(&quot;file:///data/data/space.subread.app/x&quot;, book, &quot;ja&quot;, false))</span>
+<span class="a">+            .contains(&quot;content://&quot;))</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(audio, &quot;/sdcard/book.epub&quot;, &quot;ja&quot;, false)).contains(&quot;content://&quot;))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aWordThatIsNotALanguageCodeIsRefused() {</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(audio, book, &quot;Japanese&quot;, false)).contains(&quot;Japanese&quot;))</span>
+<span class="a">+        assertTrue(refusal(AlignRequests.read(audio, book, &quot;j&quot;, false)).contains(&quot;Whisper&quot;))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun anAskDuringAJobIsRefused() {</span>
+<span class="a">+        val error = refusal(AlignRequests.read(audio, book, &quot;ja&quot;, busy = true))</span>
+<span class="a">+        assertTrue(error, error.contains(&quot;busy&quot;))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun theLanguageOfTheAnswerComesFromTheNameOfTheFile() {</span>
+<span class="a">+        assertEquals(&quot;ja&quot;, AlignRequests.languageOf(&quot;book.ja.srt&quot;, &quot;auto&quot;))</span>
+<span class="a">+        assertEquals(&quot;ru&quot;, AlignRequests.languageOf(&quot;part 1. the start.ru.srt&quot;, &quot;auto&quot;))</span>
+<span class="a">+        assertEquals(&quot;yue&quot;, AlignRequests.languageOf(&quot;book.yue.srt&quot;, &quot;auto&quot;))</span>
+<span class="a">+        // No code in the name: say what was asked for.</span>
+<span class="a">+        assertEquals(&quot;ja&quot;, AlignRequests.languageOf(&quot;book.srt&quot;, &quot;ja&quot;))</span>
+<span class="a">+        assertEquals(&quot;auto&quot;, AlignRequests.languageOf(&quot;book.subtitles.srt&quot;, &quot;auto&quot;))</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/docs/intent-api.md b/docs/intent-api.md
+index 49ab55d..1969d64 100644
+--- a/docs/intent-api.md
++++ b/docs/intent-api.md
+<span class="h">@@ -22,7 +22,8 @@ startActivityForResult(ask, REQUEST_SUBTITLES)        // or an ActivityResultLau</span>
+ 
+ Both Uris must be `content://` Uris that the calling app may grant (its own
+ `FileProvider`, or a document Uri for which it holds a persisted permission).
+<span class="d">-A `file://` Uri works only for a file that SubRead can read, so do not use one.</span>
+<span class="a">+SubRead refuses every other Uri, a `file://` Uri included: SubRead would read</span>
+<span class="a">+its own private files for the caller.</span>
+ 
+ One audio file for one book. A book in many audio files is not handled yet.
+ 
+<span class="h">@@ -54,6 +55,11 @@ and Google Play when those listings are up).</span>
+ `RESULT_CANCELED`: the user went back, or the job failed.
+ `space.subread.extra.ERROR` (`String`) says why when it failed.
+ 
+<span class="a">+SubRead makes one set of subtitles at a time. An ask that arrives while a job</span>
+<span class="a">+runs is refused with `RESULT_CANCELED` and an `ERROR`; the job that runs is not</span>
+<span class="a">+touched. An ask with a file that is missing or is not a `content://` Uri is</span>
+<span class="a">+refused the same way, before any work starts.</span>
+<span class="a">+</span>
+ The job takes about a third of the length of the audio on a mid-range device.
+ SubRead keeps what it has transcribed, so asking again for the same audio file
+ continues and does not start over.</pre>
+</div></body></html>

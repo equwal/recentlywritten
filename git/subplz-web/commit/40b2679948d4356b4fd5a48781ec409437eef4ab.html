@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 40b26799 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 40b2679948d4356b4fd5a48781ec409437eef4ab
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 15:28:12 -0700
+
+Three outputs: srt, clean mp4 for YouTube, mkv with subs embedded
+
+The single mp4 carrying a mov_text track served neither use well. YouTube
+wants captions uploaded separately as an .srt and handles embedded mov_text
+unreliably; a local player wants one self-contained file.
+
+So render once and remux:
+
+- .srt        the timing file alone (HoshiReader whispersync)
+- .mp4        cover + audio, no subtitle track, for YouTube
+- .mkv        the same streams copied, with the SRT embedded and defaulted on,
+              for MPV/VLC/Jellyfin
+
+MKV rather than MP4 for the embedded case because MKV stores SRT natively,
+where MP4 must down-convert to mov_text. The mkv is a stream copy of the mp4,
+so the second file costs seconds regardless of book length.
+
+Also: surface the backend&#x27;s real failure reason. subplz exits 0 even when a
+sync fails, writing the cause to a .subfail file we ignored - so a broken
+torchaudio install reported itself as &quot;the audio and text may not match&quot;,
+blaming the user&#x27;s content for a library problem. Aligner.failure_reason()
+reads that file, with the old guess kept only as a fallback.
+
+</pre><pre> backend/aligner.py  | 29 +++++++++++++++++++++++++++++
+ backend/api.py      |  2 +-
+ backend/render.py   | 49 ++++++++++++++++++++++++++++++++++++++++++-------
+ backend/runner.py   | 49 ++++++++++++++++++++++++++++++++++++++++++++++---
+ frontend/app.js     | 17 +++++++++++++----
+ frontend/index.html |  2 +-
+ 6 files changed, 132 insertions(+), 16 deletions(-)
+</pre><pre>diff --git a/backend/aligner.py b/backend/aligner.py
+index 2f93d9b..b14da54 100644
+--- a/backend/aligner.py
++++ b/backend/aligner.py
+<span class="h">@@ -95,6 +95,14 @@ class Aligner(ABC):</span>
+         &quot;&quot;&quot;Anything the user should know about this language, or None.&quot;&quot;&quot;
+         return None
+ 
+<span class="a">+    def failure_reason(self, req: &quot;AlignRequest&quot;) -&gt; str | None:</span>
+<span class="a">+        &quot;&quot;&quot;Why the run produced nothing, if the backend left an explanation.</span>
+<span class="a">+</span>
+<span class="a">+        Needed because a backend may exit 0 and still have failed, so the exit</span>
+<span class="a">+        code alone cannot be trusted to mean success.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        return None</span>
+<span class="a">+</span>
+ 
+ # ---------------------------------------------------------------------------
+ # subplz
+<span class="h">@@ -269,6 +277,27 @@ class SubPlzAligner(Aligner):</span>
+         # Fall back in case upstream changes the convention.
+         return next(iter(sorted(req.out_dir.glob(&quot;*.srt&quot;))), None)
+ 
+<span class="a">+    def failure_reason(self, req: AlignRequest) -&gt; str | None:</span>
+<span class="a">+        &quot;&quot;&quot;Read subplz&#x27;s own explanation out of the .subfail it leaves behind.</span>
+<span class="a">+</span>
+<span class="a">+        subplz exits 0 even when a sync fails, so the exit code cannot be</span>
+<span class="a">+        trusted. Without this the runner reports &quot;the audio and text may not</span>
+<span class="a">+        match&quot; for every failure - including ones that have nothing to do with</span>
+<span class="a">+        the content, such as a broken library.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        for fail in sorted(req.out_dir.glob(&quot;*.subfail&quot;)):</span>
+<span class="a">+            try:</span>
+<span class="a">+                text = fail.read_text(encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;).strip()</span>
+<span class="a">+            except OSError:</span>
+<span class="a">+                continue</span>
+<span class="a">+            if not text:</span>
+<span class="a">+                continue</span>
+<span class="a">+            # The file repeats the audio path on every line; keep the last</span>
+<span class="a">+            # line, which carries the actual reason.</span>
+<span class="a">+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]</span>
+<span class="a">+            return lines[-1] if lines else None</span>
+<span class="a">+        return None</span>
+<span class="a">+</span>
+     def language_note(self, code: str) -&gt; str | None:
+         lang = languages.get(code)
+         if lang is None or not lang.needs_nlp_flag:
+diff --git a/backend/api.py b/backend/api.py
+index 19a2a1e..c0347e3 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -488,7 +488,7 @@ def delete_job(</span>
+ @router.get(&quot;/jobs/{job_id}/files/{kind}&quot;)
+ def download(
+     job_id: str,
+<span class="d">-    kind: Literal[&quot;srt&quot;, &quot;video&quot;, &quot;metadata&quot;, &quot;log&quot;],</span>
+<span class="a">+    kind: Literal[&quot;srt&quot;, &quot;video&quot;, &quot;video_embedded&quot;, &quot;metadata&quot;, &quot;log&quot;],</span>
+     account: Annotated[Account, Depends(get_account)],
+     session: Annotated[Session, Depends(get_session)],
+ ):
+diff --git a/backend/render.py b/backend/render.py
+index b9172f1..a891816 100644
+--- a/backend/render.py
++++ b/backend/render.py
+<span class="h">@@ -181,20 +181,25 @@ def build_canvas(cover: Path | None, dest: Path) -&gt; Path:</span>
+ 
+ def render_video(
+     audio: Path,
+<span class="d">-    subtitles: Path,</span>
+     canvas: Path,
+     dest: Path,
+     duration: float | None = None,
+ ) -&gt; Path:
+<span class="d">-    &quot;&quot;&quot;Mux canvas + audio + subtitles into an MP4.&quot;&quot;&quot;</span>
+<span class="a">+    &quot;&quot;&quot;Cover image + audio into a clean MP4, carrying no subtitle track.</span>
+<span class="a">+</span>
+<span class="a">+    Subtitle-free on purpose. This is the file for YouTube, where captions are</span>
+<span class="a">+    attached separately as an .srt: YouTube&#x27;s handling of an embedded mov_text</span>
+<span class="a">+    track is unreliable, and uploading the .srt is the supported route.</span>
+<span class="a">+</span>
+<span class="a">+    This is the expensive step - `mux_subtitles` reuses its output instead of</span>
+<span class="a">+    encoding a second time.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+     dest.parent.mkdir(parents=True, exist_ok=True)
+ 
+     cmd = [
+         &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;,
+         &quot;-loop&quot;, &quot;1&quot;, &quot;-r&quot;, str(settings.video_fps), &quot;-i&quot;, str(canvas),
+         &quot;-i&quot;, str(audio),
+<span class="d">-        # Declare the format: ffmpeg will not always sniff an srt correctly.</span>
+<span class="d">-        &quot;-f&quot;, &quot;srt&quot;, &quot;-i&quot;, str(subtitles),</span>
+     ]
+     if duration:
+         cmd += [&quot;-t&quot;, f&quot;{duration:.3f}&quot;]
+<span class="h">@@ -203,14 +208,12 @@ def render_video(</span>
+ 
+     encoder = resolve_encoder()
+     cmd += [
+<span class="d">-        &quot;-map&quot;, &quot;0:v&quot;, &quot;-map&quot;, &quot;1:a&quot;, &quot;-map&quot;, &quot;2:s&quot;,</span>
+<span class="a">+        &quot;-map&quot;, &quot;0:v&quot;, &quot;-map&quot;, &quot;1:a&quot;,</span>
+         # Carry chapter marks through; harmless where they are ignored.
+         &quot;-map_chapters&quot;, &quot;1&quot;,
+         &quot;-c:v&quot;, encoder,
+         &quot;-pix_fmt&quot;, &quot;yuv420p&quot;,
+         &quot;-c:a&quot;, &quot;aac&quot;, &quot;-b:a&quot;, &quot;128k&quot;,
+<span class="d">-        # mov_text is the only subtitle codec MP4 carries.</span>
+<span class="d">-        &quot;-c:s&quot;, &quot;mov_text&quot;,</span>
+         # Lets a player start without reading the whole file first.
+         &quot;-movflags&quot;, &quot;+faststart&quot;,
+     ]
+<span class="h">@@ -229,3 +232,35 @@ def render_video(</span>
+         tail = &quot; | &quot;.join(err[-3:]) if err else &quot;no output&quot;
+         raise RenderError(f&quot;ffmpeg could not build the video: {tail}&quot;)
+     return dest
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def mux_subtitles(video: Path, subtitles: Path, dest: Path) -&gt; Path:</span>
+<span class="a">+    &quot;&quot;&quot;Copy `video` into an MKV carrying `subtitles` as a selectable track.</span>
+<span class="a">+</span>
+<span class="a">+    For local playback - MPV, VLC, Jellyfin - where one self-contained file</span>
+<span class="a">+    beats juggling a video and a sidecar .srt.</span>
+<span class="a">+</span>
+<span class="a">+    MKV rather than MP4 because MKV stores SRT natively, keeping the cue text</span>
+<span class="a">+    intact; MP4 must convert to mov_text, which is a lossy reduction. Nothing</span>
+<span class="a">+    is re-encoded here: the streams are copied, so this costs seconds however</span>
+<span class="a">+    long the book is.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    dest.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+    cmd = [</span>
+<span class="a">+        &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;,</span>
+<span class="a">+        &quot;-i&quot;, str(video),</span>
+<span class="a">+        # Declare the format; ffmpeg does not always sniff an srt correctly.</span>
+<span class="a">+        &quot;-f&quot;, &quot;srt&quot;, &quot;-i&quot;, str(subtitles),</span>
+<span class="a">+        &quot;-map&quot;, &quot;0&quot;, &quot;-map&quot;, &quot;1&quot;,</span>
+<span class="a">+        &quot;-c&quot;, &quot;copy&quot;, &quot;-c:s&quot;, &quot;srt&quot;,</span>
+<span class="a">+        # Players pick this up automatically instead of needing it turned on.</span>
+<span class="a">+        &quot;-disposition:s:0&quot;, &quot;default&quot;,</span>
+<span class="a">+        &quot;-metadata:s:s:0&quot;, &quot;title=Aligned subtitles&quot;,</span>
+<span class="a">+        str(dest),</span>
+<span class="a">+    ]</span>
+<span class="a">+    proc = subprocess.run(cmd, capture_output=True, timeout=1800)</span>
+<span class="a">+    if proc.returncode != 0 or not dest.exists():</span>
+<span class="a">+        err = proc.stderr.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;).strip().splitlines()</span>
+<span class="a">+        tail = &quot; | &quot;.join(err[-3:]) if err else &quot;no output&quot;</span>
+<span class="a">+        raise RenderError(f&quot;ffmpeg could not embed the subtitles: {tail}&quot;)</span>
+<span class="a">+    return dest</span>
+diff --git a/backend/runner.py b/backend/runner.py
+index 6f2fd2e..871a48a 100644
+--- a/backend/runner.py
++++ b/backend/runner.py
+<span class="h">@@ -470,6 +470,11 @@ def _collect_artifacts(job_id: str, paths: Paths, log_path: Path,</span>
+ 
+     produced = aligner.locate_output(request)
+     if produced is None or not produced.exists():
+<span class="a">+        # The backend may exit 0 and still have failed, so ask it why before</span>
+<span class="a">+        # falling back to guessing at the content.</span>
+<span class="a">+        reason = aligner.failure_reason(request)</span>
+<span class="a">+        if reason:</span>
+<span class="a">+            raise JobFailed(f&quot;{aligner.name} failed: {reason}&quot;)</span>
+         raise JobFailed(
+             f&quot;{aligner.name} finished but produced no subtitle file. The audio &quot;
+             &quot;and text may not match, or the language may be wrong for this book.&quot;
+<span class="h">@@ -485,22 +490,43 @@ def _collect_artifacts(job_id: str, paths: Paths, log_path: Path,</span>
+     srt_key = f&quot;{job_id}/{download_name}&quot;
+     size = storage.put_file(srt_key, produced)
+ 
+<span class="a">+    # Three deliverables, because they serve three different jobs:</span>
+<span class="a">+    #   .srt  - the timing file on its own (HoshiReader whispersync)</span>
+<span class="a">+    #   .mp4  - clean video, no subtitle track, for YouTube (captions are</span>
+<span class="a">+    #           uploaded separately there)</span>
+<span class="a">+    #   .mkv  - the same video with the subtitles embedded, for local players</span>
+<span class="a">+    # The mkv is a stream copy of the mp4, so the second file is nearly free.</span>
+     video_name = video_key = None
+<span class="d">-    video_size = 0</span>
+<span class="a">+    embed_name = embed_key = None</span>
+<span class="a">+    video_size = embed_size = 0</span>
+<span class="a">+</span>
+     if settings.render_video:
+         try:
+             _set(job_id, stage=&quot;Rendering video&quot;, progress=0.94)
+             scratch = paths.root / &quot;video&quot;
+             cover = render.extract_cover(request.text, scratch)
+             canvas = render.build_canvas(cover, scratch / &quot;canvas.png&quot;)
+<span class="a">+</span>
+             video_name = f&quot;{stem}.{language}.mp4&quot;
+             out_video = scratch / video_name
+             render.render_video(
+<span class="d">-                audio=video_audio, subtitles=produced, canvas=canvas,</span>
+<span class="a">+                audio=video_audio, canvas=canvas,</span>
+                 dest=out_video, duration=duration,
+             )
+             video_key = f&quot;{job_id}/{video_name}&quot;
+             video_size = storage.put_file(video_key, out_video)
+<span class="a">+</span>
+<span class="a">+            try:</span>
+<span class="a">+                _set(job_id, stage=&quot;Embedding subtitles&quot;, progress=0.97)</span>
+<span class="a">+                embed_name = f&quot;{stem}.{language}.mkv&quot;</span>
+<span class="a">+                out_embed = scratch / embed_name</span>
+<span class="a">+                render.mux_subtitles(out_video, produced, out_embed)</span>
+<span class="a">+                embed_key = f&quot;{job_id}/{embed_name}&quot;</span>
+<span class="a">+                embed_size = storage.put_file(embed_key, out_embed)</span>
+<span class="a">+            except Exception as exc:  # noqa: BLE001</span>
+<span class="a">+                embed_name = embed_key = None</span>
+<span class="a">+                log.warning(&quot;job %s: subtitle embed failed: %s&quot;, job_id, exc)</span>
+<span class="a">+</span>
+         except Exception as exc:  # noqa: BLE001 - never fail a job over the video
+             # The subtitles are the product, so a failed render is not fatal -
+             # but it must not be silent either, or it looks like it never ran.
+<span class="h">@@ -538,12 +564,24 @@ def _collect_artifacts(job_id: str, paths: Paths, log_path: Path,</span>
+             {
+                 &quot;filename&quot;: video_name,
+                 &quot;container&quot;: &quot;mp4&quot;,
+<span class="d">-                &quot;subtitles&quot;: &quot;soft track (mov_text)&quot;,</span>
+<span class="a">+                &quot;subtitles&quot;: &quot;none - upload the .srt to YouTube separately&quot;,</span>
+<span class="a">+                &quot;for&quot;: &quot;youtube&quot;,</span>
+                 &quot;size_bytes&quot;: video_size,
+             }
+             if video_name
+             else None
+         ),
+<span class="a">+        &quot;video_embedded&quot;: (</span>
+<span class="a">+            {</span>
+<span class="a">+                &quot;filename&quot;: embed_name,</span>
+<span class="a">+                &quot;container&quot;: &quot;mkv&quot;,</span>
+<span class="a">+                &quot;subtitles&quot;: &quot;embedded SRT track, enabled by default&quot;,</span>
+<span class="a">+                &quot;for&quot;: &quot;local playback (MPV, VLC, Jellyfin)&quot;,</span>
+<span class="a">+                &quot;size_bytes&quot;: embed_size,</span>
+<span class="a">+            }</span>
+<span class="a">+            if embed_name</span>
+<span class="a">+            else None</span>
+<span class="a">+        ),</span>
+     }
+     meta_path = paths.root / &quot;metadata.json&quot;
+     meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2),
+<span class="h">@@ -562,6 +600,11 @@ def _collect_artifacts(job_id: str, paths: Paths, log_path: Path,</span>
+             Artifact(job_id=job_id, kind=&quot;video&quot;, filename=video_name,
+                      storage_key=video_key, size_bytes=video_size)
+         )
+<span class="a">+    if embed_name and embed_key:</span>
+<span class="a">+        rows.append(</span>
+<span class="a">+            Artifact(job_id=job_id, kind=&quot;video_embedded&quot;, filename=embed_name,</span>
+<span class="a">+                     storage_key=embed_key, size_bytes=embed_size)</span>
+<span class="a">+        )</span>
+     with SessionLocal() as s:
+         for r in rows:
+             s.add(r)
+diff --git a/frontend/app.js b/frontend/app.js
+index df8e96d..1541fc1 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+<span class="h">@@ -391,20 +391,29 @@ function jobCard(j) {</span>
+ 
+   const files = j.artifacts || [];
+   if (files.length) {
+<span class="d">-    const order = { srt: 0, video: 1, metadata: 2, log: 3 };</span>
+<span class="a">+    const order = { srt: 0, video: 1, video_embedded: 2, metadata: 3, log: 4 };</span>
+<span class="a">+    // Three deliverables for three different uses; say which is which, because</span>
+<span class="a">+    // &quot;two video files&quot; is otherwise baffling.</span>
+     const label = {
+       srt: &#x27;⬇ Subtitles (.srt)&#x27;,
+<span class="d">-      video: &#x27;⬇ Video (.mp4)&#x27;,</span>
+<span class="a">+      video: &#x27;⬇ Video for YouTube (.mp4)&#x27;,</span>
+<span class="a">+      video_embedded: &#x27;⬇ Video with subs built in (.mkv)&#x27;,</span>
+       metadata: &#x27;Metadata&#x27;,
+       log: &#x27;Run log&#x27;,
+     };
+<span class="d">-    const primary = new Set([&#x27;srt&#x27;, &#x27;video&#x27;]);</span>
+<span class="a">+    const hint = {</span>
+<span class="a">+      srt: &#x27;For HoshiReader, or upload alongside the YouTube video&#x27;,</span>
+<span class="a">+      video: &#x27;No subtitles baked in — add the .srt in YouTube Studio&#x27;,</span>
+<span class="a">+      video_embedded: &#x27;Subtitles inside the file, for MPV/VLC&#x27;,</span>
+<span class="a">+    };</span>
+<span class="a">+    const primary = new Set([&#x27;srt&#x27;, &#x27;video&#x27;, &#x27;video_embedded&#x27;]);</span>
+     html += &#x27;&lt;div class=&quot;job-files&quot;&gt;&#x27; + files
+       .slice()
+       .sort((a, b) =&gt; (order[a.kind] ?? 9) - (order[b.kind] ?? 9))
+       .map((a) =&gt; {
+         const size = a.size_bytes ? ` &lt;span class=&quot;dl-size&quot;&gt;${fmtBytes(a.size_bytes)}&lt;/span&gt;` : &#x27;&#x27;;
+<span class="d">-        return `&lt;a class=&quot;dl ${primary.has(a.kind) ? &#x27;&#x27; : &#x27;secondary&#x27;}&quot;</span>
+<span class="a">+        const t = hint[a.kind] ? ` title=&quot;${escapeHtml(hint[a.kind])}&quot;` : &#x27;&#x27;;</span>
+<span class="a">+        return `&lt;a class=&quot;dl ${primary.has(a.kind) ? &#x27;&#x27; : &#x27;secondary&#x27;}&quot;${t}</span>
+                    href=&quot;${a.url}&quot; download&gt;${label[a.kind] || a.kind}${size}&lt;/a&gt;`;
+       })
+       .join(&#x27;&#x27;) + &#x27;&lt;/div&gt;&#x27;;
+diff --git a/frontend/index.html b/frontend/index.html
+index 6db962a..3a3bc72 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+<span class="h">@@ -130,6 +130,6 @@</span>
+   &lt;/p&gt;
+ &lt;/footer&gt;
+ 
+<span class="d">-&lt;script src=&quot;/app.js?v=6&quot;&gt;&lt;/script&gt;</span>
+<span class="a">+&lt;script src=&quot;/app.js?v=7&quot;&gt;&lt;/script&gt;</span>
+ &lt;/body&gt;
+ &lt;/html&gt;</pre>
+</div></body></html>

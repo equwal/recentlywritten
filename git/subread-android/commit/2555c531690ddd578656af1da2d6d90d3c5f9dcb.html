@@ -1,0 +1,1796 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android 2555c531 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../subread-android/index.html">Log</a> | <a href="../../subread-android/files.html">Files</a> | <a href="../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 2555c531690ddd578656af1da2d6d90d3c5f9dcb
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 17:04:09 -0700
+
+Android app: on-device transcription, alignment and .srt export
+
+- whisper.cpp v1.9.4 as a pinned submodule, behind a minimal JNI bridge;
+  built for ARMv8.2 (fp16 + dotprod), with a CPU check before loading so an
+  older phone gets a message instead of a SIGILL
+- AudioDecoder streams any playable file as 16 kHz mono in two-minute
+  chunks, cut at the quietest moment so no word straddles two chunks
+- TranscriptStore persists every finished chunk: a job killed hours in
+  resumes at the last chunk, and re-aligning against another edition of the
+  book reuses the transcript
+- foreground service (special use - the other types are stopped after six
+  hours) with a wake lock and a progress notification
+- Compose UI in plain black on white with nothing animated, since the first
+  device it has to work on is an e-ink reader
+- CI builds and signs the APK; the key lives in Actions secrets only
+
+</pre><pre> .github/workflows/build.yml                        | 108 +++++++++
+ .gitmodules                                        |   4 +
+ README.md                                          |  54 +++++
+ app/build.gradle.kts                               |  85 +++++++
+ app/src/main/AndroidManifest.xml                   |  48 ++++
+ app/src/main/cpp/CMakeLists.txt                    |  34 +++
+ app/src/main/cpp/whisper_jni.c                     | 153 ++++++++++++
+ .../main/kotlin/space/subread/app/MainActivity.kt  | 261 +++++++++++++++++++++
+ .../kotlin/space/subread/app/audio/AudioDecoder.kt | 218 +++++++++++++++++
+ .../kotlin/space/subread/app/job/AlignService.kt   | 136 +++++++++++
+ app/src/main/kotlin/space/subread/app/job/Job.kt   | 138 +++++++++++
+ .../space/subread/app/job/TranscriptStore.kt       | 120 ++++++++++
+ .../kotlin/space/subread/app/whisper/Whisper.kt    | 127 ++++++++++
+ .../main/res/drawable/ic_launcher_foreground.xml   |   7 +
+ app/src/main/res/drawable/ic_notification.xml      |   6 +
+ app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml |   6 +
+ .../res/mipmap-anydpi-v26/ic_launcher_round.xml    |   6 +
+ app/src/main/res/values/colors.xml                 |   4 +
+ app/src/main/res/values/strings.xml                |   6 +
+ app/src/main/res/values/themes.xml                 |   9 +
+ app/src/main/res/xml/file_paths.xml                |   5 +
+ third_party/whisper.cpp                            |   1 +
+ tools/write_res.py                                 |  68 ++++++
+ 23 files changed, 1604 insertions(+)
+</pre><pre>diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+new file mode 100644
+index 0000000..17e51bc
+--- /dev/null
++++ b/.github/workflows/build.yml
+<span class="h">@@ -0,0 +1,108 @@</span>
+<span class="a">+name: Build</span>
+<span class="a">+</span>
+<span class="a">+&quot;on&quot;:</span>
+<span class="a">+  push:</span>
+<span class="a">+    branches: [main]</span>
+<span class="a">+  workflow_dispatch:</span>
+<span class="a">+</span>
+<span class="a">+permissions:</span>
+<span class="a">+  contents: read</span>
+<span class="a">+</span>
+<span class="a">+concurrency:</span>
+<span class="a">+  group: build-${{ github.ref }}</span>
+<span class="a">+  cancel-in-progress: true</span>
+<span class="a">+</span>
+<span class="a">+jobs:</span>
+<span class="a">+  apk:</span>
+<span class="a">+    name: Test the engine, build the APK</span>
+<span class="a">+    runs-on: ubuntu-latest</span>
+<span class="a">+    timeout-minutes: 60</span>
+<span class="a">+</span>
+<span class="a">+    env:</span>
+<span class="a">+      CMAKE_VERSION: &quot;3.31.6&quot;</span>
+<span class="a">+      NDK_VERSION: &quot;29.0.14206865&quot;</span>
+<span class="a">+      # The speech model is not in git (43 MB). Pinned by hash, so the build</span>
+<span class="a">+      # fails loudly if what is served ever changes.</span>
+<span class="a">+      MODEL_URL: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q8_0.bin</span>
+<span class="a">+      MODEL_SHA256: c2085835d3f50733e2ff6e4b41ae8a2b8d8110461e18821b09a15c40c42d1cca</span>
+<span class="a">+</span>
+<span class="a">+    steps:</span>
+<span class="a">+      - name: Checkout</span>
+<span class="a">+        uses: actions/checkout@v4</span>
+<span class="a">+        with:</span>
+<span class="a">+          submodules: recursive</span>
+<span class="a">+          fetch-depth: 1</span>
+<span class="a">+</span>
+<span class="a">+      - name: Set up JDK</span>
+<span class="a">+        uses: actions/setup-java@v4</span>
+<span class="a">+        with:</span>
+<span class="a">+          distribution: temurin</span>
+<span class="a">+          java-version: &quot;21&quot;</span>
+<span class="a">+</span>
+<span class="a">+      - name: Set up Android SDK</span>
+<span class="a">+        uses: android-actions/setup-android@v3</span>
+<span class="a">+        with:</span>
+<span class="a">+          packages: platform-tools</span>
+<span class="a">+</span>
+<span class="a">+      - name: Install Android build tools</span>
+<span class="a">+        run: |</span>
+<span class="a">+          set -euo pipefail</span>
+<span class="a">+          sdkmanager &quot;platforms;android-36&quot; &quot;build-tools;36.0.0&quot; \</span>
+<span class="a">+            &quot;cmake;${CMAKE_VERSION}&quot; &quot;ndk;${NDK_VERSION}&quot;</span>
+<span class="a">+</span>
+<span class="a">+      - name: Set up Gradle</span>
+<span class="a">+        uses: gradle/actions/setup-gradle@v4</span>
+<span class="a">+</span>
+<span class="a">+      - name: Restore the speech model</span>
+<span class="a">+        id: model</span>
+<span class="a">+        uses: actions/cache@v4</span>
+<span class="a">+        with:</span>
+<span class="a">+          path: app/src/main/assets/models</span>
+<span class="a">+          key: model-${{ env.MODEL_SHA256 }}</span>
+<span class="a">+</span>
+<span class="a">+      - name: Download the speech model</span>
+<span class="a">+        if: steps.model.outputs.cache-hit != &#x27;true&#x27;</span>
+<span class="a">+        run: |</span>
+<span class="a">+          set -euo pipefail</span>
+<span class="a">+          mkdir -p app/src/main/assets/models</span>
+<span class="a">+          curl -fsSL --retry 3 -o app/src/main/assets/models/ggml-tiny-q8_0.bin &quot;${MODEL_URL}&quot;</span>
+<span class="a">+</span>
+<span class="a">+      - name: Verify the speech model</span>
+<span class="a">+        run: echo &quot;${MODEL_SHA256}  app/src/main/assets/models/ggml-tiny-q8_0.bin&quot; | sha256sum -c -</span>
+<span class="a">+</span>
+<span class="a">+      - name: Test the alignment engine</span>
+<span class="a">+        run: ./gradlew --no-daemon :core:test</span>
+<span class="a">+</span>
+<span class="a">+      - name: Unpack the signing key</span>
+<span class="a">+        env:</span>
+<span class="a">+          KEYSTORE_B64: ${{ secrets.SUBREAD_KEYSTORE_B64 }}</span>
+<span class="a">+        run: |</span>
+<span class="a">+          set -euo pipefail</span>
+<span class="a">+          if [ -n &quot;${KEYSTORE_B64}&quot; ]; then</span>
+<span class="a">+            echo &quot;${KEYSTORE_B64}&quot; | base64 -d &gt; &quot;${RUNNER_TEMP}/subread.jks&quot;</span>
+<span class="a">+            echo &quot;SUBREAD_KEYSTORE_FILE=${RUNNER_TEMP}/subread.jks&quot; &gt;&gt; &quot;${GITHUB_ENV}&quot;</span>
+<span class="a">+          else</span>
+<span class="a">+            echo &quot;::warning::No signing key configured; the APK will be unsigned and will not install.&quot;</span>
+<span class="a">+          fi</span>
+<span class="a">+</span>
+<span class="a">+      - name: Build the APK</span>
+<span class="a">+        env:</span>
+<span class="a">+          SUBREAD_KEYSTORE_PASSWORD: ${{ secrets.SUBREAD_KEYSTORE_PASSWORD }}</span>
+<span class="a">+        run: ./gradlew --no-daemon :app:assembleRelease -PversionCode=${{ github.run_number }}</span>
+<span class="a">+</span>
+<span class="a">+      - name: Upload the APK</span>
+<span class="a">+        uses: actions/upload-artifact@v4</span>
+<span class="a">+        with:</span>
+<span class="a">+          name: subread-apk</span>
+<span class="a">+          path: app/build/outputs/apk/release/*.apk</span>
+<span class="a">+          if-no-files-found: error</span>
+<span class="a">+</span>
+<span class="a">+      - name: Upload test reports</span>
+<span class="a">+        if: failure()</span>
+<span class="a">+        uses: actions/upload-artifact@v4</span>
+<span class="a">+        with:</span>
+<span class="a">+          name: reports</span>
+<span class="a">+          path: |</span>
+<span class="a">+            core/build/reports/tests</span>
+<span class="a">+            app/build/outputs/logs</span>
+<span class="a">+          if-no-files-found: ignore</span>
+diff --git a/.gitmodules b/.gitmodules
+new file mode 100644
+index 0000000..ea2d8db
+--- /dev/null
++++ b/.gitmodules
+<span class="h">@@ -0,0 +1,4 @@</span>
+<span class="a">+[submodule &quot;third_party/whisper.cpp&quot;]</span>
+<span class="a">+	path = third_party/whisper.cpp</span>
+<span class="a">+	url = https://github.com/ggml-org/whisper.cpp</span>
+<span class="a">+	shallow = true</span>
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..c0cd615
+--- /dev/null
++++ b/README.md
+<span class="h">@@ -0,0 +1,54 @@</span>
+<span class="a">+# SubRead for Android</span>
+<span class="a">+</span>
+<span class="a">+Times an audiobook against its ebook, entirely on the phone, and writes the</span>
+<span class="a">+`.srt` that [Hoshi Reader](https://github.com/HuangAntimony/Hoshi-Reader-Android)&#x27;s</span>
+<span class="a">+read-along uses. Nothing is uploaded.</span>
+<span class="a">+</span>
+<span class="a">+It is the same method as [subread.space](https://subread.space) and</span>
+<span class="a">+[SubPlz](https://github.com/kanjieater/SubPlz): a small speech model transcribes</span>
+<span class="a">+the audio, roughly; the transcript is aligned against the book; the subtitles</span>
+<span class="a">+take their *timing* from the transcript and their *words* from the book.</span>
+<span class="a">+</span>
+<span class="a">+## Layout</span>
+<span class="a">+</span>
+<span class="a">+| Path | What |</span>
+<span class="a">+|---|---|</span>
+<span class="a">+| `core/` | The alignment engine. Plain Kotlin, no Android - builds and tests with only a JDK |</span>
+<span class="a">+| `app/` | The Android app: audio decoding, the whisper.cpp bridge, the long-running job, the UI |</span>
+<span class="a">+| `third_party/whisper.cpp` | Pinned submodule |</span>
+<span class="a">+| `tools/make_golden.py` | Generates test fixtures by running the reference Python implementation |</span>
+<span class="a">+</span>
+<span class="a">+## The engine</span>
+<span class="a">+</span>
+<span class="a">+`core/` is a port of SubPlz&#x27;s aligner (`ats.align`, `subplz.align.shift_align`),</span>
+<span class="a">+checked stage by stage against the original&#x27;s real output on real Whisper-tiny</span>
+<span class="a">+transcripts: every cue across the fixtures comes out identical.</span>
+<span class="a">+</span>
+<span class="a">+What is new is `AnchoredAligner`. The reference hands Biopython one chapter at a</span>
+<span class="a">+time and needs gigabytes to do it, so it has to guess first which chapter of the</span>
+<span class="a">+book each chapter of audio is. This aligns the whole book at once instead, by</span>
+<span class="a">+anchoring on stretches unique to both texts and solving exactly only between</span>
+<span class="a">+anchors: a 19-hour audiobook against its full text in a few seconds and a few</span>
+<span class="a">+megabytes. `BookAligner` then uses the alignment itself to leave out text nobody</span>
+<span class="a">+narrated - front matter, notes - instead of matching chapters.</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+./gradlew :core:test</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+## Building the app</span>
+<span class="a">+</span>
+<span class="a">+CI builds it (`.github/workflows/build.yml`): the APK is an artifact of every</span>
+<span class="a">+push to `main`. Locally it needs the Android SDK, NDK 29 and CMake 3.31, and the</span>
+<span class="a">+speech model at `app/src/main/assets/models/ggml-tiny-q8_0.bin` (the workflow has</span>
+<span class="a">+the URL and checksum). Without an SDK, Gradle leaves `:app` out and `:core`</span>
+<span class="a">+still builds.</span>
+<span class="a">+</span>
+<span class="a">+The release key is not in the repository; CI reads it from Actions secrets.</span>
+<span class="a">+</span>
+<span class="a">+## Requirements</span>
+<span class="a">+</span>
+<span class="a">+Android 8+, a 64-bit ARM processor with ARMv8.2 half-precision and dot-product</span>
+<span class="a">+instructions (anything from 2018 on). Transcription runs at a small multiple of</span>
+<span class="a">+real time, so a long book takes hours; it carries on with the screen off and</span>
+<span class="a">+resumes where it stopped if interrupted.</span>
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+new file mode 100644
+index 0000000..fb0509e
+--- /dev/null
++++ b/app/build.gradle.kts
+<span class="h">@@ -0,0 +1,85 @@</span>
+<span class="a">+plugins {</span>
+<span class="a">+    alias(libs.plugins.android.application)</span>
+<span class="a">+    alias(libs.plugins.kotlin.compose)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Release signing comes from the environment, so the key never lives in the</span>
+<span class="a">+// repository. CI supplies it from repository secrets; without it the release</span>
+<span class="a">+// build is simply left unsigned.</span>
+<span class="a">+val keystorePath = providers.environmentVariable(&quot;SUBREAD_KEYSTORE_FILE&quot;).orNull</span>
+<span class="a">+val keystorePassword = providers.environmentVariable(&quot;SUBREAD_KEYSTORE_PASSWORD&quot;).orNull</span>
+<span class="a">+val signingReady = !keystorePath.isNullOrBlank() &amp;&amp; !keystorePassword.isNullOrBlank() &amp;&amp;</span>
+<span class="a">+    file(keystorePath).isFile</span>
+<span class="a">+</span>
+<span class="a">+android {</span>
+<span class="a">+    namespace = &quot;space.subread.app&quot;</span>
+<span class="a">+    compileSdk = 36</span>
+<span class="a">+    ndkVersion = &quot;29.0.14206865&quot;</span>
+<span class="a">+</span>
+<span class="a">+    defaultConfig {</span>
+<span class="a">+        applicationId = &quot;space.subread.app&quot;</span>
+<span class="a">+        minSdk = 26</span>
+<span class="a">+        targetSdk = 36</span>
+<span class="a">+        versionCode = (providers.gradleProperty(&quot;versionCode&quot;).orNull ?: &quot;1&quot;).toInt()</span>
+<span class="a">+        versionName = providers.gradleProperty(&quot;versionName&quot;).orNull ?: &quot;0.1.0&quot;</span>
+<span class="a">+</span>
+<span class="a">+        // Every phone worth transcribing on is 64-bit ARM; the speech library</span>
+<span class="a">+        // is built for ARMv8.2 specifically (see src/main/cpp/CMakeLists.txt).</span>
+<span class="a">+        ndk { abiFilters += &quot;arm64-v8a&quot; }</span>
+<span class="a">+        externalNativeBuild {</span>
+<span class="a">+            cmake { arguments += listOf(&quot;-DANDROID_STL=c++_static&quot;) }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    if (signingReady) {</span>
+<span class="a">+        signingConfigs {</span>
+<span class="a">+            create(&quot;release&quot;) {</span>
+<span class="a">+                storeFile = file(keystorePath!!)</span>
+<span class="a">+                storePassword = keystorePassword</span>
+<span class="a">+                keyAlias = &quot;subread&quot;</span>
+<span class="a">+                keyPassword = keystorePassword</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    buildTypes {</span>
+<span class="a">+        debug { applicationIdSuffix = &quot;.debug&quot; }</span>
+<span class="a">+        release {</span>
+<span class="a">+            // Not shrunk yet: R8 rules want a device to be verified against.</span>
+<span class="a">+            isMinifyEnabled = false</span>
+<span class="a">+            if (signingReady) signingConfig = signingConfigs.getByName(&quot;release&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    compileOptions {</span>
+<span class="a">+        sourceCompatibility = JavaVersion.VERSION_17</span>
+<span class="a">+        targetCompatibility = JavaVersion.VERSION_17</span>
+<span class="a">+    }</span>
+<span class="a">+    buildFeatures { compose = true }</span>
+<span class="a">+</span>
+<span class="a">+    externalNativeBuild {</span>
+<span class="a">+        cmake {</span>
+<span class="a">+            path = file(&quot;src/main/cpp/CMakeLists.txt&quot;)</span>
+<span class="a">+            version = &quot;3.31.6&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // The model is copied out of the APK to a real file on first run; storing</span>
+<span class="a">+    // it uncompressed makes that a straight copy.</span>
+<span class="a">+    androidResources { noCompress += &quot;bin&quot; }</span>
+<span class="a">+</span>
+<span class="a">+    lint { abortOnError = false }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+dependencies {</span>
+<span class="a">+    implementation(project(&quot;:core&quot;))</span>
+<span class="a">+    implementation(platform(libs.androidx.compose.bom))</span>
+<span class="a">+    implementation(libs.androidx.activity.compose)</span>
+<span class="a">+    implementation(libs.androidx.compose.material3)</span>
+<span class="a">+    implementation(libs.androidx.compose.ui)</span>
+<span class="a">+    implementation(libs.androidx.compose.ui.graphics)</span>
+<span class="a">+    implementation(libs.androidx.core.ktx)</span>
+<span class="a">+    implementation(libs.androidx.lifecycle.runtime.ktx)</span>
+<span class="a">+    implementation(libs.androidx.lifecycle.runtime.compose)</span>
+<span class="a">+    implementation(libs.kotlinx.coroutines.android)</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+new file mode 100644
+index 0000000..7dd66a8
+--- /dev/null
++++ b/app/src/main/AndroidManifest.xml
+<span class="h">@@ -0,0 +1,48 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;manifest xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;</span>
+<span class="a">+</span>
+<span class="a">+    &lt;uses-permission android:name=&quot;android.permission.FOREGROUND_SERVICE&quot; /&gt;</span>
+<span class="a">+    &lt;uses-permission android:name=&quot;android.permission.FOREGROUND_SERVICE_SPECIAL_USE&quot; /&gt;</span>
+<span class="a">+    &lt;uses-permission android:name=&quot;android.permission.POST_NOTIFICATIONS&quot; /&gt;</span>
+<span class="a">+    &lt;uses-permission android:name=&quot;android.permission.WAKE_LOCK&quot; /&gt;</span>
+<span class="a">+</span>
+<span class="a">+    &lt;application</span>
+<span class="a">+        android:allowBackup=&quot;false&quot;</span>
+<span class="a">+        android:icon=&quot;@mipmap/ic_launcher&quot;</span>
+<span class="a">+        android:label=&quot;@string/app_name&quot;</span>
+<span class="a">+        android:largeHeap=&quot;true&quot;</span>
+<span class="a">+        android:supportsRtl=&quot;true&quot;</span>
+<span class="a">+        android:theme=&quot;@style/Theme.SubRead&quot;&gt;</span>
+<span class="a">+</span>
+<span class="a">+        &lt;activity</span>
+<span class="a">+            android:name=&quot;.MainActivity&quot;</span>
+<span class="a">+            android:exported=&quot;true&quot;</span>
+<span class="a">+            android:launchMode=&quot;singleTop&quot;&gt;</span>
+<span class="a">+            &lt;intent-filter&gt;</span>
+<span class="a">+                &lt;action android:name=&quot;android.intent.action.MAIN&quot; /&gt;</span>
+<span class="a">+                &lt;category android:name=&quot;android.intent.category.LAUNCHER&quot; /&gt;</span>
+<span class="a">+            &lt;/intent-filter&gt;</span>
+<span class="a">+        &lt;/activity&gt;</span>
+<span class="a">+</span>
+<span class="a">+        &lt;!-- Special use, not dataSync or mediaProcessing: those are stopped by</span>
+<span class="a">+             the system after six hours, and a long book takes longer. --&gt;</span>
+<span class="a">+        &lt;service</span>
+<span class="a">+            android:name=&quot;.job.AlignService&quot;</span>
+<span class="a">+            android:exported=&quot;false&quot;</span>
+<span class="a">+            android:foregroundServiceType=&quot;specialUse&quot;&gt;</span>
+<span class="a">+            &lt;property</span>
+<span class="a">+                android:name=&quot;android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE&quot;</span>
+<span class="a">+                android:value=&quot;On-device speech recognition over a user-selected audiobook, to time it against the user&#x27;s ebook. Runs for hours and must not be interrupted.&quot; /&gt;</span>
+<span class="a">+        &lt;/service&gt;</span>
+<span class="a">+</span>
+<span class="a">+        &lt;provider</span>
+<span class="a">+            android:name=&quot;androidx.core.content.FileProvider&quot;</span>
+<span class="a">+            android:authorities=&quot;${applicationId}.files&quot;</span>
+<span class="a">+            android:exported=&quot;false&quot;</span>
+<span class="a">+            android:grantUriPermissions=&quot;true&quot;&gt;</span>
+<span class="a">+            &lt;meta-data</span>
+<span class="a">+                android:name=&quot;android.support.FILE_PROVIDER_PATHS&quot;</span>
+<span class="a">+                android:resource=&quot;@xml/file_paths&quot; /&gt;</span>
+<span class="a">+        &lt;/provider&gt;</span>
+<span class="a">+    &lt;/application&gt;</span>
+<span class="a">+&lt;/manifest&gt;</span>
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+new file mode 100644
+index 0000000..e3f86f2
+--- /dev/null
++++ b/app/src/main/cpp/CMakeLists.txt
+<span class="h">@@ -0,0 +1,34 @@</span>
+<span class="a">+cmake_minimum_required(VERSION 3.22)</span>
+<span class="a">+project(subread_whisper C CXX)</span>
+<span class="a">+</span>
+<span class="a">+set(CMAKE_C_STANDARD 11)</span>
+<span class="a">+set(CMAKE_CXX_STANDARD 17)</span>
+<span class="a">+</span>
+<span class="a">+# Transcription is hours of matrix arithmetic. Unoptimised it is ten times</span>
+<span class="a">+# slower, so optimise whatever Gradle thinks the build type is.</span>
+<span class="a">+if (CMAKE_BUILD_TYPE STREQUAL &quot;Debug&quot;)</span>
+<span class="a">+    add_compile_options(-O3)</span>
+<span class="a">+endif ()</span>
+<span class="a">+</span>
+<span class="a">+set(WHISPER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/whisper.cpp)</span>
+<span class="a">+</span>
+<span class="a">+set(BUILD_SHARED_LIBS      OFF CACHE BOOL &quot;&quot; FORCE)</span>
+<span class="a">+set(WHISPER_BUILD_TESTS    OFF CACHE BOOL &quot;&quot; FORCE)</span>
+<span class="a">+set(WHISPER_BUILD_EXAMPLES OFF CACHE BOOL &quot;&quot; FORCE)</span>
+<span class="a">+set(WHISPER_BUILD_SERVER   OFF CACHE BOOL &quot;&quot; FORCE)</span>
+<span class="a">+set(GGML_NATIVE            OFF CACHE BOOL &quot;&quot; FORCE)   # cross-compiling: never probe the build host</span>
+<span class="a">+set(GGML_OPENMP            OFF CACHE BOOL &quot;&quot; FORCE)   # ggml&#x27;s own thread pool; no libomp to ship</span>
+<span class="a">+set(GGML_LLAMAFILE         OFF CACHE BOOL &quot;&quot; FORCE)</span>
+<span class="a">+</span>
+<span class="a">+# Half-precision and dot-product instructions are most of the speed on ARM.</span>
+<span class="a">+# Everything since the Cortex-A55/A75 (2018) has them; MainActivity checks</span>
+<span class="a">+# before loading this library, so an older CPU gets a message, not a SIGILL.</span>
+<span class="a">+if (ANDROID_ABI STREQUAL &quot;arm64-v8a&quot;)</span>
+<span class="a">+    set(GGML_CPU_ARM_ARCH &quot;armv8.2-a+fp16+dotprod&quot; CACHE STRING &quot;&quot; FORCE)</span>
+<span class="a">+endif ()</span>
+<span class="a">+</span>
+<span class="a">+add_subdirectory(${WHISPER_DIR} whisper EXCLUDE_FROM_ALL)</span>
+<span class="a">+</span>
+<span class="a">+add_library(subread_whisper SHARED whisper_jni.c)</span>
+<span class="a">+target_link_libraries(subread_whisper PRIVATE whisper log)</span>
+<span class="a">+target_link_options(subread_whisper PRIVATE -Wl,--gc-sections -Wl,--exclude-libs,ALL)</span>
+diff --git a/app/src/main/cpp/whisper_jni.c b/app/src/main/cpp/whisper_jni.c
+new file mode 100644
+index 0000000..7416e0c
+--- /dev/null
++++ b/app/src/main/cpp/whisper_jni.c
+<span class="h">@@ -0,0 +1,153 @@</span>
+<span class="a">+// The narrowest possible bridge to whisper.cpp: load a model, transcribe one</span>
+<span class="a">+// buffer of 16 kHz mono float PCM, read the segments back.</span>
+<span class="a">+//</span>
+<span class="a">+// One transcription runs at a time (the service guarantees it), which is what</span>
+<span class="a">+// lets progress and cancellation be plain process-wide atomics rather than</span>
+<span class="a">+// callbacks into the JVM from whisper&#x27;s worker threads.</span>
+<span class="a">+</span>
+<span class="a">+#include &lt;jni.h&gt;</span>
+<span class="a">+#include &lt;stdatomic.h&gt;</span>
+<span class="a">+#include &lt;stdbool.h&gt;</span>
+<span class="a">+#include &lt;string.h&gt;</span>
+<span class="a">+#include &lt;android/log.h&gt;</span>
+<span class="a">+</span>
+<span class="a">+#include &quot;whisper.h&quot;</span>
+<span class="a">+</span>
+<span class="a">+#define TAG &quot;subread-whisper&quot;</span>
+<span class="a">+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)</span>
+<span class="a">+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)</span>
+<span class="a">+</span>
+<span class="a">+static atomic_int  g_progress = 0;</span>
+<span class="a">+static atomic_bool g_abort    = false;</span>
+<span class="a">+</span>
+<span class="a">+static void on_progress(struct whisper_context *ctx, struct whisper_state *state,</span>
+<span class="a">+                        int progress, void *user_data) {</span>
+<span class="a">+    (void) ctx; (void) state; (void) user_data;</span>
+<span class="a">+    atomic_store(&amp;g_progress, progress);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+static bool should_abort(void *user_data) {</span>
+<span class="a">+    (void) user_data;</span>
+<span class="a">+    return atomic_load(&amp;g_abort);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define JNI_FN(name) Java_space_subread_app_whisper_WhisperLib_##name</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT jlong JNICALL</span>
+<span class="a">+JNI_FN(initContext)(JNIEnv *env, jobject thiz, jstring model_path) {</span>
+<span class="a">+    (void) thiz;</span>
+<span class="a">+    const char *path = (*env)-&gt;GetStringUTFChars(env, model_path, NULL);</span>
+<span class="a">+    struct whisper_context_params cparams = whisper_context_default_params();</span>
+<span class="a">+    cparams.use_gpu = false;</span>
+<span class="a">+    struct whisper_context *ctx = whisper_init_from_file_with_params(path, cparams);</span>
+<span class="a">+    if (ctx == NULL) LOGW(&quot;could not load model %s&quot;, path);</span>
+<span class="a">+    (*env)-&gt;ReleaseStringUTFChars(env, model_path, path);</span>
+<span class="a">+    return (jlong) ctx;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT void JNICALL</span>
+<span class="a">+JNI_FN(freeContext)(JNIEnv *env, jobject thiz, jlong ptr) {</span>
+<span class="a">+    (void) env; (void) thiz;</span>
+<span class="a">+    if (ptr != 0) whisper_free((struct whisper_context *) ptr);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Returns 0 on success, -1 if cancelled, anything else is whisper&#x27;s own error.</span>
+<span class="a">+JNIEXPORT jint JNICALL</span>
+<span class="a">+JNI_FN(transcribe)(JNIEnv *env, jobject thiz, jlong ptr, jfloatArray samples,</span>
+<span class="a">+                   jint n_threads, jstring language) {</span>
+<span class="a">+    (void) thiz;</span>
+<span class="a">+    struct whisper_context *ctx = (struct whisper_context *) ptr;</span>
+<span class="a">+    if (ctx == NULL) return -2;</span>
+<span class="a">+</span>
+<span class="a">+    const jsize n = (*env)-&gt;GetArrayLength(env, samples);</span>
+<span class="a">+    jfloat *pcm = (*env)-&gt;GetFloatArrayElements(env, samples, NULL);</span>
+<span class="a">+    const char *lang = (*env)-&gt;GetStringUTFChars(env, language, NULL);</span>
+<span class="a">+</span>
+<span class="a">+    struct whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);</span>
+<span class="a">+    p.print_realtime   = false;</span>
+<span class="a">+    p.print_progress   = false;</span>
+<span class="a">+    p.print_timestamps = false;</span>
+<span class="a">+    p.print_special    = false;</span>
+<span class="a">+    p.translate        = false;</span>
+<span class="a">+    p.language         = lang;         // &quot;auto&quot; detects; the caller pins it after the first chunk</span>
+<span class="a">+    p.n_threads        = n_threads;</span>
+<span class="a">+    // Each chunk stands alone. Carrying text over as a prompt is how one</span>
+<span class="a">+    // hallucinated line turns into a page of the same line.</span>
+<span class="a">+    p.no_context       = true;</span>
+<span class="a">+    p.single_segment   = false;</span>
+<span class="a">+    p.suppress_blank   = true;</span>
+<span class="a">+    p.suppress_nst     = true;</span>
+<span class="a">+    p.progress_callback = on_progress;</span>
+<span class="a">+    p.abort_callback    = should_abort;</span>
+<span class="a">+</span>
+<span class="a">+    atomic_store(&amp;g_progress, 0);</span>
+<span class="a">+    atomic_store(&amp;g_abort, false);</span>
+<span class="a">+</span>
+<span class="a">+    int rc = whisper_full(ctx, p, pcm, n);</span>
+<span class="a">+</span>
+<span class="a">+    (*env)-&gt;ReleaseStringUTFChars(env, language, lang);</span>
+<span class="a">+    (*env)-&gt;ReleaseFloatArrayElements(env, samples, pcm, JNI_ABORT);</span>
+<span class="a">+</span>
+<span class="a">+    if (atomic_load(&amp;g_abort)) return -1;</span>
+<span class="a">+    if (rc != 0) LOGW(&quot;whisper_full failed: %d&quot;, rc);</span>
+<span class="a">+    return rc;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT void JNICALL</span>
+<span class="a">+JNI_FN(cancel)(JNIEnv *env, jobject thiz) {</span>
+<span class="a">+    (void) env; (void) thiz;</span>
+<span class="a">+    atomic_store(&amp;g_abort, true);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT jint JNICALL</span>
+<span class="a">+JNI_FN(progress)(JNIEnv *env, jobject thiz) {</span>
+<span class="a">+    (void) env; (void) thiz;</span>
+<span class="a">+    return atomic_load(&amp;g_progress);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT jint JNICALL</span>
+<span class="a">+JNI_FN(segmentCount)(JNIEnv *env, jobject thiz, jlong ptr) {</span>
+<span class="a">+    (void) env; (void) thiz;</span>
+<span class="a">+    return whisper_full_n_segments((struct whisper_context *) ptr);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Text as raw UTF-8 bytes. NewStringUTF wants *modified* UTF-8 and mangles or</span>
+<span class="a">+// aborts on anything outside the BMP, and the tiny model will happily emit a</span>
+<span class="a">+// truncated multi-byte sequence at a segment edge. Let Kotlin decode leniently.</span>
+<span class="a">+JNIEXPORT jbyteArray JNICALL</span>
+<span class="a">+JNI_FN(segmentText)(JNIEnv *env, jobject thiz, jlong ptr, jint index) {</span>
+<span class="a">+    (void) thiz;</span>
+<span class="a">+    const char *text = whisper_full_get_segment_text((struct whisper_context *) ptr, index);</span>
+<span class="a">+    if (text == NULL) text = &quot;&quot;;</span>
+<span class="a">+    const jsize len = (jsize) strlen(text);</span>
+<span class="a">+    jbyteArray out = (*env)-&gt;NewByteArray(env, len);</span>
+<span class="a">+    if (out != NULL) (*env)-&gt;SetByteArrayRegion(env, out, 0, len, (const jbyte *) text);</span>
+<span class="a">+    return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Both in centiseconds, as whisper reports them.</span>
+<span class="a">+JNIEXPORT jlong JNICALL</span>
+<span class="a">+JNI_FN(segmentStart)(JNIEnv *env, jobject thiz, jlong ptr, jint index) {</span>
+<span class="a">+    (void) env; (void) thiz;</span>
+<span class="a">+    return whisper_full_get_segment_t0((struct whisper_context *) ptr, index);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT jlong JNICALL</span>
+<span class="a">+JNI_FN(segmentEnd)(JNIEnv *env, jobject thiz, jlong ptr, jint index) {</span>
+<span class="a">+    (void) env; (void) thiz;</span>
+<span class="a">+    return whisper_full_get_segment_t1((struct whisper_context *) ptr, index);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT jstring JNICALL</span>
+<span class="a">+JNI_FN(detectedLanguage)(JNIEnv *env, jobject thiz, jlong ptr) {</span>
+<span class="a">+    (void) thiz;</span>
+<span class="a">+    const int id = whisper_full_lang_id((struct whisper_context *) ptr);</span>
+<span class="a">+    const char *code = id &gt;= 0 ? whisper_lang_str(id) : NULL;</span>
+<span class="a">+    return (*env)-&gt;NewStringUTF(env, code != NULL ? code : &quot;&quot;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+JNIEXPORT jstring JNICALL</span>
+<span class="a">+JNI_FN(systemInfo)(JNIEnv *env, jobject thiz) {</span>
+<span class="a">+    (void) thiz;</span>
+<span class="a">+    return (*env)-&gt;NewStringUTF(env, whisper_print_system_info());</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/MainActivity.kt b/app/src/main/kotlin/space/subread/app/MainActivity.kt
+new file mode 100644
+index 0000000..d2bfbb3
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/MainActivity.kt
+<span class="h">@@ -0,0 +1,261 @@</span>
+<span class="a">+package space.subread.app</span>
+<span class="a">+</span>
+<span class="a">+import android.Manifest</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.content.Intent</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.os.Build</span>
+<span class="a">+import android.os.Bundle</span>
+<span class="a">+import androidx.activity.ComponentActivity</span>
+<span class="a">+import androidx.activity.compose.rememberLauncherForActivityResult</span>
+<span class="a">+import androidx.activity.compose.setContent</span>
+<span class="a">+import androidx.activity.result.contract.ActivityResultContracts</span>
+<span class="a">+import androidx.compose.foundation.layout.Arrangement</span>
+<span class="a">+import androidx.compose.foundation.layout.Box</span>
+<span class="a">+import androidx.compose.foundation.layout.Column</span>
+<span class="a">+import androidx.compose.foundation.layout.Row</span>
+<span class="a">+import androidx.compose.foundation.layout.fillMaxSize</span>
+<span class="a">+import androidx.compose.foundation.layout.fillMaxWidth</span>
+<span class="a">+import androidx.compose.foundation.layout.padding</span>
+<span class="a">+import androidx.compose.foundation.layout.safeDrawingPadding</span>
+<span class="a">+import androidx.compose.foundation.rememberScrollState</span>
+<span class="a">+import androidx.compose.foundation.verticalScroll</span>
+<span class="a">+import androidx.compose.material3.Button</span>
+<span class="a">+import androidx.compose.material3.DropdownMenu</span>
+<span class="a">+import androidx.compose.material3.DropdownMenuItem</span>
+<span class="a">+import androidx.compose.material3.HorizontalDivider</span>
+<span class="a">+import androidx.compose.material3.LinearProgressIndicator</span>
+<span class="a">+import androidx.compose.material3.MaterialTheme</span>
+<span class="a">+import androidx.compose.material3.OutlinedButton</span>
+<span class="a">+import androidx.compose.material3.Surface</span>
+<span class="a">+import androidx.compose.material3.Text</span>
+<span class="a">+import androidx.compose.material3.lightColorScheme</span>
+<span class="a">+import androidx.compose.runtime.Composable</span>
+<span class="a">+import androidx.compose.runtime.getValue</span>
+<span class="a">+import androidx.compose.runtime.mutableStateOf</span>
+<span class="a">+import androidx.compose.runtime.remember</span>
+<span class="a">+import androidx.compose.runtime.setValue</span>
+<span class="a">+import androidx.compose.ui.Modifier</span>
+<span class="a">+import androidx.compose.ui.graphics.Color</span>
+<span class="a">+import androidx.compose.ui.platform.LocalContext</span>
+<span class="a">+import androidx.compose.ui.text.font.FontWeight</span>
+<span class="a">+import androidx.compose.ui.unit.dp</span>
+<span class="a">+import androidx.core.content.FileProvider</span>
+<span class="a">+import androidx.lifecycle.compose.collectAsStateWithLifecycle</span>
+<span class="a">+import space.subread.app.job.AlignService</span>
+<span class="a">+import space.subread.app.job.Job</span>
+<span class="a">+import space.subread.app.job.JobStatus</span>
+<span class="a">+import space.subread.app.job.Phase</span>
+<span class="a">+import space.subread.app.job.TranscriptStore</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+class MainActivity : ComponentActivity() {</span>
+<span class="a">+    override fun onCreate(savedInstanceState: Bundle?) {</span>
+<span class="a">+        super.onCreate(savedInstanceState)</span>
+<span class="a">+        setContent { App() }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Black on white and nothing that moves: this has to be as usable on an e-ink</span>
+<span class="a">+ * reader - where an animation is a smear - as on a phone.</span>
+<span class="a">+ */</span>
+<span class="a">+private val Paper = lightColorScheme(</span>
+<span class="a">+    primary = Color.Black, onPrimary = Color.White,</span>
+<span class="a">+    secondary = Color.Black, onSecondary = Color.White,</span>
+<span class="a">+    background = Color.White, onBackground = Color.Black,</span>
+<span class="a">+    surface = Color.White, onSurface = Color.Black,</span>
+<span class="a">+    surfaceVariant = Color(0xFFEDEDED), onSurfaceVariant = Color(0xFF333333),</span>
+<span class="a">+    outline = Color.Black,</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+/** Whisper&#x27;s codes. &quot;auto&quot; listens to the first two minutes and decides. */</span>
+<span class="a">+private val LANGUAGES = listOf(</span>
+<span class="a">+    &quot;auto&quot; to &quot;Detect automatically&quot;,</span>
+<span class="a">+    &quot;ja&quot; to &quot;Japanese&quot;, &quot;es&quot; to &quot;Spanish&quot;, &quot;pt&quot; to &quot;Portuguese&quot;, &quot;ru&quot; to &quot;Russian&quot;,</span>
+<span class="a">+    &quot;fi&quot; to &quot;Finnish&quot;, &quot;en&quot; to &quot;English&quot;, &quot;de&quot; to &quot;German&quot;, &quot;fr&quot; to &quot;French&quot;,</span>
+<span class="a">+    &quot;it&quot; to &quot;Italian&quot;, &quot;zh&quot; to &quot;Chinese&quot;, &quot;ko&quot; to &quot;Korean&quot;, &quot;nl&quot; to &quot;Dutch&quot;,</span>
+<span class="a">+    &quot;sv&quot; to &quot;Swedish&quot;, &quot;pl&quot; to &quot;Polish&quot;, &quot;uk&quot; to &quot;Ukrainian&quot;, &quot;tr&quot; to &quot;Turkish&quot;,</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+@Composable</span>
+<span class="a">+private fun App() {</span>
+<span class="a">+    val context = LocalContext.current</span>
+<span class="a">+    val prefs = remember { context.getSharedPreferences(&quot;picks&quot;, Context.MODE_PRIVATE) }</span>
+<span class="a">+    val status by Job.status.collectAsStateWithLifecycle()</span>
+<span class="a">+</span>
+<span class="a">+    var audio by remember { mutableStateOf(prefs.getString(&quot;audio&quot;, null)?.let(Uri::parse)) }</span>
+<span class="a">+    var book by remember { mutableStateOf(prefs.getString(&quot;book&quot;, null)?.let(Uri::parse)) }</span>
+<span class="a">+    var language by remember { mutableStateOf(prefs.getString(&quot;language&quot;, &quot;auto&quot;)!!) }</span>
+<span class="a">+</span>
+<span class="a">+    fun keep(key: String, uri: Uri) {</span>
+<span class="a">+        // So the pick survives the process being killed mid-job and can resume.</span>
+<span class="a">+        runCatching {</span>
+<span class="a">+            context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)</span>
+<span class="a">+        }</span>
+<span class="a">+        prefs.edit().putString(key, uri.toString()).apply()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    val pickAudio = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -&gt;</span>
+<span class="a">+        if (uri != null) { audio = uri; keep(&quot;audio&quot;, uri); Job.clear() }</span>
+<span class="a">+    }</span>
+<span class="a">+    val pickBook = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -&gt;</span>
+<span class="a">+        if (uri != null) { book = uri; keep(&quot;book&quot;, uri); Job.clear() }</span>
+<span class="a">+    }</span>
+<span class="a">+    val saveSrt = rememberLauncherForActivityResult(</span>
+<span class="a">+        ActivityResultContracts.CreateDocument(&quot;application/x-subrip&quot;)</span>
+<span class="a">+    ) { dest -&gt;</span>
+<span class="a">+        val srt = status.srt</span>
+<span class="a">+        if (dest != null &amp;&amp; srt != null) {</span>
+<span class="a">+            context.contentResolver.openOutputStream(dest)?.use { out -&gt; srt.inputStream().use { it.copyTo(out) } }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}</span>
+<span class="a">+</span>
+<span class="a">+    MaterialTheme(colorScheme = Paper) {</span>
+<span class="a">+        Surface(Modifier.fillMaxSize()) {</span>
+<span class="a">+            Column(</span>
+<span class="a">+                Modifier.safeDrawingPadding().padding(20.dp).verticalScroll(rememberScrollState()),</span>
+<span class="a">+                verticalArrangement = Arrangement.spacedBy(14.dp),</span>
+<span class="a">+            ) {</span>
+<span class="a">+                Text(&quot;SubRead&quot;, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)</span>
+<span class="a">+                Text(</span>
+<span class="a">+                    &quot;Times an audiobook against its ebook, on this device. Nothing is uploaded. &quot; +</span>
+<span class="a">+                        &quot;The result is an .srt for Hoshi Reader&#x27;s read-along.&quot;,</span>
+<span class="a">+                    style = MaterialTheme.typography.bodyMedium,</span>
+<span class="a">+                )</span>
+<span class="a">+                HorizontalDivider(color = Color.Black)</span>
+<span class="a">+</span>
+<span class="a">+                Pick(&quot;Audiobook&quot;, audio?.let { TranscriptStore.describe(context, it).first }, !status.running) {</span>
+<span class="a">+                    pickAudio.launch(arrayOf(&quot;audio/*&quot;, &quot;video/mp4&quot;, &quot;application/ogg&quot;, &quot;application/octet-stream&quot;))</span>
+<span class="a">+                }</span>
+<span class="a">+                Pick(&quot;Book&quot;, book?.let { TranscriptStore.describe(context, it).first }, !status.running) {</span>
+<span class="a">+                    pickBook.launch(arrayOf(&quot;application/epub+zip&quot;, &quot;text/plain&quot;, &quot;application/zip&quot;,</span>
+<span class="a">+                        &quot;application/octet-stream&quot;))</span>
+<span class="a">+                }</span>
+<span class="a">+                LanguagePick(language, !status.running) {</span>
+<span class="a">+                    language = it</span>
+<span class="a">+                    prefs.edit().putString(&quot;language&quot;, it).apply()</span>
+<span class="a">+                }</span>
+<span class="a">+</span>
+<span class="a">+                HorizontalDivider(color = Color.Black)</span>
+<span class="a">+</span>
+<span class="a">+                if (status.running) {</span>
+<span class="a">+                    Progress(status)</span>
+<span class="a">+                    OutlinedButton(onClick = { Job.cancel() }, modifier = Modifier.fillMaxWidth()) {</span>
+<span class="a">+                        Text(&quot;Stop (progress is kept)&quot;)</span>
+<span class="a">+                    }</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    val a = audio</span>
+<span class="a">+                    val b = book</span>
+<span class="a">+                    val resumable = remember(a, status.phase) {</span>
+<span class="a">+                        a != null &amp;&amp; TranscriptStore.forAudio(context, a).doneUntil &gt; 0</span>
+<span class="a">+                    }</span>
+<span class="a">+                    Button(</span>
+<span class="a">+                        enabled = a != null &amp;&amp; b != null,</span>
+<span class="a">+                        modifier = Modifier.fillMaxWidth(),</span>
+<span class="a">+                        onClick = {</span>
+<span class="a">+                            if (Build.VERSION.SDK_INT &gt;= 33) {</span>
+<span class="a">+                                askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)</span>
+<span class="a">+                            }</span>
+<span class="a">+                            AlignService.start(context, a!!, b!!, language)</span>
+<span class="a">+                        },</span>
+<span class="a">+                    ) { Text(if (resumable) &quot;Continue&quot; else &quot;Start&quot;) }</span>
+<span class="a">+</span>
+<span class="a">+                    if (a == null || b == null) {</span>
+<span class="a">+                        Text(&quot;Pick both files to begin. A long book takes hours; it carries on with the &quot; +</span>
+<span class="a">+                            &quot;screen off, and picks up where it stopped if interrupted.&quot;,</span>
+<span class="a">+                            style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+                    }</span>
+<span class="a">+                    Outcome(status,</span>
+<span class="a">+                        onSave = { status.srt?.let { saveSrt.launch(it.name) } },</span>
+<span class="a">+                        onShare = { status.srt?.let { share(context, it) } })</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+@Composable</span>
+<span class="a">+private fun Pick(label: String, chosen: String?, enabled: Boolean, onClick: () -&gt; Unit) {</span>
+<span class="a">+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {</span>
+<span class="a">+        Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)</span>
+<span class="a">+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {</span>
+<span class="a">+            OutlinedButton(onClick = onClick, enabled = enabled) { Text(if (chosen == null) &quot;Choose&quot; else &quot;Change&quot;) }</span>
+<span class="a">+            Text(chosen ?: &quot;Nothing chosen&quot;, modifier = Modifier.padding(top = 12.dp),</span>
+<span class="a">+                style = MaterialTheme.typography.bodyMedium)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+@Composable</span>
+<span class="a">+private fun LanguagePick(code: String, enabled: Boolean, onPick: (String) -&gt; Unit) {</span>
+<span class="a">+    var open by remember { mutableStateOf(false) }</span>
+<span class="a">+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {</span>
+<span class="a">+        Text(&quot;Language&quot;, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)</span>
+<span class="a">+        Box {</span>
+<span class="a">+            OutlinedButton(onClick = { open = true }, enabled = enabled) {</span>
+<span class="a">+                Text(LANGUAGES.firstOrNull { it.first == code }?.second ?: code)</span>
+<span class="a">+            }</span>
+<span class="a">+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {</span>
+<span class="a">+                for ((c, name) in LANGUAGES) {</span>
+<span class="a">+                    DropdownMenuItem(text = { Text(name) }, onClick = { onPick(c); open = false })</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+@Composable</span>
+<span class="a">+private fun Progress(status: JobStatus) {</span>
+<span class="a">+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {</span>
+<span class="a">+        Text(status.detail, fontWeight = FontWeight.Bold)</span>
+<span class="a">+        LinearProgressIndicator(</span>
+<span class="a">+            progress = { status.fraction },</span>
+<span class="a">+            modifier = Modifier.fillMaxWidth(),</span>
+<span class="a">+            color = Color.Black, trackColor = Color(0xFFCCCCCC),</span>
+<span class="a">+        )</span>
+<span class="a">+        val bits = listOfNotNull(</span>
+<span class="a">+            &quot;${(status.fraction * 100).toInt()}%&quot;,</span>
+<span class="a">+            status.etaSeconds?.let { &quot;about ${Job.clock(it.toDouble())} left&quot; },</span>
+<span class="a">+            status.speed?.let { &quot;%.1f× real time&quot;.format(it) },</span>
+<span class="a">+        )</span>
+<span class="a">+        Text(bits.joinToString(&quot;  ·  &quot;), style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+@Composable</span>
+<span class="a">+private fun Outcome(status: JobStatus, onSave: () -&gt; Unit, onShare: () -&gt; Unit) {</span>
+<span class="a">+    when (status.phase) {</span>
+<span class="a">+        Phase.DONE -&gt; Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {</span>
+<span class="a">+            val rate = ((status.matchRate ?: 0.0) * 100).toInt()</span>
+<span class="a">+            Text(&quot;Done: ${status.cues} lines, $rate% found in the book.&quot;, fontWeight = FontWeight.Bold)</span>
+<span class="a">+            if (rate &lt; 80) {</span>
+<span class="a">+                Text(&quot;That is low. Usually it means a different edition or translation of the book, &quot; +</span>
+<span class="a">+                    &quot;or the wrong language.&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            }</span>
+<span class="a">+            if (status.paragraphsDropped &gt; 0) {</span>
+<span class="a">+                Text(&quot;${status.paragraphsDropped} paragraphs of the book were never narrated &quot; +</span>
+<span class="a">+                    &quot;(front matter, notes) and were left out.&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            }</span>
+<span class="a">+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {</span>
+<span class="a">+                Button(onClick = onSave) { Text(&quot;Save .srt&quot;) }</span>
+<span class="a">+                OutlinedButton(onClick = onShare) { Text(&quot;Share&quot;) }</span>
+<span class="a">+            }</span>
+<span class="a">+            Text(&quot;In Hoshi Reader: long-press the book, Match, and choose the saved .srt.&quot;,</span>
+<span class="a">+                style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+        }</span>
+<span class="a">+        Phase.FAILED -&gt; Text(&quot;Failed: ${status.detail}&quot;, fontWeight = FontWeight.Bold)</span>
+<span class="a">+        Phase.CANCELLED -&gt; Text(status.detail)</span>
+<span class="a">+        else -&gt; {}</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+private fun share(context: Context, srt: File) {</span>
+<span class="a">+    val uri = FileProvider.getUriForFile(context, &quot;${context.packageName}.files&quot;, srt)</span>
+<span class="a">+    val send = Intent(Intent.ACTION_SEND)</span>
+<span class="a">+        .setType(&quot;application/x-subrip&quot;)</span>
+<span class="a">+        .putExtra(Intent.EXTRA_STREAM, uri)</span>
+<span class="a">+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)</span>
+<span class="a">+    context.startActivity(Intent.createChooser(send, srt.name))</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/audio/AudioDecoder.kt b/app/src/main/kotlin/space/subread/app/audio/AudioDecoder.kt
+new file mode 100644
+index 0000000..0eaf5b4
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/audio/AudioDecoder.kt
+<span class="h">@@ -0,0 +1,218 @@</span>
+<span class="a">+package space.subread.app.audio</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.media.MediaCodec</span>
+<span class="a">+import android.media.MediaExtractor</span>
+<span class="a">+import android.media.MediaFormat</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import java.io.Closeable</span>
+<span class="a">+import java.nio.ByteOrder</span>
+<span class="a">+import kotlin.math.abs</span>
+<span class="a">+import kotlin.math.max</span>
+<span class="a">+import kotlin.math.min</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Streams any audio file the platform can play as 16 kHz mono float chunks,</span>
+<span class="a">+ * which is the only thing the speech model accepts.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A ten-hour book is over two gigabytes as PCM, so it is never held whole:</span>
+<span class="a">+ * each call to [next] decodes a couple of minutes, cuts at the quietest moment</span>
+<span class="a">+ * near the end (so no word is split across two transcriptions) and carries the</span>
+<span class="a">+ * remainder into the next chunk.</span>
+<span class="a">+ */</span>
+<span class="a">+class AudioDecoder(context: Context, uri: Uri, startAtSeconds: Double = 0.0) : Closeable {</span>
+<span class="a">+</span>
+<span class="a">+    class Chunk(val samples: FloatArray, val startSeconds: Double) {</span>
+<span class="a">+        val endSeconds: Double get() = startSeconds + samples.size / TARGET_RATE.toDouble()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private val extractor = MediaExtractor()</span>
+<span class="a">+    private val codec: MediaCodec</span>
+<span class="a">+    private val info = MediaCodec.BufferInfo()</span>
+<span class="a">+</span>
+<span class="a">+    val durationSeconds: Double</span>
+<span class="a">+    private var sourceRate: Int</span>
+<span class="a">+    private var channels: Int</span>
+<span class="a">+</span>
+<span class="a">+    private var inputDone = false</span>
+<span class="a">+    private var outputDone = false</span>
+<span class="a">+</span>
+<span class="a">+    /** Decoded, mono, still at the source rate; what did not fit the last chunk. */</span>
+<span class="a">+    private var pending = FloatBuffer()</span>
+<span class="a">+    /** Time of pending[0], in seconds. Taken from the decoder, so seeking stays honest. */</span>
+<span class="a">+    private var pendingStart = -1.0</span>
+<span class="a">+    /**</span>
+<span class="a">+     * A seek lands on the frame *before* the one asked for. Audio ahead of this</span>
+<span class="a">+     * point was transcribed in an earlier session and is thrown away, or the</span>
+<span class="a">+     * resumed chunk would overlap the last one and repeat its final words.</span>
+<span class="a">+     */</span>
+<span class="a">+    private val skipUntil = startAtSeconds</span>
+<span class="a">+</span>
+<span class="a">+    init {</span>
+<span class="a">+        extractor.setDataSource(context, uri, null)</span>
+<span class="a">+        val track = (0 until extractor.trackCount).firstOrNull {</span>
+<span class="a">+            extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME).orEmpty().startsWith(&quot;audio/&quot;)</span>
+<span class="a">+        } ?: throw IllegalArgumentException(&quot;No audio track in this file.&quot;)</span>
+<span class="a">+        extractor.selectTrack(track)</span>
+<span class="a">+</span>
+<span class="a">+        val format = extractor.getTrackFormat(track)</span>
+<span class="a">+        durationSeconds = if (format.containsKey(MediaFormat.KEY_DURATION))</span>
+<span class="a">+            format.getLong(MediaFormat.KEY_DURATION) / 1e6 else 0.0</span>
+<span class="a">+        sourceRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)</span>
+<span class="a">+        channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)</span>
+<span class="a">+</span>
+<span class="a">+        if (startAtSeconds &gt; 0) {</span>
+<span class="a">+            extractor.seekTo((startAtSeconds * 1e6).toLong(), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)</span>
+<span class="a">+        codec.configure(format, null, null, 0)</span>
+<span class="a">+        codec.start()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The next chunk, or null at the end of the file. */</span>
+<span class="a">+    fun next(targetSeconds: Int = CHUNK_SECONDS): Chunk? {</span>
+<span class="a">+        // Re-read the rate each time round: HE-AAC files announce half of what</span>
+<span class="a">+        // the decoder actually produces, and only say so once decoding starts.</span>
+<span class="a">+        while (pending.size &lt; targetSeconds.toLong() * sourceRate &amp;&amp; !outputDone) pump()</span>
+<span class="a">+        if (pending.size == 0) return null</span>
+<span class="a">+        val want = targetSeconds.toLong() * sourceRate</span>
+<span class="a">+</span>
+<span class="a">+        val cut = if (outputDone &amp;&amp; pending.size &lt;= want) pending.size</span>
+<span class="a">+        else quietestPoint(pending, sourceRate, min(want, pending.size.toLong()).toInt())</span>
+<span class="a">+</span>
+<span class="a">+        val head = pending.take(cut)</span>
+<span class="a">+        val start = pendingStart</span>
+<span class="a">+        pending = pending.drop(cut)</span>
+<span class="a">+        pendingStart = start + cut / sourceRate.toDouble()</span>
+<span class="a">+        return Chunk(resample(head, sourceRate), start)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun pump() {</span>
+<span class="a">+        if (!inputDone) {</span>
+<span class="a">+            val i = codec.dequeueInputBuffer(10_000)</span>
+<span class="a">+            if (i &gt;= 0) {</span>
+<span class="a">+                val buffer = codec.getInputBuffer(i)!!</span>
+<span class="a">+                val n = extractor.readSampleData(buffer, 0)</span>
+<span class="a">+                if (n &lt; 0) {</span>
+<span class="a">+                    codec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)</span>
+<span class="a">+                    inputDone = true</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    codec.queueInputBuffer(i, 0, n, extractor.sampleTime, 0)</span>
+<span class="a">+                    extractor.advance()</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        when (val o = codec.dequeueOutputBuffer(info, 10_000)) {</span>
+<span class="a">+            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -&gt; {</span>
+<span class="a">+                // The container can be wrong about these; the decoder is not.</span>
+<span class="a">+                val f = codec.outputFormat</span>
+<span class="a">+                sourceRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)</span>
+<span class="a">+                channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)</span>
+<span class="a">+            }</span>
+<span class="a">+            in 0..Int.MAX_VALUE -&gt; {</span>
+<span class="a">+                if (info.size &gt; 0) {</span>
+<span class="a">+                    val bufferStart = info.presentationTimeUs / 1e6</span>
+<span class="a">+                    val shorts = codec.getOutputBuffer(o)!!.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()</span>
+<span class="a">+                    val frames = shorts.remaining() / channels</span>
+<span class="a">+                    val skip = if (bufferStart &gt;= skipUntil) 0</span>
+<span class="a">+                    else min(frames, ((skipUntil - bufferStart) * sourceRate).toInt())</span>
+<span class="a">+                    shorts.position(shorts.position() + skip * channels)</span>
+<span class="a">+                    if (frames &gt; skip &amp;&amp; pendingStart &lt; 0) {</span>
+<span class="a">+                        pendingStart = bufferStart + skip / sourceRate.toDouble()</span>
+<span class="a">+                    }</span>
+<span class="a">+                    pending.ensure(frames - skip)</span>
+<span class="a">+                    for (f in skip until frames) {</span>
+<span class="a">+                        var sum = 0</span>
+<span class="a">+                        for (c in 0 until channels) sum += shorts.get()</span>
+<span class="a">+                        pending.add(sum / (32768f * channels))</span>
+<span class="a">+                    }</span>
+<span class="a">+                }</span>
+<span class="a">+                codec.releaseOutputBuffer(o, false)</span>
+<span class="a">+                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun close() {</span>
+<span class="a">+        runCatching { codec.stop() }</span>
+<span class="a">+        runCatching { codec.release() }</span>
+<span class="a">+        runCatching { extractor.release() }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    companion object {</span>
+<span class="a">+        const val TARGET_RATE = 16_000</span>
+<span class="a">+        const val CHUNK_SECONDS = 120</span>
+<span class="a">+</span>
+<span class="a">+        /** How far back from the end of a chunk to look for a pause. */</span>
+<span class="a">+        private const val SEARCH_SECONDS = 12</span>
+<span class="a">+        private const val WINDOW_SECONDS = 0.25</span>
+<span class="a">+</span>
+<span class="a">+        /** Index at which to cut: the middle of the quietest quarter second near [limit]. */</span>
+<span class="a">+        internal fun quietestPoint(buf: FloatBuffer, rate: Int, limit: Int): Int {</span>
+<span class="a">+            val window = (WINDOW_SECONDS * rate).toInt()</span>
+<span class="a">+            val from = max(0, limit - SEARCH_SECONDS * rate)</span>
+<span class="a">+            if (limit - from &lt;= window * 2) return limit</span>
+<span class="a">+</span>
+<span class="a">+            var energy = 0.0</span>
+<span class="a">+            for (i in from until from + window) energy += abs(buf[i])</span>
+<span class="a">+            var best = energy</span>
+<span class="a">+            var bestAt = from</span>
+<span class="a">+            var i = from</span>
+<span class="a">+            while (i + window &lt; limit) {</span>
+<span class="a">+                energy += abs(buf[i + window]) - abs(buf[i])</span>
+<span class="a">+                i++</span>
+<span class="a">+                if (energy &lt; best) { best = energy; bestAt = i }</span>
+<span class="a">+            }</span>
+<span class="a">+            return bestAt + window / 2</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /**</span>
+<span class="a">+         * To 16 kHz with a triangular kernel as wide as the rate ratio: a</span>
+<span class="a">+         * low-pass and an interpolator in one pass. Plenty for speech</span>
+<span class="a">+         * recognition, and it costs a handful of multiplies per sample.</span>
+<span class="a">+         */</span>
+<span class="a">+        internal fun resample(src: FloatArray, rate: Int): FloatArray {</span>
+<span class="a">+            if (rate == TARGET_RATE) return src</span>
+<span class="a">+            val step = rate / TARGET_RATE.toDouble()</span>
+<span class="a">+            val half = max(step, 1.0)</span>
+<span class="a">+            val out = FloatArray((src.size / step).toInt())</span>
+<span class="a">+            for (o in out.indices) {</span>
+<span class="a">+                val centre = o * step</span>
+<span class="a">+                val lo = max(0, (centre - half).toInt() + 1)</span>
+<span class="a">+                val hi = min(src.size - 1, (centre + half).toInt())</span>
+<span class="a">+                var sum = 0.0</span>
+<span class="a">+                var weight = 0.0</span>
+<span class="a">+                for (k in lo..hi) {</span>
+<span class="a">+                    val w = 1.0 - abs(k - centre) / half</span>
+<span class="a">+                    if (w &gt; 0) { sum += w * src[k]; weight += w }</span>
+<span class="a">+                }</span>
+<span class="a">+                out[o] = if (weight &gt; 0) (sum / weight).toFloat() else 0f</span>
+<span class="a">+            }</span>
+<span class="a">+            return out</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A growable float array. Minutes of audio as boxed Floats would be absurd. */</span>
+<span class="a">+internal class FloatBuffer(capacity: Int = 1 shl 16) {</span>
+<span class="a">+    private var data = FloatArray(capacity)</span>
+<span class="a">+    var size = 0</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    operator fun get(i: Int) = data[i]</span>
+<span class="a">+</span>
+<span class="a">+    fun ensure(extra: Int) {</span>
+<span class="a">+        if (size + extra &gt; data.size) data = data.copyOf(max(data.size * 2, size + extra))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun add(v: Float) { data[size++] = v }</span>
+<span class="a">+</span>
+<span class="a">+    fun take(n: Int): FloatArray = data.copyOf(n)</span>
+<span class="a">+</span>
+<span class="a">+    fun drop(n: Int): FloatBuffer = FloatBuffer(max(size - n, 1 shl 16)).also {</span>
+<span class="a">+        System.arraycopy(data, n, it.data, 0, size - n)</span>
+<span class="a">+        it.size = size - n</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/job/AlignService.kt b/app/src/main/kotlin/space/subread/app/job/AlignService.kt
+new file mode 100644
+index 0000000..7dc24b1
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/job/AlignService.kt
+<span class="h">@@ -0,0 +1,136 @@</span>
+<span class="a">+package space.subread.app.job</span>
+<span class="a">+</span>
+<span class="a">+import android.app.Notification</span>
+<span class="a">+import android.app.NotificationChannel</span>
+<span class="a">+import android.app.NotificationManager</span>
+<span class="a">+import android.app.PendingIntent</span>
+<span class="a">+import android.app.Service</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.content.Intent</span>
+<span class="a">+import android.content.pm.ServiceInfo</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.os.Build</span>
+<span class="a">+import android.os.IBinder</span>
+<span class="a">+import android.os.PowerManager</span>
+<span class="a">+import androidx.core.app.NotificationCompat</span>
+<span class="a">+import androidx.core.app.ServiceCompat</span>
+<span class="a">+import androidx.core.content.ContextCompat</span>
+<span class="a">+import kotlinx.coroutines.CoroutineScope</span>
+<span class="a">+import kotlinx.coroutines.Dispatchers</span>
+<span class="a">+import kotlinx.coroutines.SupervisorJob</span>
+<span class="a">+import kotlinx.coroutines.cancel</span>
+<span class="a">+import kotlinx.coroutines.flow.collectLatest</span>
+<span class="a">+import kotlinx.coroutines.launch</span>
+<span class="a">+import space.subread.app.MainActivity</span>
+<span class="a">+import space.subread.app.R</span>
+<span class="a">+import kotlin.concurrent.thread</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Keeps the job alive with the screen off and the app in the background.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A foreground service of type &quot;special use&quot;: transcription runs for hours,</span>
+<span class="a">+ * and the other candidate types (data sync, media processing) are cut off by</span>
+<span class="a">+ * the system after six.</span>
+<span class="a">+ */</span>
+<span class="a">+class AlignService : Service() {</span>
+<span class="a">+</span>
+<span class="a">+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)</span>
+<span class="a">+    private var wakeLock: PowerManager.WakeLock? = null</span>
+<span class="a">+</span>
+<span class="a">+    override fun onBind(intent: Intent?): IBinder? = null</span>
+<span class="a">+</span>
+<span class="a">+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {</span>
+<span class="a">+        if (intent?.action == ACTION_CANCEL) {</span>
+<span class="a">+            Job.cancel()</span>
+<span class="a">+            return START_NOT_STICKY</span>
+<span class="a">+        }</span>
+<span class="a">+        val audio = intent?.getStringExtra(EXTRA_AUDIO)</span>
+<span class="a">+        val book = intent?.getStringExtra(EXTRA_BOOK)</span>
+<span class="a">+        if (audio == null || book == null || Job.status.value.running) {</span>
+<span class="a">+            if (!Job.status.value.running) stopSelf()</span>
+<span class="a">+            return START_NOT_STICKY</span>
+<span class="a">+        }</span>
+<span class="a">+        val language = intent.getStringExtra(EXTRA_LANGUAGE) ?: &quot;auto&quot;</span>
+<span class="a">+</span>
+<span class="a">+        createChannel()</span>
+<span class="a">+        ServiceCompat.startForeground(</span>
+<span class="a">+            this, NOTIFICATION_ID, notification(Job.status.value),</span>
+<span class="a">+            if (Build.VERSION.SDK_INT &gt;= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0,</span>
+<span class="a">+        )</span>
+<span class="a">+</span>
+<span class="a">+        // Without this the CPU sleeps a few minutes after the screen goes off,</span>
+<span class="a">+        // and a four-hour job becomes a four-day one.</span>
+<span class="a">+        wakeLock = getSystemService(PowerManager::class.java)</span>
+<span class="a">+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, &quot;subread:align&quot;)</span>
+<span class="a">+            .apply { acquire(24 * 60 * 60 * 1000L) }</span>
+<span class="a">+</span>
+<span class="a">+        scope.launch {</span>
+<span class="a">+            val manager = getSystemService(NotificationManager::class.java)</span>
+<span class="a">+            Job.status.collectLatest { manager.notify(NOTIFICATION_ID, notification(it)) }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        thread(name = &quot;subread-job&quot;) {</span>
+<span class="a">+            Job.run(applicationContext, Uri.parse(audio), Uri.parse(book), language)</span>
+<span class="a">+            wakeLock?.let { if (it.isHeld) it.release() }</span>
+<span class="a">+            // Leave the final notification up: &quot;done&quot; is worth seeing hours later.</span>
+<span class="a">+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_DETACH)</span>
+<span class="a">+            stopSelf()</span>
+<span class="a">+        }</span>
+<span class="a">+        return START_NOT_STICKY</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun onDestroy() {</span>
+<span class="a">+        scope.cancel()</span>
+<span class="a">+        wakeLock?.let { if (it.isHeld) it.release() }</span>
+<span class="a">+        super.onDestroy()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun createChannel() {</span>
+<span class="a">+        val channel = NotificationChannel(CHANNEL, getString(R.string.channel_progress),</span>
+<span class="a">+            NotificationManager.IMPORTANCE_LOW)</span>
+<span class="a">+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun notification(status: JobStatus): Notification {</span>
+<span class="a">+        val open = PendingIntent.getActivity(</span>
+<span class="a">+            this, 0, Intent(this, MainActivity::class.java),</span>
+<span class="a">+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,</span>
+<span class="a">+        )</span>
+<span class="a">+        val cancel = PendingIntent.getService(</span>
+<span class="a">+            this, 1, Intent(this, AlignService::class.java).setAction(ACTION_CANCEL),</span>
+<span class="a">+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,</span>
+<span class="a">+        )</span>
+<span class="a">+        val eta = status.etaSeconds?.let { &quot; · about ${Job.clock(it.toDouble())} left&quot; }.orEmpty()</span>
+<span class="a">+        return NotificationCompat.Builder(this, CHANNEL)</span>
+<span class="a">+            .setSmallIcon(R.drawable.ic_notification)</span>
+<span class="a">+            .setContentTitle(getString(R.string.app_name))</span>
+<span class="a">+            .setContentText(status.detail + eta)</span>
+<span class="a">+            .setContentIntent(open)</span>
+<span class="a">+            .setOnlyAlertOnce(true)</span>
+<span class="a">+            .setOngoing(status.running)</span>
+<span class="a">+            .apply {</span>
+<span class="a">+                if (status.running) {</span>
+<span class="a">+                    setProgress(1000, (status.fraction * 1000).toInt(), status.phase == Phase.PREPARING)</span>
+<span class="a">+                    addAction(0, getString(R.string.stop), cancel)</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+            .build()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    companion object {</span>
+<span class="a">+        private const val CHANNEL = &quot;progress&quot;</span>
+<span class="a">+        private const val NOTIFICATION_ID = 1</span>
+<span class="a">+        private const val ACTION_CANCEL = &quot;space.subread.app.CANCEL&quot;</span>
+<span class="a">+        private const val EXTRA_AUDIO = &quot;audio&quot;</span>
+<span class="a">+        private const val EXTRA_BOOK = &quot;book&quot;</span>
+<span class="a">+        private const val EXTRA_LANGUAGE = &quot;language&quot;</span>
+<span class="a">+</span>
+<span class="a">+        fun start(context: Context, audio: Uri, book: Uri, language: String) {</span>
+<span class="a">+            val intent = Intent(context, AlignService::class.java)</span>
+<span class="a">+                .putExtra(EXTRA_AUDIO, audio.toString())</span>
+<span class="a">+                .putExtra(EXTRA_BOOK, book.toString())</span>
+<span class="a">+                .putExtra(EXTRA_LANGUAGE, language)</span>
+<span class="a">+            ContextCompat.startForegroundService(context, intent)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/job/Job.kt b/app/src/main/kotlin/space/subread/app/job/Job.kt
+new file mode 100644
+index 0000000..b088bfc
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/job/Job.kt
+<span class="h">@@ -0,0 +1,138 @@</span>
+<span class="a">+package space.subread.app.job</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.os.SystemClock</span>
+<span class="a">+import kotlinx.coroutines.flow.MutableStateFlow</span>
+<span class="a">+import kotlinx.coroutines.flow.StateFlow</span>
+<span class="a">+import space.subread.app.audio.AudioDecoder</span>
+<span class="a">+import space.subread.app.whisper.TranscriptionCancelled</span>
+<span class="a">+import space.subread.app.whisper.Whisper</span>
+<span class="a">+import space.subread.core.BookAligner</span>
+<span class="a">+import space.subread.core.BookText</span>
+<span class="a">+import space.subread.core.Language</span>
+<span class="a">+import space.subread.core.Srt</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+enum class Phase { IDLE, PREPARING, TRANSCRIBING, ALIGNING, DONE, FAILED, CANCELLED }</span>
+<span class="a">+</span>
+<span class="a">+data class JobStatus(</span>
+<span class="a">+    val phase: Phase = Phase.IDLE,</span>
+<span class="a">+    val detail: String = &quot;&quot;,</span>
+<span class="a">+    /** 0..1 over the whole job. */</span>
+<span class="a">+    val fraction: Float = 0f,</span>
+<span class="a">+    val etaSeconds: Long? = null,</span>
+<span class="a">+    /** Audio seconds transcribed per wall-clock second. */</span>
+<span class="a">+    val speed: Double? = null,</span>
+<span class="a">+    val srt: File? = null,</span>
+<span class="a">+    val cues: Int = 0,</span>
+<span class="a">+    val matchRate: Double? = null,</span>
+<span class="a">+    val paragraphsDropped: Int = 0,</span>
+<span class="a">+) {</span>
+<span class="a">+    val running: Boolean get() = phase == Phase.PREPARING || phase == Phase.TRANSCRIBING || phase == Phase.ALIGNING</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The one job this app runs at a time, observable from the UI and the service alike. */</span>
+<span class="a">+object Job {</span>
+<span class="a">+    private val state = MutableStateFlow(JobStatus())</span>
+<span class="a">+    val status: StateFlow&lt;JobStatus&gt; = state</span>
+<span class="a">+</span>
+<span class="a">+    @Volatile private var cancelled = false</span>
+<span class="a">+</span>
+<span class="a">+    fun cancel() {</span>
+<span class="a">+        cancelled = true</span>
+<span class="a">+        Whisper.cancel()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun clear() { if (!state.value.running) state.value = JobStatus() }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Transcribe (or resume transcribing) [audio], align it to [book], write</span>
+<span class="a">+     * the subtitles. Blocks for as long as that takes; call from a worker thread.</span>
+<span class="a">+     *</span>
+<span class="a">+     * @param language a whisper language code, or &quot;auto&quot;</span>
+<span class="a">+     */</span>
+<span class="a">+    fun run(context: Context, audio: Uri, book: Uri, language: String) {</span>
+<span class="a">+        cancelled = false</span>
+<span class="a">+        state.value = JobStatus(Phase.PREPARING, &quot;Loading the speech model&quot;)</span>
+<span class="a">+        try {</span>
+<span class="a">+            val store = TranscriptStore.forAudio(context, audio)</span>
+<span class="a">+            var lang = if (language == &quot;auto&quot;) store.language ?: &quot;auto&quot; else language</span>
+<span class="a">+</span>
+<span class="a">+            if (!store.complete) transcribe(context, audio, store, lang) { lang = it }</span>
+<span class="a">+            if (lang == &quot;auto&quot;) lang = store.language ?: &quot;en&quot;</span>
+<span class="a">+</span>
+<span class="a">+            state.value = state.value.copy(phase = Phase.ALIGNING, detail = &quot;Matching the book to the narration&quot;,</span>
+<span class="a">+                fraction = 0.97f, etaSeconds = null)</span>
+<span class="a">+            val (bookName, _) = TranscriptStore.describe(context, book)</span>
+<span class="a">+            val paragraphs = context.contentResolver.openInputStream(book)!!.use { BookText.read(it, bookName) }</span>
+<span class="a">+            if (paragraphs.isEmpty()) throw IllegalStateException(&quot;No text could be read from $bookName.&quot;)</span>
+<span class="a">+</span>
+<span class="a">+            val result = BookAligner.align(store.segments(), paragraphs, Language.of(lang))</span>
+<span class="a">+</span>
+<span class="a">+            val (audioName, _) = TranscriptStore.describe(context, audio)</span>
+<span class="a">+            val out = File(context.filesDir, &quot;subtitles&quot;).apply { mkdirs() }</span>
+<span class="a">+                .resolve(audioName.substringBeforeLast(&#x27;.&#x27;) + &quot;.$lang.srt&quot;)</span>
+<span class="a">+            out.writeText(Srt.write(result.cues))</span>
+<span class="a">+</span>
+<span class="a">+            state.value = JobStatus(</span>
+<span class="a">+                Phase.DONE, &quot;Done&quot;, 1f, srt = out, cues = result.cues.size,</span>
+<span class="a">+                matchRate = BookAligner.matchRate(result.cues), paragraphsDropped = result.paragraphsDropped,</span>
+<span class="a">+            )</span>
+<span class="a">+        } catch (e: TranscriptionCancelled) {</span>
+<span class="a">+            state.value = JobStatus(Phase.CANCELLED, &quot;Stopped. Progress is saved; start again to continue.&quot;)</span>
+<span class="a">+        } catch (e: Throwable) {</span>
+<span class="a">+            state.value = JobStatus(Phase.FAILED, e.message ?: e.javaClass.simpleName)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun transcribe(</span>
+<span class="a">+        context: Context, audio: Uri, store: TranscriptStore, language: String, onLanguage: (String) -&gt; Unit,</span>
+<span class="a">+    ) {</span>
+<span class="a">+        var lang = language</span>
+<span class="a">+        Whisper.open(context).use { whisper -&gt;</span>
+<span class="a">+            AudioDecoder(context, audio, startAtSeconds = store.doneUntil).use { decoder -&gt;</span>
+<span class="a">+                val total = decoder.durationSeconds</span>
+<span class="a">+                val resumedAt = store.doneUntil</span>
+<span class="a">+                val started = SystemClock.elapsedRealtime()</span>
+<span class="a">+</span>
+<span class="a">+                while (true) {</span>
+<span class="a">+                    if (cancelled) throw TranscriptionCancelled()</span>
+<span class="a">+                    val chunk = decoder.next() ?: break</span>
+<span class="a">+                    report(chunk.startSeconds, total, resumedAt, started)</span>
+<span class="a">+</span>
+<span class="a">+                    val segments = whisper.transcribe(chunk.samples, lang, chunk.startSeconds)</span>
+<span class="a">+                    // Detect once, then hold it: a stretch of music must not be</span>
+<span class="a">+                    // allowed to flip the rest of the book into another language.</span>
+<span class="a">+                    if (lang == &quot;auto&quot;) {</span>
+<span class="a">+                        lang = whisper.detectedLanguage.ifEmpty { &quot;en&quot; }</span>
+<span class="a">+                        onLanguage(lang)</span>
+<span class="a">+                    }</span>
+<span class="a">+                    store.append(segments, chunk.endSeconds, lang)</span>
+<span class="a">+                    report(chunk.endSeconds, total, resumedAt, started)</span>
+<span class="a">+                }</span>
+<span class="a">+                store.finish()</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun report(at: Double, total: Double, resumedAt: Double, startedMs: Long) {</span>
+<span class="a">+        val elapsed = (SystemClock.elapsedRealtime() - startedMs) / 1000.0</span>
+<span class="a">+        val done = at - resumedAt</span>
+<span class="a">+        val speed = if (elapsed &gt; 5 &amp;&amp; done &gt; 0) done / elapsed else null</span>
+<span class="a">+        val eta = if (speed != null &amp;&amp; total &gt; 0) ((total - at) / speed).toLong().coerceAtLeast(0) else null</span>
+<span class="a">+        state.value = JobStatus(</span>
+<span class="a">+            Phase.TRANSCRIBING,</span>
+<span class="a">+            &quot;Listening: ${clock(at)}&quot; + if (total &gt; 0) &quot; of ${clock(total)}&quot; else &quot;&quot;,</span>
+<span class="a">+            // Alignment takes seconds; nearly all of the bar is transcription.</span>
+<span class="a">+            fraction = if (total &gt; 0) (at / total * 0.96).toFloat().coerceIn(0f, 0.96f) else 0f,</span>
+<span class="a">+            etaSeconds = eta, speed = speed,</span>
+<span class="a">+        )</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun clock(seconds: Double): String {</span>
+<span class="a">+        val s = seconds.toLong()</span>
+<span class="a">+        return if (s &gt;= 3600) &quot;%d:%02d:%02d&quot;.format(s / 3600, s / 60 % 60, s % 60)</span>
+<span class="a">+        else &quot;%d:%02d&quot;.format(s / 60, s % 60)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/job/TranscriptStore.kt b/app/src/main/kotlin/space/subread/app/job/TranscriptStore.kt
+new file mode 100644
+index 0000000..7fbb9d2
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/job/TranscriptStore.kt
+<span class="h">@@ -0,0 +1,120 @@</span>
+<span class="a">+package space.subread.app.job</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.provider.OpenableColumns</span>
+<span class="a">+import org.json.JSONObject</span>
+<span class="a">+import space.subread.core.TranscriptSegment</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+import java.security.MessageDigest</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * What has been transcribed so far, on disk, per audio file.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Transcribing a book takes hours and Android is entitled to kill the process</span>
+<span class="a">+ * at any point in them. Every finished chunk is appended here, so a restart</span>
+<span class="a">+ * picks up at the last chunk rather than at the beginning - and aligning the</span>
+<span class="a">+ * same audio against a different edition of the book costs seconds, not hours,</span>
+<span class="a">+ * because the transcript depends on the audio alone.</span>
+<span class="a">+ */</span>
+<span class="a">+class TranscriptStore private constructor(private val dir: File) {</span>
+<span class="a">+</span>
+<span class="a">+    private val segmentsFile = File(dir, &quot;segments.jsonl&quot;)</span>
+<span class="a">+    private val stateFile = File(dir, &quot;state.json&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    /** Audio before this point (seconds) is transcribed and saved. */</span>
+<span class="a">+    var doneUntil: Double = 0.0</span>
+<span class="a">+        private set</span>
+<span class="a">+    var language: String? = null</span>
+<span class="a">+        private set</span>
+<span class="a">+    var complete: Boolean = false</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    init {</span>
+<span class="a">+        dir.mkdirs()</span>
+<span class="a">+        if (stateFile.exists()) runCatching {</span>
+<span class="a">+            val o = JSONObject(stateFile.readText())</span>
+<span class="a">+            doneUntil = o.optDouble(&quot;doneUntil&quot;, 0.0)</span>
+<span class="a">+            language = o.optString(&quot;language&quot;).ifEmpty { null }</span>
+<span class="a">+            complete = o.optBoolean(&quot;complete&quot;, false)</span>
+<span class="a">+        }</span>
+<span class="a">+        // A chunk&#x27;s segments are written before its state. Killed in between,</span>
+<span class="a">+        // the file holds segments past doneUntil that are about to be</span>
+<span class="a">+        // transcribed a second time; remove them now or they end up doubled.</span>
+<span class="a">+        if (segmentsFile.exists()) {</span>
+<span class="a">+            val kept = segmentsFile.readLines().filter { line -&gt;</span>
+<span class="a">+                runCatching { JSONObject(line).getDouble(&quot;s&quot;) &lt; doneUntil }.getOrDefault(false)</span>
+<span class="a">+            }</span>
+<span class="a">+            segmentsFile.writeText(kept.joinToString(&quot;&quot;) { it + &quot;\n&quot; })</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun segments(): List&lt;TranscriptSegment&gt; {</span>
+<span class="a">+        if (!segmentsFile.exists()) return emptyList()</span>
+<span class="a">+        return segmentsFile.readLines().mapNotNull { line -&gt;</span>
+<span class="a">+            runCatching {</span>
+<span class="a">+                val o = JSONObject(line)</span>
+<span class="a">+                TranscriptSegment(o.getString(&quot;t&quot;), o.getDouble(&quot;s&quot;), o.getDouble(&quot;e&quot;))</span>
+<span class="a">+            }.getOrNull()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun append(chunk: List&lt;TranscriptSegment&gt;, until: Double, language: String?) {</span>
+<span class="a">+        segmentsFile.appendText(chunk.joinToString(&quot;&quot;) { s -&gt;</span>
+<span class="a">+            JSONObject().put(&quot;s&quot;, s.start).put(&quot;e&quot;, s.end).put(&quot;t&quot;, s.text).toString() + &quot;\n&quot;</span>
+<span class="a">+        })</span>
+<span class="a">+        doneUntil = until</span>
+<span class="a">+        if (language != null) this.language = language</span>
+<span class="a">+        save()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun finish() {</span>
+<span class="a">+        complete = true</span>
+<span class="a">+        save()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun reset() {</span>
+<span class="a">+        segmentsFile.delete()</span>
+<span class="a">+        stateFile.delete()</span>
+<span class="a">+        doneUntil = 0.0</span>
+<span class="a">+        language = null</span>
+<span class="a">+        complete = false</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun save() {</span>
+<span class="a">+        val tmp = File(dir, &quot;state.json.tmp&quot;)</span>
+<span class="a">+        tmp.writeText(</span>
+<span class="a">+            JSONObject().put(&quot;doneUntil&quot;, doneUntil).put(&quot;language&quot;, language ?: &quot;&quot;)</span>
+<span class="a">+                .put(&quot;complete&quot;, complete).toString()</span>
+<span class="a">+        )</span>
+<span class="a">+        tmp.renameTo(stateFile)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    companion object {</span>
+<span class="a">+        fun forAudio(context: Context, audio: Uri): TranscriptStore {</span>
+<span class="a">+            val (name, size) = describe(context, audio)</span>
+<span class="a">+            // Name and size, not the URI: the same file picked again through a</span>
+<span class="a">+            // different route gets a different URI and should still resume.</span>
+<span class="a">+            val key = MessageDigest.getInstance(&quot;SHA-1&quot;).digest(&quot;$name|$size&quot;.toByteArray())</span>
+<span class="a">+                .joinToString(&quot;&quot;) { &quot;%02x&quot;.format(it) }.take(20)</span>
+<span class="a">+            return TranscriptStore(File(context.filesDir, &quot;transcripts/$key&quot;))</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /** Display name and byte size of a picked document. */</span>
+<span class="a">+        fun describe(context: Context, uri: Uri): Pair&lt;String, Long&gt; {</span>
+<span class="a">+            var name = uri.lastPathSegment ?: &quot;file&quot;</span>
+<span class="a">+            var size = -1L</span>
+<span class="a">+            runCatching {</span>
+<span class="a">+                context.contentResolver.query(uri, null, null, null, null)?.use { c -&gt;</span>
+<span class="a">+                    if (c.moveToFirst()) {</span>
+<span class="a">+                        val n = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)</span>
+<span class="a">+                        val s = c.getColumnIndex(OpenableColumns.SIZE)</span>
+<span class="a">+                        if (n &gt;= 0 &amp;&amp; !c.isNull(n)) name = c.getString(n)</span>
+<span class="a">+                        if (s &gt;= 0 &amp;&amp; !c.isNull(s)) size = c.getLong(s)</span>
+<span class="a">+                    }</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+            return name to size</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/whisper/Whisper.kt b/app/src/main/kotlin/space/subread/app/whisper/Whisper.kt
+new file mode 100644
+index 0000000..19ea2d1
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/whisper/Whisper.kt
+<span class="h">@@ -0,0 +1,127 @@</span>
+<span class="a">+package space.subread.app.whisper</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import space.subread.core.TranscriptSegment</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+/** JNI surface. See src/main/cpp/whisper_jni.c. */</span>
+<span class="a">+internal object WhisperLib {</span>
+<span class="a">+    external fun initContext(modelPath: String): Long</span>
+<span class="a">+    external fun freeContext(ptr: Long)</span>
+<span class="a">+    external fun transcribe(ptr: Long, samples: FloatArray, threads: Int, language: String): Int</span>
+<span class="a">+    external fun cancel()</span>
+<span class="a">+    external fun progress(): Int</span>
+<span class="a">+    external fun segmentCount(ptr: Long): Int</span>
+<span class="a">+    external fun segmentText(ptr: Long, index: Int): ByteArray</span>
+<span class="a">+    external fun segmentStart(ptr: Long, index: Int): Long</span>
+<span class="a">+    external fun segmentEnd(ptr: Long, index: Int): Long</span>
+<span class="a">+    external fun detectedLanguage(ptr: Long): String</span>
+<span class="a">+    external fun systemInfo(): String</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+class WhisperUnavailable(message: String) : Exception(message)</span>
+<span class="a">+class TranscriptionCancelled : Exception(&quot;cancelled&quot;)</span>
+<span class="a">+</span>
+<span class="a">+/** A loaded model. Not thread-safe: one transcription at a time. */</span>
+<span class="a">+class Whisper private constructor(private var ptr: Long) : AutoCloseable {</span>
+<span class="a">+</span>
+<span class="a">+    /** The language whisper settled on in the last call (&quot;ja&quot;, &quot;ru&quot;, ...). */</span>
+<span class="a">+    val detectedLanguage: String get() = WhisperLib.detectedLanguage(ptr)</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * @param samples 16 kHz mono, -1..1</span>
+<span class="a">+     * @param offset where this buffer starts in the whole recording, seconds</span>
+<span class="a">+     */</span>
+<span class="a">+    fun transcribe(samples: FloatArray, language: String, offset: Double): List&lt;TranscriptSegment&gt; {</span>
+<span class="a">+        when (val rc = WhisperLib.transcribe(ptr, samples, threads, language)) {</span>
+<span class="a">+            0 -&gt; {}</span>
+<span class="a">+            -1 -&gt; throw TranscriptionCancelled()</span>
+<span class="a">+            else -&gt; throw WhisperUnavailable(&quot;The speech model failed on this audio (code $rc).&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+        return (0 until WhisperLib.segmentCount(ptr)).mapNotNull { i -&gt;</span>
+<span class="a">+            // Lenient decode: the tiny model can end a segment mid-character.</span>
+<span class="a">+            val text = String(WhisperLib.segmentText(ptr, i), Charsets.UTF_8).replace(&quot;�&quot;, &quot;&quot;).trim()</span>
+<span class="a">+            if (text.isEmpty()) null</span>
+<span class="a">+            else TranscriptSegment(</span>
+<span class="a">+                text,</span>
+<span class="a">+                offset + WhisperLib.segmentStart(ptr, i) / 100.0,</span>
+<span class="a">+                offset + WhisperLib.segmentEnd(ptr, i) / 100.0,</span>
+<span class="a">+            )</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun close() {</span>
+<span class="a">+        if (ptr != 0L) WhisperLib.freeContext(ptr)</span>
+<span class="a">+        ptr = 0</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    companion object {</span>
+<span class="a">+        private const val MODEL_ASSET = &quot;models/ggml-tiny-q8_0.bin&quot;</span>
+<span class="a">+</span>
+<span class="a">+        /** 0..100 within the buffer currently being transcribed. */</span>
+<span class="a">+        val progress: Int get() = if (loaded) WhisperLib.progress() else 0</span>
+<span class="a">+</span>
+<span class="a">+        fun cancel() { if (loaded) WhisperLib.cancel() }</span>
+<span class="a">+</span>
+<span class="a">+        @Volatile private var loaded = false</span>
+<span class="a">+</span>
+<span class="a">+        val threads: Int by lazy { fastCores() }</span>
+<span class="a">+</span>
+<span class="a">+        fun open(context: Context): Whisper {</span>
+<span class="a">+            requireCpu()</span>
+<span class="a">+            if (!loaded) {</span>
+<span class="a">+                System.loadLibrary(&quot;subread_whisper&quot;)</span>
+<span class="a">+                loaded = true</span>
+<span class="a">+            }</span>
+<span class="a">+            val model = File(context.filesDir, &quot;ggml-tiny-q8_0.bin&quot;)</span>
+<span class="a">+            val asset = context.assets.openFd(MODEL_ASSET)</span>
+<span class="a">+            // whisper.cpp wants a path, and an asset inside the APK does not have one.</span>
+<span class="a">+            if (!model.exists() || model.length() != asset.length) {</span>
+<span class="a">+                asset.createInputStream().use { src -&gt; model.outputStream().use { src.copyTo(it) } }</span>
+<span class="a">+            }</span>
+<span class="a">+            asset.close()</span>
+<span class="a">+            val ptr = WhisperLib.initContext(model.absolutePath)</span>
+<span class="a">+            if (ptr == 0L) throw WhisperUnavailable(&quot;The speech model could not be loaded.&quot;)</span>
+<span class="a">+            return Whisper(ptr)</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /**</span>
+<span class="a">+         * The native library is built for ARMv8.2 with half-precision and</span>
+<span class="a">+         * dot-product instructions. Loading it without them is a crash with no</span>
+<span class="a">+         * message, so look first.</span>
+<span class="a">+         */</span>
+<span class="a">+        private fun requireCpu() {</span>
+<span class="a">+            val features = runCatching {</span>
+<span class="a">+                File(&quot;/proc/cpuinfo&quot;).readLines()</span>
+<span class="a">+                    .firstOrNull { it.startsWith(&quot;Features&quot;) }.orEmpty()</span>
+<span class="a">+                    .substringAfter(&#x27;:&#x27;).trim().split(&#x27; &#x27;).toSet()</span>
+<span class="a">+            }.getOrDefault(emptySet())</span>
+<span class="a">+            if (features.isEmpty()) return   // cannot tell; let it try</span>
+<span class="a">+            val missing = listOf(&quot;asimdhp&quot;, &quot;asimddp&quot;).filter { it !in features }</span>
+<span class="a">+            if (missing.isNotEmpty()) {</span>
+<span class="a">+                throw WhisperUnavailable(</span>
+<span class="a">+                    &quot;This phone&#x27;s processor is too old for on-device transcription &quot; +</span>
+<span class="a">+                        &quot;(needs ARMv8.2 half-precision and dot-product support).&quot;</span>
+<span class="a">+                )</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /**</span>
+<span class="a">+         * Threads to use: the fast cores only. whisper waits for its slowest</span>
+<span class="a">+         * thread at every layer, so adding little cores makes it slower, not</span>
+<span class="a">+         * faster. &quot;Fast&quot; is anything clocked above the slowest cluster.</span>
+<span class="a">+         */</span>
+<span class="a">+        private fun fastCores(): Int {</span>
+<span class="a">+            val max = (0 until Runtime.getRuntime().availableProcessors()).mapNotNull { cpu -&gt;</span>
+<span class="a">+                runCatching {</span>
+<span class="a">+                    File(&quot;/sys/devices/system/cpu/cpu$cpu/cpufreq/cpuinfo_max_freq&quot;).readText().trim().toLong()</span>
+<span class="a">+                }.getOrNull()</span>
+<span class="a">+            }</span>
+<span class="a">+            if (max.isEmpty()) return 4</span>
+<span class="a">+            val slowest = max.min()</span>
+<span class="a">+            val fast = max.count { it &gt; slowest }</span>
+<span class="a">+            // All cores alike (or unreadable clusters): use half, at most four.</span>
+<span class="a">+            return if (fast == 0) (max.size / 2).coerceIn(2, 4) else fast.coerceIn(2, 6)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/res/drawable/ic_launcher_foreground.xml b/app/src/main/res/drawable/ic_launcher_foreground.xml
+new file mode 100644
+index 0000000..1e6743f
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_launcher_foreground.xml
+<span class="h">@@ -0,0 +1,7 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;vector xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;</span>
+<span class="a">+    android:width=&quot;108dp&quot; android:height=&quot;108dp&quot;</span>
+<span class="a">+    android:viewportWidth=&quot;108&quot; android:viewportHeight=&quot;108&quot;&gt;</span>
+<span class="a">+    &lt;path android:fillColor=&quot;#000000&quot; android:pathData=&quot;M30,34 C38,30 46,30 53,34 L53,76 C46,72 38,72 30,76 Z M78,34 C70,30 62,30 55,34 L55,76 C62,72 70,72 78,76 Z&quot; /&gt;</span>
+<span class="a">+    &lt;path android:fillColor=&quot;#FFFFFF&quot; android:pathData=&quot;M35,50 h2 v10 h-2 Z M40,45 h2 v20 h-2 Z M45,52 h2 v6 h-2 Z M61,52 h2 v6 h-2 Z M66,45 h2 v20 h-2 Z M71,50 h2 v10 h-2 Z&quot; /&gt;</span>
+<span class="a">+&lt;/vector&gt;</span>
+diff --git a/app/src/main/res/drawable/ic_notification.xml b/app/src/main/res/drawable/ic_notification.xml
+new file mode 100644
+index 0000000..c8b9f92
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_notification.xml
+<span class="h">@@ -0,0 +1,6 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;vector xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;</span>
+<span class="a">+    android:width=&quot;24dp&quot; android:height=&quot;24dp&quot;</span>
+<span class="a">+    android:viewportWidth=&quot;108&quot; android:viewportHeight=&quot;108&quot;&gt;</span>
+<span class="a">+    &lt;path android:fillColor=&quot;#FFFFFF&quot; android:pathData=&quot;M30,34 C38,30 46,30 53,34 L53,76 C46,72 38,72 30,76 Z M78,34 C70,30 62,30 55,34 L55,76 C62,72 70,72 78,76 Z&quot; /&gt;</span>
+<span class="a">+&lt;/vector&gt;</span>
+diff --git a/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml b/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+new file mode 100644
+index 0000000..5c84730
+--- /dev/null
++++ b/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+<span class="h">@@ -0,0 +1,6 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;adaptive-icon xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;</span>
+<span class="a">+    &lt;background android:drawable=&quot;@color/ic_launcher_background&quot; /&gt;</span>
+<span class="a">+    &lt;foreground android:drawable=&quot;@drawable/ic_launcher_foreground&quot; /&gt;</span>
+<span class="a">+    &lt;monochrome android:drawable=&quot;@drawable/ic_launcher_foreground&quot; /&gt;</span>
+<span class="a">+&lt;/adaptive-icon&gt;</span>
+diff --git a/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml b/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+new file mode 100644
+index 0000000..5c84730
+--- /dev/null
++++ b/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+<span class="h">@@ -0,0 +1,6 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;adaptive-icon xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;</span>
+<span class="a">+    &lt;background android:drawable=&quot;@color/ic_launcher_background&quot; /&gt;</span>
+<span class="a">+    &lt;foreground android:drawable=&quot;@drawable/ic_launcher_foreground&quot; /&gt;</span>
+<span class="a">+    &lt;monochrome android:drawable=&quot;@drawable/ic_launcher_foreground&quot; /&gt;</span>
+<span class="a">+&lt;/adaptive-icon&gt;</span>
+diff --git a/app/src/main/res/values/colors.xml b/app/src/main/res/values/colors.xml
+new file mode 100644
+index 0000000..f42ada6
+--- /dev/null
++++ b/app/src/main/res/values/colors.xml
+<span class="h">@@ -0,0 +1,4 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;resources&gt;</span>
+<span class="a">+    &lt;color name=&quot;ic_launcher_background&quot;&gt;#FFFFFF&lt;/color&gt;</span>
+<span class="a">+&lt;/resources&gt;</span>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+new file mode 100644
+index 0000000..5b7b417
+--- /dev/null
++++ b/app/src/main/res/values/strings.xml
+<span class="h">@@ -0,0 +1,6 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;resources&gt;</span>
+<span class="a">+    &lt;string name=&quot;app_name&quot;&gt;SubRead&lt;/string&gt;</span>
+<span class="a">+    &lt;string name=&quot;channel_progress&quot;&gt;Progress&lt;/string&gt;</span>
+<span class="a">+    &lt;string name=&quot;stop&quot;&gt;Stop&lt;/string&gt;</span>
+<span class="a">+&lt;/resources&gt;</span>
+diff --git a/app/src/main/res/values/themes.xml b/app/src/main/res/values/themes.xml
+new file mode 100644
+index 0000000..a14ff15
+--- /dev/null
++++ b/app/src/main/res/values/themes.xml
+<span class="h">@@ -0,0 +1,9 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;resources&gt;</span>
+<span class="a">+    &lt;!-- Compose draws everything; this only covers the moment before it does. --&gt;</span>
+<span class="a">+    &lt;style name=&quot;Theme.SubRead&quot; parent=&quot;android:Theme.Material.Light.NoActionBar&quot;&gt;</span>
+<span class="a">+        &lt;item name=&quot;android:windowBackground&quot;&gt;@android:color/white&lt;/item&gt;</span>
+<span class="a">+        &lt;item name=&quot;android:statusBarColor&quot;&gt;@android:color/white&lt;/item&gt;</span>
+<span class="a">+        &lt;item name=&quot;android:windowLightStatusBar&quot;&gt;true&lt;/item&gt;</span>
+<span class="a">+    &lt;/style&gt;</span>
+<span class="a">+&lt;/resources&gt;</span>
+diff --git a/app/src/main/res/xml/file_paths.xml b/app/src/main/res/xml/file_paths.xml
+new file mode 100644
+index 0000000..a9f4ded
+--- /dev/null
++++ b/app/src/main/res/xml/file_paths.xml
+<span class="h">@@ -0,0 +1,5 @@</span>
+<span class="a">+&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;</span>
+<span class="a">+&lt;paths&gt;</span>
+<span class="a">+    &lt;files-path name=&quot;subtitles&quot; path=&quot;subtitles/&quot; /&gt;</span>
+<span class="a">+    &lt;files-path name=&quot;video&quot; path=&quot;video/&quot; /&gt;</span>
+<span class="a">+&lt;/paths&gt;</span>
+diff --git a/third_party/whisper.cpp b/third_party/whisper.cpp
+new file mode 160000
+index 0000000..927cfce
+--- /dev/null
++++ b/third_party/whisper.cpp
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+Subproject commit 927cfce34f31707e17f2bff35c349632fb9e2c3a</span>
+diff --git a/tools/write_res.py b/tools/write_res.py
+new file mode 100644
+index 0000000..a60b764
+--- /dev/null
++++ b/tools/write_res.py
+<span class="h">@@ -0,0 +1,68 @@</span>
+<span class="a">+&quot;&quot;&quot;Writes the app&#x27;s small static resources. Run once; the output is committed.&quot;&quot;&quot;</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+RES = Path(__file__).resolve().parent.parent / &quot;app/src/main/res&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def w(rel: str, text: str) -&gt; None:</span>
+<span class="a">+    p = RES / rel</span>
+<span class="a">+    p.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+    p.write_text(text, encoding=&quot;utf-8&quot;, newline=&quot;\n&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+HEAD = &#x27;&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;\n&#x27;</span>
+<span class="a">+</span>
+<span class="a">+w(&quot;xml/file_paths.xml&quot;, HEAD + &quot;&quot;&quot;&lt;paths&gt;</span>
+<span class="a">+    &lt;files-path name=&quot;subtitles&quot; path=&quot;subtitles/&quot; /&gt;</span>
+<span class="a">+    &lt;files-path name=&quot;video&quot; path=&quot;video/&quot; /&gt;</span>
+<span class="a">+&lt;/paths&gt;</span>
+<span class="a">+&quot;&quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+w(&quot;values/strings.xml&quot;, HEAD + &quot;&quot;&quot;&lt;resources&gt;</span>
+<span class="a">+    &lt;string name=&quot;app_name&quot;&gt;SubRead&lt;/string&gt;</span>
+<span class="a">+    &lt;string name=&quot;channel_progress&quot;&gt;Progress&lt;/string&gt;</span>
+<span class="a">+    &lt;string name=&quot;stop&quot;&gt;Stop&lt;/string&gt;</span>
+<span class="a">+&lt;/resources&gt;</span>
+<span class="a">+&quot;&quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+w(&quot;values/themes.xml&quot;, HEAD + &quot;&quot;&quot;&lt;resources&gt;</span>
+<span class="a">+    &lt;!-- Compose draws everything; this only covers the moment before it does. --&gt;</span>
+<span class="a">+    &lt;style name=&quot;Theme.SubRead&quot; parent=&quot;android:Theme.Material.Light.NoActionBar&quot;&gt;</span>
+<span class="a">+        &lt;item name=&quot;android:windowBackground&quot;&gt;@android:color/white&lt;/item&gt;</span>
+<span class="a">+        &lt;item name=&quot;android:statusBarColor&quot;&gt;@android:color/white&lt;/item&gt;</span>
+<span class="a">+        &lt;item name=&quot;android:windowLightStatusBar&quot;&gt;true&lt;/item&gt;</span>
+<span class="a">+    &lt;/style&gt;</span>
+<span class="a">+&lt;/resources&gt;</span>
+<span class="a">+&quot;&quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+w(&quot;values/colors.xml&quot;, HEAD + &quot;&quot;&quot;&lt;resources&gt;</span>
+<span class="a">+    &lt;color name=&quot;ic_launcher_background&quot;&gt;#FFFFFF&lt;/color&gt;</span>
+<span class="a">+&lt;/resources&gt;</span>
+<span class="a">+&quot;&quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+# An open book with a sound wave across its pages, in one colour.</span>
+<span class="a">+BOOK = (&quot;M30,34 C38,30 46,30 53,34 L53,76 C46,72 38,72 30,76 Z &quot;</span>
+<span class="a">+        &quot;M78,34 C70,30 62,30 55,34 L55,76 C62,72 70,72 78,76 Z&quot;)</span>
+<span class="a">+WAVE = (&quot;M35,50 h2 v10 h-2 Z M40,45 h2 v20 h-2 Z M45,52 h2 v6 h-2 Z &quot;</span>
+<span class="a">+        &quot;M61,52 h2 v6 h-2 Z M66,45 h2 v20 h-2 Z M71,50 h2 v10 h-2 Z&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def vector(size: int, paths: list[tuple[str, str]]) -&gt; str:</span>
+<span class="a">+    body = &quot;&quot;.join(f&#x27;    &lt;path android:fillColor=&quot;{c}&quot; android:pathData=&quot;{d}&quot; /&gt;\n&#x27; for c, d in paths)</span>
+<span class="a">+    return (HEAD + &#x27;&lt;vector xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;\n&#x27;</span>
+<span class="a">+            f&#x27;    android:width=&quot;{size}dp&quot; android:height=&quot;{size}dp&quot;\n&#x27;</span>
+<span class="a">+            &#x27;    android:viewportWidth=&quot;108&quot; android:viewportHeight=&quot;108&quot;&gt;\n&#x27; + body + &quot;&lt;/vector&gt;\n&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+w(&quot;drawable/ic_launcher_foreground.xml&quot;, vector(108, [(&quot;#000000&quot;, BOOK), (&quot;#FFFFFF&quot;, WAVE)]))</span>
+<span class="a">+w(&quot;drawable/ic_notification.xml&quot;, vector(24, [(&quot;#FFFFFF&quot;, BOOK)]))</span>
+<span class="a">+</span>
+<span class="a">+for name in (&quot;ic_launcher&quot;, &quot;ic_launcher_round&quot;):</span>
+<span class="a">+    w(f&quot;mipmap-anydpi-v26/{name}.xml&quot;, HEAD + &quot;&quot;&quot;&lt;adaptive-icon xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;&gt;</span>
+<span class="a">+    &lt;background android:drawable=&quot;@color/ic_launcher_background&quot; /&gt;</span>
+<span class="a">+    &lt;foreground android:drawable=&quot;@drawable/ic_launcher_foreground&quot; /&gt;</span>
+<span class="a">+    &lt;monochrome android:drawable=&quot;@drawable/ic_launcher_foreground&quot; /&gt;</span>
+<span class="a">+&lt;/adaptive-icon&gt;</span>
+<span class="a">+&quot;&quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+print(&quot;resources written to&quot;, RES)</span></pre>
+</div></body></html>

@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/aligner.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/aligner.py (11519 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;The alignment backend, behind an interface.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> Everything subplz-specific lives in `SubPlzAligner`: its argument names, its
+<a id="l4" href="#l4">4</a> Japanese defaults, the shape of its progress output, where it writes the result.
+<a id="l5" href="#l5">5</a> The rest of the application talks to the `Aligner` interface, so replacing
+<a id="l6" href="#l6">6</a> subplz means writing one new class and changing SUBPLZ_WEB_ALIGNER - not
+<a id="l7" href="#l7">7</a> touching the API, the queue, storage or the job runner.
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> To add a backend:
+<a id="l10" href="#l10">10</a>   1. subclass Aligner
+<a id="l11" href="#l11">11</a>   2. register it in ALIGNERS below
+<a id="l12" href="#l12">12</a>   3. set SUBPLZ_WEB_ALIGNER to its name
+<a id="l13" href="#l13">13</a> &quot;&quot;&quot;
+<a id="l14" href="#l14">14</a> 
+<a id="l15" href="#l15">15</a> from __future__ import annotations
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> import os
+<a id="l18" href="#l18">18</a> import re
+<a id="l19" href="#l19">19</a> from abc import ABC, abstractmethod
+<a id="l20" href="#l20">20</a> from dataclasses import dataclass
+<a id="l21" href="#l21">21</a> from pathlib import Path
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> from . import languages
+<a id="l24" href="#l24">24</a> from .settings import settings
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> @dataclass(frozen=True)
+<a id="l28" href="#l28">28</a> class AlignRequest:
+<a id="l29" href="#l29">29</a>     &quot;&quot;&quot;Everything a backend needs to align one book.&quot;&quot;&quot;
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a>     audio: Path
+<a id="l32" href="#l32">32</a>     text: Path
+<a id="l33" href="#l33">33</a>     out_dir: Path
+<a id="l34" href="#l34">34</a>     language: str
+<a id="l35" href="#l35">35</a>     model: str
+<a id="l36" href="#l36">36</a>     device: str
+<a id="l37" href="#l37">37</a>     threads: int
+<a id="l38" href="#l38">38</a>     # Chapter count of the audio, or 1. Backends may use it for progress.
+<a id="l39" href="#l39">39</a>     chapters: int = 1
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> @dataclass(frozen=True)
+<a id="l43" href="#l43">43</a> class ProgressUpdate:
+<a id="l44" href="#l44">44</a>     stage: str
+<a id="l45" href="#l45">45</a>     # 0..1 within the alignment run, or None to leave the bar where it is.
+<a id="l46" href="#l46">46</a>     fraction: float | None = None
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a> class ProgressReader(ABC):
+<a id="l50" href="#l50">50</a>     &quot;&quot;&quot;Per-run state for interpreting a backend&#x27;s console output.&quot;&quot;&quot;
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a>     @abstractmethod
+<a id="l53" href="#l53">53</a>     def feed(self, line: str) -&gt; ProgressUpdate | None:
+<a id="l54" href="#l54">54</a>         &quot;&quot;&quot;Interpret one output line. Return None if it says nothing useful.&quot;&quot;&quot;
+<a id="l55" href="#l55">55</a> 
+<a id="l56" href="#l56">56</a> 
+<a id="l57" href="#l57">57</a> class Aligner(ABC):
+<a id="l58" href="#l58">58</a>     name: str = &quot;aligner&quot;
+<a id="l59" href="#l59">59</a>     output_suffix: str = &quot;.srt&quot;
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a>     # Score at or below which this backend refuses to pair audio with text.
+<a id="l62" href="#l62">62</a>     # 0 means the backend has no such notion.
+<a id="l63" href="#l63">63</a>     match_threshold: float = 0.0
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a>     def score_pair(self, audio_text: str, book_text: str) -&gt; float:
+<a id="l66" href="#l66">66</a>         &quot;&quot;&quot;How well a transcript of some audio matches a piece of the book.
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a>         Same arithmetic the backend uses internally, so a preflight number
+<a id="l69" href="#l69">69</a>         means the same thing as the one that decides a real run.
+<a id="l70" href="#l70">70</a>         &quot;&quot;&quot;
+<a id="l71" href="#l71">71</a>         return 0.0
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a>     @abstractmethod
+<a id="l74" href="#l74">74</a>     def build_command(self, req: AlignRequest) -&gt; list[str]:
+<a id="l75" href="#l75">75</a>         &quot;&quot;&quot;The subprocess to run.&quot;&quot;&quot;
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a>     @abstractmethod
+<a id="l78" href="#l78">78</a>     def progress_reader(self, req: AlignRequest) -&gt; ProgressReader:
+<a id="l79" href="#l79">79</a>         ...
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a>     @abstractmethod
+<a id="l82" href="#l82">82</a>     def locate_output(self, req: AlignRequest) -&gt; Path | None:
+<a id="l83" href="#l83">83</a>         &quot;&quot;&quot;The subtitle file produced, or None if there is not one.&quot;&quot;&quot;
+<a id="l84" href="#l84">84</a> 
+<a id="l85" href="#l85">85</a>     def environment(self) -&gt; dict[str, str]:
+<a id="l86" href="#l86">86</a>         &quot;&quot;&quot;Environment for the subprocess.&quot;&quot;&quot;
+<a id="l87" href="#l87">87</a>         env = os.environ.copy()
+<a id="l88" href="#l88">88</a>         # Backends print emoji; without this a piped stdout dies on a
+<a id="l89" href="#l89">89</a>         # cp1252/cp932 console.
+<a id="l90" href="#l90">90</a>         env[&quot;PYTHONIOENCODING&quot;] = &quot;utf-8&quot;
+<a id="l91" href="#l91">91</a>         env[&quot;PYTHONUTF8&quot;] = &quot;1&quot;
+<a id="l92" href="#l92">92</a>         return env
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a>     def language_note(self, code: str) -&gt; str | None:
+<a id="l95" href="#l95">95</a>         &quot;&quot;&quot;Anything the user should know about this language, or None.&quot;&quot;&quot;
+<a id="l96" href="#l96">96</a>         return None
+<a id="l97" href="#l97">97</a> 
+<a id="l98" href="#l98">98</a>     def failure_reason(self, req: &quot;AlignRequest&quot;) -&gt; str | None:
+<a id="l99" href="#l99">99</a>         &quot;&quot;&quot;Why the run produced nothing, if the backend left an explanation.
+<a id="l100" href="#l100">100</a> 
+<a id="l101" href="#l101">101</a>         Needed because a backend may exit 0 and still have failed, so the exit
+<a id="l102" href="#l102">102</a>         code alone cannot be trusted to mean success.
+<a id="l103" href="#l103">103</a>         &quot;&quot;&quot;
+<a id="l104" href="#l104">104</a>         return None
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a> 
+<a id="l107" href="#l107">107</a> # ---------------------------------------------------------------------------
+<a id="l108" href="#l108">108</a> # subplz
+<a id="l109" href="#l109">109</a> # ---------------------------------------------------------------------------
+<a id="l110" href="#l110">110</a> 
+<a id="l111" href="#l111">111</a> # subplz transcribes one chapter at a time and each chapter gets its own bar
+<a id="l112" href="#l112">112</a> # running 0-&gt;100%. Matching only the &quot;Transcribe:&quot; bar keeps the sentence
+<a id="l113" href="#l113">113</a> # splitting and grouping bars from yanking the number around.
+<a id="l114" href="#l114">114</a> _TRANSCRIBE_PCT = re.compile(r&quot;Transcribe:\s*(\d{1,3})%&quot;)
+<a id="l115" href="#l115">115</a> 
+<a id="l116" href="#l116">116</a> _STAGES: list[tuple[re.Pattern, str]] = [
+<a id="l117" href="#l117">117</a>     (re.compile(r&quot;Starting &#x27;&quot;), &quot;Loading audio&quot;),
+<a id="l118" href="#l118">118</a>     (re.compile(r&quot;Fuzzy matching chapters&quot;), &quot;Matching chapters&quot;),
+<a id="l119" href="#l119">119</a>     (re.compile(r&quot;Splitting transcript into sentences&quot;), &quot;Splitting text into sentences&quot;),
+<a id="l120" href="#l120">120</a>     (re.compile(r&quot;Syncing&quot;), &quot;Aligning audio to text&quot;),
+<a id="l121" href="#l121">121</a>     (re.compile(r&quot;Grouping based on transcript&quot;), &quot;Grouping subtitle lines&quot;),
+<a id="l122" href="#l122">122</a>     (re.compile(r&quot;Writing generated subs&quot;), &quot;Writing subtitles&quot;),
+<a id="l123" href="#l123">123</a> ]
+<a id="l124" href="#l124">124</a> 
+<a id="l125" href="#l125">125</a> # Transcription dominates the wall clock; the later phases share the tail.
+<a id="l126" href="#l126">126</a> _RUN_START = 0.05
+<a id="l127" href="#l127">127</a> _TRANSCRIBE_END = 0.80
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a> _STAGE_PROGRESS: dict[str, float] = {
+<a id="l130" href="#l130">130</a>     &quot;Aligning audio to text&quot;: 0.82,
+<a id="l131" href="#l131">131</a>     &quot;Grouping subtitle lines&quot;: 0.86,
+<a id="l132" href="#l132">132</a>     &quot;Writing subtitles&quot;: 0.89,
+<a id="l133" href="#l133">133</a> }
+<a id="l134" href="#l134">134</a> 
+<a id="l135" href="#l135">135</a> 
+<a id="l136" href="#l136">136</a> def _subplz_clean(text: str, lang_code: str) -&gt; str:
+<a id="l137" href="#l137">137</a>     &quot;&quot;&quot;What subplz feeds to fuzz.ratio: lang.normalize(lang.clean(text)).
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a>     Falls back to the library&#x27;s own implementation when it is importable, so
+<a id="l140" href="#l140">140</a>     this cannot drift from the real thing; the inline version is only a
+<a id="l141" href="#l141">141</a>     stand-in for when ats is not installed.
+<a id="l142" href="#l142">142</a>     &quot;&quot;&quot;
+<a id="l143" href="#l143">143</a>     try:
+<a id="l144" href="#l144">144</a>         from ats.lang import get_lang
+<a id="l145" href="#l145">145</a> 
+<a id="l146" href="#l146">146</a>         lang = get_lang(lang_code)
+<a id="l147" href="#l147">147</a>         return lang.normalize(lang.clean(text))
+<a id="l148" href="#l148">148</a>     except Exception:  # noqa: BLE001 - scoring must never break an upload
+<a id="l149" href="#l149">149</a>         import unicodedata
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a>         return unicodedata.normalize(&quot;NFKD&quot;, text.lower())
+<a id="l152" href="#l152">152</a> 
+<a id="l153" href="#l153">153</a> 
+<a id="l154" href="#l154">154</a> class _SubPlzProgress(ProgressReader):
+<a id="l155" href="#l155">155</a>     def __init__(self, chapters: int):
+<a id="l156" href="#l156">156</a>         self.chapters = max(1, chapters)
+<a id="l157" href="#l157">157</a>         self.done = 0
+<a id="l158" href="#l158">158</a>         self.last_pct = 0
+<a id="l159" href="#l159">159</a>         self.stage = &quot;Starting subplz&quot;
+<a id="l160" href="#l160">160</a>         self.best = _RUN_START
+<a id="l161" href="#l161">161</a> 
+<a id="l162" href="#l162">162</a>     def feed(self, line: str) -&gt; ProgressUpdate | None:
+<a id="l163" href="#l163">163</a>         for pattern, label in _STAGES:
+<a id="l164" href="#l164">164</a>             if pattern.search(line):
+<a id="l165" href="#l165">165</a>                 self.stage = label
+<a id="l166" href="#l166">166</a>                 break
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a>         fraction = None
+<a id="l169" href="#l169">169</a>         m = _TRANSCRIBE_PCT.search(line)
+<a id="l170" href="#l170">170</a>         if m:
+<a id="l171" href="#l171">171</a>             pct = min(100, max(0, int(m.group(1))))
+<a id="l172" href="#l172">172</a>             # The bar restarting means the previous chapter finished.
+<a id="l173" href="#l173">173</a>             if pct &lt; self.last_pct:
+<a id="l174" href="#l174">174</a>                 self.done = min(self.done + 1, self.chapters - 1)
+<a id="l175" href="#l175">175</a>             self.last_pct = pct
+<a id="l176" href="#l176">176</a>             frac = min(1.0, (self.done + pct / 100.0) / self.chapters)
+<a id="l177" href="#l177">177</a>             fraction = _RUN_START + frac * (_TRANSCRIBE_END - _RUN_START)
+<a id="l178" href="#l178">178</a>             self.stage = (
+<a id="l179" href="#l179">179</a>                 f&quot;Transcribing chapter {self.done + 1} of {self.chapters}&quot;
+<a id="l180" href="#l180">180</a>                 if self.chapters &gt; 1
+<a id="l181" href="#l181">181</a>                 else &quot;Transcribing audio&quot;
+<a id="l182" href="#l182">182</a>             )
+<a id="l183" href="#l183">183</a>         elif self.stage in _STAGE_PROGRESS:
+<a id="l184" href="#l184">184</a>             fraction = _STAGE_PROGRESS[self.stage]
+<a id="l185" href="#l185">185</a> 
+<a id="l186" href="#l186">186</a>         if fraction is not None:
+<a id="l187" href="#l187">187</a>             # Progress only ever moves forward.
+<a id="l188" href="#l188">188</a>             self.best = max(self.best, fraction)
+<a id="l189" href="#l189">189</a>         return ProgressUpdate(stage=self.stage, fraction=self.best)
+<a id="l190" href="#l190">190</a> 
+<a id="l191" href="#l191">191</a> 
+<a id="l192" href="#l192">192</a> class SubPlzAligner(Aligner):
+<a id="l193" href="#l193">193</a>     &quot;&quot;&quot;kanjieater/SubPlz, driven through its `sync` subcommand.
+<a id="l194" href="#l194">194</a> 
+<a id="l195" href="#l195">195</a>     `sync` only ever times the text you supply. `gen`, which transcribes a book
+<a id="l196" href="#l196">196</a>     from scratch, is deliberately never invoked.
+<a id="l197" href="#l197">197</a>     &quot;&quot;&quot;
+<a id="l198" href="#l198">198</a> 
+<a id="l199" href="#l199">199</a>     name = &quot;subplz&quot;
+<a id="l200" href="#l200">200</a>     output_suffix = &quot;.srt&quot;
+<a id="l201" href="#l201">201</a> 
+<a id="l202" href="#l202">202</a>     # subplz/sync.py: SCORE_THRESHOLD = 40. A chapter whose best fuzz.ratio
+<a id="l203" href="#l203">203</a>     # never exceeds this is reported as &quot;too different&quot; and left unmatched.
+<a id="l204" href="#l204">204</a>     match_threshold = 40.0
+<a id="l205" href="#l205">205</a> 
+<a id="l206" href="#l206">206</a>     def score_pair(self, audio_text: str, book_text: str) -&gt; float:
+<a id="l207" href="#l207">207</a>         &quot;&quot;&quot;Reproduces subplz&#x27;s own match_start() scoring, exactly.
+<a id="l208" href="#l208">208</a> 
+<a id="l209" href="#l209">209</a>         Two details that are easy to get wrong and both matter a lot:
+<a id="l210" href="#l210">210</a> 
+<a id="l211" href="#l211">211</a>         * It compares only the **first min(len_a, len_b, 2000) characters**, so
+<a id="l212" href="#l212">212</a>           the score is about how chapters *open*, not how similar they are
+<a id="l213" href="#l213">213</a>           overall. Front matter or an unread heading at the top of a chapter
+<a id="l214" href="#l214">214</a>           sinks it even when the rest is identical.
+<a id="l215" href="#l215">215</a>         * Cleaning is language-dependent, and ats/lang.py only implements
+<a id="l216" href="#l216">216</a>           Japanese and English - every other language falls back to English,
+<a id="l217" href="#l217">217</a>           whose clean() is nothing but .lower(). So for Russian, Spanish,
+<a id="l218" href="#l218">218</a>           Portuguese and the rest, punctuation and spacing are compared
+<a id="l219" href="#l219">219</a>           verbatim.
+<a id="l220" href="#l220">220</a>         &quot;&quot;&quot;
+<a id="l221" href="#l221">221</a>         from rapidfuzz import fuzz
+<a id="l222" href="#l222">222</a> 
+<a id="l223" href="#l223">223</a>         a = _subplz_clean(audio_text, self._lang_code)
+<a id="l224" href="#l224">224</a>         b = _subplz_clean(book_text, self._lang_code)
+<a id="l225" href="#l225">225</a>         # Below this, subplz does not even consider the pair.
+<a id="l226" href="#l226">226</a>         if len(a) &lt; 100 or len(b) &lt; 100:
+<a id="l227" href="#l227">227</a>             return 0.0
+<a id="l228" href="#l228">228</a>         n = min(len(a), len(b), 2000)
+<a id="l229" href="#l229">229</a>         return float(fuzz.ratio(a[:n], b[:n]))
+<a id="l230" href="#l230">230</a> 
+<a id="l231" href="#l231">231</a>     # Set per request so scoring matches the language subplz will run under.
+<a id="l232" href="#l232">232</a>     _lang_code: str = &quot;en&quot;
+<a id="l233" href="#l233">233</a> 
+<a id="l234" href="#l234">234</a>     def for_language(self, code: str) -&gt; &quot;SubPlzAligner&quot;:
+<a id="l235" href="#l235">235</a>         clone = SubPlzAligner()
+<a id="l236" href="#l236">236</a>         clone._lang_code = code
+<a id="l237" href="#l237">237</a>         return clone
+<a id="l238" href="#l238">238</a> 
+<a id="l239" href="#l239">239</a>     def build_command(self, req: AlignRequest) -&gt; list[str]:
+<a id="l240" href="#l240">240</a>         lang = languages.require(req.language)
+<a id="l241" href="#l241">241</a> 
+<a id="l242" href="#l242">242</a>         cmd = [
+<a id="l243" href="#l243">243</a>             str(settings.subplz_bin), &quot;sync&quot;,
+<a id="l244" href="#l244">244</a>             # subplz takes either -d, or all three of --audio/--text/
+<a id="l245" href="#l245">245</a>             # --output-dir, and rejects a mix. The explicit form pairs the files
+<a id="l246" href="#l246">246</a>             # by name rather than by directory sort order.
+<a id="l247" href="#l247">247</a>             &quot;--audio&quot;, str(req.audio),
+<a id="l248" href="#l248">248</a>             &quot;--text&quot;, str(req.text),
+<a id="l249" href="#l249">249</a>             &quot;--output-dir&quot;, str(req.out_dir),
+<a id="l250" href="#l250">250</a>             &quot;--output-format&quot;, &quot;srt&quot;,
+<a id="l251" href="#l251">251</a>             # subplz defaults BOTH of these to Japanese - always set them.
+<a id="l252" href="#l252">252</a>             &quot;--language&quot;, lang.code,
+<a id="l253" href="#l253">253</a>             &quot;--lang&quot;, lang.code,
+<a id="l254" href="#l254">254</a>             &quot;--lang-ext&quot;, lang.code,
+<a id="l255" href="#l255">255</a>             &quot;--model&quot;, req.model,
+<a id="l256" href="#l256">256</a>             &quot;--device&quot;, req.device,
+<a id="l257" href="#l257">257</a>             &quot;--overwrite&quot;,
+<a id="l258" href="#l258">258</a>             &quot;--rerun&quot;,
+<a id="l259" href="#l259">259</a>             &quot;--progress&quot;,
+<a id="l260" href="#l260">260</a>             &quot;--threads&quot;, str(req.threads),
+<a id="l261" href="#l261">261</a>         ]
+<a id="l262" href="#l262">262</a> 
+<a id="l263" href="#l263">263</a>         # pysbd cannot segment this language; make subplz use stanza instead.
+<a id="l264" href="#l264">264</a>         if lang.needs_nlp_flag:
+<a id="l265" href="#l265">265</a>             cmd.append(&quot;--nlp&quot;)
+<a id="l266" href="#l266">266</a> 
+<a id="l267" href="#l267">267</a>         return cmd
+<a id="l268" href="#l268">268</a> 
+<a id="l269" href="#l269">269</a>     def progress_reader(self, req: AlignRequest) -&gt; ProgressReader:
+<a id="l270" href="#l270">270</a>         return _SubPlzProgress(req.chapters)
+<a id="l271" href="#l271">271</a> 
+<a id="l272" href="#l272">272</a>     def locate_output(self, req: AlignRequest) -&gt; Path | None:
+<a id="l273" href="#l273">273</a>         # subplz writes &lt;stem&gt;.&lt;lang-ext&gt;.srt, and the stem is ours.
+<a id="l274" href="#l274">274</a>         expected = req.out_dir / f&quot;{req.audio.stem}.{req.language}.srt&quot;
+<a id="l275" href="#l275">275</a>         if expected.exists():
+<a id="l276" href="#l276">276</a>             return expected
+<a id="l277" href="#l277">277</a>         # Fall back in case upstream changes the convention.
+<a id="l278" href="#l278">278</a>         return next(iter(sorted(req.out_dir.glob(&quot;*.srt&quot;))), None)
+<a id="l279" href="#l279">279</a> 
+<a id="l280" href="#l280">280</a>     def failure_reason(self, req: AlignRequest) -&gt; str | None:
+<a id="l281" href="#l281">281</a>         &quot;&quot;&quot;Read subplz&#x27;s own explanation out of the .subfail it leaves behind.
+<a id="l282" href="#l282">282</a> 
+<a id="l283" href="#l283">283</a>         subplz exits 0 even when a sync fails, so the exit code cannot be
+<a id="l284" href="#l284">284</a>         trusted. Without this the runner reports &quot;the audio and text may not
+<a id="l285" href="#l285">285</a>         match&quot; for every failure - including ones that have nothing to do with
+<a id="l286" href="#l286">286</a>         the content, such as a broken library.
+<a id="l287" href="#l287">287</a>         &quot;&quot;&quot;
+<a id="l288" href="#l288">288</a>         for fail in sorted(req.out_dir.glob(&quot;*.subfail&quot;)):
+<a id="l289" href="#l289">289</a>             try:
+<a id="l290" href="#l290">290</a>                 text = fail.read_text(encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;).strip()
+<a id="l291" href="#l291">291</a>             except OSError:
+<a id="l292" href="#l292">292</a>                 continue
+<a id="l293" href="#l293">293</a>             if not text:
+<a id="l294" href="#l294">294</a>                 continue
+<a id="l295" href="#l295">295</a>             # The file repeats the audio path on every line; keep the last
+<a id="l296" href="#l296">296</a>             # line, which carries the actual reason.
+<a id="l297" href="#l297">297</a>             lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+<a id="l298" href="#l298">298</a>             return lines[-1] if lines else None
+<a id="l299" href="#l299">299</a>         return None
+<a id="l300" href="#l300">300</a> 
+<a id="l301" href="#l301">301</a>     def language_note(self, code: str) -&gt; str | None:
+<a id="l302" href="#l302">302</a>         lang = languages.get(code)
+<a id="l303" href="#l303">303</a>         if lang is None or not lang.needs_nlp_flag:
+<a id="l304" href="#l304">304</a>             return None
+<a id="l305" href="#l305">305</a>         return (
+<a id="l306" href="#l306">306</a>             f&quot;{lang.name} uses the stanza sentence splitter. &quot;
+<a id="l307" href="#l307">307</a>             f&quot;The first {lang.name} run downloads a small model.&quot;
+<a id="l308" href="#l308">308</a>         )
+<a id="l309" href="#l309">309</a> 
+<a id="l310" href="#l310">310</a> 
+<a id="l311" href="#l311">311</a> ALIGNERS: dict[str, type[Aligner]] = {
+<a id="l312" href="#l312">312</a>     SubPlzAligner.name: SubPlzAligner,
+<a id="l313" href="#l313">313</a> }
+<a id="l314" href="#l314">314</a> 
+<a id="l315" href="#l315">315</a> 
+<a id="l316" href="#l316">316</a> def get_aligner() -&gt; Aligner:
+<a id="l317" href="#l317">317</a>     try:
+<a id="l318" href="#l318">318</a>         return ALIGNERS[settings.aligner]()
+<a id="l319" href="#l319">319</a>     except KeyError:
+<a id="l320" href="#l320">320</a>         known = &quot;, &quot;.join(sorted(ALIGNERS))
+<a id="l321" href="#l321">321</a>         raise RuntimeError(
+<a id="l322" href="#l322">322</a>             f&quot;Unknown aligner {settings.aligner!r}. Known backends: {known}&quot;
+<a id="l323" href="#l323">323</a>         ) from None
+<a id="l324" href="#l324">324</a> 
+<a id="l325" href="#l325">325</a> 
+<a id="l326" href="#l326">326</a> aligner: Aligner = get_aligner()</pre>
+</div></body></html>

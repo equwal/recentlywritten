@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>deploy-handoff/skills/deploy-handoff/test_handoff.py - Recently Written</title>
+<link rel="stylesheet" href="../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
+<h1>deploy-handoff</h1><span class="desc">Claude Code plugin: the agent drives the browser to the last deploy, billing, or pull request step. You make the final click.</span><p class="url">git clone https://github.com/equwal/deploy-handoff</p><p><a href="../../../../deploy-handoff/index.html">Log</a> | <a href="../../../../deploy-handoff/files.html">Files</a> | <a href="../../../../deploy-handoff/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>skills/deploy-handoff/test_handoff.py (18965 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Tests for handoff.py. README.md tells how to run them.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> The dialog tests show small windows for a short time.
+<a id="l4" href="#l4">4</a> &quot;&quot;&quot;
+<a id="l5" href="#l5">5</a> 
+<a id="l6" href="#l6">6</a> import json
+<a id="l7" href="#l7">7</a> import subprocess
+<a id="l8" href="#l8">8</a> import tempfile
+<a id="l9" href="#l9">9</a> import tkinter as tk
+<a id="l10" href="#l10">10</a> import unittest
+<a id="l11" href="#l11">11</a> from contextlib import redirect_stdout
+<a id="l12" href="#l12">12</a> from io import StringIO
+<a id="l13" href="#l13">13</a> from pathlib import Path
+<a id="l14" href="#l14">14</a> from tkinter import ttk
+<a id="l15" href="#l15">15</a> from typing import TypeVar
+<a id="l16" href="#l16">16</a> from unittest import mock
+<a id="l17" href="#l17">17</a> from urllib.parse import parse_qs, unquote, urlsplit
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> from hypothesis import assume, given
+<a id="l20" href="#l20">20</a> from hypothesis import strategies as st
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> import handoff
+<a id="l23" href="#l23">23</a> from handoff import HandoffError, Request
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> T = TypeVar(&quot;T&quot;)
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> DOMAINS = [&quot;github.com&quot;, &quot;stripe.com&quot;, &quot;google.com&quot;, &quot;play.google.com&quot;]
+<a id="l28" href="#l28">28</a> LABEL = st.from_regex(r&quot;[a-z0-9-]{1,12}&quot;, fullmatch=True)
+<a id="l29" href="#l29">29</a> DOMAIN = st.lists(LABEL, min_size=2, max_size=3).map(&quot;.&quot;.join)
+<a id="l30" href="#l30">30</a> ALLOWED_HOST = st.builds(
+<a id="l31" href="#l31">31</a>     lambda prefix, domain: &quot;.&quot;.join([*prefix, domain]),
+<a id="l32" href="#l32">32</a>     st.lists(LABEL, max_size=3),
+<a id="l33" href="#l33">33</a>     st.sampled_from(DOMAINS),
+<a id="l34" href="#l34">34</a> )
+<a id="l35" href="#l35">35</a> # A path and a query in printable ASCII. They contain &quot;@&quot; and &quot;:&quot;, which must not change the host.
+<a id="l36" href="#l36">36</a> REST = st.from_regex(
+<a id="l37" href="#l37">37</a>     r&quot;(/[A-Za-z0-9._~%!$&amp;&#x27;()*+,;=:@-]*)*(\?[A-Za-z0-9._~%!$&amp;&#x27;()*+,;=:@/?-]*)?&quot;, fullmatch=True
+<a id="l38" href="#l38">38</a> )
+<a id="l39" href="#l39">39</a> ALLOWED_URL = st.builds(lambda host, rest: f&quot;https://{host}{rest}&quot;, ALLOWED_HOST, REST)
+<a id="l40" href="#l40">40</a> TEXT = st.text(st.characters(codec=&quot;utf-8&quot;), max_size=100)
+<a id="l41" href="#l41">41</a> REPO = st.from_regex(r&quot;[A-Za-z0-9-]{1,10}/[A-Za-z0-9_-]{1,10}&quot;, fullmatch=True)
+<a id="l42" href="#l42">42</a> OWNER = st.from_regex(r&quot;[A-Za-z0-9](?:[A-Za-z0-9-]{0,10}[A-Za-z0-9])?&quot;, fullmatch=True)
+<a id="l43" href="#l43">43</a> NAME = st.from_regex(r&quot;[A-Za-z0-9._-]{1,12}&quot;, fullmatch=True).filter(
+<a id="l44" href="#l44">44</a>     lambda name: name not in {&quot;.&quot;, &quot;..&quot;} and not name.endswith(&quot;.git&quot;)
+<a id="l45" href="#l45">45</a> )
+<a id="l46" href="#l46">46</a> REMOTE_FORMS = [
+<a id="l47" href="#l47">47</a>     &quot;https://github.com/{}.git&quot;,
+<a id="l48" href="#l48">48</a>     &quot;https://github.com/{}&quot;,
+<a id="l49" href="#l49">49</a>     &quot;https://github.com/{}/&quot;,
+<a id="l50" href="#l50">50</a>     &quot;https://user:token@github.com/{}.git&quot;,
+<a id="l51" href="#l51">51</a>     &quot;git@github.com:{}.git&quot;,
+<a id="l52" href="#l52">52</a>     &quot;git@github.com:{}&quot;,
+<a id="l53" href="#l53">53</a>     &quot;ssh://git@github.com/{}.git&quot;,
+<a id="l54" href="#l54">54</a> ]
+<a id="l55" href="#l55">55</a> WORD = st.from_regex(r&quot;[A-Za-z0-9\&quot;&#x27;.,:()-]{1,10}&quot;, fullmatch=True)
+<a id="l56" href="#l56">56</a> # Characters that git allows in a branch name, other than &quot;/&quot;. See git check-ref-format.
+<a id="l57" href="#l57">57</a> REF_CHAR = st.characters(codec=&quot;utf-8&quot;, exclude_categories=[&quot;Cc&quot;], exclude_characters=&quot; ~^:?*[\\/&quot;)
+<a id="l58" href="#l58">58</a> 
+<a id="l59" href="#l59">59</a> 
+<a id="l60" href="#l60">60</a> @st.composite
+<a id="l61" href="#l61">61</a> def branches(draw: st.DrawFn) -&gt; str:
+<a id="l62" href="#l62">62</a>     &quot;&quot;&quot;Make a branch name that git accepts.&quot;&quot;&quot;
+<a id="l63" href="#l63">63</a>     parts = draw(st.lists(st.text(REF_CHAR, min_size=1, max_size=6), min_size=1, max_size=3))
+<a id="l64" href="#l64">64</a>     name = &quot;/&quot;.join(parts)
+<a id="l65" href="#l65">65</a>     assume(&quot;..&quot; not in name and &quot;@{&quot; not in name and name != &quot;@&quot; and not name.endswith(&quot;.lock&quot;))
+<a id="l66" href="#l66">66</a>     assume(not any(part.startswith(&quot;.&quot;) or part.endswith(&quot;.&quot;) for part in parts))
+<a id="l67" href="#l67">67</a>     return name
+<a id="l68" href="#l68">68</a> 
+<a id="l69" href="#l69">69</a> 
+<a id="l70" href="#l70">70</a> @st.composite
+<a id="l71" href="#l71">71</a> def host_and_domains(draw: st.DrawFn) -&gt; tuple[str, list[str]]:
+<a id="l72" href="#l72">72</a>     &quot;&quot;&quot;Make a host near an allowed domain: the domain, a subdomain, or a look-alike.&quot;&quot;&quot;
+<a id="l73" href="#l73">73</a>     domains = draw(st.lists(DOMAIN, min_size=1, max_size=4))
+<a id="l74" href="#l74">74</a>     domain = draw(st.sampled_from(domains))
+<a id="l75" href="#l75">75</a>     label = draw(LABEL)
+<a id="l76" href="#l76">76</a>     glue = draw(st.sampled_from([&quot;.&quot;, &quot;&quot;, &quot;-&quot;]))
+<a id="l77" href="#l77">77</a>     host = draw(st.sampled_from([domain, label + glue + domain, domain + glue + label]))
+<a id="l78" href="#l78">78</a>     return host, domains
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a> def reference_match(host: str, domains: list[str]) -&gt; str | None:
+<a id="l82" href="#l82">82</a>     &quot;&quot;&quot;Do the work of match_domain slowly: compare the labels from the right.&quot;&quot;&quot;
+<a id="l83" href="#l83">83</a>     labels = host.split(&quot;.&quot;)
+<a id="l84" href="#l84">84</a>     found = [d for d in domains if labels[-len(d.split(&quot;.&quot;)) :] == d.split(&quot;.&quot;)]
+<a id="l85" href="#l85">85</a>     return max(found, key=len, default=None)
+<a id="l86" href="#l86">86</a> 
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a> def label_texts(widget: tk.Misc) -&gt; list[str]:
+<a id="l89" href="#l89">89</a>     &quot;&quot;&quot;Return the text of each label in widget, in the order in which the dialog made them.&quot;&quot;&quot;
+<a id="l90" href="#l90">90</a>     texts: list[str] = []
+<a id="l91" href="#l91">91</a>     for child in widget.winfo_children():
+<a id="l92" href="#l92">92</a>         if isinstance(child, ttk.Label):
+<a id="l93" href="#l93">93</a>             texts.append(str(child.cget(&quot;text&quot;)))
+<a id="l94" href="#l94">94</a>         texts.extend(label_texts(child))
+<a id="l95" href="#l95">95</a>     return texts
+<a id="l96" href="#l96">96</a> 
+<a id="l97" href="#l97">97</a> 
+<a id="l98" href="#l98">98</a> def run_git(*args: str) -&gt; None:
+<a id="l99" href="#l99">99</a>     identity = [&quot;-c&quot;, &quot;user.name=test&quot;, &quot;-c&quot;, &quot;user.email=test@example.com&quot;]
+<a id="l100" href="#l100">100</a>     subprocess.run([&quot;git&quot;, *identity, *args], check=True, capture_output=True)
+<a id="l101" href="#l101">101</a> 
+<a id="l102" href="#l102">102</a> 
+<a id="l103" href="#l103">103</a> def make_repo(root: Path) -&gt; Path:
+<a id="l104" href="#l104">104</a>     &quot;&quot;&quot;Make a repository with one commit on main, and a bare remote with the name origin.&quot;&quot;&quot;
+<a id="l105" href="#l105">105</a>     remote, work = root / &quot;remote.git&quot;, root / &quot;work&quot;
+<a id="l106" href="#l106">106</a>     run_git(&quot;init&quot;, &quot;--bare&quot;, str(remote))
+<a id="l107" href="#l107">107</a>     run_git(&quot;init&quot;, &quot;-b&quot;, &quot;main&quot;, str(work))
+<a id="l108" href="#l108">108</a>     run_git(&quot;-C&quot;, str(work), &quot;commit&quot;, &quot;--allow-empty&quot;, &quot;-m&quot;, &quot;first&quot;)
+<a id="l109" href="#l109">109</a>     run_git(&quot;-C&quot;, str(work), &quot;remote&quot;, &quot;add&quot;, &quot;origin&quot;, str(remote))
+<a id="l110" href="#l110">110</a>     return work
+<a id="l111" href="#l111">111</a> 
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a> class MatchDomainTest(unittest.TestCase):
+<a id="l114" href="#l114">114</a>     @given(host_and_domains())
+<a id="l115" href="#l115">115</a>     def test_same_as_reference(self, case: tuple[str, list[str]]) -&gt; None:
+<a id="l116" href="#l116">116</a>         host, domains = case
+<a id="l117" href="#l117">117</a>         self.assertEqual(handoff.match_domain(host, domains), reference_match(host, domains))
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a>     @given(st.lists(LABEL, max_size=3), DOMAIN)
+<a id="l120" href="#l120">120</a>     def test_allows_subdomains(self, prefix: list[str], domain: str) -&gt; None:
+<a id="l121" href="#l121">121</a>         self.assertEqual(handoff.match_domain(&quot;.&quot;.join([*prefix, domain]), [domain]), domain)
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a>     @given(LABEL, DOMAIN)
+<a id="l124" href="#l124">124</a>     def test_refuses_look_alikes(self, label: str, domain: str) -&gt; None:
+<a id="l125" href="#l125">125</a>         self.assertIsNone(handoff.match_domain(label + domain, [domain]))
+<a id="l126" href="#l126">126</a> 
+<a id="l127" href="#l127">127</a>     def test_most_specific_domain_wins(self) -&gt; None:
+<a id="l128" href="#l128">128</a>         self.assertEqual(handoff.match_domain(&quot;a.play.google.com&quot;, DOMAINS), &quot;play.google.com&quot;)
+<a id="l129" href="#l129">129</a> 
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a> class CheckUrlTest(unittest.TestCase):
+<a id="l132" href="#l132">132</a>     @given(ALLOWED_HOST, REST)
+<a id="l133" href="#l133">133</a>     def test_accepts_allowed_hosts(self, host: str, rest: str) -&gt; None:
+<a id="l134" href="#l134">134</a>         domain = handoff.match_domain(host, DOMAINS)
+<a id="l135" href="#l135">135</a>         self.assertEqual(handoff.check_url(f&quot;https://{host}{rest}&quot;, DOMAINS), domain)
+<a id="l136" href="#l136">136</a> 
+<a id="l137" href="#l137">137</a>     @given(
+<a id="l138" href="#l138">138</a>         ALLOWED_URL,
+<a id="l139" href="#l139">139</a>         st.integers(min_value=0),
+<a id="l140" href="#l140">140</a>         st.sampled_from([&quot;\\&quot;, &quot; &quot;, &quot;\t&quot;, &quot;\n&quot;, &quot;\x00&quot;, &quot;\x7f&quot;, &quot;\u00e9&quot;, &quot;\u3002&quot;, &quot;\u200b&quot;]),
+<a id="l141" href="#l141">141</a>     )
+<a id="l142" href="#l142">142</a>     def test_refuses_unsafe_characters(self, url: str, index: int, char: str) -&gt; None:
+<a id="l143" href="#l143">143</a>         index %= len(url) + 1
+<a id="l144" href="#l144">144</a>         with self.assertRaises(HandoffError):
+<a id="l145" href="#l145">145</a>             handoff.check_url(url[:index] + char + url[index:], DOMAINS)
+<a id="l146" href="#l146">146</a> 
+<a id="l147" href="#l147">147</a>     @given(ALLOWED_HOST, st.from_regex(r&quot;[A-Za-z0-9._~!$&amp;&#x27;()*+,;=:-]{0,12}&quot;, fullmatch=True))
+<a id="l148" href="#l148">148</a>     def test_refuses_user_info(self, host: str, user: str) -&gt; None:
+<a id="l149" href="#l149">149</a>         with self.assertRaises(HandoffError):
+<a id="l150" href="#l150">150</a>             handoff.check_url(f&quot;https://{user}@{host}/&quot;, DOMAINS)
+<a id="l151" href="#l151">151</a> 
+<a id="l152" href="#l152">152</a>     @given(ALLOWED_HOST, st.integers(min_value=0, max_value=65535))
+<a id="l153" href="#l153">153</a>     def test_refuses_ports(self, host: str, port: int) -&gt; None:
+<a id="l154" href="#l154">154</a>         with self.assertRaises(HandoffError):
+<a id="l155" href="#l155">155</a>             handoff.check_url(f&quot;https://{host}:{port}/&quot;, DOMAINS)
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a>     def test_refuses_known_attacks(self) -&gt; None:
+<a id="l158" href="#l158">158</a>         for url in [
+<a id="l159" href="#l159">159</a>             &quot;&quot;,
+<a id="l160" href="#l160">160</a>             &quot;http://github.com/&quot;,
+<a id="l161" href="#l161">161</a>             &quot;https://evil.com/&quot;,
+<a id="l162" href="#l162">162</a>             &quot;https://evilgithub.com/&quot;,
+<a id="l163" href="#l163">163</a>             &quot;https://github.com.evil.com/&quot;,
+<a id="l164" href="#l164">164</a>             &quot;https://github.com@evil.com/&quot;,
+<a id="l165" href="#l165">165</a>             &quot;https://evil.com\\@github.com/&quot;,
+<a id="l166" href="#l166">166</a>             &quot;https://evil.com\\.github.com/&quot;,
+<a id="l167" href="#l167">167</a>             &quot;https://evil.com%2F.github.com/&quot;,
+<a id="l168" href="#l168">168</a>             &quot;https://github.com./&quot;,
+<a id="l169" href="#l169">169</a>             &quot;https://gith\u0443b.com/&quot;,
+<a id="l170" href="#l170">170</a>             &quot;https:github.com/&quot;,
+<a id="l171" href="#l171">171</a>             &quot;https:///github.com/&quot;,
+<a id="l172" href="#l172">172</a>             &quot;https://[::1]/&quot;,
+<a id="l173" href="#l173">173</a>             &quot;https://[github.com/&quot;,
+<a id="l174" href="#l174">174</a>             &quot;//github.com/&quot;,
+<a id="l175" href="#l175">175</a>             &quot;javascript:alert(1)//github.com/&quot;,
+<a id="l176" href="#l176">176</a>         ]:
+<a id="l177" href="#l177">177</a>             with self.subTest(url=url), self.assertRaises(HandoffError):
+<a id="l178" href="#l178">178</a>                 handoff.check_url(url, DOMAINS)
+<a id="l179" href="#l179">179</a> 
+<a id="l180" href="#l180">180</a>     def test_ignores_the_case_of_the_host(self) -&gt; None:
+<a id="l181" href="#l181">181</a>         self.assertEqual(handoff.check_url(&quot;https://GitHub.COM/equwal&quot;, DOMAINS), &quot;github.com&quot;)
+<a id="l182" href="#l182">182</a> 
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a> class CheckTextTest(unittest.TestCase):
+<a id="l185" href="#l185">185</a>     @given(st.lists(WORD, min_size=1, max_size=20))
+<a id="l186" href="#l186">186</a>     def test_accepts_short_text(self, words: list[str]) -&gt; None:
+<a id="l187" href="#l187">187</a>         handoff.check_text(&quot; &quot;.join(words), [&quot; &quot;.join(words)])
+<a id="l188" href="#l188">188</a> 
+<a id="l189" href="#l189">189</a>     @given(st.lists(WORD, min_size=21, max_size=40))
+<a id="l190" href="#l190">190</a>     def test_refuses_long_steps(self, words: list[str]) -&gt; None:
+<a id="l191" href="#l191">191</a>         with self.assertRaises(HandoffError):
+<a id="l192" href="#l192">192</a>             handoff.check_text(&quot;Publish 1.4.0&quot;, [&quot;Click it.&quot;, &quot; &quot;.join(words)])
+<a id="l193" href="#l193">193</a> 
+<a id="l194" href="#l194">194</a>     def test_refuses_long_titles_semicolons_and_empty_text(self) -&gt; None:
+<a id="l195" href="#l195">195</a>         for title, steps in [
+<a id="l196" href="#l196">196</a>             (&quot; &quot;.join([&quot;word&quot;] * 21), [&quot;Click it.&quot;]),
+<a id="l197" href="#l197">197</a>             (&quot;Publish 1.4.0&quot;, [&quot;Open the page; click it.&quot;]),
+<a id="l198" href="#l198">198</a>             (&quot;Publish 1.4.0&quot;, [&quot;   &quot;]),
+<a id="l199" href="#l199">199</a>             (&quot;&quot;, [&quot;Click it.&quot;]),
+<a id="l200" href="#l200">200</a>         ]:
+<a id="l201" href="#l201">201</a>             with self.subTest(title=title, steps=steps), self.assertRaises(HandoffError):
+<a id="l202" href="#l202">202</a>                 handoff.check_text(title, steps)
+<a id="l203" href="#l203">203</a> 
+<a id="l204" href="#l204">204</a> 
+<a id="l205" href="#l205">205</a> class ConfigTest(unittest.TestCase):
+<a id="l206" href="#l206">206</a>     def setUp(self) -&gt; None:
+<a id="l207" href="#l207">207</a>         folder = tempfile.TemporaryDirectory()
+<a id="l208" href="#l208">208</a>         self.addCleanup(folder.cleanup)
+<a id="l209" href="#l209">209</a>         self.folder = Path(folder.name)
+<a id="l210" href="#l210">210</a> 
+<a id="l211" href="#l211">211</a>     def write(self, text: str) -&gt; Path:
+<a id="l212" href="#l212">212</a>         path = self.folder / &quot;config.toml&quot;
+<a id="l213" href="#l213">213</a>         path.write_text(text, encoding=&quot;utf-8&quot;)
+<a id="l214" href="#l214">214</a>         return path
+<a id="l215" href="#l215">215</a> 
+<a id="l216" href="#l216">216</a>     def test_shipped_file_allows_github(self) -&gt; None:
+<a id="l217" href="#l217">217</a>         self.assertIn(&quot;github.com&quot;, handoff.read_hosts(handoff.SHIPPED_CONFIG))
+<a id="l218" href="#l218">218</a> 
+<a id="l219" href="#l219">219</a>     def test_refuses_bad_files(self) -&gt; None:
+<a id="l220" href="#l220">220</a>         for text in [
+<a id="l221" href="#l221">221</a>             &#x27;allowed_hosts = [&quot;https://github.com&quot;]\n&#x27;,
+<a id="l222" href="#l222">222</a>             &#x27;allowed_hosts = [&quot;GitHub.com&quot;]\n&#x27;,
+<a id="l223" href="#l223">223</a>             &quot;allowed_hosts = [1]\n&quot;,
+<a id="l224" href="#l224">224</a>             &#x27;allowed_hosts = &quot;github.com&quot;\n&#x27;,
+<a id="l225" href="#l225">225</a>             &quot;not toml\n&quot;,
+<a id="l226" href="#l226">226</a>         ]:
+<a id="l227" href="#l227">227</a>             with self.subTest(text=text), self.assertRaises(HandoffError):
+<a id="l228" href="#l228">228</a>                 handoff.read_hosts(self.write(text))
+<a id="l229" href="#l229">229</a> 
+<a id="l230" href="#l230">230</a>     def test_refuses_a_missing_file(self) -&gt; None:
+<a id="l231" href="#l231">231</a>         with self.assertRaises(HandoffError):
+<a id="l232" href="#l232">232</a>             handoff.read_hosts(self.folder / &quot;missing.toml&quot;)
+<a id="l233" href="#l233">233</a> 
+<a id="l234" href="#l234">234</a>     def test_user_file_adds_hosts(self) -&gt; None:
+<a id="l235" href="#l235">235</a>         user = self.write(&#x27;allowed_hosts = [&quot;example.com&quot;]\n&#x27;)
+<a id="l236" href="#l236">236</a>         with mock.patch.object(handoff, &quot;USER_CONFIG&quot;, user):
+<a id="l237" href="#l237">237</a>             hosts = handoff.allowed_hosts()
+<a id="l238" href="#l238">238</a>         self.assertIn(&quot;example.com&quot;, hosts)
+<a id="l239" href="#l239">239</a>         self.assertIn(&quot;github.com&quot;, hosts)
+<a id="l240" href="#l240">240</a> 
+<a id="l241" href="#l241">241</a>     def test_user_file_is_optional(self) -&gt; None:
+<a id="l242" href="#l242">242</a>         with mock.patch.object(handoff, &quot;USER_CONFIG&quot;, self.folder / &quot;missing.toml&quot;):
+<a id="l243" href="#l243">243</a>             self.assertEqual(handoff.allowed_hosts(), handoff.read_hosts(handoff.SHIPPED_CONFIG))
+<a id="l244" href="#l244">244</a> 
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a> class OpenPageTest(unittest.TestCase):
+<a id="l247" href="#l247">247</a>     def test_opens_a_new_tab(self) -&gt; None:
+<a id="l248" href="#l248">248</a>         with mock.patch(&quot;webbrowser.open&quot;, return_value=True) as browser:
+<a id="l249" href="#l249">249</a>             handoff.open_page(&quot;https://github.com/&quot;)
+<a id="l250" href="#l250">250</a>         browser.assert_called_once_with(&quot;https://github.com/&quot;, new=2)
+<a id="l251" href="#l251">251</a> 
+<a id="l252" href="#l252">252</a>     def test_error_if_no_browser_opens(self) -&gt; None:
+<a id="l253" href="#l253">253</a>         with mock.patch(&quot;webbrowser.open&quot;, return_value=False), self.assertRaises(HandoffError):
+<a id="l254" href="#l254">254</a>             handoff.open_page(&quot;https://github.com/&quot;)
+<a id="l255" href="#l255">255</a> 
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> class GithubRepoTest(unittest.TestCase):
+<a id="l258" href="#l258">258</a>     @given(OWNER, NAME, st.sampled_from(REMOTE_FORMS))
+<a id="l259" href="#l259">259</a>     def test_round_trip(self, owner: str, name: str, form: str) -&gt; None:
+<a id="l260" href="#l260">260</a>         self.assertEqual(handoff.github_repo(form.format(f&quot;{owner}/{name}&quot;)), f&quot;{owner}/{name}&quot;)
+<a id="l261" href="#l261">261</a> 
+<a id="l262" href="#l262">262</a>     def test_refuses_other_remotes(self) -&gt; None:
+<a id="l263" href="#l263">263</a>         for remote in [
+<a id="l264" href="#l264">264</a>             &quot;https://gitlab.com/o/r.git&quot;,
+<a id="l265" href="#l265">265</a>             &quot;git@github-work:o/r.git&quot;,
+<a id="l266" href="#l266">266</a>             &quot;https://github.com.evil.com/o/r&quot;,
+<a id="l267" href="#l267">267</a>             &quot;https://github.com/o&quot;,
+<a id="l268" href="#l268">268</a>             &quot;https://github.com/o/r/extra&quot;,
+<a id="l269" href="#l269">269</a>             &quot;C:/repos/r.git&quot;,
+<a id="l270" href="#l270">270</a>         ]:
+<a id="l271" href="#l271">271</a>             with self.subTest(remote=remote), self.assertRaises(HandoffError):
+<a id="l272" href="#l272">272</a>                 handoff.github_repo(remote)
+<a id="l273" href="#l273">273</a> 
+<a id="l274" href="#l274">274</a> 
+<a id="l275" href="#l275">275</a> class CompareUrlTest(unittest.TestCase):
+<a id="l276" href="#l276">276</a>     @given(REPO, st.none() | branches(), branches(), TEXT, TEXT)
+<a id="l277" href="#l277">277</a>     def test_round_trip(
+<a id="l278" href="#l278">278</a>         self, repo: str, base: str | None, head: str, title: str, body: str
+<a id="l279" href="#l279">279</a>     ) -&gt; None:
+<a id="l280" href="#l280">280</a>         url = handoff.compare_url(repo, base, head, title, body)
+<a id="l281" href="#l281">281</a>         self.assertEqual(handoff.check_url(url, [&quot;github.com&quot;]), &quot;github.com&quot;)
+<a id="l282" href="#l282">282</a>         parts = urlsplit(url)
+<a id="l283" href="#l283">283</a>         prefix = f&quot;/{repo}/compare/&quot;
+<a id="l284" href="#l284">284</a>         self.assertTrue(parts.path.startswith(prefix))
+<a id="l285" href="#l285">285</a>         refs = [unquote(ref) for ref in parts.path.removeprefix(prefix).split(&quot;...&quot;)]
+<a id="l286" href="#l286">286</a>         self.assertEqual(refs, [head] if base is None else [base, head])
+<a id="l287" href="#l287">287</a>         query = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
+<a id="l288" href="#l288">288</a>         self.assertEqual(query, {&quot;expand&quot;: [&quot;1&quot;], &quot;title&quot;: [title], &quot;body&quot;: [body]})
+<a id="l289" href="#l289">289</a> 
+<a id="l290" href="#l290">290</a>     def test_refuses_long_urls(self) -&gt; None:
+<a id="l291" href="#l291">291</a>         with self.assertRaises(HandoffError):
+<a id="l292" href="#l292">292</a>             handoff.compare_url(&quot;o/r&quot;, None, &quot;b&quot;, &quot;t&quot;, &quot;x&quot; * handoff.MAX_PR_URL_LENGTH)
+<a id="l293" href="#l293">293</a> 
+<a id="l294" href="#l294">294</a> 
+<a id="l295" href="#l295">295</a> class GitTest(unittest.TestCase):
+<a id="l296" href="#l296">296</a>     def setUp(self) -&gt; None:
+<a id="l297" href="#l297">297</a>         folder = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+<a id="l298" href="#l298">298</a>         self.addCleanup(folder.cleanup)
+<a id="l299" href="#l299">299</a>         self.work = make_repo(Path(folder.name))
+<a id="l300" href="#l300">300</a> 
+<a id="l301" href="#l301">301</a>     def test_current_branch(self) -&gt; None:
+<a id="l302" href="#l302">302</a>         self.assertEqual(handoff.current_branch(self.work), &quot;main&quot;)
+<a id="l303" href="#l303">303</a>         run_git(&quot;-C&quot;, str(self.work), &quot;checkout&quot;, &quot;--detach&quot;)
+<a id="l304" href="#l304">304</a>         with self.assertRaises(HandoffError):
+<a id="l305" href="#l305">305</a>             handoff.current_branch(self.work)
+<a id="l306" href="#l306">306</a> 
+<a id="l307" href="#l307">307</a>     def test_check_pushed(self) -&gt; None:
+<a id="l308" href="#l308">308</a>         with self.assertRaises(HandoffError):
+<a id="l309" href="#l309">309</a>             handoff.check_pushed(self.work, &quot;origin&quot;, &quot;main&quot;)
+<a id="l310" href="#l310">310</a>         run_git(&quot;-C&quot;, str(self.work), &quot;push&quot;, &quot;origin&quot;, &quot;main&quot;)
+<a id="l311" href="#l311">311</a>         handoff.check_pushed(self.work, &quot;origin&quot;, &quot;main&quot;)
+<a id="l312" href="#l312">312</a>         run_git(&quot;-C&quot;, str(self.work), &quot;commit&quot;, &quot;--allow-empty&quot;, &quot;-m&quot;, &quot;second&quot;)
+<a id="l313" href="#l313">313</a>         with self.assertRaises(HandoffError):
+<a id="l314" href="#l314">314</a>             handoff.check_pushed(self.work, &quot;origin&quot;, &quot;main&quot;)
+<a id="l315" href="#l315">315</a> 
+<a id="l316" href="#l316">316</a> 
+<a id="l317" href="#l317">317</a> class DialogTest(unittest.TestCase):
+<a id="l318" href="#l318">318</a>     def make_dialog(self, timeout_minutes: float = 1) -&gt; handoff.Dialog:
+<a id="l319" href="#l319">319</a>         request = Request(&quot;Test handoff&quot;, &quot;https://github.com/equwal&quot;, (&quot;Look at the page.&quot;,))
+<a id="l320" href="#l320">320</a>         return handoff.Dialog(request, timeout_minutes, lambda: None)
+<a id="l321" href="#l321">321</a> 
+<a id="l322" href="#l322">322</a>     def test_done_returns_the_note(self) -&gt; None:
+<a id="l323" href="#l323">323</a>         dialog = self.make_dialog()
+<a id="l324" href="#l324">324</a> 
+<a id="l325" href="#l325">325</a>         def answer() -&gt; None:
+<a id="l326" href="#l326">326</a>             dialog.note.insert(0, &quot;  shipped  &quot;)
+<a id="l327" href="#l327">327</a>             dialog.done_button.invoke()
+<a id="l328" href="#l328">328</a> 
+<a id="l329" href="#l329">329</a>         dialog.root.after(50, answer)
+<a id="l330" href="#l330">330</a>         self.assertEqual(dialog.run(), (&quot;done&quot;, &quot;shipped&quot;))
+<a id="l331" href="#l331">331</a> 
+<a id="l332" href="#l332">332</a>     def test_not_done(self) -&gt; None:
+<a id="l333" href="#l333">333</a>         dialog = self.make_dialog()
+<a id="l334" href="#l334">334</a>         dialog.root.after(50, dialog.not_done_button.invoke)
+<a id="l335" href="#l335">335</a>         self.assertEqual(dialog.run(), (&quot;not_done&quot;, &quot;&quot;))
+<a id="l336" href="#l336">336</a> 
+<a id="l337" href="#l337">337</a>     def test_closing_the_window_means_not_done(self) -&gt; None:
+<a id="l338" href="#l338">338</a>         dialog = self.make_dialog()
+<a id="l339" href="#l339">339</a>         close = dialog.root.protocol(&quot;WM_DELETE_WINDOW&quot;)
+<a id="l340" href="#l340">340</a>         dialog.root.after(50, dialog.root.tk.call, close)
+<a id="l341" href="#l341">341</a>         self.assertEqual(dialog.run(), (&quot;not_done&quot;, &quot;&quot;))
+<a id="l342" href="#l342">342</a> 
+<a id="l343" href="#l343">343</a>     def test_timeout(self) -&gt; None:
+<a id="l344" href="#l344">344</a>         self.assertEqual(self.make_dialog(timeout_minutes=0.001).run(), (&quot;timeout&quot;, &quot;&quot;))
+<a id="l345" href="#l345">345</a> 
+<a id="l346" href="#l346">346</a>     def test_shows_the_steps_under_a_heading(self) -&gt; None:
+<a id="l347" href="#l347">347</a>         # The smoke test on 2026-09-21 showed this request. The user could not see what to do.
+<a id="l348" href="#l348">348</a>         request = Request(
+<a id="l349" href="#l349">349</a>             &quot;Smoke test: deploy-handoff&quot;,
+<a id="l350" href="#l350">350</a>             &quot;https://github.com/equwal&quot;,
+<a id="l351" href="#l351">351</a>             (&quot;No action needed. This window closes itself.&quot;,),
+<a id="l352" href="#l352">352</a>         )
+<a id="l353" href="#l353">353</a>         dialog = handoff.Dialog(request, 1, lambda: None)
+<a id="l354" href="#l354">354</a>         texts = label_texts(dialog.root)
+<a id="l355" href="#l355">355</a>         dialog.finish(&quot;not_done&quot;)
+<a id="l356" href="#l356">356</a>         expected = [
+<a id="l357" href="#l357">357</a>             &quot;Smoke test: deploy-handoff&quot;,
+<a id="l358" href="#l358">358</a>             &quot;Do these steps in your browser:&quot;,
+<a id="l359" href="#l359">359</a>             &quot;1. No action needed. This window closes itself.&quot;,
+<a id="l360" href="#l360">360</a>         ]
+<a id="l361" href="#l361">361</a>         self.assertEqual(texts[:3], expected)
+<a id="l362" href="#l362">362</a>         self.assertIn(&quot;Site: github.com&quot;, texts)
+<a id="l363" href="#l363">363</a> 
+<a id="l364" href="#l364">364</a> 
+<a id="l365" href="#l365">365</a> class MainTest(unittest.TestCase):
+<a id="l366" href="#l366">366</a>     &quot;&quot;&quot;Test main with a fake browser and a fake dialog.&quot;&quot;&quot;
+<a id="l367" href="#l367">367</a> 
+<a id="l368" href="#l368">368</a>     def setUp(self) -&gt; None:
+<a id="l369" href="#l369">369</a>         folder = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+<a id="l370" href="#l370">370</a>         self.addCleanup(folder.cleanup)
+<a id="l371" href="#l371">371</a>         self.root = Path(folder.name)
+<a id="l372" href="#l372">372</a>         config = self.root / &quot;config.toml&quot;
+<a id="l373" href="#l373">373</a>         config.write_text(&#x27;allowed_hosts = [&quot;github.com&quot;]\n&#x27;, encoding=&quot;utf-8&quot;)
+<a id="l374" href="#l374">374</a>         self.patch(&quot;SHIPPED_CONFIG&quot;, config)
+<a id="l375" href="#l375">375</a>         self.patch(&quot;USER_CONFIG&quot;, self.root / &quot;missing.toml&quot;)
+<a id="l376" href="#l376">376</a>         self.open_page = self.patch(&quot;open_page&quot;, mock.MagicMock())
+<a id="l377" href="#l377">377</a>         self.dialog = self.patch(&quot;Dialog&quot;, mock.MagicMock())
+<a id="l378" href="#l378">378</a>         self.dialog.return_value.run.return_value = (&quot;done&quot;, &quot;ok&quot;)
+<a id="l379" href="#l379">379</a> 
+<a id="l380" href="#l380">380</a>     def patch(self, name: str, value: T) -&gt; T:
+<a id="l381" href="#l381">381</a>         patcher = mock.patch.object(handoff, name, value)
+<a id="l382" href="#l382">382</a>         patcher.start()
+<a id="l383" href="#l383">383</a>         self.addCleanup(patcher.stop)
+<a id="l384" href="#l384">384</a>         return value
+<a id="l385" href="#l385">385</a> 
+<a id="l386" href="#l386">386</a>     def run_main(self, *argv: str) -&gt; tuple[int, dict[str, object]]:
+<a id="l387" href="#l387">387</a>         output = StringIO()
+<a id="l388" href="#l388">388</a>         with redirect_stdout(output):
+<a id="l389" href="#l389">389</a>             code = handoff.main(list(argv))
+<a id="l390" href="#l390">390</a>         result: dict[str, object] = json.loads(output.getvalue())
+<a id="l391" href="#l391">391</a>         return code, result
+<a id="l392" href="#l392">392</a> 
+<a id="l393" href="#l393">393</a>     def open_url(self, url: str) -&gt; tuple[int, dict[str, object]]:
+<a id="l394" href="#l394">394</a>         return self.run_main(&quot;open&quot;, &quot;--url&quot;, url, &quot;--title&quot;, &quot;Do it&quot;, &quot;--step&quot;, &quot;Click it.&quot;)
+<a id="l395" href="#l395">395</a> 
+<a id="l396" href="#l396">396</a>     def test_open(self) -&gt; None:
+<a id="l397" href="#l397">397</a>         self.assertEqual(
+<a id="l398" href="#l398">398</a>             self.open_url(&quot;https://github.com/o&quot;), (0, {&quot;status&quot;: &quot;done&quot;, &quot;note&quot;: &quot;ok&quot;})
+<a id="l399" href="#l399">399</a>         )
+<a id="l400" href="#l400">400</a>         self.open_page.assert_called_once_with(&quot;https://github.com/o&quot;)
+<a id="l401" href="#l401">401</a> 
+<a id="l402" href="#l402">402</a>     def test_exit_codes_for_other_answers(self) -&gt; None:
+<a id="l403" href="#l403">403</a>         for status, expected in [(&quot;not_done&quot;, 3), (&quot;timeout&quot;, 4)]:
+<a id="l404" href="#l404">404</a>             self.dialog.return_value.run.return_value = (status, &quot;&quot;)
+<a id="l405" href="#l405">405</a>             code, result = self.open_url(&quot;https://github.com/o&quot;)
+<a id="l406" href="#l406">406</a>             self.assertEqual((code, result[&quot;status&quot;]), (expected, status))
+<a id="l407" href="#l407">407</a> 
+<a id="l408" href="#l408">408</a>     def test_no_open_shows_only_the_dialog(self) -&gt; None:
+<a id="l409" href="#l409">409</a>         code, result = self.run_main(
+<a id="l410" href="#l410">410</a>             &quot;open&quot;,
+<a id="l411" href="#l411">411</a>             &quot;--no-open&quot;,
+<a id="l412" href="#l412">412</a>             &quot;--url&quot;,
+<a id="l413" href="#l413">413</a>             &quot;https://github.com/o&quot;,
+<a id="l414" href="#l414">414</a>             &quot;--title&quot;,
+<a id="l415" href="#l415">415</a>             &quot;Do it&quot;,
+<a id="l416" href="#l416">416</a>             &quot;--step&quot;,
+<a id="l417" href="#l417">417</a>             &quot;Go.&quot;,
+<a id="l418" href="#l418">418</a>         )
+<a id="l419" href="#l419">419</a>         self.assertEqual((code, result[&quot;status&quot;]), (0, &quot;done&quot;))
+<a id="l420" href="#l420">420</a>         self.open_page.assert_not_called()
+<a id="l421" href="#l421">421</a>         self.dialog.assert_called_once()
+<a id="l422" href="#l422">422</a> 
+<a id="l423" href="#l423">423</a>     def test_open_refuses_long_steps(self) -&gt; None:
+<a id="l424" href="#l424">424</a>         code, result = self.run_main(
+<a id="l425" href="#l425">425</a>             &quot;open&quot;, &quot;--url&quot;, &quot;https://github.com/o&quot;, &quot;--title&quot;, &quot;Do it&quot;, &quot;--step&quot;, &quot;word &quot; * 21
+<a id="l426" href="#l426">426</a>         )
+<a id="l427" href="#l427">427</a>         self.assertEqual((code, result[&quot;status&quot;]), (1, &quot;error&quot;))
+<a id="l428" href="#l428">428</a>         self.open_page.assert_not_called()
+<a id="l429" href="#l429">429</a> 
+<a id="l430" href="#l430">430</a>     def test_open_refuses_hosts_that_are_not_allowed(self) -&gt; None:
+<a id="l431" href="#l431">431</a>         code, result = self.open_url(&quot;https://evil.example/&quot;)
+<a id="l432" href="#l432">432</a>         self.assertEqual((code, result[&quot;status&quot;]), (1, &quot;error&quot;))
+<a id="l433" href="#l433">433</a>         self.open_page.assert_not_called()
+<a id="l434" href="#l434">434</a>         self.dialog.assert_not_called()
+<a id="l435" href="#l435">435</a> 
+<a id="l436" href="#l436">436</a>     def test_pr(self) -&gt; None:
+<a id="l437" href="#l437">437</a>         work = make_repo(self.root)
+<a id="l438" href="#l438">438</a>         run_git(&quot;-C&quot;, str(work), &quot;push&quot;, &quot;origin&quot;, &quot;main&quot;)
+<a id="l439" href="#l439">439</a>         find_open_pr = self.patch(&quot;find_open_pr&quot;, mock.MagicMock())
+<a id="l440" href="#l440">440</a>         find_open_pr.return_value = &quot;https://github.com/o/r/pull/1&quot;
+<a id="l441" href="#l441">441</a>         code, result = self.run_main(
+<a id="l442" href="#l442">442</a>             &quot;pr&quot;, &quot;--repo&quot;, &quot;o/r&quot;, &quot;--repo-dir&quot;, str(work), &quot;--title&quot;, &quot;Add X&quot;, &quot;--body&quot;, &quot;Why&quot;
+<a id="l443" href="#l443">443</a>         )
+<a id="l444" href="#l444">444</a>         expected = {&quot;status&quot;: &quot;done&quot;, &quot;note&quot;: &quot;ok&quot;, &quot;pr_url&quot;: &quot;https://github.com/o/r/pull/1&quot;}
+<a id="l445" href="#l445">445</a>         self.assertEqual((code, result), (0, expected))
+<a id="l446" href="#l446">446</a>         self.open_page.assert_called_once_with(
+<a id="l447" href="#l447">447</a>             &quot;https://github.com/o/r/compare/main?expand=1&amp;title=Add%20X&amp;body=Why&quot;
+<a id="l448" href="#l448">448</a>         )
+<a id="l449" href="#l449">449</a>         find_open_pr.assert_called_once_with(&quot;o/r&quot;, &quot;main&quot;)
+<a id="l450" href="#l450">450</a> 
+<a id="l451" href="#l451">451</a>     def test_pr_refuses_a_branch_that_is_not_pushed(self) -&gt; None:
+<a id="l452" href="#l452">452</a>         work = make_repo(self.root)
+<a id="l453" href="#l453">453</a>         code, result = self.run_main(&quot;pr&quot;, &quot;--repo&quot;, &quot;o/r&quot;, &quot;--repo-dir&quot;, str(work), &quot;--title&quot;, &quot;X&quot;)
+<a id="l454" href="#l454">454</a>         self.assertEqual((code, result[&quot;status&quot;]), (1, &quot;error&quot;))
+<a id="l455" href="#l455">455</a>         self.assertIn(&quot;Push main first&quot;, str(result[&quot;error&quot;]))
+<a id="l456" href="#l456">456</a>         self.open_page.assert_not_called()
+<a id="l457" href="#l457">457</a> 
+<a id="l458" href="#l458">458</a> 
+<a id="l459" href="#l459">459</a> if __name__ == &quot;__main__&quot;:
+<a id="l460" href="#l460">460</a>     unittest.main()</pre>
+</div></body></html>

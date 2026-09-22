@@ -1,0 +1,2758 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine 71ab31e7 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../ideamine/index.html">Log</a> | <a href="../../ideamine/files.html">Files</a> | <a href="../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 71ab31e7a64250413289c0c472dd5e81f1a4ba49
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-09-21 12:30:08 -0700
+
+ideamine 0.5.0: search by meaning, groups, and a dashboard
+
+/ideas-find searches by meaning and /ideas-groups groups the ideas by
+meaning. The hook answers both with no model call. idea_list gets the
+parameters semantic and groups, so Claude can do the same.
+
+Embeddings come from nomic-embed-text through an OpenAI-compatible
+/v1/embeddings server (Ollama, or the llama.cpp server). The design
+follows memstate: the search_document and search_query prefixes, one
+cached vector for each idea (a content hash tells when to embed again),
+cosine similarity with a threshold, and word search when the server does
+not answer. A text that is too long is halved until the server takes it.
+Groups use average-linkage clustering on the same vectors, so no graph
+database is necessary. The thresholds (0.5 for search, 0.65 for groups)
+come from the 17 real ideas: an unrelated query stays below 0.46.
+
+ideamine publish uploads index.html and data.json with HTTP PUT. The
+page shows a board of tickets, a timeline, the groups, and search by
+meaning. After the first publish, the hook starts a background publish
+when the archive changes, like the watcher. updateIdea records started
+when an idea goes to doing, for the timeline.
+
+Settings are in ~/.ideamine/config.json (ideamine config), and
+environment variables override them. fast-check is a new development
+dependency for the property tests of the vector codec and the
+clustering. The plugin itself still installs nothing.
+
+</pre><pre> .claude-plugin/marketplace.json |   2 +-
+ .claude-plugin/plugin.json      |   2 +-
+ README.md                       | 101 ++++-
+ bin/ideamine.js                 |  56 ++-
+ dashboard/index.html            | 899 ++++++++++++++++++++++++++++++++++++++++
+ package-lock.json               |  62 +++
+ package.json                    |   8 +-
+ skills/ideas-find/SKILL.md      |  11 +
+ skills/ideas-groups/SKILL.md    |  11 +
+ skills/ideas/SKILL.md           |   2 +-
+ src/config.js                   |  89 ++++
+ src/embed.js                    | 318 ++++++++++++++
+ src/hook.js                     |  57 ++-
+ src/mcp.js                      |  24 +-
+ src/publish.js                  | 234 +++++++++++
+ src/render.js                   |  23 +
+ src/store.js                    |  39 +-
+ tests/embed.test.js             | 163 ++++++++
+ tests/fixtures/fake-server.js   |  51 +++
+ tests/hook.test.js              |  41 +-
+ tests/mcp.test.js               |   2 +-
+ tests/publish.test.js           | 126 ++++++
+ tests/store.test.js             |  12 +
+ 23 files changed, 2285 insertions(+), 48 deletions(-)
+</pre><pre>diff --git a/.claude-plugin/marketplace.json b/.claude-plugin/marketplace.json
+index c72f57c..51b5526 100644
+--- a/.claude-plugin/marketplace.json
++++ b/.claude-plugin/marketplace.json
+<span class="h">@@ -10,7 +10,7 @@</span>
+     {
+       &quot;name&quot;: &quot;ideamine&quot;,
+       &quot;description&quot;: &quot;An idea inbox for Claude Code. /idea saves an idea without a model call. Claude triages the ideas and picks the cheapest model that can build each one.&quot;,
+<span class="d">-      &quot;version&quot;: &quot;0.4.0&quot;,</span>
+<span class="a">+      &quot;version&quot;: &quot;0.5.0&quot;,</span>
+       &quot;author&quot;: {
+         &quot;name&quot;: &quot;equwal&quot;
+       },
+diff --git a/.claude-plugin/plugin.json b/.claude-plugin/plugin.json
+index 5e4f1f7..b449e53 100644
+--- a/.claude-plugin/plugin.json
++++ b/.claude-plugin/plugin.json
+<span class="h">@@ -1,6 +1,6 @@</span>
+ {
+   &quot;name&quot;: &quot;ideamine&quot;,
+<span class="d">-  &quot;version&quot;: &quot;0.4.0&quot;,</span>
+<span class="a">+  &quot;version&quot;: &quot;0.5.0&quot;,</span>
+   &quot;description&quot;: &quot;An idea inbox for Claude Code. /idea saves an idea without a model call, so it works at any time, even at your usage limit. Claude triages the ideas and picks the cheapest model that can build each one.&quot;,
+   &quot;author&quot;: {
+     &quot;name&quot;: &quot;equwal&quot;,
+diff --git a/README.md b/README.md
+index 39ad54a..dba01b9 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -42,6 +42,8 @@ Marketplaces you add yourself do not auto-update. To upgrade, run `claude plugin</span>
+ | `/ideas-rm 12 14` | Delete ideas for good | **No** |
+ | `/ideas-done 12 shipped it` | Mark an idea done, with a note | **No** |
+ | `/ideas-reopen 12` | Put an idea back in the queue, for example one that the triage skipped | **No** |
+<span class="a">+| `/ideas-find sync subtitles` | Search every lane by meaning, not only by the words. See [Search by meaning](#search-by-meaning-and-groups). | **No** |</span>
+<span class="a">+| `/ideas-groups` · `done` · `-a` | Show the ideas grouped by meaning | **No** |</span>
+ | `/ideas-go [12]` | Build the idea that fits this chat, else the first in the queue, or #12, on its recommended model. New ideas are triaged first. | Yes, this is the build |
+ | `/ideas-all` | Claude reads every idea, takes the ones that fit this chat out of the queue, and does them. The others stay in the queue. | Yes, this is the build |
+ | `/ideas-sort` | Triage the inbox now and show the queue. You do not have to: `/ideas-go` triages when it must. | Yes, briefly |
+<span class="h">@@ -67,6 +69,68 @@ Run `/ideas-watch` once. After that, a few seconds after you save an idea, Haiku</span>
+ 
+ The watcher is not a process that stays alive, because a process like that can stop: a crash, a reboot, a full context, or a usage limit. Instead, the ideamine hook starts a short background pass when you send a prompt and there is work. Thus the watcher keeps going while you use Claude Code, and it costs nothing while no new ideas come in. A failed call gets 2 more tries in the same pass. After a failed pass, the watcher waits 10 minutes before it tries again. `/ideas-watch` shows the last passes, and `/ideas-watch off` turns the watcher off. In a terminal, `ideamine watch` does the same. The log is `~/.ideamine/watch.log`.
+ 
+<span class="a">+## Search by meaning and groups</span>
+<span class="a">+</span>
+<span class="a">+```</span>
+<span class="a">+&gt; /ideas-find make money</span>
+<span class="a">+  ideas like &quot;make money&quot;, by meaning</span>
+<span class="a">+    53% done    #4   sonnet S  ▲3  Research monetization models for device-hacking utility apps</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+`/ideas-find` finds ideas that mean the same thing as your words, also when they use other words. `/ideas-groups` puts ideas that are about the same thing in one group, for example all the ideas for one app. Both come from embeddings: an embedding model turns each idea into a vector, and ideas with similar meaning get similar vectors. The default model is [nomic-embed-text](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5). The design follows [memstate](https://github.com/map588/memstate): the `search_document:` and `search_query:` task prefixes of nomic, one cached vector for each idea that ideamine computes again when the idea changes, cosine similarity with a threshold, and word search when the embedding server does not answer. The groups and the related ideas come from the same vectors, so ideamine needs no graph database.</span>
+<span class="a">+</span>
+<span class="a">+ideamine sends the text of each new or changed idea to an embedding server that has an OpenAI-compatible `/v1/embeddings` endpoint. Two servers work:</span>
+<span class="a">+</span>
+<span class="a">+- [Ollama](https://ollama.com) on your machine: `ollama pull nomic-embed-text`. This is the default (`http://127.0.0.1:11434/v1`).</span>
+<span class="a">+- The [llama.cpp](https://github.com/ggml-org/llama.cpp) server on another machine, for example a small VPS. The model file is [`nomic-embed-text-v1.5.Q8_0.gguf`](https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF) (146 MB). With `-c 512` the server uses about 20 MB of memory plus the model file, which the kernel can page out:</span>
+<span class="a">+</span>
+<span class="a">+  ```bash</span>
+<span class="a">+  llama-server -m nomic-embed-text-v1.5.Q8_0.gguf --embeddings --pooling mean -c 512 -b 512 -ub 512 --alias nomic-embed-text --host 127.0.0.1 --port 8081</span>
+<span class="a">+  ```</span>
+<span class="a">+</span>
+<span class="a">+Then tell ideamine where the server is:</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+ideamine config embed_url http://10.66.0.1/v1</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+ideamine embed</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+`ideamine embed` embeds the ideas that have no vector yet. It also shows the similarity of each idea to its nearest neighbour, like `memstated embed status`. Use these numbers to set the thresholds for a new model. With nomic-embed-text, a search result must have a similarity of 0.5 or more (`search_threshold`), and the ideas in a group must have a mean similarity of 0.65 or more (`group_threshold`). A group gets a label from the words that its ideas share and other ideas do not use. If the server does not answer, `/ideas-find` searches by words and tells you why, and `/ideas-groups` tells you that it needs the server. The vectors are in `~/.ideamine/vectors.json`. When you delete an idea, its vector goes too.</span>
+<span class="a">+</span>
+<span class="a">+Claude can search by meaning with `idea_list` and `semantic: true`, and group with `groups: true`.</span>
+<span class="a">+</span>
+<span class="a">+## Dashboard</span>
+<span class="a">+</span>
+<span class="a">+`ideamine publish` makes a web page of your ideas: a board with a ticket for each idea, a timeline (a Gantt chart) of how long each idea waited and how long the work took, the groups, and search by meaning. A ticket opens a preview with the brief, the notes, and the related ideas. The page is one static file, `index.html`, and it reads a snapshot, `data.json`. It loads nothing from the internet.</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+ideamine publish http://10.66.0.1/</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+This uploads both files with HTTP PUT. It also saves the address, so the ideamine hook publishes again in the background after each change, at no model cost. `ideamine publish off` stops that. `ideamine publish --dir &lt;folder&gt;` writes the two files to a folder instead. The timeline uses the time when an idea went to `doing`. ideamine records that time from 0.5.0 on, so for older ideas the timeline shows an estimated bar.</span>
+<span class="a">+</span>
+<span class="a">+The snapshot contains the full text of your ideas. Serve it only where only you can open it. For example, this nginx site answers only on the address of a WireGuard interface, and it accepts uploads only from one peer:</span>
+<span class="a">+</span>
+<span class="a">+```nginx</span>
+<span class="a">+server {</span>
+<span class="a">+    listen 10.66.0.1:80;           # the WireGuard address of the server</span>
+<span class="a">+    allow 10.66.0.0/24;            # WireGuard peers only</span>
+<span class="a">+    deny all;</span>
+<span class="a">+    root /var/www/ideamine;</span>
+<span class="a">+    location ~ ^/(index\.html|data\.json)$ {</span>
+<span class="a">+        limit_except GET HEAD { allow 10.66.0.2; deny all; }   # only your PC uploads</span>
+<span class="a">+        dav_methods PUT;</span>
+<span class="a">+        client_max_body_size 16m;</span>
+<span class="a">+    }</span>
+<span class="a">+    location /v1/ { proxy_pass http://127.0.0.1:8081; }        # the llama.cpp server, for search on the page</span>
+<span class="a">+}</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+`data.json` has `version` (1), `generated`, `embed` (model, query prefix, thresholds, and whether vectors are present), `counts`, `ideas`, and `groups`. Each idea has its ticket key (`IDEA-12`), lane, rank in the queue, triage, times (`created`, `triaged`, `started`, `closed`), timeline `phases`, notes, `group`, `related` ideas with their similarity, and `vec`, the vector as base64 of little-endian float32.</span>
+<span class="a">+</span>
+ ## Model routing
+ 
+ The triage gives each idea a verdict (`do`, `maybe`, `skip`), an impact from 1 to 5, a size from `xs` to `xl`, a one-line reason, and a short brief that an agent can act on without the original chat. It also picks the cheapest model that is likely to finish the idea in one pass. If a weaker model fails and has to retry, that costs more than using the right model once.
+<span class="h">@@ -106,6 +170,11 @@ ideamine next                                     # what to build next</span>
+ ideamine go 12                                    # opens Claude Code on the right model, in the idea&#x27;s project
+ ideamine sort                                     # headless triage (see above)
+ ideamine watch [off]                              # the watcher (see above)
+<span class="a">+ideamine find sync subtitles                      # search by meaning</span>
+<span class="a">+ideamine groups [-a]                              # ideas grouped by meaning</span>
+<span class="a">+ideamine embed                                    # embed new ideas, show the similarity numbers</span>
+<span class="a">+ideamine publish [url|off] [--dir folder]         # the dashboard (see above)</span>
+<span class="a">+ideamine config [key [value]]                     # show or change a setting</span>
+ ideamine export IDEAS.md                          # Markdown copy of everything
+ ```
+ 
+<span class="h">@@ -125,14 +194,21 @@ Tools: `idea_add`, `idea_list`, `idea_triage`, `idea_update`, `idea_next`, `idea</span>
+ 
+ ## Where your ideas live
+ 
+<span class="d">-`~/.ideamine/ideas.json` is plain, readable JSON. Set `IDEAMINE_HOME` to move it, for example into a synced folder. Each write takes a lock and then replaces the file in one step, so many sessions can write at the same time without losing an idea. The previous version is kept as `ideas.json.bak`. If the file becomes damaged, ideamine stops and does not overwrite it. Nothing leaves your machine, except when you run triage or a build, which go through Claude as usual. So that it can pair ideas with projects, the triage also sends the paths of your project folders and the first line of each README.</span>
+<span class="a">+`~/.ideamine/ideas.json` is plain, readable JSON. Set `IDEAMINE_HOME` to move it, for example into a synced folder. Each write takes a lock and then replaces the file in one step, so many sessions can write at the same time without losing an idea. The previous version is kept as `ideas.json.bak`. If the file becomes damaged, ideamine stops and does not overwrite it. Nothing leaves your machine, except in these cases: triage and builds go through Claude as usual; search by meaning and groups send the text of your ideas to the embedding server that you set; `ideamine publish` uploads a snapshot to the dashboard server that you set. So that it can pair ideas with projects, the triage also sends the paths of your project folders and the first line of each README.</span>
+ 
+<span class="d">-| Variable | Default | Purpose |</span>
+<span class="d">-|---|---|---|</span>
+<span class="d">-| `IDEAMINE_HOME` | `~/.ideamine` | archive location |</span>
+<span class="d">-| `IDEAMINE_TRIAGE_MODEL` | `sonnet` | model for the headless triage |</span>
+<span class="d">-| `IDEAMINE_CLAUDE_BIN` | `claude` | Claude Code executable |</span>
+<span class="d">-| `IDEAMINE_SETTING_SOURCES` | *(empty)* | set to `user` if your login needs `settings.json` (e.g. `apiKeyHelper`) |</span>
+<span class="a">+`ideamine config` shows each setting and where its value comes from. `ideamine config &lt;key&gt; &lt;value&gt;` saves a setting in `~/.ideamine/config.json`, and an empty value restores the default. An environment variable wins over the file.</span>
+<span class="a">+</span>
+<span class="a">+| Variable | Setting | Default | Purpose |</span>
+<span class="a">+|---|---|---|---|</span>
+<span class="a">+| `IDEAMINE_HOME` | | `~/.ideamine` | archive location |</span>
+<span class="a">+| `IDEAMINE_TRIAGE_MODEL` | | `sonnet` | model for the headless triage |</span>
+<span class="a">+| `IDEAMINE_CLAUDE_BIN` | | `claude` | Claude Code executable |</span>
+<span class="a">+| `IDEAMINE_SETTING_SOURCES` | | *(empty)* | set to `user` if your login needs `settings.json` (e.g. `apiKeyHelper`) |</span>
+<span class="a">+| `IDEAMINE_EMBED_URL` | `embed_url` | `http://127.0.0.1:11434/v1` | OpenAI-compatible embeddings API (Ollama, llama.cpp server) |</span>
+<span class="a">+| `IDEAMINE_EMBED_MODEL` | `embed_model` | `nomic-embed-text` | embedding model; nomic models get their task prefixes |</span>
+<span class="a">+| `IDEAMINE_SEARCH_THRESHOLD` | `search_threshold` | `0.5` | lowest similarity of a search result |</span>
+<span class="a">+| `IDEAMINE_GROUP_THRESHOLD` | `group_threshold` | `0.65` | lowest mean similarity in a group, and of a related idea |</span>
+<span class="a">+| `IDEAMINE_PUBLISH_URL` | `publish_url` | *(off)* | dashboard server for `ideamine publish` |</span>
+ 
+ ## How it works
+ 
+<span class="h">@@ -146,17 +222,24 @@ Tools: `idea_add`, `idea_list`, `idea_triage`, `idea_update`, `idea_next`, `idea</span>
+ /ideas-all       ──► Claude ──► MCP idea_list (full) ──► idea_remove for the ideas that fit this chat ──► builds them
+ 
+ watcher on: any prompt ──► hook ──► background pass ──► claude -p (Haiku) ──► verdicts + a project for each idea
+<span class="a">+</span>
+<span class="a">+/ideas-find, /ideas-groups ──► hook ──► embedding server (new ideas only) ──► cosine similarity ──► answer</span>
+<span class="a">+publish on: any prompt after a change ──► hook ──► background publish ──► PUT index.html + data.json</span>
+ ```
+ 
+<span class="d">-The plugin contains a Node MCP server with no dependencies, eleven skills (the slash commands), and one hook. The hook answers `/idea`, `/ideas`, and the local `/ideas-*` commands before any API call, and it lets every other prompt through. The hook runs directly, not through a shell, and takes about 130 ms per prompt on Windows. The skills are user-only, so their descriptions add no tokens to your sessions. If the archive cannot be read, the hook lets the prompt through, so the `/idea` skill can still save it with the MCP tool. Your text is never dropped.</span>
+<span class="a">+The plugin contains a Node MCP server with no dependencies, thirteen skills (the slash commands), and one hook. The hook answers `/idea`, `/ideas`, and the local `/ideas-*` commands before any API call, and it lets every other prompt through. The hook runs directly, not through a shell, and takes about 130 ms per prompt on Windows. The skills are user-only, so their descriptions add no tokens to your sessions. If the archive cannot be read, the hook lets the prompt through, so the `/idea` skill can still save it with the MCP tool. Your text is never dropped.</span>
+ 
+ ## Development
+ 
+<span class="a">+```bash</span>
+<span class="a">+npm install</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+ ```bash
+ npm test
+ ```
+ 
+<span class="d">-The tests use `node:test` only. They cover the store, including concurrent writers from several processes, the hook, the MCP protocol, headless triage with pairing, and the watcher. Triage runs against a stand-in `claude`, so the tests spend no tokens.</span>
+<span class="a">+The tests use `node:test`, and [fast-check](https://fast-check.dev) for the property tests. fast-check is a development dependency only: the plugin itself installs nothing. The tests cover the store, including concurrent writers from several processes, the hook, the MCP protocol, headless triage with pairing, the watcher, embeddings and groups, and the dashboard upload. Triage runs against a stand-in `claude`, and embeddings and uploads run against a stand-in server, so the tests spend no tokens and need no network.</span>
+ 
+ ## License
+ 
+diff --git a/bin/ideamine.js b/bin/ideamine.js
+index 2cef36f..60050e2 100644
+--- a/bin/ideamine.js
++++ b/bin/ideamine.js
+<span class="h">@@ -18,6 +18,13 @@ const HELP = `ideamine: an idea inbox for Claude Code</span>
+                                   triage the inbox with one headless \`claude -p\` call
+   ideamine watch [off]            the watcher: Haiku triages new ideas and pairs them with projects
+   ideamine watch-pass             one pass of the watcher, now, in the foreground
+<span class="a">+  ideamine find &lt;words...&gt;        search by meaning (nomic-embed-text), in every lane</span>
+<span class="a">+  ideamine groups [lane|-a]       ideas grouped by meaning</span>
+<span class="a">+  ideamine embed                  embed new ideas, and show how the vectors and thresholds fit</span>
+<span class="a">+  ideamine publish [url|off] [--dir &lt;folder&gt;]</span>
+<span class="a">+                                  upload the dashboard (index.html, data.json) now; a url also turns</span>
+<span class="a">+                                  on the upload after each change; --dir writes the files to a folder</span>
+<span class="a">+  ideamine config [key [value]]   show or change a setting (an empty value restores the default)</span>
+   ideamine export [file.md]       Markdown export of the whole archive
+   ideamine path                   where the archive lives (override with IDEAMINE_HOME)
+   ideamine mcp                    run the MCP server on stdio
+<span class="h">@@ -31,7 +38,7 @@ function parseArgs(argv) {</span>
+     if (a.startsWith(&#x27;--&#x27;)) {
+       const [key, inline] = a.slice(2).split(&#x27;=&#x27;, 2);
+       if (inline !== undefined) flags[key] = inline;
+<span class="d">-      else if (argv[i + 1] !== undefined &amp;&amp; !argv[i + 1].startsWith(&#x27;--&#x27;) &amp;&amp; [&#x27;model&#x27;, &#x27;limit&#x27;, &#x27;budget&#x27;, &#x27;query&#x27;].includes(key)) flags[key] = argv[++i];</span>
+<span class="a">+      else if (argv[i + 1] !== undefined &amp;&amp; !argv[i + 1].startsWith(&#x27;--&#x27;) &amp;&amp; [&#x27;model&#x27;, &#x27;limit&#x27;, &#x27;budget&#x27;, &#x27;query&#x27;, &#x27;dir&#x27;].includes(key)) flags[key] = argv[++i];</span>
+       else flags[key] = true;
+     } else words.push(a);
+   }
+<span class="h">@@ -171,6 +178,53 @@ async function main() {</span>
+       if ((await watch.pass()) === &#x27;error&#x27;) process.exitCode = 1;
+       break;
+     }
+<span class="a">+    case &#x27;find&#x27;: {</span>
+<span class="a">+      const embed = await import(&#x27;../src/embed.js&#x27;);</span>
+<span class="a">+      const query = words.join(&#x27; &#x27;) || fail(&#x27;usage: ideamine find &lt;words...&gt;&#x27;);</span>
+<span class="a">+      console.log(render.renderFound(await embed.find(store.load(), query), query, { cwd }));</span>
+<span class="a">+      break;</span>
+<span class="a">+    }</span>
+<span class="a">+    case &#x27;groups&#x27;: {</span>
+<span class="a">+      const embed = await import(&#x27;../src/embed.js&#x27;);</span>
+<span class="a">+      const lower = words.map((w) =&gt; (w === &#x27;-a&#x27; ? &#x27;all&#x27; : w.toLowerCase()));</span>
+<span class="a">+      const filter = lower.find((w) =&gt; store.FILTERS.includes(w)) || &#x27;open&#x27;;</span>
+<span class="a">+      const ideas = store.listIdeas(store.load(), { filter });</span>
+<span class="a">+      console.log(render.renderGroups(await embed.groupIdeas(ideas), ideas, { cwd, scope: filter }));</span>
+<span class="a">+      break;</span>
+<span class="a">+    }</span>
+<span class="a">+    case &#x27;embed&#x27;: {</span>
+<span class="a">+      const embed = await import(&#x27;../src/embed.js&#x27;);</span>
+<span class="a">+      console.log(await embed.status(store.load()));</span>
+<span class="a">+      break;</span>
+<span class="a">+    }</span>
+<span class="a">+    case &#x27;publish&#x27;: {</span>
+<span class="a">+      const publish = await import(&#x27;../src/publish.js&#x27;);</span>
+<span class="a">+      if (flags.background) {</span>
+<span class="a">+        process.exitCode = (await publish.backgroundPublish()) === &#x27;error&#x27; ? 1 : 0;</span>
+<span class="a">+        break;</span>
+<span class="a">+      }</span>
+<span class="a">+      const config = await import(&#x27;../src/config.js&#x27;);</span>
+<span class="a">+      if (words[0] === &#x27;off&#x27;) {</span>
+<span class="a">+        config.set(&#x27;publish_url&#x27;, &#x27;&#x27;);</span>
+<span class="a">+        console.log(publish.status());</span>
+<span class="a">+        break;</span>
+<span class="a">+      }</span>
+<span class="a">+      if (words[0]) config.set(&#x27;publish_url&#x27;, words[0]);</span>
+<span class="a">+      const out = await publish.publish({ dir: typeof flags.dir === &#x27;string&#x27; ? flags.dir : null });</span>
+<span class="a">+      console.log(`Published ${out.ideas} ideas and ${out.groups} groups to ${out.where}`);</span>
+<span class="a">+      if (out.note) console.log(out.note);</span>
+<span class="a">+      break;</span>
+<span class="a">+    }</span>
+<span class="a">+    case &#x27;config&#x27;: {</span>
+<span class="a">+      const config = await import(&#x27;../src/config.js&#x27;);</span>
+<span class="a">+      if (words.length &gt;= 1 &amp;&amp; rest.length &gt;= 2) config.set(words[0], words.slice(1).join(&#x27; &#x27;));</span>
+<span class="a">+      else if (words.length === 1 &amp;&amp; rest.length === 1) {</span>
+<span class="a">+        console.log(config.get(words[0]));</span>
+<span class="a">+        break;</span>
+<span class="a">+      }</span>
+<span class="a">+      console.log(config.describe());</span>
+<span class="a">+      break;</span>
+<span class="a">+    }</span>
+     case &#x27;export&#x27;: {
+       const md = render.renderMarkdown(store.load());
+       if (words[0]) {
+diff --git a/dashboard/index.html b/dashboard/index.html
+new file mode 100644
+index 0000000..54331a5
+--- /dev/null
++++ b/dashboard/index.html
+<span class="h">@@ -0,0 +1,899 @@</span>
+<span class="a">+&lt;!doctype html&gt;</span>
+<span class="a">+&lt;html lang=&quot;en&quot;&gt;</span>
+<span class="a">+&lt;head&gt;</span>
+<span class="a">+&lt;meta charset=&quot;utf-8&quot;&gt;</span>
+<span class="a">+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;</span>
+<span class="a">+&lt;meta http-equiv=&quot;Content-Security-Policy&quot; content=&quot;default-src &#x27;self&#x27;; script-src &#x27;self&#x27; &#x27;unsafe-inline&#x27;; style-src &#x27;self&#x27; &#x27;unsafe-inline&#x27;; connect-src &#x27;self&#x27;; img-src &#x27;self&#x27; data:&quot;&gt;</span>
+<span class="a">+&lt;meta name=&quot;color-scheme&quot; content=&quot;light dark&quot;&gt;</span>
+<span class="a">+&lt;title&gt;ideamine&lt;/title&gt;</span>
+<span class="a">+&lt;style&gt;</span>
+<span class="a">+/* Theme tokens. Dark mode overrides the same names. */</span>
+<span class="a">+:root {</span>
+<span class="a">+  color-scheme: light dark;</span>
+<span class="a">+  --bg: #f9f9f7;</span>
+<span class="a">+  --surface: #fcfcfb;</span>
+<span class="a">+  --surface-2: #f1f1ee;</span>
+<span class="a">+  --text: #0b0b0b;</span>
+<span class="a">+  --text-dim: #52514e;</span>
+<span class="a">+  --text-muted: #898781;</span>
+<span class="a">+  --border: #e1e0d9;</span>
+<span class="a">+  --border-strong: #c3c2b7;</span>
+<span class="a">+  --accent: #2a78d6;</span>
+<span class="a">+  --focus-ring: #2a78d6;</span>
+<span class="a">+  --shadow: 0 8px 24px rgba(11, 11, 11, 0.16);</span>
+<span class="a">+  --lane-doing: #2a78d6;</span>
+<span class="a">+  --lane-do: #1baf7a;</span>
+<span class="a">+  --lane-maybe: #eda100;</span>
+<span class="a">+  --lane-inbox: #898781;</span>
+<span class="a">+  --lane-skip: #4a3aa7;</span>
+<span class="a">+  --lane-done: #0ca30c;</span>
+<span class="a">+  --lane-dropped: #d03b3b;</span>
+<span class="a">+  --phase-inbox: #86b6ef;</span>
+<span class="a">+  --phase-queued: #3987e5;</span>
+<span class="a">+  --phase-doing: #184f95;</span>
+<span class="a">+  --now-line: #0b0b0b;</span>
+<span class="a">+}</span>
+<span class="a">+@media (prefers-color-scheme: dark) {</span>
+<span class="a">+  :root {</span>
+<span class="a">+    --bg: #0d0d0d;</span>
+<span class="a">+    --surface: #1a1a19;</span>
+<span class="a">+    --surface-2: #232322;</span>
+<span class="a">+    --text: #ffffff;</span>
+<span class="a">+    --text-dim: #c3c2b7;</span>
+<span class="a">+    --text-muted: #898781;</span>
+<span class="a">+    --border: #2c2c2a;</span>
+<span class="a">+    --border-strong: #383835;</span>
+<span class="a">+    --accent: #3987e5;</span>
+<span class="a">+    --focus-ring: #86b6ef;</span>
+<span class="a">+    --shadow: 0 8px 24px rgba(0, 0, 0, 0.6);</span>
+<span class="a">+    --lane-doing: #3987e5;</span>
+<span class="a">+    --lane-do: #199e70;</span>
+<span class="a">+    --lane-maybe: #c98500;</span>
+<span class="a">+    --lane-inbox: #898781;</span>
+<span class="a">+    --lane-skip: #9085e9;</span>
+<span class="a">+    --lane-done: #0ca30c;</span>
+<span class="a">+    --lane-dropped: #e66767;</span>
+<span class="a">+    --phase-inbox: #184f95;</span>
+<span class="a">+    --phase-queued: #3987e5;</span>
+<span class="a">+    --phase-doing: #86b6ef;</span>
+<span class="a">+    --now-line: #ffffff;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+* { box-sizing: border-box; }</span>
+<span class="a">+html, body { margin: 0; padding: 0; }</span>
+<span class="a">+body {</span>
+<span class="a">+  background: var(--bg);</span>
+<span class="a">+  color: var(--text);</span>
+<span class="a">+  font-family: system-ui, -apple-system, &quot;Segoe UI&quot;, Roboto, sans-serif;</span>
+<span class="a">+  font-size: 14px;</span>
+<span class="a">+  line-height: 1.45;</span>
+<span class="a">+}</span>
+<span class="a">+h1, h2, h3, p, dl, dd { margin: 0; }</span>
+<span class="a">+button { font: inherit; color: inherit; }</span>
+<span class="a">+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }</span>
+<span class="a">+</span>
+<span class="a">+/* header */</span>
+<span class="a">+.app-header { position: sticky; top: 0; z-index: 5; background: var(--surface); border-bottom: 1px solid var(--border); }</span>
+<span class="a">+.header-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 12px; }</span>
+<span class="a">+.header-top { justify-content: space-between; padding-top: 10px; }</span>
+<span class="a">+.brand { font-size: 18px; font-weight: 700; }</span>
+<span class="a">+.updated { color: var(--text-muted); font-size: 12px; }</span>
+<span class="a">+.counts { padding-top: 0; }</span>
+<span class="a">+.count-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-dim); }</span>
+<span class="a">+.count-chip-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--chip-color); flex: none; }</span>
+<span class="a">+.header-controls { padding-top: 0; padding-bottom: 10px; }</span>
+<span class="a">+.tabs { display: flex; gap: 4px; }</span>
+<span class="a">+.tabs button { padding: 6px 12px; border: 1px solid var(--border); background: var(--surface-2); border-radius: 6px; cursor: pointer; }</span>
+<span class="a">+.tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }</span>
+<span class="a">+.parked-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); white-space: nowrap; cursor: pointer; }</span>
+<span class="a">+.search-input { flex: 1 1 160px; min-width: 120px; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }</span>
+<span class="a">+</span>
+<span class="a">+/* layout */</span>
+<span class="a">+main { padding: 12px; }</span>
+<span class="a">+.empty-note { color: var(--text-muted); padding: 24px 4px; }</span>
+<span class="a">+.load-error { padding: 24px; color: var(--lane-dropped); }</span>
+<span class="a">+</span>
+<span class="a">+/* board */</span>
+<span class="a">+.board { display: flex; align-items: flex-start; gap: 12px; overflow-x: auto; padding-bottom: 8px; }</span>
+<span class="a">+.column { flex: 0 0 260px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }</span>
+<span class="a">+.column-header { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-weight: 600; }</span>
+<span class="a">+.column-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--chip-color); flex: none; }</span>
+<span class="a">+.column-title { flex: 1; }</span>
+<span class="a">+.column-count { color: var(--text-muted); font-weight: 400; }</span>
+<span class="a">+.column-body { display: flex; flex-direction: column; gap: 8px; padding: 8px; min-height: 12px; }</span>
+<span class="a">+.column-empty { color: var(--text-muted); font-size: 12px; padding: 4px; }</span>
+<span class="a">+</span>
+<span class="a">+/* ticket cards */</span>
+<span class="a">+.card { display: block; width: 100%; text-align: left; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; cursor: pointer; }</span>
+<span class="a">+.card:hover { border-color: var(--border-strong); }</span>
+<span class="a">+.card-compact { padding: 6px 8px; }</span>
+<span class="a">+.card-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }</span>
+<span class="a">+.card-key { font-size: 11px; color: var(--text-muted); }</span>
+<span class="a">+.card-chips { display: flex; gap: 4px; flex-wrap: wrap; }</span>
+<span class="a">+.card-title { font-size: 13px; }</span>
+<span class="a">+.card-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }</span>
+<span class="a">+.card-project { font-size: 11px; color: var(--text-muted); }</span>
+<span class="a">+.card-score { margin-left: auto; font-size: 11px; font-weight: 600; color: var(--accent); }</span>
+<span class="a">+</span>
+<span class="a">+/* chips (lane / model / size / impact / tag) */</span>
+<span class="a">+.chip { display: inline-flex; align-items: center; border: 1px solid var(--border-strong); border-radius: 999px; padding: 1px 8px; font-size: 11px; color: var(--text-dim); background: var(--surface-2); white-space: nowrap; }</span>
+<span class="a">+.chip-lane { border-color: var(--chip-color); color: var(--chip-color); font-weight: 600; background: transparent; }</span>
+<span class="a">+.chip-model { text-transform: capitalize; }</span>
+<span class="a">+.chip-tag::before { content: &quot;#&quot;; opacity: .6; }</span>
+<span class="a">+</span>
+<span class="a">+/* groups view */</span>
+<span class="a">+.group-section { margin-bottom: 20px; }</span>
+<span class="a">+.group-title { font-size: 15px; font-weight: 700; margin-bottom: 8px; }</span>
+<span class="a">+.group-count { color: var(--text-muted); font-weight: 400; }</span>
+<span class="a">+.group-cards { display: flex; flex-wrap: wrap; gap: 8px; }</span>
+<span class="a">+.group-cards .card { width: 220px; }</span>
+<span class="a">+</span>
+<span class="a">+/* search results */</span>
+<span class="a">+.search-mode { color: var(--text-muted); font-size: 12px; margin-bottom: 8px; }</span>
+<span class="a">+.search-list { display: flex; flex-direction: column; gap: 8px; max-width: 520px; }</span>
+<span class="a">+</span>
+<span class="a">+/* timeline (gantt) */</span>
+<span class="a">+.tl-legend { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 6px 2px 10px; font-size: 12px; color: var(--text-dim); }</span>
+<span class="a">+.tl-legend-item { display: inline-flex; align-items: center; gap: 5px; }</span>
+<span class="a">+.tl-legend-swatch { display: inline-block; width: 14px; height: 10px; border-radius: 2px; background: var(--chip-color); }</span>
+<span class="a">+.tl-legend-hatch { background-image: repeating-linear-gradient(45deg, var(--chip-color) 0 2px, transparent 2px 4px); }</span>
+<span class="a">+.tl-legend-mark { font-weight: 700; }</span>
+<span class="a">+.tl-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }</span>
+<span class="a">+.tl-inner { display: flex; align-items: flex-start; width: max-content; }</span>
+<span class="a">+.tl-labels { position: sticky; left: 0; z-index: 2; background: var(--surface); border-right: 1px solid var(--border); flex: 0 0 auto; }</span>
+<span class="a">+.tl-label-header { border-bottom: 1px solid var(--border); }</span>
+<span class="a">+.tl-label-row { display: flex; align-items: center; gap: 6px; width: 220px; padding: 0 8px; border: 0; border-bottom: 1px solid var(--border); background: none; cursor: pointer; text-align: left; }</span>
+<span class="a">+.tl-label-row:hover, .tl-label-row:focus-visible { background: var(--surface-2); }</span>
+<span class="a">+.tl-label-key { font-size: 11px; color: var(--text-muted); flex: none; }</span>
+<span class="a">+.tl-label-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }</span>
+<span class="a">+.tl-chart { flex: 0 0 auto; }</span>
+<span class="a">+.tl-grid { stroke: var(--border); stroke-width: 1; }</span>
+<span class="a">+.tl-tick-label { fill: var(--text-muted); font-size: 10px; }</span>
+<span class="a">+.tl-now { stroke: var(--now-line); stroke-width: 1.5; stroke-dasharray: 4 3; }</span>
+<span class="a">+.tl-now-label { fill: var(--now-line); font-size: 10px; }</span>
+<span class="a">+.tl-seg-inbox { fill: var(--phase-inbox); }</span>
+<span class="a">+.tl-seg-queued { fill: var(--phase-queued); }</span>
+<span class="a">+.tl-seg-doing { fill: var(--phase-doing); }</span>
+<span class="a">+.tl-seg-estimated.tl-seg-inbox { fill: url(#hatch-inbox); }</span>
+<span class="a">+.tl-seg-estimated.tl-seg-queued { fill: url(#hatch-queued); }</span>
+<span class="a">+.tl-seg-estimated.tl-seg-doing { fill: url(#hatch-doing); }</span>
+<span class="a">+.tl-seg { cursor: pointer; }</span>
+<span class="a">+.tl-seg:hover, .tl-seg:focus-visible { stroke: var(--text); stroke-width: 1.5; outline: none; }</span>
+<span class="a">+.tl-end-mark { font-size: 13px; font-weight: 700; dominant-baseline: middle; }</span>
+<span class="a">+.tl-end-done { fill: var(--lane-done); }</span>
+<span class="a">+.tl-end-dropped { fill: var(--lane-dropped); }</span>
+<span class="a">+</span>
+<span class="a">+/* detail drawer */</span>
+<span class="a">+.drawer-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .4); z-index: 20; }</span>
+<span class="a">+.drawer-backdrop[hidden] { display: none; }</span>
+<span class="a">+.drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 420px; max-width: 100%; background: var(--surface); box-shadow: var(--shadow); z-index: 21; overflow-y: auto; padding: 16px; }</span>
+<span class="a">+.drawer[hidden] { display: none; }</span>
+<span class="a">+@media (max-width: 640px) { .drawer { width: 100%; } }</span>
+<span class="a">+.drawer-close { position: sticky; top: 0; float: right; background: none; border: none; font-size: 22px; line-height: 1; cursor: pointer; color: var(--text-dim); }</span>
+<span class="a">+.drawer-title { font-size: 16px; font-weight: 700; margin: 4px 0 10px; clear: both; }</span>
+<span class="a">+.drawer-key { color: var(--text-muted); font-size: 13px; margin-right: 6px; }</span>
+<span class="a">+.drawer-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }</span>
+<span class="a">+.drawer-meta { color: var(--text-dim); font-size: 12px; margin-bottom: 10px; }</span>
+<span class="a">+.date-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 12px; margin-bottom: 14px; }</span>
+<span class="a">+.date-grid dt { color: var(--text-muted); }</span>
+<span class="a">+.drawer-section { margin-bottom: 16px; }</span>
+<span class="a">+.drawer-section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); margin-bottom: 6px; }</span>
+<span class="a">+.drawer-text { white-space: pre-wrap; font-size: 13px; }</span>
+<span class="a">+.notes { display: flex; flex-direction: column; gap: 8px; }</span>
+<span class="a">+.note { border-left: 2px solid var(--border-strong); padding-left: 8px; }</span>
+<span class="a">+.note-at { font-size: 11px; color: var(--text-muted); }</span>
+<span class="a">+.note-text { white-space: pre-wrap; font-size: 13px; }</span>
+<span class="a">+.link-button { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; text-align: left; font: inherit; }</span>
+<span class="a">+.related-list { display: flex; flex-direction: column; gap: 6px; }</span>
+<span class="a">+.related-item { display: flex; align-items: center; gap: 8px; width: 100%; }</span>
+<span class="a">+.related-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }</span>
+<span class="a">+.related-score { color: var(--text-muted); font-size: 11px; }</span>
+<span class="a">+.text-muted { color: var(--text-muted); }</span>
+<span class="a">+</span>
+<span class="a">+/* hover / tap preview for timeline bars */</span>
+<span class="a">+.tooltip { position: fixed; z-index: 30; max-width: 240px; background: var(--surface-2); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 12px; box-shadow: var(--shadow); pointer-events: none; }</span>
+<span class="a">+.tooltip[hidden] { display: none; }</span>
+<span class="a">+.tooltip-key { font-weight: 700; }</span>
+<span class="a">+.tooltip-title { color: var(--text-dim); margin: 2px 0; }</span>
+<span class="a">+.tooltip-phase { color: var(--text-muted); }</span>
+<span class="a">+</span>
+<span class="a">+/* focus */</span>
+<span class="a">+button:focus-visible, input:focus-visible, [tabindex]:focus-visible {</span>
+<span class="a">+  outline: 2px solid var(--focus-ring);</span>
+<span class="a">+  outline-offset: 2px;</span>
+<span class="a">+}</span>
+<span class="a">+&lt;/style&gt;</span>
+<span class="a">+&lt;/head&gt;</span>
+<span class="a">+&lt;body&gt;</span>
+<span class="a">+&lt;header class=&quot;app-header&quot;&gt;</span>
+<span class="a">+  &lt;div class=&quot;header-row header-top&quot;&gt;</span>
+<span class="a">+    &lt;h1 class=&quot;brand&quot;&gt;ideamine&lt;/h1&gt;</span>
+<span class="a">+    &lt;span class=&quot;updated&quot; id=&quot;updated&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+  &lt;div class=&quot;header-row counts&quot; id=&quot;counts&quot; aria-label=&quot;Idea counts by lane&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+  &lt;div class=&quot;header-row header-controls&quot;&gt;</span>
+<span class="a">+    &lt;nav class=&quot;tabs&quot; id=&quot;tabs&quot; role=&quot;tablist&quot; aria-label=&quot;Views&quot;&gt;</span>
+<span class="a">+      &lt;button type=&quot;button&quot; role=&quot;tab&quot; data-view=&quot;board&quot; aria-controls=&quot;main&quot;&gt;Board&lt;/button&gt;</span>
+<span class="a">+      &lt;button type=&quot;button&quot; role=&quot;tab&quot; data-view=&quot;timeline&quot; aria-controls=&quot;main&quot;&gt;Timeline&lt;/button&gt;</span>
+<span class="a">+      &lt;button type=&quot;button&quot; role=&quot;tab&quot; data-view=&quot;groups&quot; aria-controls=&quot;main&quot;&gt;Groups&lt;/button&gt;</span>
+<span class="a">+    &lt;/nav&gt;</span>
+<span class="a">+    &lt;label class=&quot;parked-toggle&quot;&gt;</span>
+<span class="a">+      &lt;input type=&quot;checkbox&quot; id=&quot;parked-toggle&quot;&gt; Show parked</span>
+<span class="a">+    &lt;/label&gt;</span>
+<span class="a">+    &lt;input type=&quot;search&quot; id=&quot;search-input&quot; class=&quot;search-input&quot; placeholder=&quot;Search ideas…&quot; aria-label=&quot;Search ideas&quot;&gt;</span>
+<span class="a">+  &lt;/div&gt;</span>
+<span class="a">+&lt;/header&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;main id=&quot;main&quot; role=&quot;tabpanel&quot;&gt;&lt;/main&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;div class=&quot;drawer-backdrop&quot; id=&quot;drawer-backdrop&quot; hidden&gt;&lt;/div&gt;</span>
+<span class="a">+&lt;aside class=&quot;drawer&quot; id=&quot;drawer&quot; hidden role=&quot;dialog&quot; aria-modal=&quot;true&quot; aria-labelledby=&quot;drawer-title&quot;&gt;</span>
+<span class="a">+  &lt;button class=&quot;drawer-close&quot; id=&quot;drawer-close&quot; type=&quot;button&quot; aria-label=&quot;Close&quot;&gt;×&lt;/button&gt;</span>
+<span class="a">+  &lt;div id=&quot;drawer-body&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+&lt;/aside&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;div class=&quot;tooltip&quot; id=&quot;tooltip&quot; hidden role=&quot;status&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+</span>
+<span class="a">+&lt;script&gt;</span>
+<span class="a">+&#x27;use strict&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/* ideamine dashboard. One file, no build step, no external calls</span>
+<span class="a">+   besides data.json and v1/embeddings on the same origin. */</span>
+<span class="a">+</span>
+<span class="a">+const SVG_NS = &#x27;http://www.w3.org/2000/svg&#x27;;</span>
+<span class="a">+const MIN = 60000, HOUR = 3600000, DAY = 86400000;</span>
+<span class="a">+const TL_STEPS = [MIN, 5 * MIN, 15 * MIN, 30 * MIN, HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR, DAY, 2 * DAY, 7 * DAY, 30 * DAY, 90 * DAY];</span>
+<span class="a">+const TL_ROW_H = 34, TL_HEADER_H = 28, TL_BAR_H = 16;</span>
+<span class="a">+const BOARD_LANES = [&#x27;doing&#x27;, &#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;inbox&#x27;, &#x27;done&#x27;];</span>
+<span class="a">+const PARKED_LANES = [&#x27;skip&#x27;, &#x27;dropped&#x27;];</span>
+<span class="a">+const ALL_LANES = [&#x27;doing&#x27;, &#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;inbox&#x27;, &#x27;skip&#x27;, &#x27;done&#x27;, &#x27;dropped&#x27;];</span>
+<span class="a">+const LANE_LABELS = { doing: &#x27;Doing&#x27;, do: &#x27;Do&#x27;, maybe: &#x27;Maybe&#x27;, inbox: &#x27;Inbox&#x27;, skip: &#x27;Skip&#x27;, done: &#x27;Done&#x27;, dropped: &#x27;Dropped&#x27; };</span>
+<span class="a">+const PHASE_LABELS = { inbox: &#x27;Inbox&#x27;, queued: &#x27;Queued&#x27;, doing: &#x27;Doing&#x27; };</span>
+<span class="a">+const SEARCH_DEBOUNCE_MS = 300;</span>
+<span class="a">+const EMBED_TIMEOUT_MS = 4000;</span>
+<span class="a">+</span>
+<span class="a">+const state = {</span>
+<span class="a">+  data: null,</span>
+<span class="a">+  byId: new Map(),</span>
+<span class="a">+  byKey: new Map(),</span>
+<span class="a">+  view: &#x27;board&#x27;,</span>
+<span class="a">+  showParked: false,</span>
+<span class="a">+  openKey: null,</span>
+<span class="a">+  query: &#x27;&#x27;,</span>
+<span class="a">+  searchResult: null,</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+let searchTimer = null;</span>
+<span class="a">+let searchToken = 0;</span>
+<span class="a">+let lastFocused = null;</span>
+<span class="a">+const vecCache = new Map();</span>
+<span class="a">+</span>
+<span class="a">+const $main = document.getElementById(&#x27;main&#x27;);</span>
+<span class="a">+const $counts = document.getElementById(&#x27;counts&#x27;);</span>
+<span class="a">+const $updated = document.getElementById(&#x27;updated&#x27;);</span>
+<span class="a">+const $tabs = document.getElementById(&#x27;tabs&#x27;);</span>
+<span class="a">+const $parkedToggle = document.getElementById(&#x27;parked-toggle&#x27;);</span>
+<span class="a">+const $searchInput = document.getElementById(&#x27;search-input&#x27;);</span>
+<span class="a">+const $drawer = document.getElementById(&#x27;drawer&#x27;);</span>
+<span class="a">+const $drawerBackdrop = document.getElementById(&#x27;drawer-backdrop&#x27;);</span>
+<span class="a">+const $drawerClose = document.getElementById(&#x27;drawer-close&#x27;);</span>
+<span class="a">+const $drawerBody = document.getElementById(&#x27;drawer-body&#x27;);</span>
+<span class="a">+const $tooltip = document.getElementById(&#x27;tooltip&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+/* ---- small DOM builders. Text children become text nodes, never HTML. ---- */</span>
+<span class="a">+</span>
+<span class="a">+function el(tag, attrs, ...kids) {</span>
+<span class="a">+  const node = document.createElement(tag);</span>
+<span class="a">+  if (attrs) {</span>
+<span class="a">+    for (const [k, v] of Object.entries(attrs)) {</span>
+<span class="a">+      if (v == null || v === false) continue;</span>
+<span class="a">+      if (k === &#x27;class&#x27;) node.className = v;</span>
+<span class="a">+      else if (k.startsWith(&#x27;on&#x27;) &amp;&amp; typeof v === &#x27;function&#x27;) node.addEventListener(k.slice(2), v);</span>
+<span class="a">+      else node.setAttribute(k, v === true ? &#x27;&#x27; : v);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  for (const kid of kids.flat(Infinity)) {</span>
+<span class="a">+    if (kid == null || kid === false) continue;</span>
+<span class="a">+    node.append(kid.nodeType ? kid : String(kid));</span>
+<span class="a">+  }</span>
+<span class="a">+  return node;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function svgEl(tag, attrs, ...kids) {</span>
+<span class="a">+  const node = document.createElementNS(SVG_NS, tag);</span>
+<span class="a">+  if (attrs) {</span>
+<span class="a">+    for (const [k, v] of Object.entries(attrs)) {</span>
+<span class="a">+      if (v == null || v === false) continue;</span>
+<span class="a">+      node.setAttribute(k, v === true ? &#x27;&#x27; : v);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  for (const kid of kids.flat(Infinity)) {</span>
+<span class="a">+    if (kid == null || kid === false) continue;</span>
+<span class="a">+    node.append(kid.nodeType ? kid : String(kid));</span>
+<span class="a">+  }</span>
+<span class="a">+  return node;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- formatting ---- */</span>
+<span class="a">+</span>
+<span class="a">+// The page text is English, so dates and &quot;5 minutes ago&quot; are English too, whatever the browser locale.</span>
+<span class="a">+const LOCALE = &#x27;en&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+function fmtDate(iso) {</span>
+<span class="a">+  if (!iso) return null;</span>
+<span class="a">+  const d = new Date(iso);</span>
+<span class="a">+  if (Number.isNaN(d.getTime())) return iso;</span>
+<span class="a">+  return d.toLocaleString(LOCALE, { year: &#x27;numeric&#x27;, month: &#x27;short&#x27;, day: &#x27;numeric&#x27;, hour: &#x27;2-digit&#x27;, minute: &#x27;2-digit&#x27; });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function fmtRelative(iso) {</span>
+<span class="a">+  const then = new Date(iso).getTime();</span>
+<span class="a">+  if (Number.isNaN(then)) return &#x27;at an unknown time&#x27;;</span>
+<span class="a">+  const diffSec = Math.round((then - Date.now()) / 1000);</span>
+<span class="a">+  const rtf = new Intl.RelativeTimeFormat(LOCALE, { numeric: &#x27;auto&#x27; });</span>
+<span class="a">+  const units = [[&#x27;year&#x27;, 31536000], [&#x27;month&#x27;, 2592000], [&#x27;day&#x27;, 86400], [&#x27;hour&#x27;, 3600], [&#x27;minute&#x27;, 60], [&#x27;second&#x27;, 1]];</span>
+<span class="a">+  for (const [unit, secs] of units) {</span>
+<span class="a">+    if (Math.abs(diffSec) &gt;= secs || unit === &#x27;second&#x27;) return rtf.format(Math.round(diffSec / secs), unit);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function formatTick(t, step) {</span>
+<span class="a">+  const d = new Date(t);</span>
+<span class="a">+  if (step &lt; HOUR) return d.toLocaleTimeString(LOCALE, { hour: &#x27;2-digit&#x27;, minute: &#x27;2-digit&#x27; });</span>
+<span class="a">+  if (step &lt; DAY) return d.toLocaleString(LOCALE, { month: &#x27;short&#x27;, day: &#x27;numeric&#x27;, hour: &#x27;2-digit&#x27; });</span>
+<span class="a">+  if (step &lt; 30 * DAY) return d.toLocaleDateString(LOCALE, { month: &#x27;short&#x27;, day: &#x27;numeric&#x27; });</span>
+<span class="a">+  return d.toLocaleDateString(LOCALE, { month: &#x27;short&#x27;, year: &#x27;numeric&#x27; });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- vectors: decode base64 little-endian float32, dot product ---- */</span>
+<span class="a">+</span>
+<span class="a">+function decodeVec(b64) {</span>
+<span class="a">+  if (!b64) return null;</span>
+<span class="a">+  const bin = atob(b64);</span>
+<span class="a">+  const bytes = new Uint8Array(bin.length);</span>
+<span class="a">+  for (let i = 0; i &lt; bin.length; i++) bytes[i] = bin.charCodeAt(i);</span>
+<span class="a">+  const view = new DataView(bytes.buffer);</span>
+<span class="a">+  const n = Math.floor(bin.length / 4);</span>
+<span class="a">+  const out = new Float32Array(n);</span>
+<span class="a">+  for (let i = 0; i &lt; n; i++) out[i] = view.getFloat32(i * 4, true);</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function getIdeaVec(idea) {</span>
+<span class="a">+  if (!idea.vec) return null;</span>
+<span class="a">+  if (vecCache.has(idea.id)) return vecCache.get(idea.id);</span>
+<span class="a">+  const v = decodeVec(idea.vec);</span>
+<span class="a">+  vecCache.set(idea.id, v);</span>
+<span class="a">+  return v;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function normalize(arr) {</span>
+<span class="a">+  let sum = 0;</span>
+<span class="a">+  for (let i = 0; i &lt; arr.length; i++) sum += arr[i] * arr[i];</span>
+<span class="a">+  const norm = Math.sqrt(sum) || 1;</span>
+<span class="a">+  const out = new Float64Array(arr.length);</span>
+<span class="a">+  for (let i = 0; i &lt; arr.length; i++) out[i] = arr[i] / norm;</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function dot(a, b) {</span>
+<span class="a">+  const n = Math.min(a.length, b.length);</span>
+<span class="a">+  let s = 0;</span>
+<span class="a">+  for (let i = 0; i &lt; n; i++) s += a[i] * b[i];</span>
+<span class="a">+  return s;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function findByKey(key) { return state.byKey.get(key.toUpperCase()) || null; }</span>
+<span class="a">+</span>
+<span class="a">+/* ---- ticket card, shared by board, groups, and search results ---- */</span>
+<span class="a">+</span>
+<span class="a">+function ideaCard(idea, opts) {</span>
+<span class="a">+  opts = opts || {};</span>
+<span class="a">+  const chips = [el(&#x27;span&#x27;, { class: &#x27;chip chip-lane&#x27;, style: &#x27;--chip-color:var(--lane-&#x27; + idea.lane + &#x27;)&#x27; }, LANE_LABELS[idea.lane] || idea.lane)];</span>
+<span class="a">+  if (idea.model) chips.push(el(&#x27;span&#x27;, { class: &#x27;chip chip-model&#x27; }, idea.model));</span>
+<span class="a">+  if (idea.size) chips.push(el(&#x27;span&#x27;, { class: &#x27;chip&#x27; }, idea.size.toUpperCase()));</span>
+<span class="a">+  if (idea.impact != null) chips.push(el(&#x27;span&#x27;, { class: &#x27;chip chip-impact&#x27; }, &#x27;▲&#x27; + idea.impact));</span>
+<span class="a">+</span>
+<span class="a">+  const top = el(&#x27;div&#x27;, { class: &#x27;card-top&#x27; }, el(&#x27;code&#x27;, { class: &#x27;card-key&#x27; }, idea.key), el(&#x27;span&#x27;, { class: &#x27;card-chips&#x27; }, chips));</span>
+<span class="a">+  if (opts.scoreLabel) top.append(el(&#x27;span&#x27;, { class: &#x27;card-score&#x27; }, opts.scoreLabel));</span>
+<span class="a">+</span>
+<span class="a">+  const meta = [];</span>
+<span class="a">+  if (idea.project) meta.push(el(&#x27;span&#x27;, { class: &#x27;card-project&#x27; }, idea.project));</span>
+<span class="a">+  for (const t of idea.tags || []) meta.push(el(&#x27;span&#x27;, { class: &#x27;chip chip-tag&#x27; }, t));</span>
+<span class="a">+</span>
+<span class="a">+  return el(&#x27;button&#x27;, { class: &#x27;card&#x27; + (opts.compact ? &#x27; card-compact&#x27; : &#x27;&#x27;), type: &#x27;button&#x27;, onclick: () =&gt; openTicket(idea.key) },</span>
+<span class="a">+    top,</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;card-title&#x27; }, idea.title),</span>
+<span class="a">+    meta.length ? el(&#x27;div&#x27;, { class: &#x27;card-meta&#x27; }, meta) : null);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- header: counts + relative update time ---- */</span>
+<span class="a">+</span>
+<span class="a">+function renderHeader() {</span>
+<span class="a">+  $counts.textContent = &#x27;&#x27;;</span>
+<span class="a">+  const counts = state.data.counts || {};</span>
+<span class="a">+  for (const lane of ALL_LANES) {</span>
+<span class="a">+    $counts.append(el(&#x27;span&#x27;, { class: &#x27;count-chip&#x27; },</span>
+<span class="a">+      el(&#x27;span&#x27;, { class: &#x27;count-chip-dot&#x27;, style: &#x27;--chip-color:var(--lane-&#x27; + lane + &#x27;)&#x27; }),</span>
+<span class="a">+      LANE_LABELS[lane] + &#x27; &#x27; + (counts[lane] ?? 0)));</span>
+<span class="a">+  }</span>
+<span class="a">+  $updated.textContent = &#x27;updated &#x27; + fmtRelative(state.data.generated);</span>
+<span class="a">+  $updated.title = fmtDate(state.data.generated) || &#x27;&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderTabsActive() {</span>
+<span class="a">+  for (const btn of $tabs.querySelectorAll(&#x27;button&#x27;)) {</span>
+<span class="a">+    const active = btn.dataset.view === state.view;</span>
+<span class="a">+    btn.classList.toggle(&#x27;active&#x27;, active);</span>
+<span class="a">+    btn.setAttribute(&#x27;aria-selected&#x27;, String(active));</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- board view ---- */</span>
+<span class="a">+</span>
+<span class="a">+function renderColumn(lane) {</span>
+<span class="a">+  const ideas = state.data.ideas.filter((i) =&gt; i.lane === lane).sort((a, b) =&gt; a.rank - b.rank);</span>
+<span class="a">+  return el(&#x27;div&#x27;, { class: &#x27;column&#x27; },</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;column-header&#x27; },</span>
+<span class="a">+      el(&#x27;span&#x27;, { class: &#x27;column-dot&#x27;, style: &#x27;--chip-color:var(--lane-&#x27; + lane + &#x27;)&#x27; }),</span>
+<span class="a">+      el(&#x27;span&#x27;, { class: &#x27;column-title&#x27; }, LANE_LABELS[lane]),</span>
+<span class="a">+      el(&#x27;span&#x27;, { class: &#x27;column-count&#x27; }, String(ideas.length))),</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;column-body&#x27; }, ideas.length ? ideas.map((i) =&gt; ideaCard(i)) : el(&#x27;p&#x27;, { class: &#x27;column-empty&#x27; }, &#x27;No tickets&#x27;)));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderBoard() {</span>
+<span class="a">+  $main.textContent = &#x27;&#x27;;</span>
+<span class="a">+  const lanes = state.showParked ? BOARD_LANES.concat(PARKED_LANES) : BOARD_LANES;</span>
+<span class="a">+  $main.append(el(&#x27;div&#x27;, { class: &#x27;board&#x27; }, lanes.map(renderColumn)));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- groups view ---- */</span>
+<span class="a">+</span>
+<span class="a">+function renderGroupSection(label, ideas) {</span>
+<span class="a">+  return el(&#x27;section&#x27;, { class: &#x27;group-section&#x27; },</span>
+<span class="a">+    el(&#x27;h2&#x27;, { class: &#x27;group-title&#x27; }, label + &#x27; &#x27;, el(&#x27;span&#x27;, { class: &#x27;group-count&#x27; }, &#x27;(&#x27; + ideas.length + &#x27;)&#x27;)),</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;group-cards&#x27; }, ideas.map((i) =&gt; ideaCard(i, { compact: true }))));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderGroups() {</span>
+<span class="a">+  $main.textContent = &#x27;&#x27;;</span>
+<span class="a">+  const wrap = el(&#x27;div&#x27;, { class: &#x27;groups&#x27; });</span>
+<span class="a">+  const grouped = new Set();</span>
+<span class="a">+  for (const g of state.data.groups || []) {</span>
+<span class="a">+    const ideas = g.ids.map((id) =&gt; state.byId.get(id)).filter(Boolean);</span>
+<span class="a">+    for (const id of g.ids) grouped.add(id);</span>
+<span class="a">+    wrap.append(renderGroupSection(g.label, ideas));</span>
+<span class="a">+  }</span>
+<span class="a">+  const ungrouped = state.data.ideas.filter((i) =&gt; !grouped.has(i.id));</span>
+<span class="a">+  if (ungrouped.length) wrap.append(renderGroupSection(&#x27;Ungrouped&#x27;, ungrouped));</span>
+<span class="a">+  $main.append(wrap);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- timeline (gantt) view ---- */</span>
+<span class="a">+</span>
+<span class="a">+function chooseStep(spanMs, targetTicks) {</span>
+<span class="a">+  for (const step of TL_STEPS) { if (spanMs / step &lt;= targetTicks) return step; }</span>
+<span class="a">+  return TL_STEPS[TL_STEPS.length - 1];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function buildTimeScale(domainStart, domainEnd) {</span>
+<span class="a">+  const span = Math.max(domainEnd - domainStart, 1);</span>
+<span class="a">+  const step = chooseStep(span, 8);</span>
+<span class="a">+  const ticksCount = Math.ceil(span / step) + 1;</span>
+<span class="a">+  const width = Math.max(640, ticksCount * 90);</span>
+<span class="a">+  const pxPerMs = width / span;</span>
+<span class="a">+  const ticks = [];</span>
+<span class="a">+  const first = Math.ceil(domainStart / step) * step;</span>
+<span class="a">+  for (let t = first; t &lt;= domainEnd; t += step) ticks.push(t);</span>
+<span class="a">+  return { width, step, ticks, x: (t) =&gt; (t - domainStart) * pxPerMs };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function makeHatchPattern(id, colorVar) {</span>
+<span class="a">+  return svgEl(&#x27;pattern&#x27;, { id, patternUnits: &#x27;userSpaceOnUse&#x27;, width: 6, height: 6, patternTransform: &#x27;rotate(45)&#x27; },</span>
+<span class="a">+    svgEl(&#x27;rect&#x27;, { width: 6, height: 6, fill: colorVar, &#x27;fill-opacity&#x27;: 0.35 }),</span>
+<span class="a">+    svgEl(&#x27;line&#x27;, { x1: 0, y1: 0, x2: 0, y2: 6, stroke: colorVar, &#x27;stroke-width&#x27;: 3 }));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function tooltipContentForSegment(idea, seg) {</span>
+<span class="a">+  const to = seg.to ? fmtDate(seg.to) : &#x27;now&#x27;;</span>
+<span class="a">+  return el(&#x27;div&#x27;, {},</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;tooltip-key&#x27; }, idea.key + (seg.estimated ? &#x27; (estimated)&#x27; : &#x27;&#x27;)),</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;tooltip-title&#x27; }, idea.title),</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;tooltip-phase&#x27; }, (PHASE_LABELS[seg.phase] || seg.phase) + &#x27;: &#x27; + fmtDate(seg.from) + &#x27; → &#x27; + to));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function positionTooltip(evt, node) {</span>
+<span class="a">+  const rect = node.getBoundingClientRect();</span>
+<span class="a">+  const x = evt.clientX ?? (rect.left + rect.width / 2);</span>
+<span class="a">+  const y = evt.clientY ?? rect.top;</span>
+<span class="a">+  const pad = 12, tw = 240, th = 90;</span>
+<span class="a">+  let left = x + pad, top = y + pad;</span>
+<span class="a">+  if (left + tw &gt; window.innerWidth) left = x - tw - pad;</span>
+<span class="a">+  if (top + th &gt; window.innerHeight) top = y - th - pad;</span>
+<span class="a">+  $tooltip.style.left = Math.max(4, left) + &#x27;px&#x27;;</span>
+<span class="a">+  $tooltip.style.top = Math.max(4, top) + &#x27;px&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function attachTooltip(node, contentFn) {</span>
+<span class="a">+  const show = (evt) =&gt; {</span>
+<span class="a">+    $tooltip.textContent = &#x27;&#x27;;</span>
+<span class="a">+    $tooltip.append(contentFn());</span>
+<span class="a">+    $tooltip.hidden = false;</span>
+<span class="a">+    positionTooltip(evt, node);</span>
+<span class="a">+  };</span>
+<span class="a">+  const hide = () =&gt; { $tooltip.hidden = true; };</span>
+<span class="a">+  node.addEventListener(&#x27;mouseenter&#x27;, show);</span>
+<span class="a">+  node.addEventListener(&#x27;mousemove&#x27;, (e) =&gt; { if (!$tooltip.hidden) positionTooltip(e, node); });</span>
+<span class="a">+  node.addEventListener(&#x27;mouseleave&#x27;, hide);</span>
+<span class="a">+  node.addEventListener(&#x27;focus&#x27;, show);</span>
+<span class="a">+  node.addEventListener(&#x27;blur&#x27;, hide);</span>
+<span class="a">+  node.addEventListener(&#x27;click&#x27;, (e) =&gt; { e.stopPropagation(); show(e); });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderTimelineRow(idea, y, scale) {</span>
+<span class="a">+  const g = svgEl(&#x27;g&#x27;, { class: &#x27;tl-row&#x27; });</span>
+<span class="a">+  const barY = y + (TL_ROW_H - TL_BAR_H) / 2;</span>
+<span class="a">+  const phases = idea.phases || [];</span>
+<span class="a">+  let endX = null;</span>
+<span class="a">+  phases.forEach((seg, i) =&gt; {</span>
+<span class="a">+    const from = Date.parse(seg.from);</span>
+<span class="a">+    if (Number.isNaN(from)) return;</span>
+<span class="a">+    const to = seg.to ? Date.parse(seg.to) : Date.now();</span>
+<span class="a">+    let x1 = scale.x(from);</span>
+<span class="a">+    let x2 = scale.x(Math.max(to, from));</span>
+<span class="a">+    if (i &gt; 0) x1 += 1;</span>
+<span class="a">+    if (i &lt; phases.length - 1) x2 -= 1;</span>
+<span class="a">+    const w = Math.max(x2 - x1, 1);</span>
+<span class="a">+    const phaseName = seg.phase || &#x27;inbox&#x27;;</span>
+<span class="a">+    const rect = svgEl(&#x27;rect&#x27;, {</span>
+<span class="a">+      x: x1, y: barY, width: w, height: TL_BAR_H, rx: 3,</span>
+<span class="a">+      class: &#x27;tl-seg tl-seg-&#x27; + phaseName + (seg.estimated ? &#x27; tl-seg-estimated&#x27; : &#x27;&#x27;),</span>
+<span class="a">+      tabindex: &#x27;0&#x27;, role: &#x27;img&#x27;,</span>
+<span class="a">+      &#x27;aria-label&#x27;: idea.key + &#x27; &#x27; + (PHASE_LABELS[phaseName] || phaseName) + &#x27; from &#x27; + fmtDate(seg.from) + &#x27; to &#x27; + (seg.to ? fmtDate(seg.to) : &#x27;now&#x27;),</span>
+<span class="a">+    });</span>
+<span class="a">+    attachTooltip(rect, () =&gt; tooltipContentForSegment(idea, seg));</span>
+<span class="a">+    g.append(rect);</span>
+<span class="a">+    endX = x1 + w;</span>
+<span class="a">+  });</span>
+<span class="a">+  if (endX != null &amp;&amp; (idea.lane === &#x27;done&#x27; || idea.lane === &#x27;dropped&#x27;)) {</span>
+<span class="a">+    const mark = idea.lane === &#x27;done&#x27; ? &#x27;✓&#x27; : &#x27;✗&#x27;;</span>
+<span class="a">+    g.append(svgEl(&#x27;text&#x27;, { x: endX + 6, y: y + TL_ROW_H / 2 + 4, class: &#x27;tl-end-mark tl-end-&#x27; + idea.lane }, mark));</span>
+<span class="a">+  }</span>
+<span class="a">+  return g;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderTimelineLegend() {</span>
+<span class="a">+  function item(colorVar, label, hatch) {</span>
+<span class="a">+    return el(&#x27;span&#x27;, { class: &#x27;tl-legend-item&#x27; }, el(&#x27;span&#x27;, { class: &#x27;tl-legend-swatch&#x27; + (hatch ? &#x27; tl-legend-hatch&#x27; : &#x27;&#x27;), style: &#x27;--chip-color:&#x27; + colorVar }), label);</span>
+<span class="a">+  }</span>
+<span class="a">+  return el(&#x27;div&#x27;, { class: &#x27;tl-legend&#x27; },</span>
+<span class="a">+    item(&#x27;var(--phase-inbox)&#x27;, &#x27;Inbox&#x27;),</span>
+<span class="a">+    item(&#x27;var(--phase-queued)&#x27;, &#x27;Queued&#x27;),</span>
+<span class="a">+    item(&#x27;var(--phase-doing)&#x27;, &#x27;Doing&#x27;),</span>
+<span class="a">+    item(&#x27;var(--phase-doing)&#x27;, &#x27;Estimated&#x27;, true),</span>
+<span class="a">+    el(&#x27;span&#x27;, { class: &#x27;tl-legend-item&#x27; }, el(&#x27;span&#x27;, { class: &#x27;tl-legend-mark&#x27;, style: &#x27;color:var(--lane-done)&#x27; }, &#x27;✓&#x27;), &#x27;Done&#x27;),</span>
+<span class="a">+    el(&#x27;span&#x27;, { class: &#x27;tl-legend-item&#x27; }, el(&#x27;span&#x27;, { class: &#x27;tl-legend-mark&#x27;, style: &#x27;color:var(--lane-dropped)&#x27; }, &#x27;✗&#x27;), &#x27;Dropped&#x27;));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderTimeline() {</span>
+<span class="a">+  $main.textContent = &#x27;&#x27;;</span>
+<span class="a">+  const ideas = state.data.ideas</span>
+<span class="a">+    .filter((i) =&gt; state.showParked || (i.lane !== &#x27;skip&#x27; &amp;&amp; i.lane !== &#x27;dropped&#x27;))</span>
+<span class="a">+    .slice()</span>
+<span class="a">+    .sort((a, b) =&gt; Date.parse(a.created) - Date.parse(b.created));</span>
+<span class="a">+</span>
+<span class="a">+  if (!ideas.length) {</span>
+<span class="a">+    $main.append(el(&#x27;p&#x27;, { class: &#x27;empty-note&#x27; }, &#x27;No ideas to show.&#x27;));</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  const now = Date.now();</span>
+<span class="a">+  let domainStart = Infinity, domainEnd = -Infinity;</span>
+<span class="a">+  for (const idea of ideas) {</span>
+<span class="a">+    for (const seg of idea.phases || []) {</span>
+<span class="a">+      const from = Date.parse(seg.from);</span>
+<span class="a">+      const to = seg.to ? Date.parse(seg.to) : now;</span>
+<span class="a">+      if (!Number.isNaN(from)) domainStart = Math.min(domainStart, from);</span>
+<span class="a">+      if (!Number.isNaN(to)) domainEnd = Math.max(domainEnd, to);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  if (!Number.isFinite(domainStart)) domainStart = now - DAY;</span>
+<span class="a">+  domainEnd = Math.max(domainEnd, now);</span>
+<span class="a">+  const pad = (domainEnd - domainStart) * 0.03 || HOUR;</span>
+<span class="a">+  domainStart -= pad;</span>
+<span class="a">+  domainEnd += pad;</span>
+<span class="a">+</span>
+<span class="a">+  const scale = buildTimeScale(domainStart, domainEnd);</span>
+<span class="a">+  const chartHeight = TL_HEADER_H + ideas.length * TL_ROW_H;</span>
+<span class="a">+</span>
+<span class="a">+  const defs = svgEl(&#x27;defs&#x27;, {}, makeHatchPattern(&#x27;hatch-inbox&#x27;, &#x27;var(--phase-inbox)&#x27;), makeHatchPattern(&#x27;hatch-queued&#x27;, &#x27;var(--phase-queued)&#x27;), makeHatchPattern(&#x27;hatch-doing&#x27;, &#x27;var(--phase-doing)&#x27;));</span>
+<span class="a">+</span>
+<span class="a">+  const axis = svgEl(&#x27;g&#x27;, { class: &#x27;tl-axis&#x27; });</span>
+<span class="a">+  for (const t of scale.ticks) {</span>
+<span class="a">+    const x = scale.x(t);</span>
+<span class="a">+    axis.append(svgEl(&#x27;line&#x27;, { x1: x, x2: x, y1: TL_HEADER_H, y2: chartHeight, class: &#x27;tl-grid&#x27; }), svgEl(&#x27;text&#x27;, { x: x + 4, y: TL_HEADER_H - 8, class: &#x27;tl-tick-label&#x27; }, formatTick(t, scale.step)));</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  const rows = svgEl(&#x27;g&#x27;, { class: &#x27;tl-rows&#x27; });</span>
+<span class="a">+  ideas.forEach((idea, i) =&gt; rows.append(renderTimelineRow(idea, TL_HEADER_H + i * TL_ROW_H, scale)));</span>
+<span class="a">+</span>
+<span class="a">+  const svgRoot = svgEl(&#x27;svg&#x27;, { width: scale.width, height: chartHeight, viewBox: &#x27;0 0 &#x27; + scale.width + &#x27; &#x27; + chartHeight, role: &#x27;img&#x27;, &#x27;aria-label&#x27;: &#x27;Idea timeline&#x27; }, defs, axis, rows);</span>
+<span class="a">+</span>
+<span class="a">+  if (now &gt;= domainStart &amp;&amp; now &lt;= domainEnd) {</span>
+<span class="a">+    const nx = scale.x(now);</span>
+<span class="a">+    svgRoot.append(svgEl(&#x27;line&#x27;, { x1: nx, x2: nx, y1: 0, y2: chartHeight, class: &#x27;tl-now&#x27; }), svgEl(&#x27;text&#x27;, { x: nx - 4, y: 11, &#x27;text-anchor&#x27;: &#x27;end&#x27;, class: &#x27;tl-now-label&#x27; }, &#x27;now&#x27;));</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  const labels = el(&#x27;div&#x27;, { class: &#x27;tl-labels&#x27; },</span>
+<span class="a">+    el(&#x27;div&#x27;, { class: &#x27;tl-label-header&#x27;, style: &#x27;height:&#x27; + TL_HEADER_H + &#x27;px&#x27; }),</span>
+<span class="a">+    ideas.map((idea) =&gt; el(&#x27;button&#x27;, { class: &#x27;tl-label-row&#x27;, type: &#x27;button&#x27;, style: &#x27;height:&#x27; + TL_ROW_H + &#x27;px&#x27;, onclick: () =&gt; openTicket(idea.key) },</span>
+<span class="a">+      el(&#x27;code&#x27;, { class: &#x27;tl-label-key&#x27; }, idea.key),</span>
+<span class="a">+      el(&#x27;span&#x27;, { class: &#x27;tl-label-title&#x27; }, idea.title))));</span>
+<span class="a">+</span>
+<span class="a">+  const scroll = el(&#x27;div&#x27;, { class: &#x27;tl-scroll&#x27; }, el(&#x27;div&#x27;, { class: &#x27;tl-inner&#x27; }, labels, el(&#x27;div&#x27;, { class: &#x27;tl-chart&#x27; }, svgRoot)));</span>
+<span class="a">+  $main.append(renderTimelineLegend(), scroll);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- search: semantic first, word fallback ---- */</span>
+<span class="a">+</span>
+<span class="a">+function wordSearch(q) {</span>
+<span class="a">+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);</span>
+<span class="a">+  const items = [];</span>
+<span class="a">+  for (const idea of state.data.ideas) {</span>
+<span class="a">+    const hay = [idea.title, idea.text, (idea.tags || []).join(&#x27; &#x27;), idea.brief].filter(Boolean).join(&#x27; \n &#x27;).toLowerCase();</span>
+<span class="a">+    let score = 0;</span>
+<span class="a">+    for (const w of words) { if (hay.includes(w)) score++; }</span>
+<span class="a">+    if (score &gt;= 1) items.push({ idea, score });</span>
+<span class="a">+  }</span>
+<span class="a">+  items.sort((a, b) =&gt; b.score - a.score);</span>
+<span class="a">+  return { mode: &#x27;words&#x27;, items };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function trySemanticSearch(q, embed) {</span>
+<span class="a">+  const ctrl = new AbortController();</span>
+<span class="a">+  const timer = setTimeout(() =&gt; ctrl.abort(), EMBED_TIMEOUT_MS);</span>
+<span class="a">+  try {</span>
+<span class="a">+    const res = await fetch(&#x27;v1/embeddings&#x27;, {</span>
+<span class="a">+      method: &#x27;POST&#x27;,</span>
+<span class="a">+      headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+      body: JSON.stringify({ model: embed.model, input: [embed.query_prefix + q] }),</span>
+<span class="a">+      signal: ctrl.signal,</span>
+<span class="a">+    });</span>
+<span class="a">+    if (!res.ok) return null;</span>
+<span class="a">+    const json = await res.json();</span>
+<span class="a">+    const raw = json &amp;&amp; json.data &amp;&amp; json.data[0] &amp;&amp; json.data[0].embedding;</span>
+<span class="a">+    if (!Array.isArray(raw) || raw.length === 0) return null;</span>
+<span class="a">+    const qvec = normalize(raw);</span>
+<span class="a">+    const threshold = embed.search_threshold ?? 0.5;</span>
+<span class="a">+    const items = [];</span>
+<span class="a">+    for (const idea of state.data.ideas) {</span>
+<span class="a">+      const vec = getIdeaVec(idea);</span>
+<span class="a">+      if (!vec) continue;</span>
+<span class="a">+      const score = dot(qvec, vec);</span>
+<span class="a">+      if (score &gt;= threshold) items.push({ idea, score });</span>
+<span class="a">+    }</span>
+<span class="a">+    items.sort((a, b) =&gt; b.score - a.score);</span>
+<span class="a">+    return { mode: &#x27;meaning&#x27;, items };</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    return null;</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    clearTimeout(timer);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function runSearch(query) {</span>
+<span class="a">+  const q = query.trim();</span>
+<span class="a">+  if (!q) { state.searchResult = null; render(); return; }</span>
+<span class="a">+  const token = ++searchToken;</span>
+<span class="a">+  state.searchResult = null;</span>
+<span class="a">+  render();</span>
+<span class="a">+  const embed = state.data.embed || {};</span>
+<span class="a">+  const hasVecs = state.data.ideas.some((i) =&gt; i.vec);</span>
+<span class="a">+  let result = null;</span>
+<span class="a">+  if (embed.available &amp;&amp; hasVecs) result = await trySemanticSearch(q, embed);</span>
+<span class="a">+  if (token !== searchToken) return;</span>
+<span class="a">+  if (!result) result = wordSearch(q);</span>
+<span class="a">+  state.searchResult = result;</span>
+<span class="a">+  render();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function searchResultCard(item) {</span>
+<span class="a">+  const label = state.searchResult.mode === &#x27;meaning&#x27; ? Math.round(item.score * 100) + &#x27;%&#x27; : item.score + (item.score === 1 ? &#x27; word&#x27; : &#x27; words&#x27;);</span>
+<span class="a">+  return ideaCard(item.idea, { compact: true, scoreLabel: label });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderSearch() {</span>
+<span class="a">+  $main.textContent = &#x27;&#x27;;</span>
+<span class="a">+  if (!state.searchResult) { $main.append(el(&#x27;p&#x27;, { class: &#x27;empty-note&#x27; }, &#x27;Searching…&#x27;)); return; }</span>
+<span class="a">+  const { mode, items } = state.searchResult;</span>
+<span class="a">+  const modeLabel = mode === &#x27;meaning&#x27; ? &#x27;Showing results by meaning&#x27; : &#x27;Showing results by words, meaning search is not available&#x27;;</span>
+<span class="a">+  const wrap = el(&#x27;div&#x27;, { class: &#x27;search-results&#x27; }, el(&#x27;p&#x27;, { class: &#x27;search-mode&#x27; }, modeLabel));</span>
+<span class="a">+  if (!items.length) wrap.append(el(&#x27;p&#x27;, { class: &#x27;empty-note&#x27; }, &#x27;No matching ideas.&#x27;));</span>
+<span class="a">+  else wrap.append(el(&#x27;div&#x27;, { class: &#x27;search-list&#x27; }, items.map(searchResultCard)));</span>
+<span class="a">+  $main.append(wrap);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- detail drawer ---- */</span>
+<span class="a">+</span>
+<span class="a">+function renderDateGrid(idea) {</span>
+<span class="a">+  const grid = el(&#x27;dl&#x27;, { class: &#x27;date-grid&#x27; });</span>
+<span class="a">+  for (const [label, value] of [[&#x27;Created&#x27;, idea.created], [&#x27;Triaged&#x27;, idea.triaged], [&#x27;Started&#x27;, idea.started], [&#x27;Closed&#x27;, idea.closed]]) {</span>
+<span class="a">+    grid.append(el(&#x27;dt&#x27;, {}, label), el(&#x27;dd&#x27;, {}, value ? fmtDate(value) : &#x27;—&#x27;));</span>
+<span class="a">+  }</span>
+<span class="a">+  return grid;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderNotes(notes) {</span>
+<span class="a">+  if (!notes || !notes.length) return null;</span>
+<span class="a">+  const list = el(&#x27;div&#x27;, { class: &#x27;notes&#x27; });</span>
+<span class="a">+  for (const note of notes) list.append(el(&#x27;div&#x27;, { class: &#x27;note&#x27; }, el(&#x27;div&#x27;, { class: &#x27;note-at&#x27; }, fmtDate(note.at)), el(&#x27;div&#x27;, { class: &#x27;note-text&#x27; }, note.text)));</span>
+<span class="a">+  return el(&#x27;section&#x27;, { class: &#x27;drawer-section&#x27; }, el(&#x27;h3&#x27;, {}, &#x27;Notes&#x27;), list);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderDupOf(dupId) {</span>
+<span class="a">+  const target = state.byId.get(dupId);</span>
+<span class="a">+  const key = target ? target.key : &#x27;IDEA-&#x27; + dupId;</span>
+<span class="a">+  const content = target</span>
+<span class="a">+    ? el(&#x27;button&#x27;, { class: &#x27;link-button&#x27;, type: &#x27;button&#x27;, onclick: () =&gt; openTicket(target.key) }, key + &#x27; — &#x27; + target.title)</span>
+<span class="a">+    : el(&#x27;span&#x27;, { class: &#x27;text-muted&#x27; }, key + &#x27; (not found)&#x27;);</span>
+<span class="a">+  return el(&#x27;section&#x27;, { class: &#x27;drawer-section&#x27; }, el(&#x27;h3&#x27;, {}, &#x27;Duplicate of&#x27;), content);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderRelated(related) {</span>
+<span class="a">+  const list = el(&#x27;div&#x27;, { class: &#x27;related-list&#x27; });</span>
+<span class="a">+  for (const r of related) {</span>
+<span class="a">+    const target = state.byId.get(r.id);</span>
+<span class="a">+    if (!target) continue;</span>
+<span class="a">+    const pct = Math.round((r.score ?? 0) * 100) + &#x27;%&#x27;;</span>
+<span class="a">+    list.append(el(&#x27;button&#x27;, { class: &#x27;link-button related-item&#x27;, type: &#x27;button&#x27;, onclick: () =&gt; openTicket(target.key) },</span>
+<span class="a">+      el(&#x27;code&#x27;, { class: &#x27;card-key&#x27; }, target.key), el(&#x27;span&#x27;, { class: &#x27;related-title&#x27; }, target.title), el(&#x27;span&#x27;, { class: &#x27;related-score&#x27; }, pct)));</span>
+<span class="a">+  }</span>
+<span class="a">+  if (!list.childNodes.length) return null;</span>
+<span class="a">+  return el(&#x27;section&#x27;, { class: &#x27;drawer-section&#x27; }, el(&#x27;h3&#x27;, {}, &#x27;Related&#x27;), list);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function buildDrawerContent(idea) {</span>
+<span class="a">+  const frag = document.createDocumentFragment();</span>
+<span class="a">+  const chips = el(&#x27;div&#x27;, { class: &#x27;drawer-chips&#x27; }, el(&#x27;span&#x27;, { class: &#x27;chip chip-lane&#x27;, style: &#x27;--chip-color:var(--lane-&#x27; + idea.lane + &#x27;)&#x27; }, LANE_LABELS[idea.lane] || idea.lane));</span>
+<span class="a">+  if (idea.model) chips.append(el(&#x27;span&#x27;, { class: &#x27;chip chip-model&#x27; }, idea.model));</span>
+<span class="a">+  if (idea.size) chips.append(el(&#x27;span&#x27;, { class: &#x27;chip&#x27; }, idea.size.toUpperCase()));</span>
+<span class="a">+  if (idea.impact != null) chips.append(el(&#x27;span&#x27;, { class: &#x27;chip chip-impact&#x27; }, &#x27;▲&#x27; + idea.impact));</span>
+<span class="a">+  if (idea.verdict) chips.append(el(&#x27;span&#x27;, { class: &#x27;chip&#x27; }, &#x27;verdict: &#x27; + idea.verdict));</span>
+<span class="a">+</span>
+<span class="a">+  frag.append(el(&#x27;h2&#x27;, { id: &#x27;drawer-title&#x27;, class: &#x27;drawer-title&#x27; }, el(&#x27;code&#x27;, { class: &#x27;drawer-key&#x27; }, idea.key), idea.title), chips);</span>
+<span class="a">+</span>
+<span class="a">+  const metaLines = [];</span>
+<span class="a">+  if (idea.project) metaLines.push(&#x27;Project: &#x27; + idea.project);</span>
+<span class="a">+  if (idea.tags &amp;&amp; idea.tags.length) metaLines.push(&#x27;Tags: &#x27; + idea.tags.join(&#x27;, &#x27;));</span>
+<span class="a">+  if (metaLines.length) frag.append(el(&#x27;p&#x27;, { class: &#x27;drawer-meta&#x27; }, metaLines.join(&#x27; · &#x27;)));</span>
+<span class="a">+</span>
+<span class="a">+  frag.append(renderDateGrid(idea));</span>
+<span class="a">+</span>
+<span class="a">+  if (idea.text) frag.append(el(&#x27;section&#x27;, { class: &#x27;drawer-section&#x27; }, el(&#x27;h3&#x27;, {}, &#x27;Text&#x27;), el(&#x27;p&#x27;, { class: &#x27;drawer-text&#x27; }, idea.text)));</span>
+<span class="a">+  if (idea.why) frag.append(el(&#x27;section&#x27;, { class: &#x27;drawer-section&#x27; }, el(&#x27;h3&#x27;, {}, &#x27;Why&#x27;), el(&#x27;p&#x27;, { class: &#x27;drawer-text&#x27; }, idea.why)));</span>
+<span class="a">+  if (idea.brief) frag.append(el(&#x27;section&#x27;, { class: &#x27;drawer-section&#x27; }, el(&#x27;h3&#x27;, {}, &#x27;Build brief&#x27;), el(&#x27;p&#x27;, { class: &#x27;drawer-text&#x27; }, idea.brief)));</span>
+<span class="a">+</span>
+<span class="a">+  const notes = renderNotes(idea.notes);</span>
+<span class="a">+  if (notes) frag.append(notes);</span>
+<span class="a">+  if (idea.dup_of != null) frag.append(renderDupOf(idea.dup_of));</span>
+<span class="a">+  if (idea.related &amp;&amp; idea.related.length) {</span>
+<span class="a">+    const related = renderRelated(idea.related);</span>
+<span class="a">+    if (related) frag.append(related);</span>
+<span class="a">+  }</span>
+<span class="a">+  return frag;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderDrawer() {</span>
+<span class="a">+  const idea = state.openKey ? findByKey(state.openKey) : null;</span>
+<span class="a">+  const wasHidden = $drawer.hidden;</span>
+<span class="a">+  if (!idea) {</span>
+<span class="a">+    if (!wasHidden) {</span>
+<span class="a">+      $drawer.hidden = true;</span>
+<span class="a">+      $drawerBackdrop.hidden = true;</span>
+<span class="a">+      if (lastFocused &amp;&amp; document.contains(lastFocused)) lastFocused.focus();</span>
+<span class="a">+      lastFocused = null;</span>
+<span class="a">+    }</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  if (wasHidden) lastFocused = document.activeElement;</span>
+<span class="a">+  $drawer.hidden = false;</span>
+<span class="a">+  $drawerBackdrop.hidden = false;</span>
+<span class="a">+  $drawerBody.textContent = &#x27;&#x27;;</span>
+<span class="a">+  $drawerBody.append(buildDrawerContent(idea));</span>
+<span class="a">+  if (wasHidden) requestAnimationFrame(() =&gt; $drawerClose.focus());</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function openTicket(key) { location.hash = key; }</span>
+<span class="a">+function closeDrawer() { location.hash = state.view; }</span>
+<span class="a">+</span>
+<span class="a">+/* ---- load error ---- */</span>
+<span class="a">+</span>
+<span class="a">+class HttpError extends Error {</span>
+<span class="a">+  constructor(status) { super(&#x27;HTTP &#x27; + status); this.status = status; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function renderLoadError(err) {</span>
+<span class="a">+  $main.textContent = &#x27;&#x27;;</span>
+<span class="a">+  $counts.textContent = &#x27;&#x27;;</span>
+<span class="a">+  $updated.textContent = &#x27;&#x27;;</span>
+<span class="a">+  const msg = err instanceof HttpError ? &#x27;Could not load data.json (HTTP &#x27; + err.status + &#x27;).&#x27; : &#x27;Could not load data.json (&#x27; + (err &amp;&amp; err.message ? err.message : &#x27;network error&#x27;) + &#x27;).&#x27;;</span>
+<span class="a">+  $main.append(el(&#x27;div&#x27;, { class: &#x27;load-error&#x27; }, el(&#x27;p&#x27;, {}, msg)));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---- top-level render and hash routing ---- */</span>
+<span class="a">+</span>
+<span class="a">+function render() {</span>
+<span class="a">+  renderHeader();</span>
+<span class="a">+  renderTabsActive();</span>
+<span class="a">+  if (state.query.trim() !== &#x27;&#x27;) renderSearch();</span>
+<span class="a">+  else if (state.view === &#x27;timeline&#x27;) renderTimeline();</span>
+<span class="a">+  else if (state.view === &#x27;groups&#x27;) renderGroups();</span>
+<span class="a">+  else renderBoard();</span>
+<span class="a">+  renderDrawer();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function applyHash() {</span>
+<span class="a">+  const raw = decodeURIComponent(location.hash.slice(1));</span>
+<span class="a">+  if (raw === &#x27;board&#x27; || raw === &#x27;timeline&#x27; || raw === &#x27;groups&#x27;) {</span>
+<span class="a">+    state.view = raw;</span>
+<span class="a">+    state.openKey = null;</span>
+<span class="a">+  } else if (/^IDEA-\d+$/i.test(raw)) {</span>
+<span class="a">+    state.openKey = raw.toUpperCase();</span>
+<span class="a">+  } else {</span>
+<span class="a">+    state.openKey = null;</span>
+<span class="a">+    if (raw) state.view = &#x27;board&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function onHashChange() { applyHash(); render(); }</span>
+<span class="a">+</span>
+<span class="a">+function onSearchInput() {</span>
+<span class="a">+  const q = $searchInput.value;</span>
+<span class="a">+  state.query = q;</span>
+<span class="a">+  clearTimeout(searchTimer);</span>
+<span class="a">+  if (q.trim() === &#x27;&#x27;) { state.searchResult = null; render(); return; }</span>
+<span class="a">+  searchTimer = setTimeout(() =&gt; runSearch(q), SEARCH_DEBOUNCE_MS);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function bindStaticEvents() {</span>
+<span class="a">+  for (const btn of $tabs.querySelectorAll(&#x27;button&#x27;)) {</span>
+<span class="a">+    btn.addEventListener(&#x27;click&#x27;, () =&gt; {</span>
+<span class="a">+      $searchInput.value = &#x27;&#x27;;</span>
+<span class="a">+      state.query = &#x27;&#x27;;</span>
+<span class="a">+      state.searchResult = null;</span>
+<span class="a">+      location.hash = btn.dataset.view;</span>
+<span class="a">+    });</span>
+<span class="a">+  }</span>
+<span class="a">+  $parkedToggle.addEventListener(&#x27;change&#x27;, () =&gt; { state.showParked = $parkedToggle.checked; render(); });</span>
+<span class="a">+  $searchInput.addEventListener(&#x27;input&#x27;, onSearchInput);</span>
+<span class="a">+  $searchInput.addEventListener(&#x27;keydown&#x27;, (e) =&gt; { if (e.key === &#x27;Enter&#x27;) { clearTimeout(searchTimer); runSearch($searchInput.value); } });</span>
+<span class="a">+  $drawerClose.addEventListener(&#x27;click&#x27;, closeDrawer);</span>
+<span class="a">+  $drawerBackdrop.addEventListener(&#x27;click&#x27;, closeDrawer);</span>
+<span class="a">+  document.addEventListener(&#x27;keydown&#x27;, (e) =&gt; { if (e.key === &#x27;Escape&#x27; &amp;&amp; !$drawer.hidden) closeDrawer(); });</span>
+<span class="a">+  document.addEventListener(&#x27;click&#x27;, () =&gt; { $tooltip.hidden = true; });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function main() {</span>
+<span class="a">+  bindStaticEvents();</span>
+<span class="a">+  try {</span>
+<span class="a">+    const res = await fetch(&#x27;data.json&#x27;, { cache: &#x27;no-store&#x27; });</span>
+<span class="a">+    if (!res.ok) throw new HttpError(res.status);</span>
+<span class="a">+    const data = await res.json();</span>
+<span class="a">+    state.data = data;</span>
+<span class="a">+    for (const idea of data.ideas) {</span>
+<span class="a">+      state.byId.set(idea.id, idea);</span>
+<span class="a">+      state.byKey.set(idea.key.toUpperCase(), idea);</span>
+<span class="a">+    }</span>
+<span class="a">+    window.addEventListener(&#x27;hashchange&#x27;, onHashChange);</span>
+<span class="a">+    applyHash();</span>
+<span class="a">+    render();</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    renderLoadError(err);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+main();</span>
+<span class="a">+&lt;/script&gt;</span>
+<span class="a">+&lt;/body&gt;</span>
+<span class="a">+&lt;/html&gt;</span>
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..3c4bbe0
+--- /dev/null
++++ b/package-lock.json
+<span class="h">@@ -0,0 +1,62 @@</span>
+<span class="a">+{</span>
+<span class="a">+  &quot;name&quot;: &quot;ideamine&quot;,</span>
+<span class="a">+  &quot;version&quot;: &quot;0.4.0&quot;,</span>
+<span class="a">+  &quot;lockfileVersion&quot;: 3,</span>
+<span class="a">+  &quot;requires&quot;: true,</span>
+<span class="a">+  &quot;packages&quot;: {</span>
+<span class="a">+    &quot;&quot;: {</span>
+<span class="a">+      &quot;name&quot;: &quot;ideamine&quot;,</span>
+<span class="a">+      &quot;version&quot;: &quot;0.4.0&quot;,</span>
+<span class="a">+      &quot;license&quot;: &quot;MIT&quot;,</span>
+<span class="a">+      &quot;bin&quot;: {</span>
+<span class="a">+        &quot;ideamine&quot;: &quot;bin/ideamine.js&quot;</span>
+<span class="a">+      },</span>
+<span class="a">+      &quot;devDependencies&quot;: {</span>
+<span class="a">+        &quot;fast-check&quot;: &quot;^4.10.2&quot;</span>
+<span class="a">+      },</span>
+<span class="a">+      &quot;engines&quot;: {</span>
+<span class="a">+        &quot;node&quot;: &quot;&gt;=18&quot;</span>
+<span class="a">+      }</span>
+<span class="a">+    },</span>
+<span class="a">+    &quot;node_modules/fast-check&quot;: {</span>
+<span class="a">+      &quot;version&quot;: &quot;4.10.2&quot;,</span>
+<span class="a">+      &quot;resolved&quot;: &quot;https://registry.npmjs.org/fast-check/-/fast-check-4.10.2.tgz&quot;,</span>
+<span class="a">+      &quot;integrity&quot;: &quot;sha512-iK2f+YrcmoeGqk6fA0ea2bptcu/itMIm4NfEozq6N25+aG6h7s5HZbB/k1aV7b5w5sFLMCbbtRUsTVR+BgC3xw==&quot;,</span>
+<span class="a">+      &quot;dev&quot;: true,</span>
+<span class="a">+      &quot;funding&quot;: [</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;individual&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://github.com/sponsors/dubzzz&quot;</span>
+<span class="a">+        },</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;opencollective&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://opencollective.com/fast-check&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;license&quot;: &quot;MIT&quot;,</span>
+<span class="a">+      &quot;dependencies&quot;: {</span>
+<span class="a">+        &quot;pure-rand&quot;: &quot;^8.0.0&quot;</span>
+<span class="a">+      },</span>
+<span class="a">+      &quot;engines&quot;: {</span>
+<span class="a">+        &quot;node&quot;: &quot;&gt;=12.17.0&quot;</span>
+<span class="a">+      }</span>
+<span class="a">+    },</span>
+<span class="a">+    &quot;node_modules/pure-rand&quot;: {</span>
+<span class="a">+      &quot;version&quot;: &quot;8.4.2&quot;,</span>
+<span class="a">+      &quot;resolved&quot;: &quot;https://registry.npmjs.org/pure-rand/-/pure-rand-8.4.2.tgz&quot;,</span>
+<span class="a">+      &quot;integrity&quot;: &quot;sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng==&quot;,</span>
+<span class="a">+      &quot;dev&quot;: true,</span>
+<span class="a">+      &quot;funding&quot;: [</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;individual&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://github.com/sponsors/dubzzz&quot;</span>
+<span class="a">+        },</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;opencollective&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://opencollective.com/fast-check&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;license&quot;: &quot;MIT&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/package.json b/package.json
+index a5b0a54..e7da825 100644
+--- a/package.json
++++ b/package.json
+<span class="h">@@ -1,6 +1,6 @@</span>
+ {
+   &quot;name&quot;: &quot;ideamine&quot;,
+<span class="d">-  &quot;version&quot;: &quot;0.4.0&quot;,</span>
+<span class="a">+  &quot;version&quot;: &quot;0.5.0&quot;,</span>
+   &quot;description&quot;: &quot;An idea inbox for Claude Code. /idea saves an idea without calling the model; Claude later triages each idea and picks the cheapest model that can build it.&quot;,
+   &quot;type&quot;: &quot;module&quot;,
+   &quot;bin&quot;: {
+<span class="h">@@ -9,6 +9,7 @@</span>
+   &quot;files&quot;: [
+     &quot;bin&quot;,
+     &quot;src&quot;,
+<span class="a">+    &quot;dashboard&quot;,</span>
+     &quot;skills&quot;,
+     &quot;hooks&quot;,
+     &quot;.claude-plugin&quot;,
+<span class="h">@@ -39,5 +40,8 @@</span>
+     &quot;ideas&quot;,
+     &quot;backlog&quot;,
+     &quot;vibecoding&quot;
+<span class="d">-  ]</span>
+<span class="a">+  ],</span>
+<span class="a">+  &quot;devDependencies&quot;: {</span>
+<span class="a">+    &quot;fast-check&quot;: &quot;^4.10.2&quot;</span>
+<span class="a">+  }</span>
+ }
+diff --git a/skills/ideas-find/SKILL.md b/skills/ideas-find/SKILL.md
+new file mode 100644
+index 0000000..e81e87d
+--- /dev/null
++++ b/skills/ideas-find/SKILL.md
+<span class="h">@@ -0,0 +1,11 @@</span>
+<span class="a">+---</span>
+<span class="a">+name: ideas-find</span>
+<span class="a">+description: Search the ideamine archive by meaning (nomic-embed-text), in every lane. The ideamine hook answers this with no model call.</span>
+<span class="a">+argument-hint: &quot;&lt;words&gt;&quot;</span>
+<span class="a">+disable-model-invocation: true</span>
+<span class="a">+allowed-tools: mcp__plugin_ideamine_ideamine__idea_list</span>
+<span class="a">+---</span>
+<span class="a">+</span>
+<span class="a">+Call `idea_list` with `semantic: true`, `filter: &quot;all&quot;`, and `query` set to: $ARGUMENTS</span>
+<span class="a">+</span>
+<span class="a">+Show the result exactly as returned.</span>
+diff --git a/skills/ideas-groups/SKILL.md b/skills/ideas-groups/SKILL.md
+new file mode 100644
+index 0000000..8626e2b
+--- /dev/null
++++ b/skills/ideas-groups/SKILL.md
+<span class="h">@@ -0,0 +1,11 @@</span>
+<span class="a">+---</span>
+<span class="a">+name: ideas-groups</span>
+<span class="a">+description: Show the ideamine ideas grouped by meaning (nomic-embed-text). A lane name or -a picks the ideas. The ideamine hook answers this with no model call.</span>
+<span class="a">+argument-hint: &quot;[inbox|do|maybe|skip|doing|done|dropped|-a]&quot;</span>
+<span class="a">+disable-model-invocation: true</span>
+<span class="a">+allowed-tools: mcp__plugin_ideamine_ideamine__idea_list</span>
+<span class="a">+---</span>
+<span class="a">+</span>
+<span class="a">+Call `idea_list` with `groups: true` for this request: $ARGUMENTS</span>
+<span class="a">+</span>
+<span class="a">+A lane name is the `filter`, and `-a` is `filter: &quot;all&quot;`. Show the result exactly as returned.</span>
+diff --git a/skills/ideas/SKILL.md b/skills/ideas/SKILL.md
+index a4b54df..47d8532 100644
+--- a/skills/ideas/SKILL.md
++++ b/skills/ideas/SKILL.md
+<span class="h">@@ -8,4 +8,4 @@ allowed-tools: mcp__plugin_ideamine_ideamine__idea_list, mcp__plugin_ideamine_id</span>
+ 
+ Request: $ARGUMENTS
+ 
+<span class="d">-Answer from `idea_list`. Pass `filter`, `id`, `query`, `here`, or `full` when the request asks for them. If the request is empty, show the board exactly as returned. To change a status, use `idea_update`. To delete ideas, use `idea_remove`. Keep the answer short. Do not start to build an idea: /ideas-go and /ideas-all do that.</span>
+<span class="a">+Answer from `idea_list`. Pass `filter`, `id`, `query`, `here`, or `full` when the request asks for them. For a question about a topic, pass the topic as `query` with `semantic: true`, which finds ideas by meaning. For a question about themes or clusters, pass `groups: true`. If the request is empty, show the board exactly as returned. To change a status, use `idea_update`. To delete ideas, use `idea_remove`. Keep the answer short. Do not start to build an idea: /ideas-go and /ideas-all do that.</span>
+diff --git a/src/config.js b/src/config.js
+new file mode 100644
+index 0000000..63af809
+--- /dev/null
++++ b/src/config.js
+<span class="h">@@ -0,0 +1,89 @@</span>
+<span class="a">+// Settings. `ideamine config` writes them to ~/.ideamine/config.json. An environment variable</span>
+<span class="a">+// overrides the file, so a test or a single command can use other values.</span>
+<span class="a">+</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import { home, withLock, writeAtomic } from &#x27;./store.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+export const SETTINGS = {</span>
+<span class="a">+  embed_url: {</span>
+<span class="a">+    env: &#x27;IDEAMINE_EMBED_URL&#x27;,</span>
+<span class="a">+    value: &#x27;http://127.0.0.1:11434/v1&#x27;,</span>
+<span class="a">+    about: &#x27;OpenAI-compatible embeddings API (Ollama, llama.cpp server)&#x27;,</span>
+<span class="a">+  },</span>
+<span class="a">+  embed_model: { env: &#x27;IDEAMINE_EMBED_MODEL&#x27;, value: &#x27;nomic-embed-text&#x27;, about: &#x27;embedding model&#x27; },</span>
+<span class="a">+  search_threshold: {</span>
+<span class="a">+    env: &#x27;IDEAMINE_SEARCH_THRESHOLD&#x27;,</span>
+<span class="a">+    value: 0.5,</span>
+<span class="a">+    about: &#x27;lowest similarity (0 to 1) of a search result to the query&#x27;,</span>
+<span class="a">+  },</span>
+<span class="a">+  group_threshold: {</span>
+<span class="a">+    env: &#x27;IDEAMINE_GROUP_THRESHOLD&#x27;,</span>
+<span class="a">+    value: 0.65,</span>
+<span class="a">+    about: &#x27;lowest mean similarity (0 to 1) of the ideas in a group; also the floor for related ideas&#x27;,</span>
+<span class="a">+  },</span>
+<span class="a">+  publish_url: {</span>
+<span class="a">+    env: &#x27;IDEAMINE_PUBLISH_URL&#x27;,</span>
+<span class="a">+    value: &#x27;&#x27;,</span>
+<span class="a">+    about: &#x27;dashboard server that gets index.html and data.json by HTTP PUT (empty: off)&#x27;,</span>
+<span class="a">+  },</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+const configPath = () =&gt; path.join(home(), &#x27;config.json&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+function readFile() {</span>
+<span class="a">+  try {</span>
+<span class="a">+    return JSON.parse(fs.readFileSync(configPath(), &#x27;utf8&#x27;));</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return {};</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function setting(key) {</span>
+<span class="a">+  const s = SETTINGS[key];</span>
+<span class="a">+  if (!s) throw new Error(`unknown setting &quot;${key}&quot; (use: ${Object.keys(SETTINGS).join(&#x27;, &#x27;)})`);</span>
+<span class="a">+  return s;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function parse(key, raw) {</span>
+<span class="a">+  if (typeof setting(key).value !== &#x27;number&#x27;) return String(raw).trim();</span>
+<span class="a">+  const n = Number(raw);</span>
+<span class="a">+  if (String(raw).trim() === &#x27;&#x27; || !Number.isFinite(n) || n &lt; 0 || n &gt; 1) throw new Error(`${key} must be a number from 0 to 1`);</span>
+<span class="a">+  return n;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The value and where it comes from: env, file, or default. */</span>
+<span class="a">+function lookup(key) {</span>
+<span class="a">+  const s = setting(key);</span>
+<span class="a">+  const env = process.env[s.env];</span>
+<span class="a">+  if (env !== undefined &amp;&amp; env !== &#x27;&#x27;) return { value: parse(key, env), from: s.env };</span>
+<span class="a">+  const saved = readFile()[key];</span>
+<span class="a">+  if (saved !== undefined) return { value: parse(key, saved), from: &#x27;config.json&#x27; };</span>
+<span class="a">+  return { value: s.value, from: &#x27;default&#x27; };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function get(key) {</span>
+<span class="a">+  return lookup(key).value;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Save a setting. An empty value removes it from the file, so the default applies again. */</span>
+<span class="a">+export function set(key, value) {</span>
+<span class="a">+  const clean = value == null || String(value).trim() === &#x27;&#x27; ? undefined : parse(key, value);</span>
+<span class="a">+  withLock(() =&gt; {</span>
+<span class="a">+    const all = readFile();</span>
+<span class="a">+    if (clean === undefined) delete all[key];</span>
+<span class="a">+    else all[key] = clean;</span>
+<span class="a">+    writeAtomic(configPath(), JSON.stringify(all, null, 2) + &#x27;\n&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+  return get(key);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Every setting, one line each, with its source. */</span>
+<span class="a">+export function describe() {</span>
+<span class="a">+  return Object.keys(SETTINGS)</span>
+<span class="a">+    .map((key) =&gt; {</span>
+<span class="a">+      const { value, from } = lookup(key);</span>
+<span class="a">+      return `${key.padEnd(17)} ${String(value === &#x27;&#x27; ? &#x27;(off)&#x27; : value).padEnd(28)} ${from} · ${SETTINGS[key].about}`;</span>
+<span class="a">+    })</span>
+<span class="a">+    .join(&#x27;\n&#x27;);</span>
+<span class="a">+}</span>
+diff --git a/src/embed.js b/src/embed.js
+new file mode 100644
+index 0000000..13b21d5
+--- /dev/null
++++ b/src/embed.js
+<span class="h">@@ -0,0 +1,318 @@</span>
+<span class="a">+// Search by meaning, and groups of ideas that are close in meaning. This follows memstate</span>
+<span class="a">+// (github.com/map588/memstate): nomic-embed-text with its task prefixes, one vector for each idea</span>
+<span class="a">+// that a content hash keeps current, cosine similarity with a threshold, and word search when the</span>
+<span class="a">+// embedding server does not answer. The groups and the &quot;related&quot; links come from the vectors, so</span>
+<span class="a">+// ideamine needs no graph database.</span>
+<span class="a">+</span>
+<span class="a">+import crypto from &#x27;node:crypto&#x27;;</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import * as config from &#x27;./config.js&#x27;;</span>
+<span class="a">+import { home, listIdeas, load, withLock, writeAtomic } from &#x27;./store.js&#x27;;</span>
+<span class="a">+import { clip, wordSet } from &#x27;./text.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const MAX_CHARS = 1500; // the first cut; embed() halves a text again when the server says it is too long</span>
+<span class="a">+const MIN_CHARS = 100;</span>
+<span class="a">+const BATCH = 32;</span>
+<span class="a">+</span>
+<span class="a">+/** The embedding server cannot answer. Callers then use word search. */</span>
+<span class="a">+export class EmbedError extends Error {}</span>
+<span class="a">+</span>
+<span class="a">+const vectorsPath = () =&gt; path.join(home(), &#x27;vectors.json&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+/** The text that stands for an idea: its title (when the text does not start with it), text, and tags. */</span>
+<span class="a">+export function ideaText(idea) {</span>
+<span class="a">+  const text = String(idea.text || &#x27;&#x27;);</span>
+<span class="a">+  const title = String(idea.title || &#x27;&#x27;).replace(/…$/, &#x27;&#x27;);</span>
+<span class="a">+  const head = text.startsWith(title) ? text : `${idea.title}\n${text}`;</span>
+<span class="a">+  return idea.tags?.length ? `${head}\ntags: ${idea.tags.join(&#x27;, &#x27;)}` : head;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// nomic-embed models expect a task prefix on each side of a search. Other models get the raw text.</span>
+<span class="a">+const isNomic = (model) =&gt; /^nomic-embed/i.test(model);</span>
+<span class="a">+export const documentText = (model, text) =&gt; (isNomic(model) ? `search_document: ${text}` : text);</span>
+<span class="a">+export const queryText = (model, text) =&gt; (isNomic(model) ? `search_query: ${text}` : text);</span>
+<span class="a">+</span>
+<span class="a">+/** Base64 of the vector as little-endian float32, the form that data.json and vectors.json use. */</span>
+<span class="a">+export function encodeVec(vec) {</span>
+<span class="a">+  const buf = Buffer.alloc(vec.length * 4);</span>
+<span class="a">+  for (let i = 0; i &lt; vec.length; i++) buf.writeFloatLE(vec[i], i * 4);</span>
+<span class="a">+  return buf.toString(&#x27;base64&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function decodeVec(b64) {</span>
+<span class="a">+  const buf = Buffer.from(b64, &#x27;base64&#x27;);</span>
+<span class="a">+  const vec = new Float32Array(buf.length &gt;&gt; 2);</span>
+<span class="a">+  for (let i = 0; i &lt; vec.length; i++) vec[i] = buf.readFloatLE(i * 4);</span>
+<span class="a">+  return vec;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The vector scaled to length 1. */</span>
+<span class="a">+export function unit(values) {</span>
+<span class="a">+  const vec = Float32Array.from(values);</span>
+<span class="a">+  let sum = 0;</span>
+<span class="a">+  for (const x of vec) sum += x * x;</span>
+<span class="a">+  const norm = Math.sqrt(sum);</span>
+<span class="a">+  if (!norm || !Number.isFinite(norm)) throw new EmbedError(&#x27;the embedding server returned an empty vector&#x27;);</span>
+<span class="a">+  for (let i = 0; i &lt; vec.length; i++) vec[i] /= norm;</span>
+<span class="a">+  return vec;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Cosine similarity of two unit vectors. */</span>
+<span class="a">+export function cosine(a, b) {</span>
+<span class="a">+  let sum = 0;</span>
+<span class="a">+  for (let i = 0; i &lt; a.length; i++) sum += a[i] * b[i];</span>
+<span class="a">+  return sum;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Cut at a code point, never inside a surrogate pair. */</span>
+<span class="a">+const cut = (text, max) =&gt; (text.length &lt;= max ? text : [...text].slice(0, max).join(&#x27;&#x27;));</span>
+<span class="a">+</span>
+<span class="a">+async function post(texts, { url, model, timeoutMs }) {</span>
+<span class="a">+  const endpoint = `${url.replace(/\/+$/, &#x27;&#x27;)}/embeddings`;</span>
+<span class="a">+  let res;</span>
+<span class="a">+  try {</span>
+<span class="a">+    res = await fetch(endpoint, {</span>
+<span class="a">+      method: &#x27;POST&#x27;,</span>
+<span class="a">+      headers: { &#x27;content-type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+      body: JSON.stringify({ model, input: texts }),</span>
+<span class="a">+      signal: AbortSignal.timeout(timeoutMs),</span>
+<span class="a">+    });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    const why = e.name === &#x27;TimeoutError&#x27; ? `no answer in ${timeoutMs / 1000} s` : e.cause?.code || e.cause?.message || e.message;</span>
+<span class="a">+    throw new EmbedError(`cannot reach ${endpoint} (${why})`);</span>
+<span class="a">+  }</span>
+<span class="a">+  const body = await res.text();</span>
+<span class="a">+  if (!res.ok) {</span>
+<span class="a">+    const err = new EmbedError(`${endpoint} answered ${res.status}: ${clip(body, 160)}`);</span>
+<span class="a">+    err.tooLong = /too large|too long|context/i.test(body);</span>
+<span class="a">+    throw err;</span>
+<span class="a">+  }</span>
+<span class="a">+  let data;</span>
+<span class="a">+  try {</span>
+<span class="a">+    data = JSON.parse(body).data;</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    data = null;</span>
+<span class="a">+  }</span>
+<span class="a">+  if (!Array.isArray(data) || data.length !== texts.length) {</span>
+<span class="a">+    throw new EmbedError(`${endpoint} did not return ${texts.length} embeddings: ${clip(body, 160)}`);</span>
+<span class="a">+  }</span>
+<span class="a">+  return [...data].sort((a, b) =&gt; a.index - b.index).map((d) =&gt; unit(d.embedding));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Unit vectors for the texts, with the document or the query prefix. When the server says that a</span>
+<span class="a">+ * text is too long, it embeds the texts one at a time and halves each text that is still too long.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function embed(texts, { query = false, timeoutMs = 30000 } = {}) {</span>
+<span class="a">+  const url = config.get(&#x27;embed_url&#x27;);</span>
+<span class="a">+  const model = config.get(&#x27;embed_model&#x27;);</span>
+<span class="a">+  const wrap = (t) =&gt; (query ? queryText(model, t) : documentText(model, t));</span>
+<span class="a">+  const first = texts.map((t) =&gt; cut(String(t), MAX_CHARS));</span>
+<span class="a">+  try {</span>
+<span class="a">+    return await post(first.map(wrap), { url, model, timeoutMs });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    if (!e.tooLong) throw e;</span>
+<span class="a">+  }</span>
+<span class="a">+  const out = [];</span>
+<span class="a">+  for (let text of first) {</span>
+<span class="a">+    for (;;) {</span>
+<span class="a">+      try {</span>
+<span class="a">+        out.push((await post([wrap(text)], { url, model, timeoutMs }))[0]);</span>
+<span class="a">+        break;</span>
+<span class="a">+      } catch (e) {</span>
+<span class="a">+        if (!e.tooLong || text.length &lt;= MIN_CHARS) throw e;</span>
+<span class="a">+        text = cut(text, Math.floor([...text].length / 2));</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const hashOf = (model, text) =&gt; crypto.createHash(&#x27;sha256&#x27;).update(`${model}\n${text}`).digest(&#x27;hex&#x27;).slice(0, 16);</span>
+<span class="a">+</span>
+<span class="a">+function readVectors(model) {</span>
+<span class="a">+  try {</span>
+<span class="a">+    const file = JSON.parse(fs.readFileSync(vectorsPath(), &#x27;utf8&#x27;));</span>
+<span class="a">+    return file.model === model &amp;&amp; file.items ? file.items : {};</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return {};</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Add vectors to the cache. Vectors of deleted ideas go, so a deleted idea leaves nothing behind. */</span>
+<span class="a">+function saveVectors(model, entries) {</span>
+<span class="a">+  withLock(() =&gt; {</span>
+<span class="a">+    const live = new Set(load().ideas.map((i) =&gt; String(i.id)));</span>
+<span class="a">+    const items = Object.fromEntries(Object.entries(readVectors(model)).filter(([id]) =&gt; live.has(id)));</span>
+<span class="a">+    for (const [id, item] of entries) if (live.has(String(id))) items[id] = item;</span>
+<span class="a">+    writeAtomic(vectorsPath(), JSON.stringify({ model, items }) + &#x27;\n&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A vector for each idea. Only new and changed ideas go to the server; the others come from the cache. */</span>
+<span class="a">+export async function vectorsFor(ideas, { timeoutMs } = {}) {</span>
+<span class="a">+  const model = config.get(&#x27;embed_model&#x27;);</span>
+<span class="a">+  const cached = readVectors(model);</span>
+<span class="a">+  const vectors = new Map();</span>
+<span class="a">+  const todo = [];</span>
+<span class="a">+  for (const idea of ideas) {</span>
+<span class="a">+    const text = ideaText(idea);</span>
+<span class="a">+    const hash = hashOf(model, text);</span>
+<span class="a">+    if (cached[idea.id]?.hash === hash) vectors.set(idea.id, decodeVec(cached[idea.id].vec));</span>
+<span class="a">+    else todo.push({ id: idea.id, text, hash });</span>
+<span class="a">+  }</span>
+<span class="a">+  for (let i = 0; i &lt; todo.length; i += BATCH) {</span>
+<span class="a">+    const part = todo.slice(i, i + BATCH);</span>
+<span class="a">+    const vecs = await embed(part.map((t) =&gt; t.text), { timeoutMs });</span>
+<span class="a">+    part.forEach((t, k) =&gt; vectors.set(t.id, vecs[k]));</span>
+<span class="a">+    saveVectors(model, part.map((t, k) =&gt; [t.id, { hash: t.hash, vec: encodeVec(vecs[k]) }]));</span>
+<span class="a">+  }</span>
+<span class="a">+  return vectors;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Groups of ideas that are close in meaning, by average-linkage clustering: two groups join while</span>
+<span class="a">+ * the mean similarity of the pairs across them is at least `threshold`. The ids are sorted first,</span>
+<span class="a">+ * so the order of the input does not change the result. Only groups of 2 or more ideas are returned.</span>
+<span class="a">+ */</span>
+<span class="a">+export function groupIds(ids, vectors, threshold) {</span>
+<span class="a">+  const sorted = [...new Set(ids)].sort((a, b) =&gt; a - b);</span>
+<span class="a">+  const n = sorted.length;</span>
+<span class="a">+  // sum[i][j]: sum of the similarities of all pairs across clusters i and j.</span>
+<span class="a">+  const sum = sorted.map((a) =&gt; sorted.map((b) =&gt; cosine(vectors.get(a), vectors.get(b))));</span>
+<span class="a">+  const clusters = sorted.map((id) =&gt; [id]);</span>
+<span class="a">+  const alive = new Array(n).fill(true);</span>
+<span class="a">+  for (;;) {</span>
+<span class="a">+    let best = -Infinity;</span>
+<span class="a">+    let pair = null;</span>
+<span class="a">+    for (let i = 0; i &lt; n; i++) {</span>
+<span class="a">+      if (!alive[i]) continue;</span>
+<span class="a">+      for (let j = i + 1; j &lt; n; j++) {</span>
+<span class="a">+        if (!alive[j]) continue;</span>
+<span class="a">+        const avg = sum[i][j] / (clusters[i].length * clusters[j].length);</span>
+<span class="a">+        if (avg &gt; best) {</span>
+<span class="a">+          best = avg;</span>
+<span class="a">+          pair = [i, j];</span>
+<span class="a">+        }</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+    if (!pair || best &lt; threshold) break;</span>
+<span class="a">+    const [i, j] = pair;</span>
+<span class="a">+    clusters[i] = [...clusters[i], ...clusters[j]].sort((a, b) =&gt; a - b);</span>
+<span class="a">+    alive[j] = false;</span>
+<span class="a">+    for (let k = 0; k &lt; n; k++) {</span>
+<span class="a">+      sum[i][k] += sum[j][k];</span>
+<span class="a">+      sum[k][i] = sum[i][k];</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  return clusters.filter((c, i) =&gt; alive[i] &amp;&amp; c.length &gt; 1);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Words that many ideas use and that say little about a group (&quot;Add full support for ...&quot;).</span>
+<span class="a">+const LABEL_SKIP = new Set(</span>
+<span class="a">+  &#x27;add added also app apps better build built fix full idea ideas made need new nicer now should support want work&#x27;.split(&#x27; &#x27;),</span>
+<span class="a">+);</span>
+<span class="a">+</span>
+<span class="a">+/** A few words that the ideas of a group share and other ideas do not, most distinctive first. */</span>
+<span class="a">+export function groupLabel(members, all) {</span>
+<span class="a">+  const words = (idea) =&gt; [...wordSet(`${idea.title} ${idea.text} ${(idea.tags || []).join(&#x27; &#x27;)}`)].filter((w) =&gt; !LABEL_SKIP.has(w));</span>
+<span class="a">+  const count = (ideas) =&gt; {</span>
+<span class="a">+    const df = new Map();</span>
+<span class="a">+    for (const idea of ideas) for (const w of words(idea)) df.set(w, (df.get(w) || 0) + 1);</span>
+<span class="a">+    return df;</span>
+<span class="a">+  };</span>
+<span class="a">+  const inside = count(members);</span>
+<span class="a">+  const overall = count(all);</span>
+<span class="a">+  const best = [...inside]</span>
+<span class="a">+    .filter(([, n]) =&gt; n &gt;= 2)</span>
+<span class="a">+    .map(([w, n]) =&gt; [w, (n / members.length) * Math.log((all.length + 1) / (overall.get(w) || 1))])</span>
+<span class="a">+    .sort((a, b) =&gt; b[1] - a[1] || a[0].localeCompare(b[0]))</span>
+<span class="a">+    .slice(0, 3)</span>
+<span class="a">+    .map(([w]) =&gt; w);</span>
+<span class="a">+  return best.length ? best.join(&#x27; · &#x27;) : clip(members[0].title, 40);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Groups for these ideas: [{ ids, label }], the biggest first. Throws EmbedError when the server does not answer. */</span>
+<span class="a">+export async function groupIdeas(ideas, { threshold = config.get(&#x27;group_threshold&#x27;), vectors = null, timeoutMs } = {}) {</span>
+<span class="a">+  vectors ||= await vectorsFor(ideas, { timeoutMs });</span>
+<span class="a">+  const byId = new Map(ideas.map((i) =&gt; [i.id, i]));</span>
+<span class="a">+  return groupIds(ideas.map((i) =&gt; i.id), vectors, threshold)</span>
+<span class="a">+    .map((ids) =&gt; ({ ids, label: groupLabel(ids.map((id) =&gt; byId.get(id)), ideas) }))</span>
+<span class="a">+    .sort((a, b) =&gt; b.ids.length - a.ids.length || a.ids[0] - b.ids[0]);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The `k` ideas closest to idea `id`, with a similarity of at least `threshold`. */</span>
+<span class="a">+export function nearest(id, ids, vectors, { k = 3, threshold = 0 } = {}) {</span>
+<span class="a">+  const own = vectors.get(id);</span>
+<span class="a">+  if (!own) return [];</span>
+<span class="a">+  return ids</span>
+<span class="a">+    .filter((other) =&gt; other !== id &amp;&amp; vectors.has(other))</span>
+<span class="a">+    .map((other) =&gt; ({ id: other, score: Math.round(cosine(own, vectors.get(other)) * 1000) / 1000 }))</span>
+<span class="a">+    .filter((r) =&gt; r.score &gt;= threshold)</span>
+<span class="a">+    .sort((a, b) =&gt; b.score - a.score || a.id - b.id)</span>
+<span class="a">+    .slice(0, k);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Word search for when meaning search is not available: more query words found ranks higher. */</span>
+<span class="a">+function byWords(ideas, query) {</span>
+<span class="a">+  const words = [...wordSet(query)];</span>
+<span class="a">+  if (!words.length) words.push(...String(query).toLowerCase().split(/\s+/).filter(Boolean));</span>
+<span class="a">+  return ideas</span>
+<span class="a">+    .map((idea) =&gt; {</span>
+<span class="a">+      const hay = `${ideaText(idea)}\n${idea.triage?.brief || &#x27;&#x27;}`.toLowerCase();</span>
+<span class="a">+      return { idea, score: words.filter((w) =&gt; hay.includes(w)).length / words.length };</span>
+<span class="a">+    })</span>
+<span class="a">+    .filter((r) =&gt; r.score &gt; 0)</span>
+<span class="a">+    .sort((a, b) =&gt; b.score - a.score || b.idea.id - a.idea.id);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Ideas like the query, best first: { mode: &#x27;meaning&#x27; | &#x27;words&#x27;, results: [{ idea, score }], note }.</span>
+<span class="a">+ * When the embedding server does not answer, it falls back to word search and says why in `note`.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function find(db, query, { filter = &#x27;all&#x27;, project = null, limit = 10, threshold, timeoutMs = 8000 } = {}) {</span>
+<span class="a">+  const ideas = listIdeas(db, { filter, project });</span>
+<span class="a">+  threshold ??= config.get(&#x27;search_threshold&#x27;);</span>
+<span class="a">+  try {</span>
+<span class="a">+    const vectors = await vectorsFor(ideas, { timeoutMs });</span>
+<span class="a">+    const [q] = await embed([query], { query: true, timeoutMs });</span>
+<span class="a">+    const results = ideas</span>
+<span class="a">+      .map((idea) =&gt; ({ idea, score: cosine(q, vectors.get(idea.id)) }))</span>
+<span class="a">+      .filter((r) =&gt; r.score &gt;= threshold)</span>
+<span class="a">+      .sort((a, b) =&gt; b.score - a.score || a.idea.id - b.idea.id);</span>
+<span class="a">+    return { mode: &#x27;meaning&#x27;, results: limit ? results.slice(0, limit) : results, note: &#x27;&#x27; };</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    if (!(e instanceof EmbedError)) throw e;</span>
+<span class="a">+    const results = byWords(ideas, query);</span>
+<span class="a">+    return { mode: &#x27;words&#x27;, results: limit ? results.slice(0, limit) : results, note: e.message };</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Percentile `p` (0 to 1) of sorted numbers. */</span>
+<span class="a">+const percentile = (sorted, p) =&gt; sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Embed every idea that has no current vector, then describe the set, like memstate&#x27;s `embed</span>
+<span class="a">+ * status`: coverage, the nearest-neighbour similarity of each idea, and how many ideas the</span>
+<span class="a">+ * thresholds keep. Use it to set group_threshold and search_threshold for a new model.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function status(db, { timeoutMs } = {}) {</span>
+<span class="a">+  const url = config.get(&#x27;embed_url&#x27;);</span>
+<span class="a">+  const model = config.get(&#x27;embed_model&#x27;);</span>
+<span class="a">+  const groupThreshold = config.get(&#x27;group_threshold&#x27;);</span>
+<span class="a">+  const lines = [`model ${model} at ${url}`];</span>
+<span class="a">+  const vectors = await vectorsFor(db.ideas, { timeoutMs });</span>
+<span class="a">+  const ids = db.ideas.map((i) =&gt; i.id);</span>
+<span class="a">+  const dim = vectors.size ? vectors.values().next().value.length : 0;</span>
+<span class="a">+  lines.push(`vectors ${vectors.size}/${ids.length}${dim ? `, ${dim} dimensions` : &#x27;&#x27;} · ${vectorsPath()}`);</span>
+<span class="a">+  if (ids.length &gt; 1) {</span>
+<span class="a">+    const nn = ids.map((id) =&gt; nearest(id, ids, vectors, { k: 1 })[0]?.score ?? 0).sort((a, b) =&gt; a - b);</span>
+<span class="a">+    const p = (x) =&gt; percentile(nn, x).toFixed(2);</span>
+<span class="a">+    lines.push(`nearest neighbour similarity: p10 ${p(0.1)} · p50 ${p(0.5)} · p90 ${p(0.9)} · max ${nn[nn.length - 1].toFixed(2)}`);</span>
+<span class="a">+    const groups = groupIds(ids, vectors, groupThreshold);</span>
+<span class="a">+    const grouped = groups.reduce((n, g) =&gt; n + g.length, 0);</span>
+<span class="a">+    lines.push(`group_threshold ${groupThreshold}: ${groups.length} groups hold ${grouped} of ${ids.length} ideas`);</span>
+<span class="a">+  }</span>
+<span class="a">+  return lines.join(&#x27;\n&#x27;);</span>
+<span class="a">+}</span>
+diff --git a/src/hook.js b/src/hook.js
+index ce9a813..0af0987 100644
+--- a/src/hook.js
++++ b/src/hook.js
+<span class="h">@@ -1,11 +1,13 @@</span>
+ // UserPromptSubmit hook: answers /idea, /ideas, and the local /ideas-* commands (ls, cat, rm, done,
+<span class="d">-// reopen, watch) and blocks the prompt, so the model is never called. That makes capture free,</span>
+<span class="d">-// instant, and possible even when the session is out of usage. Every other prompt passes through</span>
+<span class="d">-// untouched, including /ideas-go, /ideas-all, /ideas-sort, and questions, which their skills answer.</span>
+<span class="d">-// After each prompt, the hook lets the watcher start a background pass when there is work.</span>
+<span class="a">+// reopen, find, groups, watch) and blocks the prompt, so the model is never called. That makes</span>
+<span class="a">+// capture free, instant, and possible even when the session is out of usage. Every other prompt</span>
+<span class="a">+// passes through untouched, including /ideas-go, /ideas-all, /ideas-sort, and questions, which their</span>
+<span class="a">+// skills answer. After each prompt, the hook lets the watcher and the dashboard catch up.</span>
+ 
+<span class="d">-import { renderAdded, renderBoard, renderIdea } from &#x27;./render.js&#x27;;</span>
+<span class="d">-import { addIdeas, FILTERS, findIdea, lane, load, removeIdeas, updateIdea } from &#x27;./store.js&#x27;;</span>
+<span class="a">+import * as embed from &#x27;./embed.js&#x27;;</span>
+<span class="a">+import * as publish from &#x27;./publish.js&#x27;;</span>
+<span class="a">+import { renderAdded, renderBoard, renderFound, renderGroups, renderIdea } from &#x27;./render.js&#x27;;</span>
+<span class="a">+import { addIdeas, FILTERS, findIdea, lane, listIdeas, load, removeIdeas, updateIdea } from &#x27;./store.js&#x27;;</span>
+ import { clip, splitIdeas } from &#x27;./text.js&#x27;;
+ import * as watch from &#x27;./watch.js&#x27;;
+ 
+<span class="h">@@ -21,6 +23,8 @@ const USAGE = `Usage: /idea &lt;text&gt;                add an idea (a bulleted list a</span>
+        /ideas-cat N...              show ideas in full
+        /ideas-rm N...               delete ideas for good
+        /ideas-done N [note] · /ideas-reopen N
+<span class="a">+       /ideas-find &lt;words&gt;          search by meaning (all lanes)</span>
+<span class="a">+       /ideas-groups [lane|-a]      ideas grouped by meaning</span>
+ These call the model:
+        /ideas-go [N]                build the next idea, or #N, on its model. New ideas are triaged first.
+        /ideas-all                   do every idea that fits this chat. The others stay in the queue.
+<span class="h">@@ -40,8 +44,11 @@ function readStdin() {</span>
+   });
+ }
+ 
+<span class="d">-/** Handle one prompt. Returns the text to show the user, or null to let the prompt through. */</span>
+<span class="d">-export function handlePrompt(prompt, { cwd = process.cwd(), session = null } = {}) {</span>
+<span class="a">+// A search by meaning must not hold the prompt for long when the embedding server is away.</span>
+<span class="a">+const SEARCH_TIMEOUT_MS = 4000;</span>
+<span class="a">+</span>
+<span class="a">+/** Handle one prompt. Resolves to the text to show the user, or null to let the prompt through. */</span>
+<span class="a">+export async function handlePrompt(prompt, { cwd = process.cwd(), session = null } = {}) {</span>
+   const m = COMMAND.exec(prompt || &#x27;&#x27;);
+   if (!m) return null;
+   const command = m[1].toLowerCase();
+<span class="h">@@ -66,6 +73,26 @@ export function handlePrompt(prompt, { cwd = process.cwd(), session = null } = {</span>
+ 
+   if (command === &#x27;ideas&#x27; &amp;&amp; !words.length) return renderBoard(db, { cwd, hints: true });
+ 
+<span class="a">+  if (command === &#x27;ideas-find&#x27;) {</span>
+<span class="a">+    if (!arg) return USAGE;</span>
+<span class="a">+    return renderFound(await embed.find(db, arg, { timeoutMs: SEARCH_TIMEOUT_MS }), arg, { cwd });</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  if (command === &#x27;ideas-groups&#x27;) {</span>
+<span class="a">+    const lower = words.map((w) =&gt; (w === &#x27;-a&#x27; ? &#x27;all&#x27; : w.toLowerCase()));</span>
+<span class="a">+    if (lower.length &lt;= 1 &amp;&amp; lower.every((w) =&gt; FILTERS.includes(w))) {</span>
+<span class="a">+      const filter = lower[0] || &#x27;open&#x27;;</span>
+<span class="a">+      const ideas = listIdeas(db, { filter });</span>
+<span class="a">+      try {</span>
+<span class="a">+        const groups = await embed.groupIdeas(ideas, { timeoutMs: SEARCH_TIMEOUT_MS });</span>
+<span class="a">+        return renderGroups(groups, ideas, { cwd, scope: filter });</span>
+<span class="a">+      } catch (e) {</span>
+<span class="a">+        if (!(e instanceof embed.EmbedError)) throw e;</span>
+<span class="a">+        return `Groups need the embedding server, which does not answer: ${e.message}`;</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+   if (command === &#x27;ideas-ls&#x27;) {
+     const lower = words.map((w) =&gt; (w === &#x27;-a&#x27; ? &#x27;all&#x27; : w.toLowerCase()));
+     const filters = lower.filter((w) =&gt; FILTERS.includes(w));
+<span class="h">@@ -103,7 +130,7 @@ export async function runHook() {</span>
+   }
+   let message = null;
+   try {
+<span class="d">-    message = handlePrompt(typeof input?.prompt === &#x27;string&#x27; ? input.prompt : &#x27;&#x27;, {</span>
+<span class="a">+    message = await handlePrompt(typeof input?.prompt === &#x27;string&#x27; ? input.prompt : &#x27;&#x27;, {</span>
+       cwd: input.cwd || process.cwd(),
+       session: input.session_id || null,
+     });
+<span class="h">@@ -120,10 +147,12 @@ export async function runHook() {</span>
+       hookSpecificOutput: { hookEventName: &#x27;UserPromptSubmit&#x27;, suppressOriginalPrompt: true },
+     }));
+   }
+<span class="d">-  // Each prompt lets the watcher catch up, so it keeps going while it is on.</span>
+<span class="d">-  try {</span>
+<span class="d">-    watch.kick();</span>
+<span class="d">-  } catch {</span>
+<span class="d">-    // The watcher must never stop a prompt.</span>
+<span class="a">+  // Each prompt lets the watcher and the dashboard catch up, so they keep going while they are on.</span>
+<span class="a">+  for (const kick of [watch.kick, publish.kick]) {</span>
+<span class="a">+    try {</span>
+<span class="a">+      kick();</span>
+<span class="a">+    } catch {</span>
+<span class="a">+      // The watcher and the dashboard must never stop a prompt.</span>
+<span class="a">+    }</span>
+   }
+ }
+diff --git a/src/mcp.js b/src/mcp.js
+index da75325..0827e9f 100644
+--- a/src/mcp.js
++++ b/src/mcp.js
+<span class="h">@@ -6,8 +6,9 @@ import path from &#x27;node:path&#x27;;</span>
+ import readline from &#x27;node:readline&#x27;;
+ import { fileURLToPath } from &#x27;node:url&#x27;;
+ import { headlessTriage, triageFirst } from &#x27;./claude.js&#x27;;
+<span class="a">+import * as embed from &#x27;./embed.js&#x27;;</span>
+ import { knownProjects } from &#x27;./projects.js&#x27;;
+<span class="d">-import { renderAdded, renderBoard, renderIdea } from &#x27;./render.js&#x27;;</span>
+<span class="a">+import { renderAdded, renderBoard, renderFound, renderGroups, renderIdea } from &#x27;./render.js&#x27;;</span>
+ import { BATCH_SCHEMA, MODELS, pendingIdeas, triagePrompt } from &#x27;./rubric.js&#x27;;
+ import {
+   addIdeas,
+<span class="h">@@ -58,13 +59,17 @@ const TOOLS = [</span>
+   },
+   {
+     name: &#x27;idea_list&#x27;,
+<span class="d">-    description: &#x27;Show the idea board, or one idea in full when id is given. full=true shows every listed idea in full.&#x27;,</span>
+<span class="a">+    description:</span>
+<span class="a">+      &#x27;Show the idea board, or one idea in full when id is given. full=true shows every listed idea in full. &#x27; +</span>
+<span class="a">+      &#x27;semantic=true ranks ideas by meaning for the query. groups=true groups the listed ideas by meaning.&#x27;,</span>
+     inputSchema: {
+       type: &#x27;object&#x27;,
+       properties: {
+         id: { type: &#x27;integer&#x27;, description: &#x27;Show this idea in full.&#x27; },
+         filter: { type: &#x27;string&#x27;, enum: FILTERS, description: &#x27;Default: open (doing, do, maybe, inbox).&#x27; },
+<span class="d">-        query: { type: &#x27;string&#x27;, description: &#x27;Only ideas containing all of these words.&#x27; },</span>
+<span class="a">+        query: { type: &#x27;string&#x27;, description: &#x27;Only ideas containing all of these words (with semantic: ideas like it).&#x27; },</span>
+<span class="a">+        semantic: { type: &#x27;boolean&#x27;, description: &#x27;Rank by meaning (nomic-embed-text), best first. Falls back to words.&#x27; },</span>
+<span class="a">+        groups: { type: &#x27;boolean&#x27;, description: &#x27;Group the listed ideas by meaning.&#x27; },</span>
+         here: { type: &#x27;boolean&#x27;, description: &#x27;Only ideas from the current project.&#x27; },
+         limit: { type: &#x27;integer&#x27; },
+         full: { type: &#x27;boolean&#x27;, description: &#x27;Every listed idea in full (brief, text, notes), not one line each.&#x27; },
+<span class="h">@@ -156,6 +161,8 @@ const PROMPTS = [</span>
+   { name: &#x27;ideas-ls&#x27;, description: &#x27;List the queue, one lane, or every lane (-a)&#x27;, arguments: [{ name: &#x27;lane&#x27;, required: false }] },
+   { name: &#x27;ideas-cat&#x27;, description: &#x27;Show ideas in full&#x27;, arguments: [{ name: &#x27;ids&#x27;, required: true }] },
+   { name: &#x27;ideas-rm&#x27;, description: &#x27;Delete ideas for good&#x27;, arguments: [{ name: &#x27;ids&#x27;, required: true }] },
+<span class="a">+  { name: &#x27;ideas-find&#x27;, description: &#x27;Search ideas by meaning&#x27;, arguments: [{ name: &#x27;words&#x27;, required: true }] },</span>
+<span class="a">+  { name: &#x27;ideas-groups&#x27;, description: &#x27;Show ideas grouped by meaning&#x27;, arguments: [{ name: &#x27;lane&#x27;, required: false }] },</span>
+   { name: &#x27;ideas-done&#x27;, description: &#x27;Mark an idea done&#x27;, arguments: [{ name: &#x27;id&#x27;, required: true }, { name: &#x27;note&#x27;, required: false }] },
+   { name: &#x27;ideas-reopen&#x27;, description: &#x27;Put an idea back in the queue&#x27;, arguments: [{ name: &#x27;id&#x27;, required: true }] },
+   { name: &#x27;ideas-go&#x27;, description: &#x27;Build the next idea on its recommended model&#x27;, arguments: [{ name: &#x27;id&#x27;, required: false }] },
+<span class="h">@@ -202,7 +209,7 @@ const handlers = {</span>
+     return renderAdded(results, load());
+   },
+ 
+<span class="d">-  idea_list({ id, filter = &#x27;open&#x27;, query = &#x27;&#x27;, here = false, limit = 0, full = false }) {</span>
+<span class="a">+  async idea_list({ id, filter = &#x27;open&#x27;, query = &#x27;&#x27;, here = false, limit = 0, full = false, semantic = false, groups = false }) {</span>
+     const db = load();
+     if (id != null) {
+       const idea = findIdea(db, id);
+<span class="h">@@ -210,6 +217,15 @@ const handlers = {</span>
+       return renderIdea(idea);
+     }
+     const project = here ? currentProject() : null;
+<span class="a">+    if (semantic &amp;&amp; query) {</span>
+<span class="a">+      const found = await embed.find(db, query, { filter, project, limit: limit || 10 });</span>
+<span class="a">+      if (!full) return renderFound(found, query, { cwd: currentProject() });</span>
+<span class="a">+      return found.results.length ? found.results.map((r) =&gt; renderIdea(r.idea)).join(&#x27;\n\n&#x27;) : &#x27;No ideas match.&#x27;;</span>
+<span class="a">+    }</span>
+<span class="a">+    if (groups) {</span>
+<span class="a">+      const ideas = listIdeas(db, { filter, query, limit, project });</span>
+<span class="a">+      return renderGroups(await embed.groupIdeas(ideas), ideas, { cwd: currentProject(), scope: filter });</span>
+<span class="a">+    }</span>
+     if (full) {
+       const ideas = listIdeas(db, { filter, query, limit, project });
+       return ideas.length ? ideas.map(renderIdea).join(&#x27;\n\n&#x27;) : &#x27;No ideas match.&#x27;;
+diff --git a/src/publish.js b/src/publish.js
+new file mode 100644
+index 0000000..17a0a68
+--- /dev/null
++++ b/src/publish.js
+<span class="h">@@ -0,0 +1,234 @@</span>
+<span class="a">+// The dashboard: a static page (dashboard/index.html) and a snapshot of the archive (data.json).</span>
+<span class="a">+// `ideamine publish` uploads both with HTTP PUT, for example to nginx on a WireGuard address, or</span>
+<span class="a">+// writes them to a folder. Like the watcher, no process stays alive: the hook calls kick() for</span>
+<span class="a">+// each prompt, and kick() starts a background publish when the archive changed since the last one.</span>
+<span class="a">+</span>
+<span class="a">+import { spawn } from &#x27;node:child_process&#x27;;</span>
+<span class="a">+import crypto from &#x27;node:crypto&#x27;;</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import { fileURLToPath } from &#x27;node:url&#x27;;</span>
+<span class="a">+import * as config from &#x27;./config.js&#x27;;</span>
+<span class="a">+import * as embed from &#x27;./embed.js&#x27;;</span>
+<span class="a">+import { counts, dbPath, home, lane, listIdeas, load } from &#x27;./store.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const PAGE = new URL(&#x27;../dashboard/index.html&#x27;, import.meta.url);</span>
+<span class="a">+const WAIT_AFTER_ERROR_MS = 10 * 60 * 1000; // after a failed publish, before kick() tries again</span>
+<span class="a">+const LOCK_STALE_MS = 10 * 60 * 1000;</span>
+<span class="a">+</span>
+<span class="a">+const statePath = () =&gt; path.join(home(), &#x27;publish.json&#x27;);</span>
+<span class="a">+const lockPath = () =&gt; path.join(home(), &#x27;.publish&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+/** The earliest of the given times; null when none is set. */</span>
+<span class="a">+const earliest = (...times) =&gt; times.filter(Boolean).sort()[0] || null;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Bars for the timeline: the time an idea waited in the inbox, waited in the queue, and was in work.</span>
+<span class="a">+ * `to: null` means &quot;until now&quot;. Ideas that started before ideamine recorded start times get an</span>
+<span class="a">+ * `estimated` work bar from the triage (or the creation) to the end.</span>
+<span class="a">+ */</span>
+<span class="a">+export function phases(idea) {</span>
+<span class="a">+  const triaged = idea.triage?.at || null;</span>
+<span class="a">+  const started = idea.started || null;</span>
+<span class="a">+  const closed = idea.closed || null;</span>
+<span class="a">+  const out = [];</span>
+<span class="a">+  const add = (phase, from, to, estimated = false) =&gt; {</span>
+<span class="a">+    if (from &amp;&amp; (!to || to &gt;= from)) out.push(estimated ? { phase, from, to, estimated } : { phase, from, to });</span>
+<span class="a">+  };</span>
+<span class="a">+  if (!started &amp;&amp; (idea.status === &#x27;doing&#x27; || idea.status === &#x27;done&#x27;)) {</span>
+<span class="a">+    if (triaged) add(&#x27;inbox&#x27;, idea.created, triaged);</span>
+<span class="a">+    add(&#x27;doing&#x27;, triaged || idea.created, closed, true);</span>
+<span class="a">+    return out;</span>
+<span class="a">+  }</span>
+<span class="a">+  add(&#x27;inbox&#x27;, idea.created, earliest(triaged, started, closed));</span>
+<span class="a">+  if (triaged &amp;&amp; (!started || triaged &lt; started)) add(&#x27;queued&#x27;, triaged, started || closed);</span>
+<span class="a">+  if (started) add(&#x27;doing&#x27;, started, closed);</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** data.json (version 1). The dashboard page reads it; its format is in the README. */</span>
+<span class="a">+export function snapshot(db, { vectors = null, groups = [], generated = new Date().toISOString() } = {}) {</span>
+<span class="a">+  const model = config.get(&#x27;embed_model&#x27;);</span>
+<span class="a">+  const groupThreshold = config.get(&#x27;group_threshold&#x27;);</span>
+<span class="a">+  const rank = new Map(listIdeas(db, { filter: &#x27;all&#x27; }).map((idea, n) =&gt; [idea.id, n]));</span>
+<span class="a">+  const groupOf = new Map();</span>
+<span class="a">+  groups.forEach((g, n) =&gt; g.ids.forEach((id) =&gt; groupOf.set(id, n)));</span>
+<span class="a">+  const ids = db.ideas.map((i) =&gt; i.id);</span>
+<span class="a">+  return {</span>
+<span class="a">+    version: 1,</span>
+<span class="a">+    generated,</span>
+<span class="a">+    embed: {</span>
+<span class="a">+      model,</span>
+<span class="a">+      dim: vectors?.size ? vectors.values().next().value.length : 0,</span>
+<span class="a">+      query_prefix: embed.queryText(model, &#x27;&#x27;),</span>
+<span class="a">+      search_threshold: config.get(&#x27;search_threshold&#x27;),</span>
+<span class="a">+      group_threshold: groupThreshold,</span>
+<span class="a">+      available: !!vectors,</span>
+<span class="a">+    },</span>
+<span class="a">+    counts: counts(db),</span>
+<span class="a">+    ideas: db.ideas.map((i) =&gt; {</span>
+<span class="a">+      const t = i.triage;</span>
+<span class="a">+      return {</span>
+<span class="a">+        id: i.id,</span>
+<span class="a">+        key: `IDEA-${i.id}`,</span>
+<span class="a">+        title: i.title,</span>
+<span class="a">+        text: i.text,</span>
+<span class="a">+        lane: lane(i),</span>
+<span class="a">+        status: i.status,</span>
+<span class="a">+        rank: rank.get(i.id),</span>
+<span class="a">+        tags: i.tags || [],</span>
+<span class="a">+        project: i.project ? path.basename(i.project) : null,</span>
+<span class="a">+        created: i.created,</span>
+<span class="a">+        updated: i.updated,</span>
+<span class="a">+        triaged: t?.at || null,</span>
+<span class="a">+        started: i.started || null,</span>
+<span class="a">+        closed: i.closed || null,</span>
+<span class="a">+        verdict: t?.verdict || null,</span>
+<span class="a">+        impact: t?.impact ?? null,</span>
+<span class="a">+        size: t?.size || null,</span>
+<span class="a">+        model: t?.model || null,</span>
+<span class="a">+        why: t?.why || &#x27;&#x27;,</span>
+<span class="a">+        brief: t?.brief || &#x27;&#x27;,</span>
+<span class="a">+        notes: i.notes || [],</span>
+<span class="a">+        dup_of: i.dup_of || null,</span>
+<span class="a">+        group: groupOf.has(i.id) ? groupOf.get(i.id) : null,</span>
+<span class="a">+        related: vectors ? embed.nearest(i.id, ids, vectors, { k: 3, threshold: groupThreshold }) : [],</span>
+<span class="a">+        phases: phases(i),</span>
+<span class="a">+        vec: vectors?.has(i.id) ? embed.encodeVec(vectors.get(i.id)) : null,</span>
+<span class="a">+      };</span>
+<span class="a">+    }),</span>
+<span class="a">+    groups: groups.map((g, n) =&gt; ({ id: n, label: g.label, ids: g.ids })),</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The snapshot, with groups when the embedding server answers. `note` says why there are none. */</span>
+<span class="a">+export async function build(db, { timeoutMs = 60000 } = {}) {</span>
+<span class="a">+  let vectors = null;</span>
+<span class="a">+  let groups = [];</span>
+<span class="a">+  let note = &#x27;&#x27;;</span>
+<span class="a">+  try {</span>
+<span class="a">+    vectors = await embed.vectorsFor(db.ideas, { timeoutMs });</span>
+<span class="a">+    groups = await embed.groupIdeas(db.ideas, { vectors });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    if (!(e instanceof embed.EmbedError)) throw e;</span>
+<span class="a">+    vectors = null;</span>
+<span class="a">+    note = `published without search by meaning or groups: ${e.message}`;</span>
+<span class="a">+  }</span>
+<span class="a">+  return { data: snapshot(db, { vectors, groups }), note };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function put(url, body, type) {</span>
+<span class="a">+  let res;</span>
+<span class="a">+  try {</span>
+<span class="a">+    res = await fetch(url, { method: &#x27;PUT&#x27;, body, headers: { &#x27;content-type&#x27;: type }, signal: AbortSignal.timeout(30000) });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    throw new Error(`cannot reach ${url} (${e.name === &#x27;TimeoutError&#x27; ? &#x27;no answer in 30 s&#x27; : e.cause?.code || e.cause?.message || e.message})`);</span>
+<span class="a">+  }</span>
+<span class="a">+  if (!res.ok) throw new Error(`${url} answered ${res.status} ${res.statusText}`);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const pageHash = () =&gt; crypto.createHash(&#x27;sha256&#x27;).update(fs.readFileSync(PAGE)).digest(&#x27;hex&#x27;).slice(0, 16);</span>
+<span class="a">+</span>
+<span class="a">+function archiveTime() {</span>
+<span class="a">+  try {</span>
+<span class="a">+    return fs.statSync(dbPath()).mtimeMs;</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return 0;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function readState() {</span>
+<span class="a">+  try {</span>
+<span class="a">+    return JSON.parse(fs.readFileSync(statePath(), &#x27;utf8&#x27;));</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return {};</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function writeState(patch) {</span>
+<span class="a">+  fs.mkdirSync(home(), { recursive: true });</span>
+<span class="a">+  fs.writeFileSync(statePath(), JSON.stringify({ ...readState(), ...patch }, null, 2) + &#x27;\n&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Upload index.html and data.json to `url` (a folder URL on the dashboard server), or write them</span>
+<span class="a">+ * to the folder `dir`. Returns what it did, for the caller to show.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function publish({ url = config.get(&#x27;publish_url&#x27;), dir = null } = {}) {</span>
+<span class="a">+  if (!url &amp;&amp; !dir) throw new Error(&#x27;no dashboard server is set. Run `ideamine publish &lt;url&gt;` once, or pass --dir &lt;folder&gt;&#x27;);</span>
+<span class="a">+  const mtime = archiveTime();</span>
+<span class="a">+  const { data, note } = await build(load());</span>
+<span class="a">+  const files = [</span>
+<span class="a">+    [&#x27;data.json&#x27;, JSON.stringify(data), &#x27;application/json&#x27;],</span>
+<span class="a">+    [&#x27;index.html&#x27;, fs.readFileSync(PAGE), &#x27;text/html; charset=utf-8&#x27;],</span>
+<span class="a">+  ];</span>
+<span class="a">+  if (dir) {</span>
+<span class="a">+    fs.mkdirSync(dir, { recursive: true });</span>
+<span class="a">+    for (const [name, body] of files) fs.writeFileSync(path.join(dir, name), body);</span>
+<span class="a">+  } else {</span>
+<span class="a">+    const base = url.endsWith(&#x27;/&#x27;) ? url : `${url}/`;</span>
+<span class="a">+    for (const [name, body, type] of files) await put(new URL(name, base), body, type);</span>
+<span class="a">+    writeState({ at: new Date().toISOString(), mtime, page: pageHash(), url, error: null, errorAt: null });</span>
+<span class="a">+  }</span>
+<span class="a">+  return { where: dir || url, ideas: data.ideas.length, groups: data.groups.length, note };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function isRunning(now) {</span>
+<span class="a">+  try {</span>
+<span class="a">+    return now - fs.statSync(lockPath()).mtimeMs &lt; LOCK_STALE_MS;</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return false;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** One background publish, from kick(). Only one runs at a time, and a failure waits 10 minutes. */</span>
+<span class="a">+export async function backgroundPublish() {</span>
+<span class="a">+  fs.mkdirSync(home(), { recursive: true });</span>
+<span class="a">+  try {</span>
+<span class="a">+    fs.mkdirSync(lockPath());</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    if (e.code !== &#x27;EEXIST&#x27; || isRunning(Date.now())) return &#x27;busy&#x27;;</span>
+<span class="a">+    fs.utimesSync(lockPath(), new Date(), new Date()); // take over the lock of a crashed publish</span>
+<span class="a">+  }</span>
+<span class="a">+  try {</span>
+<span class="a">+    await publish();</span>
+<span class="a">+    return &#x27;done&#x27;;</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    writeState({ error: e.message, errorAt: new Date().toISOString() });</span>
+<span class="a">+    return &#x27;error&#x27;;</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    fs.rmSync(lockPath(), { recursive: true, force: true });</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function startProcess() {</span>
+<span class="a">+  const bin = fileURLToPath(new URL(&#x27;../bin/ideamine.js&#x27;, import.meta.url));</span>
+<span class="a">+  spawn(process.execPath, [bin, &#x27;publish&#x27;, &#x27;--background&#x27;], { cwd: home(), detached: true, stdio: &#x27;ignore&#x27;, windowsHide: true }).unref();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Start a background publish when a dashboard server is set, the archive or the page changed since</span>
+<span class="a">+ * the last publish, no publish runs, and no publish failed a short time ago.</span>
+<span class="a">+ */</span>
+<span class="a">+export function kick({ start = startProcess, now = Date.now() } = {}) {</span>
+<span class="a">+  const url = config.get(&#x27;publish_url&#x27;);</span>
+<span class="a">+  if (!url) return false;</span>
+<span class="a">+  const state = readState();</span>
+<span class="a">+  if (state.errorAt &amp;&amp; now - Date.parse(state.errorAt) &lt; WAIT_AFTER_ERROR_MS) return false;</span>
+<span class="a">+  if (isRunning(now)) return false;</span>
+<span class="a">+  const current = state.url === url &amp;&amp; archiveTime() &lt;= (state.mtime || 0) &amp;&amp; state.page === pageHash();</span>
+<span class="a">+  if (current) return false;</span>
+<span class="a">+  start();</span>
+<span class="a">+  return true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Where the dashboard goes and how the last publish went. */</span>
+<span class="a">+export function status() {</span>
+<span class="a">+  const url = config.get(&#x27;publish_url&#x27;);</span>
+<span class="a">+  if (!url) return &#x27;ideamine publish: off. `ideamine publish &lt;url&gt;` sets the dashboard server.&#x27;;</span>
+<span class="a">+  const s = readState();</span>
+<span class="a">+  const lines = [`ideamine publish: ${url}`];</span>
+<span class="a">+  lines.push(s.at ? `last publish ${s.at}` : &#x27;not published yet&#x27;);</span>
+<span class="a">+  if (s.error) lines.push(`the last background publish failed at ${s.errorAt}: ${s.error}`);</span>
+<span class="a">+  return lines.join(&#x27;\n&#x27;);</span>
+<span class="a">+}</span>
+diff --git a/src/render.js b/src/render.js
+index be694ed..805e05e 100644
+--- a/src/render.js
++++ b/src/render.js
+<span class="h">@@ -71,6 +71,29 @@ export function renderBoard(db, { filter = &#x27;open&#x27;, project = null, query = &#x27;&#x27;, c</span>
+   return out.join(&#x27;\n&#x27;);
+ }
+ 
+<span class="a">+/** Search results, best first, with the similarity (by meaning) or the share of words found. */</span>
+<span class="a">+export function renderFound({ mode, results, note }, query, { cwd = null } = {}) {</span>
+<span class="a">+  const how = mode === &#x27;meaning&#x27; ? &#x27;by meaning&#x27; : `by words, because search by meaning is not available (${note})`;</span>
+<span class="a">+  const out = [`ideas like &quot;${clip(query, 60)}&quot;, ${how}`];</span>
+<span class="a">+  if (!results.length) out.push(&#x27;  (no match)&#x27;);</span>
+<span class="a">+  for (const { idea, score } of results) {</span>
+<span class="a">+    out.push(`${String(Math.round(score * 100)).padStart(4)}% ${lane(idea).padEnd(7)}${ideaLine(idea, { cwd }).slice(1)}`);</span>
+<span class="a">+  }</span>
+<span class="a">+  return out.join(&#x27;\n&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Groups of ideas that are close in meaning, then the ideas in no group. */</span>
+<span class="a">+export function renderGroups(groups, ideas, { cwd = null, scope = &#x27;open&#x27; } = {}) {</span>
+<span class="a">+  const out = [`ideamine groups: ${groups.length} group${groups.length === 1 ? &#x27;&#x27; : &#x27;s&#x27;} of ${scope} ideas, by meaning`];</span>
+<span class="a">+  const byId = new Map(ideas.map((i) =&gt; [i.id, i]));</span>
+<span class="a">+  const line = (idea) =&gt; `  ${lane(idea).padEnd(7)}${ideaLine(idea, { cwd }).slice(1)}`;</span>
+<span class="a">+  for (const g of groups) out.push(&#x27;&#x27;, g.label.toUpperCase(), ...g.ids.map((id) =&gt; line(byId.get(id))));</span>
+<span class="a">+  const grouped = new Set(groups.flatMap((g) =&gt; g.ids));</span>
+<span class="a">+  const rest = ideas.filter((i) =&gt; !grouped.has(i.id));</span>
+<span class="a">+  if (rest.length) out.push(&#x27;&#x27;, &#x27;IN NO GROUP&#x27;, ...rest.map(line));</span>
+<span class="a">+  return out.join(&#x27;\n&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** One idea in full. */
+ export function renderIdea(idea) {
+   const t = idea.triage;
+diff --git a/src/store.js b/src/store.js
+index c0efa83..f624ec1 100644
+--- a/src/store.js
++++ b/src/store.js
+<span class="h">@@ -102,29 +102,42 @@ function renameWithRetry(from, to) {</span>
+   }
+ }
+ 
+<span class="d">-function save(db) {</span>
+<span class="d">-  const file = dbPath();</span>
+<span class="a">+/** Replace `file` in one step, so a reader never sees half a file. Call it while you hold the lock. */</span>
+<span class="a">+export function writeAtomic(file, text, { backup = false } = {}) {</span>
+   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+<span class="d">-  fs.writeFileSync(tmp, JSON.stringify(db, null, 2) + &#x27;\n&#x27;);</span>
+<span class="d">-  try {</span>
+<span class="d">-    fs.copyFileSync(file, `${file}.bak`);</span>
+<span class="d">-  } catch (e) {</span>
+<span class="d">-    if (e.code !== &#x27;ENOENT&#x27;) throw e;</span>
+<span class="a">+  fs.writeFileSync(tmp, text);</span>
+<span class="a">+  if (backup) {</span>
+<span class="a">+    try {</span>
+<span class="a">+      fs.copyFileSync(file, `${file}.bak`);</span>
+<span class="a">+    } catch (e) {</span>
+<span class="a">+      if (e.code !== &#x27;ENOENT&#x27;) throw e;</span>
+<span class="a">+    }</span>
+   }
+   renameWithRetry(tmp, file);
+ }
+ 
+<span class="d">-/** Lock, read, apply `fn(db)`, write. Nothing is written if `fn` throws. */</span>
+<span class="d">-export function mutate(fn) {</span>
+<span class="a">+function save(db) {</span>
+<span class="a">+  writeAtomic(dbPath(), JSON.stringify(db, null, 2) + &#x27;\n&#x27;, { backup: true });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Run `fn` while this process holds the archive lock. Other files in home() can share the lock. */</span>
+<span class="a">+export function withLock(fn) {</span>
+   const release = acquireLock();
+   try {
+<span class="a">+    return fn();</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    release();</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Lock, read, apply `fn(db)`, write. Nothing is written if `fn` throws. */</span>
+<span class="a">+export function mutate(fn) {</span>
+<span class="a">+  return withLock(() =&gt; {</span>
+     const db = load();
+     const result = fn(db);
+     save(db);
+     return result;
+<span class="d">-  } finally {</span>
+<span class="d">-    release();</span>
+<span class="d">-  }</span>
+<span class="a">+  });</span>
+ }
+ 
+ // ---------------------------------------------------------------------------------------------
+<span class="h">@@ -332,6 +345,8 @@ export function updateIdea(id, patch = {}) {</span>
+       status = STATUS_ALIASES[status] || status;
+       if (status === &#x27;reopen&#x27; || status === &#x27;open&#x27;) status = idea.triage ? &#x27;triaged&#x27; : &#x27;inbox&#x27;;
+       if (!STATUSES.includes(status)) throw new Error(`status must be one of ${STATUSES.join(&#x27;, &#x27;)}, or reopen`);
+<span class="a">+      // The dashboard timeline shows work from the latest start.</span>
+<span class="a">+      if (status === &#x27;doing&#x27; &amp;&amp; idea.status !== &#x27;doing&#x27;) idea.started = now();</span>
+       idea.status = status;
+       if (status === &#x27;done&#x27; || status === &#x27;dropped&#x27;) idea.closed = now();
+       else delete idea.closed;
+diff --git a/tests/embed.test.js b/tests/embed.test.js
+new file mode 100644
+index 0000000..616ba05
+--- /dev/null
++++ b/tests/embed.test.js
+<span class="h">@@ -0,0 +1,163 @@</span>
+<span class="a">+import assert from &#x27;node:assert/strict&#x27;;</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import os from &#x27;node:os&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import { afterEach, beforeEach, test } from &#x27;node:test&#x27;;</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import * as embed from &#x27;../src/embed.js&#x27;;</span>
+<span class="a">+import * as store from &#x27;../src/store.js&#x27;;</span>
+<span class="a">+import { startFakeServer } from &#x27;./fixtures/fake-server.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+let server;</span>
+<span class="a">+</span>
+<span class="a">+beforeEach(async () =&gt; {</span>
+<span class="a">+  process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-embed-&#x27;));</span>
+<span class="a">+  server = await startFakeServer();</span>
+<span class="a">+  process.env.IDEAMINE_EMBED_URL = `${server.url}/v1`;</span>
+<span class="a">+  delete process.env.IDEAMINE_EMBED_MODEL;</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+afterEach(() =&gt; server.close());</span>
+<span class="a">+</span>
+<span class="a">+const unitVector = (dim) =&gt;</span>
+<span class="a">+  fc</span>
+<span class="a">+    .array(fc.float({ min: -1, max: 1, noNaN: true }), { minLength: dim, maxLength: dim })</span>
+<span class="a">+    .filter((v) =&gt; v.some((x) =&gt; Math.abs(x) &gt; 1e-3))</span>
+<span class="a">+    .map((v) =&gt; embed.unit(v));</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;property: a vector survives encode and decode unchanged&#x27;, () =&gt; {</span>
+<span class="a">+  fc.assert(</span>
+<span class="a">+    fc.property(fc.float32Array(), (vec) =&gt; {</span>
+<span class="a">+      const back = embed.decodeVec(embed.encodeVec(vec));</span>
+<span class="a">+      assert.equal(back.length, vec.length);</span>
+<span class="a">+      for (let i = 0; i &lt; vec.length; i++) assert.ok(Object.is(back[i], vec[i]), `index ${i}: ${back[i]} != ${vec[i]}`);</span>
+<span class="a">+    }),</span>
+<span class="a">+  );</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;property: cosine of unit vectors is symmetric, at most 1, and 1 for the same vector&#x27;, () =&gt; {</span>
+<span class="a">+  fc.assert(</span>
+<span class="a">+    fc.property(unitVector(8), unitVector(8), (a, b) =&gt; {</span>
+<span class="a">+      assert.ok(Math.abs(embed.cosine(a, b) - embed.cosine(b, a)) &lt; 1e-6);</span>
+<span class="a">+      assert.ok(Math.abs(embed.cosine(a, b)) &lt;= 1 + 1e-5);</span>
+<span class="a">+      assert.ok(Math.abs(embed.cosine(a, a) - 1) &lt; 1e-5);</span>
+<span class="a">+    }),</span>
+<span class="a">+  );</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;property: groups are disjoint, follow the average-linkage rule, and do not depend on the input order&#x27;, () =&gt; {</span>
+<span class="a">+  const cases = fc</span>
+<span class="a">+    .uniqueArray(fc.integer({ min: 1, max: 500 }), { minLength: 0, maxLength: 12 })</span>
+<span class="a">+    .chain((ids) =&gt; fc.tuple(fc.constant(ids), fc.array(unitVector(4), { minLength: ids.length, maxLength: ids.length }), fc.double({ min: -1, max: 1, noNaN: true })));</span>
+<span class="a">+  fc.assert(</span>
+<span class="a">+    fc.property(cases, ([ids, vecs, threshold]) =&gt; {</span>
+<span class="a">+      const vectors = new Map(ids.map((id, i) =&gt; [id, vecs[i]]));</span>
+<span class="a">+      const groups = embed.groupIds(ids, vectors, threshold);</span>
+<span class="a">+      const seen = groups.flat();</span>
+<span class="a">+      assert.equal(new Set(seen).size, seen.length);</span>
+<span class="a">+      assert.ok(seen.every((id) =&gt; ids.includes(id)));</span>
+<span class="a">+      assert.ok(groups.every((g) =&gt; g.length &gt;= 2));</span>
+<span class="a">+      assert.deepEqual(embed.groupIds([...ids].reverse(), vectors, threshold), groups);</span>
+<span class="a">+      // Average linkage: the mean similarity inside a group is at least the threshold, and the mean</span>
+<span class="a">+      // similarity across any two clusters that stayed apart (single ideas too) is below it.</span>
+<span class="a">+      const mean = (a, b) =&gt; {</span>
+<span class="a">+        let sum = 0;</span>
+<span class="a">+        for (const x of a) for (const y of b) sum += embed.cosine(vectors.get(x), vectors.get(y));</span>
+<span class="a">+        return sum / (a.length * b.length);</span>
+<span class="a">+      };</span>
+<span class="a">+      for (const g of groups) {</span>
+<span class="a">+        let sum = 0;</span>
+<span class="a">+        let pairs = 0;</span>
+<span class="a">+        for (let i = 0; i &lt; g.length; i++) for (let j = i + 1; j &lt; g.length; j++, pairs++) sum += embed.cosine(vectors.get(g[i]), vectors.get(g[j]));</span>
+<span class="a">+        assert.ok(sum / pairs &gt;= threshold - 1e-6, `group ${g} has mean ${sum / pairs} &lt; ${threshold}`);</span>
+<span class="a">+      }</span>
+<span class="a">+      const clusters = [...groups, ...ids.filter((id) =&gt; !seen.includes(id)).map((id) =&gt; [id])];</span>
+<span class="a">+      for (let i = 0; i &lt; clusters.length; i++) {</span>
+<span class="a">+        for (let j = i + 1; j &lt; clusters.length; j++) assert.ok(mean(clusters[i], clusters[j]) &lt; threshold + 1e-6);</span>
+<span class="a">+      }</span>
+<span class="a">+    }),</span>
+<span class="a">+  );</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;property: a higher threshold only splits groups, it never joins ideas from two groups&#x27;, () =&gt; {</span>
+<span class="a">+  const cases = fc</span>
+<span class="a">+    .uniqueArray(fc.integer({ min: 1, max: 500 }), { minLength: 2, maxLength: 10 })</span>
+<span class="a">+    .chain((ids) =&gt; fc.tuple(fc.constant(ids), fc.array(unitVector(4), { minLength: ids.length, maxLength: ids.length }), fc.double({ min: -1, max: 1, noNaN: true }), fc.double({ min: 0, max: 1, noNaN: true })));</span>
+<span class="a">+  fc.assert(</span>
+<span class="a">+    fc.property(cases, ([ids, vecs, low, step]) =&gt; {</span>
+<span class="a">+      const vectors = new Map(ids.map((id, i) =&gt; [id, vecs[i]]));</span>
+<span class="a">+      const coarse = embed.groupIds(ids, vectors, low);</span>
+<span class="a">+      for (const g of embed.groupIds(ids, vectors, low + step)) {</span>
+<span class="a">+        assert.ok(coarse.some((c) =&gt; g.every((id) =&gt; c.includes(id))), `${g} is not inside one group of ${JSON.stringify(coarse)}`);</span>
+<span class="a">+      }</span>
+<span class="a">+    }),</span>
+<span class="a">+  );</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;nomic prefixes: documents and queries get their own task prefix; other models get raw text&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;read subtitles aloud&#x27;]);</span>
+<span class="a">+  await embed.find(store.load(), &#x27;subtitles&#x27;);</span>
+<span class="a">+  assert.deepEqual(server.inputs, [&#x27;search_document: read subtitles aloud&#x27;, &#x27;search_query: subtitles&#x27;]);</span>
+<span class="a">+  process.env.IDEAMINE_EMBED_MODEL = &#x27;mxbai-embed-large&#x27;;</span>
+<span class="a">+  await embed.find(store.load(), &#x27;subtitles&#x27;);</span>
+<span class="a">+  assert.deepEqual(server.inputs.slice(2), [&#x27;read subtitles aloud&#x27;, &#x27;subtitles&#x27;]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;the cache embeds each idea once, again after a change, and drops deleted ideas&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;sync subtitles with audiobooks&#x27;, &#x27;dark mode for the popup&#x27;]);</span>
+<span class="a">+  await embed.vectorsFor(store.load().ideas);</span>
+<span class="a">+  assert.equal(server.inputs.length, 2);</span>
+<span class="a">+  await embed.vectorsFor(store.load().ideas);</span>
+<span class="a">+  assert.equal(server.inputs.length, 2); // from the cache</span>
+<span class="a">+  store.updateIdea(2, { text: &#x27;dark mode for the settings page&#x27; });</span>
+<span class="a">+  await embed.vectorsFor(store.load().ideas);</span>
+<span class="a">+  assert.deepEqual(server.inputs.slice(2), [&#x27;search_document: dark mode for the settings page&#x27;]);</span>
+<span class="a">+  store.removeIdeas([1]);</span>
+<span class="a">+  store.addIdeas([&#x27;a third idea&#x27;]);</span>
+<span class="a">+  await embed.vectorsFor(store.load().ideas);</span>
+<span class="a">+  const cached = JSON.parse(fs.readFileSync(path.join(store.home(), &#x27;vectors.json&#x27;), &#x27;utf8&#x27;));</span>
+<span class="a">+  assert.deepEqual(Object.keys(cached.items).sort(), [&#x27;2&#x27;, &#x27;3&#x27;]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;a text that is too long is halved until the server takes it&#x27;, async () =&gt; {</span>
+<span class="a">+  server.options.maxChars = 400;</span>
+<span class="a">+  store.addIdeas([`${&#x27;subtitle &#x27;.repeat(100)}end`, &#x27;short idea&#x27;]);</span>
+<span class="a">+  const vectors = await embed.vectorsFor(store.load().ideas);</span>
+<span class="a">+  assert.equal(vectors.size, 2);</span>
+<span class="a">+  const tries = server.inputs.filter((x) =&gt; x.startsWith(&#x27;search_document: subtitle&#x27;)).map((x) =&gt; x.length);</span>
+<span class="a">+  assert.deepEqual(tries, [920, 920, 468, 242]); // the batch, then one at a time, halved twice</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;find ranks by meaning and keeps results above the threshold&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;subtitles for audiobooks in the reader&#x27;, &#x27;a tor exit relay on the server&#x27;, &#x27;subtitles in the video player&#x27;]);</span>
+<span class="a">+  const found = await embed.find(store.load(), &#x27;subtitles audiobooks reader&#x27;, { threshold: 0.3 });</span>
+<span class="a">+  assert.equal(found.mode, &#x27;meaning&#x27;);</span>
+<span class="a">+  assert.deepEqual(found.results.map((r) =&gt; r.idea.id), [1, 3]);</span>
+<span class="a">+  assert.ok(found.results[0].score &gt; found.results[1].score);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;find falls back to word search and says why when the server does not answer&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;subtitles for audiobooks&#x27;, &#x27;dark mode&#x27;]);</span>
+<span class="a">+  server.options.down = true;</span>
+<span class="a">+  const found = await embed.find(store.load(), &#x27;audiobooks subtitles&#x27;);</span>
+<span class="a">+  assert.equal(found.mode, &#x27;words&#x27;);</span>
+<span class="a">+  assert.match(found.note, /503/);</span>
+<span class="a">+  assert.deepEqual(found.results.map((r) =&gt; r.idea.id), [1]);</span>
+<span class="a">+  const closed = await startFakeServer();</span>
+<span class="a">+  await closed.close(); // now nothing listens on its port</span>
+<span class="a">+  process.env.IDEAMINE_EMBED_URL = `${closed.url}/v1`;</span>
+<span class="a">+  const offline = await embed.find(store.load(), &#x27;dark&#x27;, { timeoutMs: 5000 });</span>
+<span class="a">+  assert.equal(offline.mode, &#x27;words&#x27;);</span>
+<span class="a">+  assert.match(offline.note, /cannot reach http:\/\/127\.0\.0\.1:\d+\/v1\/embeddings \((ECONNREFUSED|no answer)/);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;group labels use the distinctive shared words, not &quot;add full support&quot;&#x27;, () =&gt; {</span>
+<span class="a">+  store.addIdeas([</span>
+<span class="a">+    &#x27;Add full support for subread to hoshireader&#x27;,</span>
+<span class="a">+    &#x27;Add full support for subread and whispersync to chimahon&#x27;,</span>
+<span class="a">+    &#x27;Add full support for whispersync to koreader&#x27;,</span>
+<span class="a">+    &#x27;Add a back button to the key screen&#x27;,</span>
+<span class="a">+  ]);</span>
+<span class="a">+  const ideas = store.load().ideas;</span>
+<span class="a">+  assert.equal(embed.groupLabel(ideas.slice(0, 3), ideas), &#x27;subread · whispersync&#x27;);</span>
+<span class="a">+});</span>
+diff --git a/tests/fixtures/fake-server.js b/tests/fixtures/fake-server.js
+new file mode 100644
+index 0000000..abc0293
+--- /dev/null
++++ b/tests/fixtures/fake-server.js
+<span class="h">@@ -0,0 +1,51 @@</span>
+<span class="a">+// A stand-in for the dashboard server in the tests: an OpenAI-compatible POST /v1/embeddings, and</span>
+<span class="a">+// PUT for the files that `ideamine publish` uploads. The vectors are a hashed bag of words, so</span>
+<span class="a">+// texts that share words are similar, and the same text always gets the same vector.</span>
+<span class="a">+</span>
+<span class="a">+import crypto from &#x27;node:crypto&#x27;;</span>
+<span class="a">+import http from &#x27;node:http&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+export const DIM = 64;</span>
+<span class="a">+</span>
+<span class="a">+export function fakeVector(text) {</span>
+<span class="a">+  const vec = new Array(DIM).fill(0);</span>
+<span class="a">+  const words = String(text).toLowerCase().replace(/^search_(query|document): /, &#x27;&#x27;).match(/[\p{L}\p{N}]{3,}/gu) || [&#x27;empty&#x27;];</span>
+<span class="a">+  for (const w of words) vec[crypto.createHash(&#x27;sha1&#x27;).update(w).digest().readUInt16LE(0) % DIM] += 1;</span>
+<span class="a">+  return vec;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Start the server on a free port. Options: `maxChars` makes it refuse longer inputs the way</span>
+<span class="a">+ * llama.cpp does; `down` makes it answer 503. Returns { url, inputs, files, close, options }.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function startFakeServer(options = {}) {</span>
+<span class="a">+  const inputs = []; // every text that /v1/embeddings got, in order</span>
+<span class="a">+  const files = new Map(); // path -&gt; body of each PUT</span>
+<span class="a">+  const server = http.createServer((req, res) =&gt; {</span>
+<span class="a">+    let body = &#x27;&#x27;;</span>
+<span class="a">+    req.setEncoding(&#x27;utf8&#x27;);</span>
+<span class="a">+    req.on(&#x27;data&#x27;, (chunk) =&gt; (body += chunk));</span>
+<span class="a">+    req.on(&#x27;end&#x27;, () =&gt; {</span>
+<span class="a">+      if (req.method === &#x27;PUT&#x27;) {</span>
+<span class="a">+        files.set(req.url, body);</span>
+<span class="a">+        res.writeHead(201).end();</span>
+<span class="a">+        return;</span>
+<span class="a">+      }</span>
+<span class="a">+      if (req.method !== &#x27;POST&#x27; || req.url !== &#x27;/v1/embeddings&#x27;) return res.writeHead(404).end();</span>
+<span class="a">+      if (options.down) return res.writeHead(503).end(&#x27;{&quot;error&quot;:&quot;model is loading&quot;}&#x27;);</span>
+<span class="a">+      const { input } = JSON.parse(body);</span>
+<span class="a">+      const texts = Array.isArray(input) ? input : [input];</span>
+<span class="a">+      inputs.push(...texts);</span>
+<span class="a">+      const long = texts.find((t) =&gt; options.maxChars &amp;&amp; t.length &gt; options.maxChars);</span>
+<span class="a">+      if (long) {</span>
+<span class="a">+        const error = { code: 500, message: `input (${long.length} tokens) is too large to process. increase the physical batch size`, type: &#x27;server_error&#x27; };</span>
+<span class="a">+        return res.writeHead(500, { &#x27;content-type&#x27;: &#x27;application/json&#x27; }).end(JSON.stringify({ error }));</span>
+<span class="a">+      }</span>
+<span class="a">+      const data = texts.map((t, index) =&gt; ({ object: &#x27;embedding&#x27;, index, embedding: fakeVector(t) }));</span>
+<span class="a">+      res.writeHead(200, { &#x27;content-type&#x27;: &#x27;application/json&#x27; }).end(JSON.stringify({ object: &#x27;list&#x27;, data }));</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+  await new Promise((resolve) =&gt; server.listen(0, &#x27;127.0.0.1&#x27;, resolve));</span>
+<span class="a">+  const url = `http://127.0.0.1:${server.address().port}`;</span>
+<span class="a">+  return { url, inputs, files, options, close: () =&gt; new Promise((resolve) =&gt; server.close(resolve)) };</span>
+<span class="a">+}</span>
+diff --git a/tests/hook.test.js b/tests/hook.test.js
+index afed0d5..7b66153 100644
+--- a/tests/hook.test.js
++++ b/tests/hook.test.js
+<span class="h">@@ -7,6 +7,7 @@ import { beforeEach, test } from &#x27;node:test&#x27;;</span>
+ import { fileURLToPath } from &#x27;node:url&#x27;;
+ import { handlePrompt } from &#x27;../src/hook.js&#x27;;
+ import * as store from &#x27;../src/store.js&#x27;;
+<span class="a">+import { startFakeServer } from &#x27;./fixtures/fake-server.js&#x27;;</span>
+ 
+ const BIN = fileURLToPath(new URL(&#x27;../bin/ideamine.js&#x27;, import.meta.url));
+ 
+<span class="h">@@ -113,10 +114,10 @@ test(&#x27;while the watcher is on, a saved idea is triaged in the background&#x27;, async</span>
+   assert.equal(store.findIdea(store.load(), 1).triage?.by, &#x27;haiku (headless)&#x27;);
+ });
+ 
+<span class="d">-test(&#x27;handlePrompt filters by project with &quot;here&quot;&#x27;, () =&gt; {</span>
+<span class="a">+test(&#x27;handlePrompt filters by project with &quot;here&quot;&#x27;, async () =&gt; {</span>
+   store.addIdeas([&#x27;mine&#x27;], { project: &#x27;/a&#x27; });
+   store.addIdeas([&#x27;theirs&#x27;], { project: &#x27;/b&#x27; });
+<span class="d">-  const board = handlePrompt(&#x27;/ideas-ls here&#x27;, { cwd: &#x27;/a&#x27; });</span>
+<span class="a">+  const board = await handlePrompt(&#x27;/ideas-ls here&#x27;, { cwd: &#x27;/a&#x27; });</span>
+   assert.match(board, /mine/);
+   assert.doesNotMatch(board, /theirs/);
+ });
+<span class="h">@@ -133,3 +134,39 @@ test(&#x27;when the archive is unreadable the prompt goes through instead of being lo</span>
+   assert.equal(r.stdout, &#x27;&#x27;);
+   assert.match(r.stderr, /not valid JSON/);
+ });
+<span class="a">+</span>
+<span class="a">+test(&#x27;/ideas-find searches by meaning and /ideas-groups groups by meaning, with no model call&#x27;, async () =&gt; {</span>
+<span class="a">+  const server = await startFakeServer();</span>
+<span class="a">+  process.env.IDEAMINE_EMBED_URL = `${server.url}/v1`;</span>
+<span class="a">+  process.env.IDEAMINE_GROUP_THRESHOLD = &#x27;0.5&#x27;;</span>
+<span class="a">+  try {</span>
+<span class="a">+    store.addIdeas([&#x27;subtitles for audiobooks&#x27;, &#x27;subtitles for audiobooks on android&#x27;, &#x27;a tor exit relay&#x27;]);</span>
+<span class="a">+    const found = await handlePrompt(&#x27;/ideas-find audiobooks with subtitles&#x27;);</span>
+<span class="a">+    assert.match(found, /^ideas like &quot;audiobooks with subtitles&quot;, by meaning\n.*#1 .*\n.*#2 /);</span>
+<span class="a">+    assert.doesNotMatch(found, /tor exit/);</span>
+<span class="a">+    const groups = await handlePrompt(&#x27;/ideas-groups&#x27;);</span>
+<span class="a">+    assert.match(groups, /^ideamine groups: 1 group of open ideas/);</span>
+<span class="a">+    assert.match(groups, /IN NO GROUP\n.*#3 /);</span>
+<span class="a">+    assert.equal(await handlePrompt(&#x27;/ideas-groups what is this&#x27;), null); // a question: the skill answers</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    await server.close();</span>
+<span class="a">+    delete process.env.IDEAMINE_EMBED_URL;</span>
+<span class="a">+    delete process.env.IDEAMINE_GROUP_THRESHOLD;</span>
+<span class="a">+  }</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;/ideas-find falls back to words when the embedding server is away&#x27;, async () =&gt; {</span>
+<span class="a">+  const closed = await startFakeServer();</span>
+<span class="a">+  await closed.close(); // nothing listens on its port now</span>
+<span class="a">+  process.env.IDEAMINE_EMBED_URL = `${closed.url}/v1`;</span>
+<span class="a">+  try {</span>
+<span class="a">+    store.addIdeas([&#x27;subtitles for audiobooks&#x27;, &#x27;dark mode&#x27;]);</span>
+<span class="a">+    const out = runHook(&#x27;/ideas-find subtitles&#x27;);</span>
+<span class="a">+    assert.equal(out.decision, &#x27;block&#x27;);</span>
+<span class="a">+    assert.match(out.reason, /by words, because search by meaning is not available \(cannot reach/);</span>
+<span class="a">+    assert.match(out.reason, /#1 /);</span>
+<span class="a">+    assert.doesNotMatch(out.reason, /#2 /);</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    delete process.env.IDEAMINE_EMBED_URL;</span>
+<span class="a">+  }</span>
+<span class="a">+});</span>
+diff --git a/tests/mcp.test.js b/tests/mcp.test.js
+index b772897..90986d8 100644
+--- a/tests/mcp.test.js
++++ b/tests/mcp.test.js
+<span class="h">@@ -109,7 +109,7 @@ test(&#x27;tool errors come back as isError results, not protocol errors&#x27;, async () =</span>
+ test(&#x27;prompts mirror the skills&#x27;, async () =&gt; {
+   const list = await request(&#x27;prompts/list&#x27;);
+   const names = list.result.prompts.map((p) =&gt; p.name);
+<span class="d">-  assert.deepEqual(names, [&#x27;idea&#x27;, &#x27;ideas&#x27;, &#x27;ideas-ls&#x27;, &#x27;ideas-cat&#x27;, &#x27;ideas-rm&#x27;, &#x27;ideas-done&#x27;, &#x27;ideas-reopen&#x27;, &#x27;ideas-go&#x27;, &#x27;ideas-all&#x27;, &#x27;ideas-sort&#x27;, &#x27;ideas-watch&#x27;]);</span>
+<span class="a">+  assert.deepEqual(names, [&#x27;idea&#x27;, &#x27;ideas&#x27;, &#x27;ideas-ls&#x27;, &#x27;ideas-cat&#x27;, &#x27;ideas-rm&#x27;, &#x27;ideas-find&#x27;, &#x27;ideas-groups&#x27;, &#x27;ideas-done&#x27;, &#x27;ideas-reopen&#x27;, &#x27;ideas-go&#x27;, &#x27;ideas-all&#x27;, &#x27;ideas-sort&#x27;, &#x27;ideas-watch&#x27;]);</span>
+   // One prompt for each skill, so that other MCP clients get the same commands as the plugin.
+   assert.deepEqual([...names].sort(), fs.readdirSync(new URL(&#x27;../skills&#x27;, import.meta.url)).sort());
+   const go = await request(&#x27;prompts/get&#x27;, { name: &#x27;ideas-go&#x27;, arguments: { id: &#x27;12&#x27; } });
+diff --git a/tests/publish.test.js b/tests/publish.test.js
+new file mode 100644
+index 0000000..61376e0
+--- /dev/null
++++ b/tests/publish.test.js
+<span class="h">@@ -0,0 +1,126 @@</span>
+<span class="a">+import assert from &#x27;node:assert/strict&#x27;;</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import os from &#x27;node:os&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import { afterEach, beforeEach, test } from &#x27;node:test&#x27;;</span>
+<span class="a">+import * as config from &#x27;../src/config.js&#x27;;</span>
+<span class="a">+import * as embed from &#x27;../src/embed.js&#x27;;</span>
+<span class="a">+import * as publish from &#x27;../src/publish.js&#x27;;</span>
+<span class="a">+import * as store from &#x27;../src/store.js&#x27;;</span>
+<span class="a">+import { startFakeServer } from &#x27;./fixtures/fake-server.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+let server;</span>
+<span class="a">+</span>
+<span class="a">+beforeEach(async () =&gt; {</span>
+<span class="a">+  process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-publish-&#x27;));</span>
+<span class="a">+  server = await startFakeServer();</span>
+<span class="a">+  process.env.IDEAMINE_EMBED_URL = `${server.url}/v1`;</span>
+<span class="a">+  for (const name of [&#x27;IDEAMINE_PUBLISH_URL&#x27;, &#x27;IDEAMINE_EMBED_MODEL&#x27;, &#x27;IDEAMINE_GROUP_THRESHOLD&#x27;, &#x27;IDEAMINE_SEARCH_THRESHOLD&#x27;]) delete process.env[name];</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+afterEach(() =&gt; server.close());</span>
+<span class="a">+</span>
+<span class="a">+const T = (h) =&gt; `2026-09-21T${String(h).padStart(2, &#x27;0&#x27;)}:00:00.000Z`;</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;timeline phases follow the inbox, the queue, and the work&#x27;, () =&gt; {</span>
+<span class="a">+  const base = { id: 1, created: T(1), status: &#x27;inbox&#x27; };</span>
+<span class="a">+  assert.deepEqual(publish.phases(base), [{ phase: &#x27;inbox&#x27;, from: T(1), to: null }]);</span>
+<span class="a">+  const queued = { ...base, status: &#x27;triaged&#x27;, triage: { at: T(2) } };</span>
+<span class="a">+  assert.deepEqual(publish.phases(queued), [</span>
+<span class="a">+    { phase: &#x27;inbox&#x27;, from: T(1), to: T(2) },</span>
+<span class="a">+    { phase: &#x27;queued&#x27;, from: T(2), to: null },</span>
+<span class="a">+  ]);</span>
+<span class="a">+  const done = { ...queued, status: &#x27;done&#x27;, started: T(3), closed: T(5) };</span>
+<span class="a">+  assert.deepEqual(publish.phases(done), [</span>
+<span class="a">+    { phase: &#x27;inbox&#x27;, from: T(1), to: T(2) },</span>
+<span class="a">+    { phase: &#x27;queued&#x27;, from: T(2), to: T(3) },</span>
+<span class="a">+    { phase: &#x27;doing&#x27;, from: T(3), to: T(5) },</span>
+<span class="a">+  ]);</span>
+<span class="a">+  // Done before start times were recorded: the work bar is a guess, and says so.</span>
+<span class="a">+  assert.deepEqual(publish.phases({ ...queued, status: &#x27;done&#x27;, closed: T(5) }), [</span>
+<span class="a">+    { phase: &#x27;inbox&#x27;, from: T(1), to: T(2) },</span>
+<span class="a">+    { phase: &#x27;doing&#x27;, from: T(2), to: T(5), estimated: true },</span>
+<span class="a">+  ]);</span>
+<span class="a">+  assert.deepEqual(publish.phases({ ...base, status: &#x27;dropped&#x27;, closed: T(4) }), [{ phase: &#x27;inbox&#x27;, from: T(1), to: T(4) }]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;the snapshot has a ticket for each idea, groups, related ideas, and the vectors&#x27;, async () =&gt; {</span>
+<span class="a">+  process.env.IDEAMINE_GROUP_THRESHOLD = &#x27;0.5&#x27;;</span>
+<span class="a">+  store.addIdeas([&#x27;subtitles for audiobooks&#x27;, &#x27;subtitles for audiobooks on android&#x27;, &#x27;a tor exit relay&#x27;], { project: &#x27;/work/app&#x27; });</span>
+<span class="a">+  store.applyTriage([{ id: 3, verdict: &#x27;do&#x27;, impact: 4, size: &#x27;s&#x27;, model: &#x27;haiku&#x27;, title: &#x27;Tor relay&#x27;, why: &#x27;w&#x27;, brief: &#x27;b&#x27; }]);</span>
+<span class="a">+  store.updateIdea(3, { status: &#x27;doing&#x27; });</span>
+<span class="a">+  const { data, note } = await publish.build(store.load());</span>
+<span class="a">+  assert.equal(note, &#x27;&#x27;);</span>
+<span class="a">+  assert.equal(data.version, 1);</span>
+<span class="a">+  assert.equal(data.embed.available, true);</span>
+<span class="a">+  assert.equal(data.embed.query_prefix, &#x27;search_query: &#x27;);</span>
+<span class="a">+  assert.equal(data.counts.doing, 1);</span>
+<span class="a">+  const [one, two, three] = data.ideas;</span>
+<span class="a">+  assert.deepEqual([one.key, one.lane, one.project, three.lane, three.model], [&#x27;IDEA-1&#x27;, &#x27;inbox&#x27;, &#x27;app&#x27;, &#x27;doing&#x27;, &#x27;haiku&#x27;]);</span>
+<span class="a">+  assert.deepEqual(data.ideas.map((i) =&gt; i.rank), [2, 1, 0]); // doing first, then the inbox, newest first</span>
+<span class="a">+  assert.deepEqual(data.groups, [{ id: 0, label: data.groups[0].label, ids: [1, 2] }]);</span>
+<span class="a">+  assert.deepEqual([one.group, two.group, three.group], [0, 0, null]);</span>
+<span class="a">+  assert.equal(one.related[0].id, 2);</span>
+<span class="a">+  assert.ok(three.phases.some((p) =&gt; p.phase === &#x27;doing&#x27; &amp;&amp; p.from === three.started));</span>
+<span class="a">+  const vectors = await embed.vectorsFor(store.load().ideas);</span>
+<span class="a">+  assert.deepEqual([...embed.decodeVec(one.vec)], [...vectors.get(1)]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;without the embedding server, the snapshot has no groups or vectors, and says why&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;one idea&#x27;]);</span>
+<span class="a">+  server.options.down = true;</span>
+<span class="a">+  const { data, note } = await publish.build(store.load());</span>
+<span class="a">+  assert.match(note, /without search by meaning or groups: .*503/);</span>
+<span class="a">+  assert.equal(data.embed.available, false);</span>
+<span class="a">+  assert.deepEqual([data.groups, data.ideas[0].vec, data.ideas[0].related], [[], null, []]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;publish uploads data.json and index.html with PUT, and kick() starts again only after a change&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;one idea&#x27;]);</span>
+<span class="a">+  let started = 0;</span>
+<span class="a">+  const kick = () =&gt; publish.kick({ start: () =&gt; started++ });</span>
+<span class="a">+  assert.equal(kick(), false); // no dashboard server set</span>
+<span class="a">+  config.set(&#x27;publish_url&#x27;, `${server.url}/dash`);</span>
+<span class="a">+  assert.equal(kick(), true); // never published</span>
+<span class="a">+  const out = await publish.publish();</span>
+<span class="a">+  assert.deepEqual([out.where, out.ideas], [`${server.url}/dash`, 1]);</span>
+<span class="a">+  assert.deepEqual([...server.files.keys()], [&#x27;/dash/data.json&#x27;, &#x27;/dash/index.html&#x27;]);</span>
+<span class="a">+  assert.equal(JSON.parse(server.files.get(&#x27;/dash/data.json&#x27;)).ideas[0].title, &#x27;one idea&#x27;);</span>
+<span class="a">+  assert.match(server.files.get(&#x27;/dash/index.html&#x27;), /&lt;html/i);</span>
+<span class="a">+  assert.equal(kick(), false); // nothing changed</span>
+<span class="a">+  await new Promise((resolve) =&gt; setTimeout(resolve, 20)); // a later modification time</span>
+<span class="a">+  store.addIdeas([&#x27;two&#x27;]);</span>
+<span class="a">+  assert.equal(kick(), true);</span>
+<span class="a">+  assert.equal(started, 2);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;a failed background publish is recorded, and kick() waits before the next try&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;one idea&#x27;]);</span>
+<span class="a">+  const closed = await startFakeServer();</span>
+<span class="a">+  await closed.close();</span>
+<span class="a">+  config.set(&#x27;publish_url&#x27;, `${closed.url}/`);</span>
+<span class="a">+  assert.equal(await publish.backgroundPublish(), &#x27;error&#x27;);</span>
+<span class="a">+  assert.match(publish.readState().error, /cannot reach/);</span>
+<span class="a">+  assert.equal(publish.kick({ start: () =&gt; assert.fail(&#x27;must wait&#x27;) }), false);</span>
+<span class="a">+  assert.match(publish.status(), /failed/);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;publish --dir writes both files to a folder&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;one idea&#x27;]);</span>
+<span class="a">+  const dir = path.join(store.home(), &#x27;out&#x27;);</span>
+<span class="a">+  const out = await publish.publish({ dir });</span>
+<span class="a">+  assert.equal(out.where, dir);</span>
+<span class="a">+  assert.deepEqual(fs.readdirSync(dir).sort(), [&#x27;data.json&#x27;, &#x27;index.html&#x27;]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;config: the environment wins over the file, and an empty value restores the default&#x27;, () =&gt; {</span>
+<span class="a">+  assert.equal(config.get(&#x27;search_threshold&#x27;), 0.5);</span>
+<span class="a">+  assert.equal(config.set(&#x27;search_threshold&#x27;, &#x27;0.42&#x27;), 0.42);</span>
+<span class="a">+  process.env.IDEAMINE_SEARCH_THRESHOLD = &#x27;0.9&#x27;;</span>
+<span class="a">+  assert.equal(config.get(&#x27;search_threshold&#x27;), 0.9);</span>
+<span class="a">+  delete process.env.IDEAMINE_SEARCH_THRESHOLD;</span>
+<span class="a">+  assert.equal(config.set(&#x27;search_threshold&#x27;, &#x27;&#x27;), 0.5);</span>
+<span class="a">+  assert.throws(() =&gt; config.set(&#x27;search_threshold&#x27;, &#x27;2&#x27;), /from 0 to 1/);</span>
+<span class="a">+  assert.throws(() =&gt; config.get(&#x27;nope&#x27;), /unknown setting/);</span>
+<span class="a">+  assert.match(config.describe(), /^embed_url\s+http:\/\/127\.0\.0\.1:\d+\/v1\s+IDEAMINE_EMBED_URL/);</span>
+<span class="a">+});</span>
+diff --git a/tests/store.test.js b/tests/store.test.js
+index f52abd1..8f79093 100644
+--- a/tests/store.test.js
++++ b/tests/store.test.js
+<span class="h">@@ -97,6 +97,18 @@ test(&#x27;status changes, notes, model override, and reopen&#x27;, () =&gt; {</span>
+   assert.throws(() =&gt; store.updateIdea(42, { note: &#x27;x&#x27; }), /no idea #42/);
+ });
+ 
+<span class="a">+test(&#x27;the start time is recorded when work starts, for the dashboard timeline&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;thing&#x27;]);</span>
+<span class="a">+  assert.equal(store.findIdea(store.load(), 1).started, undefined);</span>
+<span class="a">+  const first = store.updateIdea(1, { status: &#x27;doing&#x27; }).started;</span>
+<span class="a">+  assert.ok(first);</span>
+<span class="a">+  assert.equal(store.updateIdea(1, { status: &#x27;doing&#x27;, note: &#x27;still on it&#x27; }).started, first); // no new start</span>
+<span class="a">+  assert.equal(store.updateIdea(1, { status: &#x27;done&#x27; }).started, first);</span>
+<span class="a">+  store.updateIdea(1, { status: &#x27;reopen&#x27; });</span>
+<span class="a">+  await new Promise((resolve) =&gt; setTimeout(resolve, 5));</span>
+<span class="a">+  assert.ok(store.updateIdea(1, { status: &#x27;start&#x27; }).started &gt; first); // the latest start</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ test(&#x27;a corrupt archive is never overwritten&#x27;, () =&gt; {
+   fs.mkdirSync(store.home(), { recursive: true });
+   fs.writeFileSync(store.dbPath(), &#x27;{&quot;ideas&quot;: [oops&#x27;);</pre>
+</div></body></html>

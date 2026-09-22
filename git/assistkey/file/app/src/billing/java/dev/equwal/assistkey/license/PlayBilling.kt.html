@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey/app/src/billing/java/dev/equwal/assistkey/license/PlayBilling.kt - Recently Written</title>
+<link rel="stylesheet" href="../../../../../../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../../../../../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../../../../../../../../../assistkey/index.html">Log</a> | <a href="../../../../../../../../../../assistkey/files.html">Files</a> | <a href="../../../../../../../../../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>app/src/billing/java/dev/equwal/assistkey/license/PlayBilling.kt (12480 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package dev.equwal.assistkey.license
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import android.app.Activity
+<a id="l4" href="#l4">4</a> import android.content.Context
+<a id="l5" href="#l5">5</a> import android.os.Handler
+<a id="l6" href="#l6">6</a> import android.os.Looper
+<a id="l7" href="#l7">7</a> import android.util.Log
+<a id="l8" href="#l8">8</a> import com.android.billingclient.api.AcknowledgePurchaseParams
+<a id="l9" href="#l9">9</a> import com.android.billingclient.api.BillingClient
+<a id="l10" href="#l10">10</a> import com.android.billingclient.api.BillingClient.BillingResponseCode
+<a id="l11" href="#l11">11</a> import com.android.billingclient.api.BillingClient.ProductType
+<a id="l12" href="#l12">12</a> import com.android.billingclient.api.BillingClientStateListener
+<a id="l13" href="#l13">13</a> import com.android.billingclient.api.BillingFlowParams
+<a id="l14" href="#l14">14</a> import com.android.billingclient.api.BillingResult
+<a id="l15" href="#l15">15</a> import com.android.billingclient.api.PendingPurchasesParams
+<a id="l16" href="#l16">16</a> import com.android.billingclient.api.ProductDetails
+<a id="l17" href="#l17">17</a> import com.android.billingclient.api.Purchase
+<a id="l18" href="#l18">18</a> import com.android.billingclient.api.PurchasesUpdatedListener
+<a id="l19" href="#l19">19</a> import com.android.billingclient.api.QueryProductDetailsParams
+<a id="l20" href="#l20">20</a> import com.android.billingclient.api.QueryPurchasesParams
+<a id="l21" href="#l21">21</a> import com.android.billingclient.api.UnfetchedProduct
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> /**
+<a id="l24" href="#l24">24</a>  * Everything that touches Google Play Billing.
+<a id="l25" href="#l25">25</a>  *
+<a id="l26" href="#l26">26</a>  * The rest of the app never sees a billing type: this object turns what Play
+<a id="l27" href="#l27">27</a>  * says into [License.recordOwned] and [License.recordCatalog], and the licence
+<a id="l28" href="#l28">28</a>  * is computed from those. That keeps the key-event hot path free of IPC, and
+<a id="l29" href="#l29">29</a>  * means a device with no Play Store at all simply never writes anything.
+<a id="l30" href="#l30">30</a>  *
+<a id="l31" href="#l31">31</a>  * All state here is confined to the main thread. Billing callbacks are
+<a id="l32" href="#l32">32</a>  * re-posted onto it rather than trusted to arrive there.
+<a id="l33" href="#l33">33</a>  */
+<a id="l34" href="#l34">34</a> object PlayBilling {
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a>     private const val TAG = &quot;AssistKey&quot;
+<a id="l37" href="#l37">37</a> 
+<a id="l38" href="#l38">38</a>     enum class Availability { UNKNOWN, READY, UNAVAILABLE }
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a>     /** Whether Play could be reached the last time anyone tried. */
+<a id="l41" href="#l41">41</a>     var availability = Availability.UNKNOWN
+<a id="l42" href="#l42">42</a>         private set
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a>     /** The last problem worth showing a person, or null if there is none. */
+<a id="l45" href="#l45">45</a>     var lastProblem: String? = null
+<a id="l46" href="#l46">46</a>         private set
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a>     /** True while a purchase is waiting on a slow payment method. */
+<a id="l49" href="#l49">49</a>     var purchasePending = false
+<a id="l50" href="#l50">50</a>         private set
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a>     /** Set by whichever screen is in front, so it can redraw. */
+<a id="l53" href="#l53">53</a>     var onChange: (() -&gt; Unit)? = null
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a>     private val main = Handler(Looper.getMainLooper())
+<a id="l56" href="#l56">56</a>     private val details = HashMap&lt;String, ProductDetails&gt;()
+<a id="l57" href="#l57">57</a>     private val waiters = ArrayList&lt;() -&gt; Unit&gt;()
+<a id="l58" href="#l58">58</a>     private var client: BillingClient? = null
+<a id="l59" href="#l59">59</a>     private var inFlight = false
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a>     // ---- what the screens read ----------------------------------------------
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a>     fun price(productId: String): String? = details[productId]?.let(::offerOf)?.formattedPrice
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a>     fun canBuy(productId: String): Boolean = details.containsKey(productId)
+<a id="l66" href="#l66">66</a> 
+<a id="l67" href="#l67">67</a>     // ---- refresh --------------------------------------------------------------
+<a id="l68" href="#l68">68</a> 
+<a id="l69" href="#l69">69</a>     /**
+<a id="l70" href="#l70">70</a>      * Connects if need be, then re-reads the catalogue and the purchases.
+<a id="l71" href="#l71">71</a>      * Callers that arrive while one is running share its result.
+<a id="l72" href="#l72">72</a>      */
+<a id="l73" href="#l73">73</a>     fun refresh(c: Context, done: (() -&gt; Unit)? = null) {
+<a id="l74" href="#l74">74</a>         val app = c.applicationContext
+<a id="l75" href="#l75">75</a>         main.post {
+<a id="l76" href="#l76">76</a>             done?.let { waiters.add(it) }
+<a id="l77" href="#l77">77</a>             if (inFlight) return@post
+<a id="l78" href="#l78">78</a>             inFlight = true
+<a id="l79" href="#l79">79</a>             connect(app) { ok -&gt;
+<a id="l80" href="#l80">80</a>                 if (!ok) finish() else queryCatalog(app) { queryOwned(app) { finish() } }
+<a id="l81" href="#l81">81</a>             }
+<a id="l82" href="#l82">82</a>         }
+<a id="l83" href="#l83">83</a>     }
+<a id="l84" href="#l84">84</a> 
+<a id="l85" href="#l85">85</a>     private fun finish() {
+<a id="l86" href="#l86">86</a>         inFlight = false
+<a id="l87" href="#l87">87</a>         val run = ArrayList(waiters)
+<a id="l88" href="#l88">88</a>         waiters.clear()
+<a id="l89" href="#l89">89</a>         run.forEach { it() }
+<a id="l90" href="#l90">90</a>         onChange?.invoke()
+<a id="l91" href="#l91">91</a>     }
+<a id="l92" href="#l92">92</a> 
+<a id="l93" href="#l93">93</a>     private fun connect(app: Context, then: (Boolean) -&gt; Unit) {
+<a id="l94" href="#l94">94</a>         val existing = client
+<a id="l95" href="#l95">95</a>         if (existing != null &amp;&amp; existing.isReady) {
+<a id="l96" href="#l96">96</a>             then(true)
+<a id="l97" href="#l97">97</a>             return
+<a id="l98" href="#l98">98</a>         }
+<a id="l99" href="#l99">99</a>         val fresh = existing ?: try {
+<a id="l100" href="#l100">100</a>             BillingClient.newBuilder(app)
+<a id="l101" href="#l101">101</a>                 .setListener(purchaseListener(app))
+<a id="l102" href="#l102">102</a>                 .enablePendingPurchases(
+<a id="l103" href="#l103">103</a>                     PendingPurchasesParams.newBuilder().enableOneTimeProducts().build()
+<a id="l104" href="#l104">104</a>                 )
+<a id="l105" href="#l105">105</a>                 .build()
+<a id="l106" href="#l106">106</a>                 .also { client = it }
+<a id="l107" href="#l107">107</a>         } catch (e: Exception) {
+<a id="l108" href="#l108">108</a>             // No Play Store, or one too old to speak this protocol.
+<a id="l109" href="#l109">109</a>             Log.w(TAG, &quot;billing client could not be built&quot;, e)
+<a id="l110" href="#l110">110</a>             unavailable(&quot;Google Play billing is not available on this device.&quot;)
+<a id="l111" href="#l111">111</a>             then(false)
+<a id="l112" href="#l112">112</a>             return
+<a id="l113" href="#l113">113</a>         }
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a>         var answered = false
+<a id="l116" href="#l116">116</a>         fresh.startConnection(object : BillingClientStateListener {
+<a id="l117" href="#l117">117</a>             override fun onBillingSetupFinished(result: BillingResult) {
+<a id="l118" href="#l118">118</a>                 main.post {
+<a id="l119" href="#l119">119</a>                     if (answered) return@post
+<a id="l120" href="#l120">120</a>                     answered = true
+<a id="l121" href="#l121">121</a>                     Log.i(TAG, &quot;billing setup: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)
+<a id="l122" href="#l122">122</a>                     if (result.responseCode == BillingResponseCode.OK) {
+<a id="l123" href="#l123">123</a>                         availability = Availability.READY
+<a id="l124" href="#l124">124</a>                         then(true)
+<a id="l125" href="#l125">125</a>                     } else {
+<a id="l126" href="#l126">126</a>                         unavailable(explain(result))
+<a id="l127" href="#l127">127</a>                         then(false)
+<a id="l128" href="#l128">128</a>                     }
+<a id="l129" href="#l129">129</a>                 }
+<a id="l130" href="#l130">130</a>             }
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a>             override fun onBillingServiceDisconnected() {
+<a id="l133" href="#l133">133</a>                 // Nothing to do here. Every refresh checks isReady and connects
+<a id="l134" href="#l134">134</a>                 // again if need be, which is one attempt with a prompt answer.
+<a id="l135" href="#l135">135</a>                 // The library&#x27;s own auto-reconnection was tried and dropped: on
+<a id="l136" href="#l136">136</a>                 // a device with the Play Store disabled - how this reader ships
+<a id="l137" href="#l137">137</a>                 // - it retries three times per call and holds each answer back
+<a id="l138" href="#l138">138</a>                 // for seconds.
+<a id="l139" href="#l139">139</a>             }
+<a id="l140" href="#l140">140</a>         })
+<a id="l141" href="#l141">141</a>     }
+<a id="l142" href="#l142">142</a> 
+<a id="l143" href="#l143">143</a>     private fun unavailable(why: String) {
+<a id="l144" href="#l144">144</a>         availability = Availability.UNAVAILABLE
+<a id="l145" href="#l145">145</a>         lastProblem = why
+<a id="l146" href="#l146">146</a>     }
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a>     private fun queryCatalog(app: Context, then: () -&gt; Unit) {
+<a id="l149" href="#l149">149</a>         val c = client ?: return then()
+<a id="l150" href="#l150">150</a>         val params = QueryProductDetailsParams.newBuilder()
+<a id="l151" href="#l151">151</a>             .setProductList(
+<a id="l152" href="#l152">152</a>                 Sku.ALL.map {
+<a id="l153" href="#l153">153</a>                     QueryProductDetailsParams.Product.newBuilder()
+<a id="l154" href="#l154">154</a>                         .setProductId(it)
+<a id="l155" href="#l155">155</a>                         .setProductType(ProductType.INAPP)
+<a id="l156" href="#l156">156</a>                         .build()
+<a id="l157" href="#l157">157</a>                 }
+<a id="l158" href="#l158">158</a>             )
+<a id="l159" href="#l159">159</a>             .build()
+<a id="l160" href="#l160">160</a> 
+<a id="l161" href="#l161">161</a>         c.queryProductDetailsAsync(params) { result, response -&gt;
+<a id="l162" href="#l162">162</a>             main.post {
+<a id="l163" href="#l163">163</a>                 if (result.responseCode == BillingResponseCode.OK) {
+<a id="l164" href="#l164">164</a>                     details.clear()
+<a id="l165" href="#l165">165</a>                     response.productDetailsList.forEach { details[it.productId] = it }
+<a id="l166" href="#l166">166</a>                     val missing = response.unfetchedProductList
+<a id="l167" href="#l167">167</a>                         .associate { it.productId to it.statusCode }
+<a id="l168" href="#l168">168</a>                     License.recordCatalog(
+<a id="l169" href="#l169">169</a>                         app,
+<a id="l170" href="#l170">170</a>                         pro = seen(Sku.PRO, missing),
+<a id="l171" href="#l171">171</a>                         beta = seen(Sku.BETA_OPEN, missing)
+<a id="l172" href="#l172">172</a>                     )
+<a id="l173" href="#l173">173</a>                     lastProblem = null
+<a id="l174" href="#l174">174</a>                 } else {
+<a id="l175" href="#l175">175</a>                     // Keep whatever was cached; one bad answer proves nothing.
+<a id="l176" href="#l176">176</a>                     lastProblem = explain(result)
+<a id="l177" href="#l177">177</a>                     Log.i(TAG, &quot;catalogue query: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)
+<a id="l178" href="#l178">178</a>                 }
+<a id="l179" href="#l179">179</a>                 then()
+<a id="l180" href="#l180">180</a>             }
+<a id="l181" href="#l181">181</a>         }
+<a id="l182" href="#l182">182</a>     }
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a>     /**
+<a id="l185" href="#l185">185</a>      * Present means found. Absent means not found - unless Play said it could
+<a id="l186" href="#l186">186</a>      * not tell, in which case neither can we. A product whose only purchase
+<a id="l187" href="#l187">187</a>      * option has been switched off comes back as NO_ELIGIBLE_OFFER rather than
+<a id="l188" href="#l188">188</a>      * PRODUCT_NOT_FOUND; for a flag that means the same thing.
+<a id="l189" href="#l189">189</a>      */
+<a id="l190" href="#l190">190</a>     private fun seen(productId: String, missing: Map&lt;String, Int&gt;): Int = when {
+<a id="l191" href="#l191">191</a>         details.containsKey(productId) -&gt; License.Seen.FOUND
+<a id="l192" href="#l192">192</a>         missing[productId] == UnfetchedProduct.StatusCode.UNKNOWN -&gt; License.Seen.UNKNOWN
+<a id="l193" href="#l193">193</a>         else -&gt; License.Seen.NOT_FOUND
+<a id="l194" href="#l194">194</a>     }
+<a id="l195" href="#l195">195</a> 
+<a id="l196" href="#l196">196</a>     private fun queryOwned(app: Context, then: () -&gt; Unit) {
+<a id="l197" href="#l197">197</a>         val c = client ?: return then()
+<a id="l198" href="#l198">198</a>         val params = QueryPurchasesParams.newBuilder().setProductType(ProductType.INAPP).build()
+<a id="l199" href="#l199">199</a>         c.queryPurchasesAsync(params) { result, purchases -&gt;
+<a id="l200" href="#l200">200</a>             main.post {
+<a id="l201" href="#l201">201</a>                 if (result.responseCode == BillingResponseCode.OK) {
+<a id="l202" href="#l202">202</a>                     absorb(app, purchases, replace = true)
+<a id="l203" href="#l203">203</a>                 } else {
+<a id="l204" href="#l204">204</a>                     Log.i(TAG, &quot;purchase query: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)
+<a id="l205" href="#l205">205</a>                 }
+<a id="l206" href="#l206">206</a>                 then()
+<a id="l207" href="#l207">207</a>             }
+<a id="l208" href="#l208">208</a>         }
+<a id="l209" href="#l209">209</a>     }
+<a id="l210" href="#l210">210</a> 
+<a id="l211" href="#l211">211</a>     // ---- buying ---------------------------------------------------------------
+<a id="l212" href="#l212">212</a> 
+<a id="l213" href="#l213">213</a>     /** Returns false, with [lastProblem] set, if the purchase sheet could not open. */
+<a id="l214" href="#l214">214</a>     fun buy(activity: Activity, productId: String): Boolean {
+<a id="l215" href="#l215">215</a>         val product = details[productId]
+<a id="l216" href="#l216">216</a>         val c = client
+<a id="l217" href="#l217">217</a>         if (product == null || c == null || !c.isReady) {
+<a id="l218" href="#l218">218</a>             lastProblem = &quot;Google Play has not answered yet. Try again in a moment.&quot;
+<a id="l219" href="#l219">219</a>             return false
+<a id="l220" href="#l220">220</a>         }
+<a id="l221" href="#l221">221</a>         val item = BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(product)
+<a id="l222" href="#l222">222</a>         offerOf(product)?.offerToken?.takeIf { it.isNotEmpty() }?.let { item.setOfferToken(it) }
+<a id="l223" href="#l223">223</a> 
+<a id="l224" href="#l224">224</a>         val result = c.launchBillingFlow(
+<a id="l225" href="#l225">225</a>             activity,
+<a id="l226" href="#l226">226</a>             BillingFlowParams.newBuilder().setProductDetailsParamsList(listOf(item.build())).build()
+<a id="l227" href="#l227">227</a>         )
+<a id="l228" href="#l228">228</a>         if (result.responseCode == BillingResponseCode.OK) return true
+<a id="l229" href="#l229">229</a>         if (result.responseCode == BillingResponseCode.ITEM_ALREADY_OWNED) {
+<a id="l230" href="#l230">230</a>             refresh(activity)
+<a id="l231" href="#l231">231</a>             return true
+<a id="l232" href="#l232">232</a>         }
+<a id="l233" href="#l233">233</a>         lastProblem = explain(result)
+<a id="l234" href="#l234">234</a>         return false
+<a id="l235" href="#l235">235</a>     }
+<a id="l236" href="#l236">236</a> 
+<a id="l237" href="#l237">237</a>     private fun purchaseListener(app: Context) = PurchasesUpdatedListener { result, purchases -&gt;
+<a id="l238" href="#l238">238</a>         main.post {
+<a id="l239" href="#l239">239</a>             when (result.responseCode) {
+<a id="l240" href="#l240">240</a>                 BillingResponseCode.OK -&gt; {
+<a id="l241" href="#l241">241</a>                     absorb(app, purchases ?: emptyList(), replace = false)
+<a id="l242" href="#l242">242</a>                     lastProblem = null
+<a id="l243" href="#l243">243</a>                 }
+<a id="l244" href="#l244">244</a>                 BillingResponseCode.USER_CANCELED -&gt; Unit
+<a id="l245" href="#l245">245</a>                 BillingResponseCode.ITEM_ALREADY_OWNED -&gt; refresh(app)
+<a id="l246" href="#l246">246</a>                 else -&gt; lastProblem = explain(result)
+<a id="l247" href="#l247">247</a>             }
+<a id="l248" href="#l248">248</a>             onChange?.invoke()
+<a id="l249" href="#l249">249</a>         }
+<a id="l250" href="#l250">250</a>     }
+<a id="l251" href="#l251">251</a> 
+<a id="l252" href="#l252">252</a>     /**
+<a id="l253" href="#l253">253</a>      * Records what is owned and acknowledges anything new. Acknowledging is not
+<a id="l254" href="#l254">254</a>      * optional: Play refunds a purchase that goes three days without it.
+<a id="l255" href="#l255">255</a>      */
+<a id="l256" href="#l256">256</a>     private fun absorb(app: Context, purchases: List&lt;Purchase&gt;, replace: Boolean) {
+<a id="l257" href="#l257">257</a>         val owned = HashSet&lt;String&gt;()
+<a id="l258" href="#l258">258</a>         var pending = false
+<a id="l259" href="#l259">259</a>         purchases.forEach { p -&gt;
+<a id="l260" href="#l260">260</a>             when (p.purchaseState) {
+<a id="l261" href="#l261">261</a>                 Purchase.PurchaseState.PURCHASED -&gt; {
+<a id="l262" href="#l262">262</a>                     owned.addAll(p.products)
+<a id="l263" href="#l263">263</a>                     if (!p.isAcknowledged) acknowledge(p)
+<a id="l264" href="#l264">264</a>                 }
+<a id="l265" href="#l265">265</a>                 Purchase.PurchaseState.PENDING -&gt; pending = true
+<a id="l266" href="#l266">266</a>                 else -&gt; Unit
+<a id="l267" href="#l267">267</a>             }
+<a id="l268" href="#l268">268</a>         }
+<a id="l269" href="#l269">269</a>         purchasePending = pending
+<a id="l270" href="#l270">270</a>         if (replace || owned.isNotEmpty()) License.recordOwned(app, owned)
+<a id="l271" href="#l271">271</a>     }
+<a id="l272" href="#l272">272</a> 
+<a id="l273" href="#l273">273</a>     private fun acknowledge(p: Purchase) {
+<a id="l274" href="#l274">274</a>         val params = AcknowledgePurchaseParams.newBuilder().setPurchaseToken(p.purchaseToken).build()
+<a id="l275" href="#l275">275</a>         client?.acknowledgePurchase(params) { result -&gt;
+<a id="l276" href="#l276">276</a>             if (result.responseCode != BillingResponseCode.OK) {
+<a id="l277" href="#l277">277</a>                 // Not fatal: the next refresh sees it unacknowledged and retries.
+<a id="l278" href="#l278">278</a>                 Log.w(TAG, &quot;acknowledge failed: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)
+<a id="l279" href="#l279">279</a>             }
+<a id="l280" href="#l280">280</a>         }
+<a id="l281" href="#l281">281</a>     }
+<a id="l282" href="#l282">282</a> 
+<a id="l283" href="#l283">283</a>     // ---- helpers ----------------------------------------------------------------
+<a id="l284" href="#l284">284</a> 
+<a id="l285" href="#l285">285</a>     /** The cheapest way to buy a product, should it ever carry more than one offer. */
+<a id="l286" href="#l286">286</a>     private fun offerOf(p: ProductDetails): ProductDetails.OneTimePurchaseOfferDetails? =
+<a id="l287" href="#l287">287</a>         p.oneTimePurchaseOfferDetailsList?.minByOrNull { it.priceAmountMicros }
+<a id="l288" href="#l288">288</a>             ?: p.oneTimePurchaseOfferDetails
+<a id="l289" href="#l289">289</a> 
+<a id="l290" href="#l290">290</a>     private fun explain(r: BillingResult): String = when (r.responseCode) {
+<a id="l291" href="#l291">291</a>         BillingResponseCode.BILLING_UNAVAILABLE -&gt;
+<a id="l292" href="#l292">292</a>             &quot;Google Play billing is not available for this device or account.&quot;
+<a id="l293" href="#l293">293</a>         BillingResponseCode.SERVICE_UNAVAILABLE,
+<a id="l294" href="#l294">294</a>         BillingResponseCode.SERVICE_DISCONNECTED,
+<a id="l295" href="#l295">295</a>         BillingResponseCode.NETWORK_ERROR -&gt;
+<a id="l296" href="#l296">296</a>             &quot;Could not reach Google Play. Check the connection and try again.&quot;
+<a id="l297" href="#l297">297</a>         BillingResponseCode.ITEM_UNAVAILABLE -&gt;
+<a id="l298" href="#l298">298</a>             &quot;That product is not available for this account.&quot;
+<a id="l299" href="#l299">299</a>         BillingResponseCode.FEATURE_NOT_SUPPORTED -&gt;
+<a id="l300" href="#l300">300</a>             &quot;The Play Store app on this device is too old. Update it and try again.&quot;
+<a id="l301" href="#l301">301</a>         else -&gt; &quot;Google Play error &quot; + r.responseCode +
+<a id="l302" href="#l302">302</a>             (if (r.debugMessage.isNullOrBlank()) &quot;&quot; else &quot;: &quot; + r.debugMessage)
+<a id="l303" href="#l303">303</a>     }
+<a id="l304" href="#l304">304</a> }</pre>
+</div></body></html>

@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey 30fa1216 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../assistkey/index.html">Log</a> | <a href="../../assistkey/files.html">Files</a> | <a href="../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 30fa1216cf865a558deafdd18a2525934ced9e70
+truex &lt;truex@equwal.com&gt;
+2026-09-21 12:07:03 -0700
+
+Keep the settings across an uninstall, and pin the stored formats
+
+An update always kept the settings, because they are in the data of the
+app. An uninstall removed them. hasFragileUserData makes Android ask at
+uninstall whether to keep the data. AutoBackup writes the export text to
+Documents/Rebind/rebind-settings.json a few seconds after each change,
+and once at start. It needs no permission. Import opens that folder.
+
+StoredFormatTest holds the bindings and the settings file as the 0.0.x
+versions wrote them. A change that cannot read them fails the test.
+
+</pre><pre> CHANGELOG.md                                       | 10 +++
+ app/src/main/AndroidManifest.xml                   |  5 ++
+ .../equwal/assistkey/engine/KeyFilterService.kt    |  1 +
+ .../java/dev/equwal/assistkey/store/AutoBackup.kt  | 98 ++++++++++++++++++++++
+ .../java/dev/equwal/assistkey/ui/BackupActivity.kt | 24 ++++--
+ .../java/dev/equwal/assistkey/ui/MainActivity.kt   |  2 +
+ .../dev/equwal/assistkey/store/StoredFormatTest.kt | 85 +++++++++++++++++++
+ play/PRIVACY.md                                    |  7 +-
+ 8 files changed, 223 insertions(+), 9 deletions(-)
+</pre><pre>diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3870891..2df3aca 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+<span class="h">@@ -1,5 +1,15 @@</span>
+ # Changelog
+ 
+<span class="a">+## Unreleased</span>
+<span class="a">+</span>
+<span class="a">+- **Settings are safe across versions and across an uninstall.** An update</span>
+<span class="a">+  always kept the settings: they are in the data of the app. An uninstall</span>
+<span class="a">+  removed them. Now Android asks at uninstall whether to keep the data</span>
+<span class="a">+  (`hasFragileUserData`), and Rebind keeps an automatic copy of the settings in</span>
+<span class="a">+  `Documents/Rebind/rebind-settings.json`, which an uninstall does not touch.</span>
+<span class="a">+  Import opens that folder. `StoredFormatTest` holds the texts that every</span>
+<span class="a">+  0.0.x version stored, so a new version cannot stop reading them unseen.</span>
+<span class="a">+</span>
+ ## 0.0.15-alpha - 2026-09-21
+ 
+ Version code 15.
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 3505deb..a8cae91 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+<span class="h">@@ -46,8 +46,13 @@</span>
+         &lt;package android:name=&quot;com.viwoods.settings&quot; /&gt;
+     &lt;/queries&gt;
+ 
+<span class="a">+    &lt;!--</span>
+<span class="a">+        hasFragileUserData: on uninstall, Android asks the user whether to keep</span>
+<span class="a">+        the data of the app. With the data kept, a new install has every setting.</span>
+<span class="a">+    --&gt;</span>
+     &lt;application
+         android:allowBackup=&quot;true&quot;
+<span class="a">+        android:hasFragileUserData=&quot;true&quot;</span>
+         android:icon=&quot;@mipmap/ic_launcher&quot;
+         android:label=&quot;@string/app_name&quot;
+         android:supportsRtl=&quot;true&quot;
+diff --git a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+index 740bbf9..842d3c7 100644
+--- a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
++++ b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+<span class="h">@@ -40,6 +40,7 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         super.onServiceConnected()
+         engine = GestureEngine(this, Store.timing(this))
+         ServiceHolder.service = this
+<span class="a">+        dev.equwal.assistkey.store.AutoBackup.watch(this)</span>
+         // The service starts at boot and may run for weeks without the settings
+         // screen ever opening, so it keeps the licence fresh on its own.
+         PlayBilling.refresh(this) { syncPower() }
+diff --git a/app/src/main/java/dev/equwal/assistkey/store/AutoBackup.kt b/app/src/main/java/dev/equwal/assistkey/store/AutoBackup.kt
+new file mode 100644
+index 0000000..df96489
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/store/AutoBackup.kt
+<span class="h">@@ -0,0 +1,98 @@</span>
+<span class="a">+package dev.equwal.assistkey.store</span>
+<span class="a">+</span>
+<span class="a">+import android.content.ContentValues</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.content.SharedPreferences</span>
+<span class="a">+import android.os.Environment</span>
+<span class="a">+import android.os.Handler</span>
+<span class="a">+import android.os.HandlerThread</span>
+<span class="a">+import android.provider.MediaStore</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import dev.equwal.assistkey.BuildConfig</span>
+<span class="a">+import dev.equwal.assistkey.device.Device</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * A copy of the settings outside the app, kept up to date by itself.</span>
+<span class="a">+ *</span>
+<span class="a">+ * An update keeps the settings: they are in the data of the app, and Android</span>
+<span class="a">+ * keeps that data when a new version goes over the old one. An uninstall</span>
+<span class="a">+ * removes the data. This copy is in the shared Documents folder, which an</span>
+<span class="a">+ * uninstall does not touch, so the user can import it after a new install.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The copy holds what an export holds, and nothing else. See [SettingsFile].</span>
+<span class="a">+ * It needs no permission: an app may write its own file to Documents.</span>
+<span class="a">+ */</span>
+<span class="a">+object AutoBackup {</span>
+<span class="a">+</span>
+<span class="a">+    const val FOLDER = &quot;Rebind&quot;</span>
+<span class="a">+    const val FILE_NAME = &quot;rebind-settings.json&quot;</span>
+<span class="a">+</span>
+<span class="a">+    /** For the user: where the copy is. */</span>
+<span class="a">+    val PLACE = Environment.DIRECTORY_DOCUMENTS + &quot;/&quot; + FOLDER + &quot;/&quot; + FILE_NAME</span>
+<span class="a">+</span>
+<span class="a">+    private const val TAG = &quot;AssistKey&quot;</span>
+<span class="a">+    private const val DELAY_MS = 3000L</span>
+<span class="a">+</span>
+<span class="a">+    private val thread by lazy { HandlerThread(&quot;rebind-backup&quot;).apply { start() } }</span>
+<span class="a">+    private val worker by lazy { Handler(thread.looper) }</span>
+<span class="a">+</span>
+<span class="a">+    // SharedPreferences holds its listeners weakly. These references keep them alive.</span>
+<span class="a">+    private val listeners = ArrayList&lt;SharedPreferences.OnSharedPreferenceChangeListener&gt;()</span>
+<span class="a">+</span>
+<span class="a">+    /** The settings as one JSON text, the same text that Export writes. */</span>
+<span class="a">+    fun export(c: Context): String {</span>
+<span class="a">+        val settings = SettingsFile.ALLOWED.keys.associateWith { file -&gt;</span>
+<span class="a">+            c.getSharedPreferences(file, Context.MODE_PRIVATE).all</span>
+<span class="a">+        }</span>
+<span class="a">+        return SettingsFile.encode(settings, BuildConfig.VERSION_NAME, Device.name)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Starts to watch the settings. Each change writes the copy again, a few</span>
+<span class="a">+     * seconds later, so that a run of changes makes one write. Safe to call</span>
+<span class="a">+     * more than once.</span>
+<span class="a">+     */</span>
+<span class="a">+    @Synchronized</span>
+<span class="a">+    fun watch(context: Context) {</span>
+<span class="a">+        if (listeners.isNotEmpty()) return</span>
+<span class="a">+        val app = context.applicationContext</span>
+<span class="a">+        SettingsFile.ALLOWED.keys.forEach { file -&gt;</span>
+<span class="a">+            val l = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -&gt; schedule(app) }</span>
+<span class="a">+            listeners += l</span>
+<span class="a">+            app.getSharedPreferences(file, Context.MODE_PRIVATE).registerOnSharedPreferenceChangeListener(l)</span>
+<span class="a">+        }</span>
+<span class="a">+        // One write at the start, so that a user who only updates has a copy too.</span>
+<span class="a">+        schedule(app)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private val token = Any()</span>
+<span class="a">+</span>
+<span class="a">+    private fun schedule(app: Context) {</span>
+<span class="a">+        worker.removeCallbacksAndMessages(token)</span>
+<span class="a">+        worker.postDelayed({ write(app) }, token, DELAY_MS)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Writes the copy now. False when the device refused. The app works without the copy. */</span>
+<span class="a">+    fun write(c: Context): Boolean = runCatching {</span>
+<span class="a">+        val resolver = c.contentResolver</span>
+<span class="a">+        val files = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)</span>
+<span class="a">+        val path = Environment.DIRECTORY_DOCUMENTS + &quot;/&quot; + FOLDER + &quot;/&quot;</span>
+<span class="a">+        // The file of this install, if there is one. After a new install the old</span>
+<span class="a">+        // file belongs to nobody, and Android gives the new file a name of its own.</span>
+<span class="a">+        val mine = resolver.query(</span>
+<span class="a">+            files, arrayOf(MediaStore.MediaColumns._ID),</span>
+<span class="a">+            MediaStore.MediaColumns.RELATIVE_PATH + &quot;=? AND &quot; + MediaStore.MediaColumns.DISPLAY_NAME + &quot;=?&quot;,</span>
+<span class="a">+            arrayOf(path, FILE_NAME), null</span>
+<span class="a">+        )?.use { if (it.moveToFirst()) android.content.ContentUris.withAppendedId(files, it.getLong(0)) else null }</span>
+<span class="a">+        val target = mine ?: resolver.insert(</span>
+<span class="a">+            files,</span>
+<span class="a">+            ContentValues().apply {</span>
+<span class="a">+                put(MediaStore.MediaColumns.DISPLAY_NAME, FILE_NAME)</span>
+<span class="a">+                put(MediaStore.MediaColumns.MIME_TYPE, &quot;application/json&quot;)</span>
+<span class="a">+                put(MediaStore.MediaColumns.RELATIVE_PATH, path)</span>
+<span class="a">+            }</span>
+<span class="a">+        ) ?: return false</span>
+<span class="a">+        resolver.openOutputStream(target, &quot;wt&quot;)?.use { it.write(export(c).toByteArray()) } ?: return false</span>
+<span class="a">+        true</span>
+<span class="a">+    }.onFailure { Log.w(TAG, &quot;settings copy not written&quot;, it) }.getOrDefault(false)</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/BackupActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/BackupActivity.kt
+index 2a815d0..e9aad0e 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/BackupActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/BackupActivity.kt
+<span class="h">@@ -12,11 +12,13 @@ import dev.equwal.assistkey.device.Device</span>
+ import dev.equwal.assistkey.engine.KeyFilterService
+ import dev.equwal.assistkey.model.Trigger
+ import dev.equwal.assistkey.route.ServiceHolder
+<span class="a">+import dev.equwal.assistkey.store.AutoBackup</span>
+ import dev.equwal.assistkey.store.SettingsFile
+ import dev.equwal.assistkey.store.Store
+ import dev.equwal.assistkey.ui.Ui.button
+ import dev.equwal.assistkey.ui.Ui.header
+ import dev.equwal.assistkey.ui.Ui.note
+<span class="a">+import dev.equwal.assistkey.ui.Ui.row</span>
+ import org.json.JSONObject
+ 
+ /**
+<span class="h">@@ -32,6 +34,11 @@ class BackupActivity : Activity() {</span>
+         const val OPEN = 2
+         const val FILE_NAME = &quot;assistkey-settings.json&quot;
+ 
+<span class="a">+        /** Documents/Rebind, as the file picker of Android names it. */</span>
+<span class="a">+        val COPY_FOLDER: Uri = android.provider.DocumentsContract.buildDocumentUri(</span>
+<span class="a">+            &quot;com.android.externalstorage.documents&quot;, &quot;primary:Documents/&quot; + AutoBackup.FOLDER</span>
+<span class="a">+        )</span>
+<span class="a">+</span>
+     }
+ 
+     override fun onResume() {
+<span class="h">@@ -42,6 +49,9 @@ class BackupActivity : Activity() {</span>
+     private fun build() {
+         val col = Ui.page(this, &quot;Export and import&quot;)
+ 
+<span class="a">+        col.header(&quot;Automatic copy&quot;)</span>
+<span class="a">+        col.row(AutoBackup.PLACE, &quot;Kept up to date. It stays after an uninstall.&quot;, enabled = false)</span>
+<span class="a">+</span>
+         col.header(&quot;Export&quot;)
+         col.button(&quot;Save to a file&quot;) {
+             start(
+<span class="h">@@ -64,7 +74,12 @@ class BackupActivity : Activity() {</span>
+ 
+         col.header(&quot;Import&quot;)
+         col.button(&quot;Open a file&quot;) {
+<span class="d">-            start(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(&quot;*/*&quot;), OPEN)</span>
+<span class="a">+            start(</span>
+<span class="a">+                Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType(&quot;*/*&quot;)</span>
+<span class="a">+                    // Start in the folder of the automatic copy.</span>
+<span class="a">+                    .putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI, COPY_FOLDER),</span>
+<span class="a">+                OPEN</span>
+<span class="a">+            )</span>
+         }
+         col.button(&quot;Paste from the clipboard&quot;) {
+             val clip = getSystemService(android.content.ClipboardManager::class.java)
+<span class="h">@@ -96,12 +111,7 @@ class BackupActivity : Activity() {</span>
+ 
+     // ---- export ---------------------------------------------------------------------------------
+ 
+<span class="d">-    private fun export(): String {</span>
+<span class="d">-        val settings = SettingsFile.ALLOWED.keys.associateWith { file -&gt;</span>
+<span class="d">-            getSharedPreferences(file, Context.MODE_PRIVATE).all</span>
+<span class="d">-        }</span>
+<span class="d">-        return SettingsFile.encode(settings, BuildConfig.VERSION_NAME, Device.name)</span>
+<span class="d">-    }</span>
+<span class="a">+    private fun export(): String = AutoBackup.export(this)</span>
+ 
+     // ---- import ---------------------------------------------------------------------------------
+ 
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+index a45e622..46a43fd 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+<span class="h">@@ -23,6 +23,7 @@ import dev.equwal.assistkey.model.Trigger</span>
+ import dev.equwal.assistkey.native.NavNative
+ import dev.equwal.assistkey.setup.DeviceView
+ import dev.equwal.assistkey.setup.GuidedSetupActivity
+<span class="a">+import dev.equwal.assistkey.store.AutoBackup</span>
+ import dev.equwal.assistkey.store.Store
+ import dev.equwal.assistkey.ui.Ui.dp
+ import dev.equwal.assistkey.ui.Ui.header
+<span class="h">@@ -53,6 +54,7 @@ class MainActivity : Activity() {</span>
+         // Finds the buttons and the capabilities of this device. It runs at
+         // first start, and again after a firmware or app change.
+         Detect.refreshIfStale(this)
+<span class="a">+        AutoBackup.watch(this)</span>
+         PermissionsActivity.showOnce(this)
+     }
+ 
+diff --git a/app/src/test/java/dev/equwal/assistkey/store/StoredFormatTest.kt b/app/src/test/java/dev/equwal/assistkey/store/StoredFormatTest.kt
+new file mode 100644
+index 0000000..559a74f
+--- /dev/null
++++ b/app/src/test/java/dev/equwal/assistkey/store/StoredFormatTest.kt
+<span class="h">@@ -0,0 +1,85 @@</span>
+<span class="a">+package dev.equwal.assistkey.store</span>
+<span class="a">+</span>
+<span class="a">+import dev.equwal.assistkey.model.ActionKind</span>
+<span class="a">+import dev.equwal.assistkey.model.ActionSpec</span>
+<span class="a">+import dev.equwal.assistkey.model.GestureType</span>
+<span class="a">+import dev.equwal.assistkey.model.HwKey</span>
+<span class="a">+import dev.equwal.assistkey.model.Trigger</span>
+<span class="a">+import org.json.JSONObject</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertNotNull</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * A new version must read what an old version stored. These are the texts that</span>
+<span class="a">+ * the 0.0.x versions wrote. If a change makes one of them unreadable, the</span>
+<span class="a">+ * settings of every user are lost at the update. Do not edit the texts: add</span>
+<span class="a">+ * a new one for a new format.</span>
+<span class="a">+ */</span>
+<span class="a">+class StoredFormatTest {</span>
+<span class="a">+</span>
+<span class="a">+    /** The &quot;bindings&quot; preference, as 0.0.7 to 0.0.15 wrote it. One entry for each kind of action. */</span>
+<span class="a">+    private val bindings = &quot;&quot;&quot;</span>
+<span class="a">+        {&quot;power:tap:1&quot;:{&quot;kind&quot;:&quot;GLOBAL&quot;,&quot;payload&quot;:&quot;BACK&quot;,&quot;label&quot;:&quot;Back&quot;},</span>
+<span class="a">+         &quot;power:hold:1&quot;:{&quot;kind&quot;:&quot;GLOBAL&quot;,&quot;payload&quot;:&quot;HOME_CLOSE_IME&quot;,&quot;label&quot;:&quot;Home&quot;},</span>
+<span class="a">+         &quot;power:tap:2&quot;:{&quot;kind&quot;:&quot;LAUNCH_COMPONENT&quot;,&quot;payload&quot;:&quot;dev.equwal.assistkey/dev.equwal.assistkey.home.RecentsActivity&quot;,&quot;label&quot;:&quot;Recent apps&quot;},</span>
+<span class="a">+         &quot;power:tap:3&quot;:{&quot;kind&quot;:&quot;GLOBAL&quot;,&quot;payload&quot;:&quot;LOCK_SCREEN&quot;,&quot;label&quot;:&quot;Lock screen&quot;},</span>
+<span class="a">+         &quot;vol_up:tap:1&quot;:{&quot;kind&quot;:&quot;SWIPE&quot;,&quot;payload&quot;:&quot;right&quot;,&quot;label&quot;:&quot;Previous page&quot;},</span>
+<span class="a">+         &quot;vol_down:tap:1&quot;:{&quot;kind&quot;:&quot;SCROLL&quot;,&quot;payload&quot;:&quot;forward&quot;,&quot;label&quot;:&quot;Scroll&quot;},</span>
+<span class="a">+         &quot;ai:tap:2&quot;:{&quot;kind&quot;:&quot;VOICE&quot;,&quot;payload&quot;:&quot;&quot;,&quot;label&quot;:&quot;Voice typing&quot;},</span>
+<span class="a">+         &quot;ai:hold:1&quot;:{&quot;kind&quot;:&quot;DIM&quot;,&quot;payload&quot;:&quot;toggle&quot;,&quot;label&quot;:&quot;&quot;},</span>
+<span class="a">+         &quot;ai+vol_up:tap:1&quot;:{&quot;kind&quot;:&quot;MENU&quot;,&quot;payload&quot;:&quot;[]&quot;,&quot;label&quot;:&quot;Menu&quot;},</span>
+<span class="a">+         &quot;vol_down+power:tap:1&quot;:{&quot;kind&quot;:&quot;LAUNCH_APP&quot;,&quot;payload&quot;:&quot;org.koreader.launcher&quot;,&quot;label&quot;:&quot;KOReader&quot;},</span>
+<span class="a">+         &quot;screen:tap:1&quot;:{&quot;kind&quot;:&quot;LAUNCH_COMPONENT&quot;,&quot;payload&quot;:&quot;com.viwoods.viwoodsai/com.wisky.wiskyai.WebViewAiActivity?recodeKey=recode_key_start&quot;,&quot;label&quot;:&quot;AI voice prompt&quot;},</span>
+<span class="a">+         &quot;page_down:tap:1&quot;:{&quot;kind&quot;:&quot;NAV&quot;,&quot;payload&quot;:&quot;toggle_bar&quot;,&quot;label&quot;:&quot;Show or hide the button bar&quot;},</span>
+<span class="a">+         &quot;page_up:tap:1&quot;:{&quot;kind&quot;:&quot;MEDIA&quot;,&quot;payload&quot;:&quot;play_pause&quot;,&quot;label&quot;:&quot;Play or pause&quot;},</span>
+<span class="a">+         &quot;camera:tap:1&quot;:{&quot;kind&quot;:&quot;VOLUME&quot;,&quot;payload&quot;:&quot;raise&quot;,&quot;label&quot;:&quot;Volume up&quot;},</span>
+<span class="a">+         &quot;f2:tap:1&quot;:{&quot;kind&quot;:&quot;LAUNCH_ACTION&quot;,&quot;payload&quot;:&quot;dev.equwal.inkdim.TOGGLE&quot;,&quot;label&quot;:&quot;TOGGLE&quot;},</span>
+<span class="a">+         &quot;f3:tap:1&quot;:{&quot;kind&quot;:&quot;BROADCAST&quot;,&quot;payload&quot;:&quot;com.example.PING&quot;,&quot;label&quot;:&quot;PING&quot;},</span>
+<span class="a">+         &quot;f4:tap:1&quot;:{&quot;kind&quot;:&quot;NONE&quot;,&quot;payload&quot;:&quot;&quot;,&quot;label&quot;:&quot;Disabled&quot;}}</span>
+<span class="a">+    &quot;&quot;&quot;.trimIndent()</span>
+<span class="a">+</span>
+<span class="a">+    @Test fun `every trigger and action that an old version stored still reads`() {</span>
+<span class="a">+        val root = JSONObject(bindings)</span>
+<span class="a">+        val kinds = HashSet&lt;ActionKind&gt;()</span>
+<span class="a">+        root.keys().forEach { id -&gt;</span>
+<span class="a">+            val trigger = Trigger.parse(id)</span>
+<span class="a">+            assertNotNull(&quot;trigger &quot; + id, trigger)</span>
+<span class="a">+            assertEquals(id, trigger!!.id)</span>
+<span class="a">+            val spec = ActionSpec.fromJson(root.getJSONObject(id))</span>
+<span class="a">+            assertEquals(root.getJSONObject(id).getString(&quot;kind&quot;), spec.kind.name)</span>
+<span class="a">+            assertEquals(root.getJSONObject(id).getString(&quot;payload&quot;), spec.payload)</span>
+<span class="a">+            kinds += spec.kind</span>
+<span class="a">+        }</span>
+<span class="a">+        // PASS_THROUGH is never stored: it means &quot;no binding&quot;.</span>
+<span class="a">+        assertEquals(ActionKind.entries.toSet() - ActionKind.PASS_THROUGH, kinds)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test fun `the tokens of the keys do not change`() {</span>
+<span class="a">+        assertEquals(</span>
+<span class="a">+            listOf(&quot;ai&quot;, &quot;vol_up&quot;, &quot;vol_down&quot;, &quot;page_up&quot;, &quot;page_down&quot;, &quot;camera&quot;, &quot;focus&quot;, &quot;assist&quot;,</span>
+<span class="a">+                &quot;headset&quot;, &quot;mute&quot;, &quot;f2&quot;, &quot;f3&quot;, &quot;f4&quot;, &quot;power&quot;, &quot;screen&quot;),</span>
+<span class="a">+            HwKey.entries.map { it.token }</span>
+<span class="a">+        )</span>
+<span class="a">+        assertEquals(Trigger(setOf(HwKey.POWER), GestureType.HOLD), Trigger.parse(&quot;power:hold:1&quot;))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** A settings file as 0.0.9 exported it, with a home screen block that no longer exists. */</span>
+<span class="a">+    @Test fun `an export of an old version still imports, and what is gone is skipped`() {</span>
+<span class="a">+        val file = &quot;&quot;&quot;</span>
+<span class="a">+            {&quot;app&quot;:&quot;AssistKey&quot;,&quot;format&quot;:1,&quot;version&quot;:&quot;0.0.9-alpha-full&quot;,&quot;device&quot;:&quot;Viwoods AiPaper Reader&quot;,</span>
+<span class="a">+             &quot;settings&quot;:{</span>
+<span class="a">+               &quot;assistkey&quot;:{&quot;bindings&quot;:{&quot;t&quot;:&quot;json&quot;,&quot;v&quot;:{&quot;ai:tap:2&quot;:{&quot;kind&quot;:&quot;VOICE&quot;,&quot;payload&quot;:&quot;&quot;,&quot;label&quot;:&quot;Voice typing&quot;}}},</span>
+<span class="a">+                            &quot;hold_ms&quot;:{&quot;t&quot;:&quot;i&quot;,&quot;v&quot;:450},&quot;multitap_ms&quot;:{&quot;t&quot;:&quot;i&quot;,&quot;v&quot;:280},&quot;chord_ms&quot;:{&quot;t&quot;:&quot;i&quot;,&quot;v&quot;:140}},</span>
+<span class="a">+               &quot;assistkey_home&quot;:{&quot;favourites&quot;:{&quot;t&quot;:&quot;s&quot;,&quot;v&quot;:&quot;org.koreader.launcher&quot;},&quot;clock&quot;:{&quot;t&quot;:&quot;b&quot;,&quot;v&quot;:true}},</span>
+<span class="a">+               &quot;assistkey_nav&quot;:{&quot;buttons&quot;:{&quot;t&quot;:&quot;b&quot;,&quot;v&quot;:true},&quot;gestures&quot;:{&quot;t&quot;:&quot;b&quot;,&quot;v&quot;:false},&quot;keys&quot;:{&quot;t&quot;:&quot;b&quot;,&quot;v&quot;:true}},</span>
+<span class="a">+               &quot;assistkey_voice&quot;:{&quot;engine&quot;:{&quot;t&quot;:&quot;s&quot;,&quot;v&quot;:&quot;org.woheller69.whisper/com.whispertflite.WhisperRecognitionService&quot;},</span>
+<span class="a">+                                  &quot;language&quot;:{&quot;t&quot;:&quot;s&quot;,&quot;v&quot;:&quot;ja-JP&quot;}},</span>
+<span class="a">+               &quot;assistkey_power&quot;:{&quot;wanted&quot;:{&quot;t&quot;:&quot;b&quot;,&quot;v&quot;:true}}}}</span>
+<span class="a">+        &quot;&quot;&quot;.trimIndent()</span>
+<span class="a">+        val read = SettingsFile.decode(file)</span>
+<span class="a">+        assertEquals(setOf(&quot;assistkey&quot;, &quot;assistkey_nav&quot;, &quot;assistkey_voice&quot;, &quot;assistkey_power&quot;), read.keys)</span>
+<span class="a">+        assertEquals(450, read.getValue(&quot;assistkey&quot;)[&quot;hold_ms&quot;])</span>
+<span class="a">+        assertEquals(&quot;ja-JP&quot;, read.getValue(&quot;assistkey_voice&quot;)[&quot;language&quot;])</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/play/PRIVACY.md b/play/PRIVACY.md
+index 2473fa0..f5fc45e 100644
+--- a/play/PRIVACY.md
++++ b/play/PRIVACY.md
+<span class="h">@@ -23,8 +23,11 @@ service asks Android which part of the current window can scroll, so that it</span>
+ can scroll it. It does not read, record or transmit what the window contains.
+ 
+ **Your settings.** Your key bindings, timing preferences and which capture
+<span class="d">-channels are on are saved in the app&#x27;s private storage on your device. They</span>
+<span class="d">-leave the device only through Android&#x27;s own backup, if you have it on.</span>
+<span class="a">+channels are on are saved in the app&#x27;s private storage on your device. Rebind</span>
+<span class="a">+also keeps a copy of them as a file in your Documents folder</span>
+<span class="a">+(`Documents/Rebind/rebind-settings.json`), so that an uninstall does not lose</span>
+<span class="a">+them. The file stays on your device. Your settings leave the device only</span>
+<span class="a">+through Android&#x27;s own backup, if you have it on, or if you share the file.</span>
+ 
+ **Voice typing.** If you bind the Voice typing action, Rebind asks for the
+ microphone permission. A speech recognition app on your device, which you</pre>
+</div></body></html>

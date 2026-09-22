@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread.koplugin a1bd68d1 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread.koplugin</h1><span class="desc">KOReader plugin: the book follows the narration of an audiobook, from an .srt made by subread.space</span><p class="url">git clone https://github.com/equwal/subread.koplugin</p><p><a href="../../subread.koplugin/index.html">Log</a> | <a href="../../subread.koplugin/files.html">Files</a> | <a href="../../subread.koplugin/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit a1bd68d14754479363569dbf647bbcb9e1d121f2
+equwal &lt;truex@equwal.com&gt;
+2026-09-21 05:19:11 -0700
+
+Add the KOReader plugin: menu, follow loop, controls
+
+The follow loop searches forward from the current page for a short piece of
+the cue text, turns the page when the place leaves the screen, and marks the
+line with the crengine selection. The screen is only redrawn when the cue
+changes.
+
+</pre><pre> .gitattributes |   1 +
+ _meta.lua      |  13 +
+ main.lua       | 854 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 868 insertions(+)
+</pre><pre>diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..6313b56
+--- /dev/null
++++ b/.gitattributes
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+* text=auto eol=lf</span>
+diff --git a/_meta.lua b/_meta.lua
+new file mode 100644
+index 0000000..3c7dbeb
+--- /dev/null
++++ b/_meta.lua
+<span class="h">@@ -0,0 +1,13 @@</span>
+<span class="a">+local _ = require(&quot;gettext&quot;)</span>
+<span class="a">+return {</span>
+<span class="a">+    fullname = _(&quot;SubRead read-along&quot;),</span>
+<span class="a">+    description = _([[</span>
+<span class="a">+Follows an audiobook narration in the book text.</span>
+<span class="a">+</span>
+<span class="a">+Load the SubRead subtitle file (.srt) that belongs to the book, start the</span>
+<span class="a">+clock with the audio player, and the book turns its own pages and marks the</span>
+<span class="a">+line that the narrator reads.</span>
+<span class="a">+</span>
+<span class="a">+Make the subtitle file at https://subread.space. Only EPUB, FB2, TXT and HTML</span>
+<span class="a">+books are supported.]]),</span>
+<span class="a">+}</span>
+diff --git a/main.lua b/main.lua
+new file mode 100644
+index 0000000..2950d28
+--- /dev/null
++++ b/main.lua
+<span class="h">@@ -0,0 +1,854 @@</span>
+<span class="a">+--[[--</span>
+<span class="a">+SubRead read-along.</span>
+<span class="a">+</span>
+<span class="a">+A SubRead subtitle file (.srt) holds the text of the book as cue text, and the</span>
+<span class="a">+time when the narrator reads each line as cue times. This plugin runs a clock</span>
+<span class="a">+with the audio player and keeps the place of the narration on the screen.</span>
+<span class="a">+</span>
+<span class="a">+Only crengine documents (EPUB, FB2, TXT, HTML) are supported. PDF and DjVu</span>
+<span class="a">+have no xpointer, so the place cannot be followed.</span>
+<span class="a">+</span>
+<span class="a">+@module koplugin.SubRead</span>
+<span class="a">+--]]--</span>
+<span class="a">+</span>
+<span class="a">+local ButtonDialog = require(&quot;ui/widget/buttondialog&quot;)</span>
+<span class="a">+local DateTimeWidget = require(&quot;ui/widget/datetimewidget&quot;)</span>
+<span class="a">+local Dispatcher = require(&quot;dispatcher&quot;)</span>
+<span class="a">+local InfoMessage = require(&quot;ui/widget/infomessage&quot;)</span>
+<span class="a">+local Notification = require(&quot;ui/widget/notification&quot;)</span>
+<span class="a">+local SpinWidget = require(&quot;ui/widget/spinwidget&quot;)</span>
+<span class="a">+local UIManager = require(&quot;ui/uimanager&quot;)</span>
+<span class="a">+local WidgetContainer = require(&quot;ui/widget/container/widgetcontainer&quot;)</span>
+<span class="a">+local datetime = require(&quot;datetime&quot;)</span>
+<span class="a">+local logger = require(&quot;logger&quot;)</span>
+<span class="a">+local time = require(&quot;ui/time&quot;)</span>
+<span class="a">+local util = require(&quot;util&quot;)</span>
+<span class="a">+local _ = require(&quot;gettext&quot;)</span>
+<span class="a">+local C_ = _.pgettext</span>
+<span class="a">+local T = require(&quot;ffi/util&quot;).template</span>
+<span class="a">+</span>
+<span class="a">+local Clock = require(&quot;subread.clock&quot;)</span>
+<span class="a">+local Cues = require(&quot;subread.cues&quot;)</span>
+<span class="a">+local Srt = require(&quot;subread.srt&quot;)</span>
+<span class="a">+local Text = require(&quot;subread.text&quot;)</span>
+<span class="a">+</span>
+<span class="a">+-- Search flags of the crengine full text search. The list is in</span>
+<span class="a">+-- frontend/apps/reader/modules/readersearch.lua:33-41.</span>
+<span class="a">+-- 0x00FF is every flag except IGNORE_DIACRITICS, the same value that</span>
+<span class="a">+-- KOReader itself uses by default (readersearch.lua:50). The plugin needs</span>
+<span class="a">+-- MATCH_ACROSS_TEXT_NODES (0x0001), because a cue often runs over an inline</span>
+<span class="a">+-- tag, and FOLD_SPACES (0x0020), because the white space of the cue text and</span>
+<span class="a">+-- of the book text is not the same.</span>
+<span class="a">+local SEARCH_FLAGS = 0x00FF</span>
+<span class="a">+-- Stop the search after this many hits. A small number keeps a search that</span>
+<span class="a">+-- hits early cheap. See readersearch.lua:61.</span>
+<span class="a">+local SEARCH_MAX_HITS = 20</span>
+<span class="a">+-- findText origin: -1 whole book, 0 from the current page, 1 after the</span>
+<span class="a">+-- current page. See ReaderSearch:searchFromStart and searchFromCurrent,</span>
+<span class="a">+-- readersearch.lua:708-724.</span>
+<span class="a">+local SEARCH_WHOLE_BOOK = -1</span>
+<span class="a">+local SEARCH_FROM_CURRENT_PAGE = 0</span>
+<span class="a">+-- findText direction: 0 forward, 1 backward. See readersearch.lua:29.</span>
+<span class="a">+local SEARCH_FORWARD = 0</span>
+<span class="a">+</span>
+<span class="a">+-- The tick never sleeps longer than this, so a change of speed or a device</span>
+<span class="a">+-- suspend cannot make the follow late for long.</span>
+<span class="a">+local MAX_SLEEP = 30</span>
+<span class="a">+local MIN_SLEEP = 0.05</span>
+<span class="a">+-- After a cue is not found, the plugin waits this many cues before it</span>
+<span class="a">+-- searches again. The wait doubles with each miss. A failed search reads the</span>
+<span class="a">+-- book to its end, so this limits the cost when the book misses a stretch.</span>
+<span class="a">+local MISS_BACKOFF_MAX = 16</span>
+<span class="a">+</span>
+<span class="a">+-- Characters of cue text shown in a dialog title.</span>
+<span class="a">+local TITLE_CHARS = 60</span>
+<span class="a">+-- Characters kept from a selection when the user syncs by selecting text.</span>
+<span class="a">+-- A long selection can hold the text of more than one cue.</span>
+<span class="a">+local SYNC_NEEDLE_CHARS = 24</span>
+<span class="a">+</span>
+<span class="a">+-- Per book settings, kept in the book&#x27;s sidecar file.</span>
+<span class="a">+local SETTING_FILE = &quot;subread_srt_file&quot;</span>
+<span class="a">+local SETTING_POSITION = &quot;subread_position&quot;</span>
+<span class="a">+local SETTING_SPEED = &quot;subread_speed&quot;</span>
+<span class="a">+local SETTING_OFFSET = &quot;subread_offset&quot;</span>
+<span class="a">+</span>
+<span class="a">+local SubRead = WidgetContainer:extend{</span>
+<span class="a">+    name = &quot;subread&quot;,</span>
+<span class="a">+    is_doc_only = true,</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:init()</span>
+<span class="a">+    self.clock = Clock.new()</span>
+<span class="a">+    self.cues = nil            -- Cues index, built when the file is read</span>
+<span class="a">+    self.srt_path = nil</span>
+<span class="a">+    self.current_index = nil   -- cue shown now</span>
+<span class="a">+    self.located = {}          -- cue index -&gt; { start xpointer, end xpointer }</span>
+<span class="a">+    self.last_xpointer = nil   -- place of the last found cue</span>
+<span class="a">+    self.miss_streak = 0</span>
+<span class="a">+    self.retry_from_index = 0</span>
+<span class="a">+    self.manual_seek = false</span>
+<span class="a">+    self.scheduled = false</span>
+<span class="a">+    self.tick_task = function() self:_tick() end</span>
+<span class="a">+</span>
+<span class="a">+    self.ui.menu:registerToMainMenu(self)</span>
+<span class="a">+    if self:isSupported() then</span>
+<span class="a">+        self:registerDispatcherActions()</span>
+<span class="a">+        self:addToHighlightDialog()</span>
+<span class="a">+    end</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:isSupported()</span>
+<span class="a">+    -- self.ui.rolling exists only for crengine documents (readerui.lua:382).</span>
+<span class="a">+    return self.ui.rolling ~= nil</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:registerDispatcherActions()</span>
+<span class="a">+    Dispatcher:registerAction(&quot;subread_controls&quot;,</span>
+<span class="a">+        { category = &quot;none&quot;, event = &quot;SubReadShowControls&quot;,</span>
+<span class="a">+          title = _(&quot;SubRead: controls&quot;), rolling = true })</span>
+<span class="a">+    Dispatcher:registerAction(&quot;subread_toggle&quot;,</span>
+<span class="a">+        { category = &quot;none&quot;, event = &quot;SubReadToggle&quot;,</span>
+<span class="a">+          title = _(&quot;SubRead: start or pause&quot;), rolling = true })</span>
+<span class="a">+    Dispatcher:registerAction(&quot;subread_sync_page&quot;,</span>
+<span class="a">+        { category = &quot;none&quot;, event = &quot;SubReadSyncToPage&quot;,</span>
+<span class="a">+          title = _(&quot;SubRead: sync to this page&quot;), rolling = true, separator = true })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- Settings ]]--</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onReadSettings(config)</span>
+<span class="a">+    self.srt_path = config:readSetting(SETTING_FILE)</span>
+<span class="a">+    self.clock = Clock.new{</span>
+<span class="a">+        position = config:readSetting(SETTING_POSITION) or 0,</span>
+<span class="a">+        speed = config:readSetting(SETTING_SPEED) or 1.0,</span>
+<span class="a">+        offset = config:readSetting(SETTING_OFFSET) or 0,</span>
+<span class="a">+    }</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onReaderReady()</span>
+<span class="a">+    if not self:isSupported() then return end</span>
+<span class="a">+    if self.srt_path and not util.fileExists(self.srt_path) then</span>
+<span class="a">+        logger.info(&quot;SubRead: saved subtitle file is gone:&quot;, self.srt_path)</span>
+<span class="a">+        self.srt_path = nil</span>
+<span class="a">+    end</span>
+<span class="a">+    if not self.srt_path then</span>
+<span class="a">+        self.srt_path = self:findSubtitleBeside(self.ui.document.file)</span>
+<span class="a">+    end</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onSaveSettings()</span>
+<span class="a">+    self:saveState()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:saveState()</span>
+<span class="a">+    local settings = self.ui.doc_settings</span>
+<span class="a">+    if not settings then return end</span>
+<span class="a">+    if not self.srt_path then</span>
+<span class="a">+        -- Leave no keys in the sidecar file of a book that does not use the</span>
+<span class="a">+        -- plugin, and clear them when the user forgets the subtitle file.</span>
+<span class="a">+        settings:delSetting(SETTING_FILE)</span>
+<span class="a">+        settings:delSetting(SETTING_POSITION)</span>
+<span class="a">+        settings:delSetting(SETTING_SPEED)</span>
+<span class="a">+        settings:delSetting(SETTING_OFFSET)</span>
+<span class="a">+        return</span>
+<span class="a">+    end</span>
+<span class="a">+    settings:saveSetting(SETTING_FILE, self.srt_path)</span>
+<span class="a">+    settings:saveSetting(SETTING_POSITION, self.clock:getPosition(self:_now()))</span>
+<span class="a">+    settings:saveSetting(SETTING_SPEED, self.clock.speed)</span>
+<span class="a">+    settings:saveSetting(SETTING_OFFSET, self.clock.offset)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onCloseDocument()</span>
+<span class="a">+    self:stop()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onCloseWidget()</span>
+<span class="a">+    self:_unschedule()</span>
+<span class="a">+    self.tick_task = nil</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Looks for &lt;book&gt;.srt or &lt;book&gt;.&lt;lang&gt;.srt beside the book file.</span>
+<span class="a">+function SubRead:findSubtitleBeside(book_path)</span>
+<span class="a">+    if not book_path then return nil end</span>
+<span class="a">+    local directory, file_name = util.splitFilePathName(book_path)</span>
+<span class="a">+    local base = util.splitFileNameSuffix(file_name)</span>
+<span class="a">+    if base == &quot;&quot; then return nil end</span>
+<span class="a">+    local candidate = directory .. base .. &quot;.srt&quot;</span>
+<span class="a">+    if util.fileExists(candidate) then return candidate end</span>
+<span class="a">+    -- &lt;book&gt;.&lt;lang&gt;.srt, for example &quot;Dracula.en.srt&quot;. The language part is</span>
+<span class="a">+    -- any name without a dot, so the loop does not need a list of languages.</span>
+<span class="a">+    local lfs = require(&quot;libs/libkoreader-lfs&quot;)</span>
+<span class="a">+    local ok, iterator = pcall(lfs.dir, directory == &quot;&quot; and &quot;.&quot; or directory)</span>
+<span class="a">+    if not ok or type(iterator) ~= &quot;function&quot; then return nil end</span>
+<span class="a">+    local prefix = base .. &quot;.&quot;</span>
+<span class="a">+    for entry in iterator do</span>
+<span class="a">+        if entry:sub(1, #prefix) == prefix and entry:sub(-4):lower() == &quot;.srt&quot; then</span>
+<span class="a">+            local middle = entry:sub(#prefix + 1, -5)</span>
+<span class="a">+            if middle ~= &quot;&quot; and not middle:find(&quot;.&quot;, 1, true) then</span>
+<span class="a">+                return directory .. entry</span>
+<span class="a">+            end</span>
+<span class="a">+        end</span>
+<span class="a">+    end</span>
+<span class="a">+    return nil</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- Subtitle file ]]--</span>
+<span class="a">+</span>
+<span class="a">+--- Reads the subtitle file. Returns true when the index is ready.</span>
+<span class="a">+function SubRead:loadSubtitles()</span>
+<span class="a">+    if self.cues then return true end</span>
+<span class="a">+    if not self.srt_path then</span>
+<span class="a">+        self:showMessage(_(&quot;No SubRead subtitle file is loaded for this book.&quot;))</span>
+<span class="a">+        return false</span>
+<span class="a">+    end</span>
+<span class="a">+    local list, err = Srt.parseFile(self.srt_path)</span>
+<span class="a">+    if not list then</span>
+<span class="a">+        self:showMessage(T(_(&quot;Could not read the subtitle file:\n%1&quot;), tostring(err)))</span>
+<span class="a">+        return false</span>
+<span class="a">+    end</span>
+<span class="a">+    if #list == 0 then</span>
+<span class="a">+        self:showMessage(_(&quot;The subtitle file holds no cues.&quot;))</span>
+<span class="a">+        return false</span>
+<span class="a">+    end</span>
+<span class="a">+    self.cues = Cues.new(list)</span>
+<span class="a">+    self.located = {}</span>
+<span class="a">+    logger.info(&quot;SubRead: loaded&quot;, #list, &quot;cues from&quot;, self.srt_path)</span>
+<span class="a">+    return true</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:setSubtitleFile(path)</span>
+<span class="a">+    self:stop()</span>
+<span class="a">+    self.srt_path = path</span>
+<span class="a">+    self.cues = nil</span>
+<span class="a">+    self.located = {}</span>
+<span class="a">+    self.current_index = nil</span>
+<span class="a">+    self.last_xpointer = nil</span>
+<span class="a">+    self:saveState()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:chooseSubtitleFile(touchmenu_instance)</span>
+<span class="a">+    local PathChooser = require(&quot;ui/widget/pathchooser&quot;)</span>
+<span class="a">+    local directory = util.splitFilePathName(self.ui.document.file)</span>
+<span class="a">+    UIManager:show(PathChooser:new{</span>
+<span class="a">+        title = _(&quot;Select a SubRead subtitle file&quot;),</span>
+<span class="a">+        path = directory,</span>
+<span class="a">+        select_directory = false,</span>
+<span class="a">+        -- With a file_filter set, FileChooser shows only the files that pass</span>
+<span class="a">+        -- it, even if they are not a book (filechooser.lua:92).</span>
+<span class="a">+        file_filter = function(file_name)</span>
+<span class="a">+            return file_name:sub(-4):lower() == &quot;.srt&quot;</span>
+<span class="a">+        end,</span>
+<span class="a">+        onConfirm = function(file_path)</span>
+<span class="a">+            self:setSubtitleFile(file_path)</span>
+<span class="a">+            if touchmenu_instance then touchmenu_instance:updateItems() end</span>
+<span class="a">+        end,</span>
+<span class="a">+    })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- The clock ]]--</span>
+<span class="a">+</span>
+<span class="a">+--- Returns a monotonic time in seconds.</span>
+<span class="a">+-- getElapsedTimeSinceBoot adds the time in standby and in suspend</span>
+<span class="a">+-- (uimanager.lua:1133), so the follow stays right when the device sleeps</span>
+<span class="a">+-- while the audio player runs on.</span>
+<span class="a">+function SubRead:_now()</span>
+<span class="a">+    return time.to_number(UIManager:getElapsedTimeSinceBoot())</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:start()</span>
+<span class="a">+    if not self:checkSupported() then return end</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    local now = self:_now()</span>
+<span class="a">+    if self.clock:getPosition(now) &lt;= 0 then</span>
+<span class="a">+        local index = self:cueIndexForCurrentPage()</span>
+<span class="a">+        if index then</span>
+<span class="a">+            self.clock:seekCueTime(self.cues:get(index).start, now)</span>
+<span class="a">+        end</span>
+<span class="a">+    end</span>
+<span class="a">+    self.clock:start(now)</span>
+<span class="a">+    -- The reader may have moved the view since the last pause, so drop the</span>
+<span class="a">+    -- lower limit and let the search start at the page that is shown.</span>
+<span class="a">+    self.last_xpointer = nil</span>
+<span class="a">+    self.miss_streak = 0</span>
+<span class="a">+    self.retry_from_index = 0</span>
+<span class="a">+    self.current_index = nil -- force a redraw of the cue that is on</span>
+<span class="a">+    self:_tick()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:pause()</span>
+<span class="a">+    self.clock:pause(self:_now())</span>
+<span class="a">+    self:_unschedule()</span>
+<span class="a">+    self:saveState()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:stop()</span>
+<span class="a">+    if self.clock:isRunning() then</span>
+<span class="a">+        self.clock:pause(self:_now())</span>
+<span class="a">+    end</span>
+<span class="a">+    self:_unschedule()</span>
+<span class="a">+    if self:isSupported() and self.ui.document then</span>
+<span class="a">+        self.ui.document:clearSelection()</span>
+<span class="a">+    end</span>
+<span class="a">+    self:saveState()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:toggle()</span>
+<span class="a">+    if self.clock:isRunning() then</span>
+<span class="a">+        self:pause()</span>
+<span class="a">+    else</span>
+<span class="a">+        self:start()</span>
+<span class="a">+    end</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Prepares for a jump that the user asked for.</span>
+<span class="a">+-- The user can jump backward, but the normal search only runs forward from</span>
+<span class="a">+-- the current page. After a manual jump the next search reads the whole book</span>
+<span class="a">+-- and uses the place of the nearest cue found before as its lower limit.</span>
+<span class="a">+function SubRead:_manualSeek()</span>
+<span class="a">+    self.manual_seek = true</span>
+<span class="a">+    self.miss_streak = 0</span>
+<span class="a">+    self.retry_from_index = 0</span>
+<span class="a">+    self.current_index = nil</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Moves the clock and shows the new place at once.</span>
+<span class="a">+function SubRead:seekAndShow(position)</span>
+<span class="a">+    local now = self:_now()</span>
+<span class="a">+    self.clock:seek(position, now)</span>
+<span class="a">+    self:_manualSeek()</span>
+<span class="a">+    self:_tick()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:skipCues(count)</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    local now = self:_now()</span>
+<span class="a">+    local index = self.cues:findNearest(self.clock:getCueTime(now))</span>
+<span class="a">+    if not index then return end</span>
+<span class="a">+    index = index + count</span>
+<span class="a">+    if index &lt; 1 then index = 1 end</span>
+<span class="a">+    if index &gt; self.cues:count() then index = self.cues:count() end</span>
+<span class="a">+    self.clock:seekCueTime(self.cues:get(index).start, now)</span>
+<span class="a">+    self:_manualSeek()</span>
+<span class="a">+    self:_tick()</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- The follow loop ]]--</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:_unschedule()</span>
+<span class="a">+    if self.scheduled then</span>
+<span class="a">+        UIManager:unschedule(self.tick_task)</span>
+<span class="a">+        self.scheduled = false</span>
+<span class="a">+    end</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- One step of the follow loop.</span>
+<span class="a">+-- The screen is only touched when the cue changes, never on a bare timer tick.</span>
+<span class="a">+function SubRead:_tick()</span>
+<span class="a">+    self.scheduled = false</span>
+<span class="a">+    if not self.cues then return end</span>
+<span class="a">+    local now = self:_now()</span>
+<span class="a">+    local cue_time = self.clock:getCueTime(now)</span>
+<span class="a">+    local index = self.cues:findByTime(cue_time)</span>
+<span class="a">+    if index and index ~= self.current_index then</span>
+<span class="a">+        self.current_index = index</span>
+<span class="a">+        self:showCue(index)</span>
+<span class="a">+    end</span>
+<span class="a">+    self:_schedule(now, cue_time)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Sleeps until the next cue starts, or MAX_SLEEP, whichever is first.</span>
+<span class="a">+function SubRead:_schedule(now, cue_time)</span>
+<span class="a">+    self:_unschedule()</span>
+<span class="a">+    if not self.clock:isRunning() then return end</span>
+<span class="a">+    local delay = MAX_SLEEP</span>
+<span class="a">+    local next_index = self.cues:nextAfter(cue_time)</span>
+<span class="a">+    if next_index then</span>
+<span class="a">+        local wait = self.clock:realSecondsUntilCueTime(self.cues:get(next_index).start, now)</span>
+<span class="a">+        if wait and wait &lt; delay then delay = wait end</span>
+<span class="a">+    end</span>
+<span class="a">+    if delay &lt; MIN_SLEEP then delay = MIN_SLEEP end</span>
+<span class="a">+    UIManager:scheduleIn(delay, self.tick_task)</span>
+<span class="a">+    self.scheduled = true</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- True when the xpointer is at or after the lower limit.</span>
+<span class="a">+function SubRead:_isAtOrAfter(floor_xpointer, xpointer)</span>
+<span class="a">+    if not floor_xpointer then return true end</span>
+<span class="a">+    -- compareXPointers returns 1 when xp2 is after xp1, 0 when they are the</span>
+<span class="a">+    -- same, -1 when not, nil when one of them is not valid</span>
+<span class="a">+    -- (credocument.lua:750-754).</span>
+<span class="a">+    local order = self.ui.document:compareXPointers(floor_xpointer, xpointer)</span>
+<span class="a">+    return order == nil or order &gt;= 0</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+-- How many cues back to look for a place that is already known.</span>
+<span class="a">+local FLOOR_LOOKBACK = 50</span>
+<span class="a">+</span>
+<span class="a">+--- Returns the place of the nearest cue before index that is already found.</span>
+<span class="a">+function SubRead:_floorFor(index)</span>
+<span class="a">+    local first = index - FLOOR_LOOKBACK</span>
+<span class="a">+    if first &lt; 1 then first = 1 end</span>
+<span class="a">+    for at = index - 1, first, -1 do</span>
+<span class="a">+        local found = self.located[at]</span>
+<span class="a">+        if found then return found[1] end</span>
+<span class="a">+    end</span>
+<span class="a">+    return nil</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Finds the place of a cue in the book.</span>
+<span class="a">+-- The search starts at the current page and runs forward, so the plugin never</span>
+<span class="a">+-- reads the whole book for every cue. Hits before the last found place are</span>
+<span class="a">+-- dropped, so a word that comes again on the same page cannot pull the</span>
+<span class="a">+-- follow backward.</span>
+<span class="a">+-- @return start xpointer, end xpointer, or nil</span>
+<span class="a">+function SubRead:_locate(index)</span>
+<span class="a">+    local cached = self.located[index]</span>
+<span class="a">+    if cached then</span>
+<span class="a">+        self.manual_seek = false</span>
+<span class="a">+        return cached[1], cached[2]</span>
+<span class="a">+    end</span>
+<span class="a">+    local cue = self.cues:get(index)</span>
+<span class="a">+    if not cue or cue.no_place then return nil end</span>
+<span class="a">+</span>
+<span class="a">+    local origin, floor = SEARCH_FROM_CURRENT_PAGE, self.last_xpointer</span>
+<span class="a">+    if self.manual_seek then</span>
+<span class="a">+        self.manual_seek = false</span>
+<span class="a">+        origin, floor = SEARCH_WHOLE_BOOK, self:_floorFor(index)</span>
+<span class="a">+    end</span>
+<span class="a">+</span>
+<span class="a">+    local document = self.ui.document</span>
+<span class="a">+    for _, anchor in ipairs(Text.anchors(cue.norm)) do</span>
+<span class="a">+        -- findText(pattern, origin, direction, case_insensitive, page, regex,</span>
+<span class="a">+        -- max_hits, search_flags) (credocument.lua:1442). Each hit holds the</span>
+<span class="a">+        -- xpointers &quot;start&quot; and &quot;end&quot; (readersearch.lua:446-447).</span>
+<span class="a">+        local hits = document:findText(anchor, origin, SEARCH_FORWARD,</span>
+<span class="a">+            true, self.view.state.page, false, SEARCH_MAX_HITS, SEARCH_FLAGS)</span>
+<span class="a">+        if hits then</span>
+<span class="a">+            for _, hit in ipairs(hits) do</span>
+<span class="a">+                if hit.start and self:_isAtOrAfter(floor, hit.start) then</span>
+<span class="a">+                    self.located[index] = { hit.start, hit[&quot;end&quot;] }</span>
+<span class="a">+                    return hit.start, hit[&quot;end&quot;]</span>
+<span class="a">+                end</span>
+<span class="a">+            end</span>
+<span class="a">+        end</span>
+<span class="a">+    end</span>
+<span class="a">+    return nil</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Brings the cue on screen and marks it.</span>
+<span class="a">+function SubRead:showCue(index)</span>
+<span class="a">+    local cue = self.cues:get(index)</span>
+<span class="a">+    if not cue or cue.no_place then return end</span>
+<span class="a">+    -- After a miss, do not search again for the next few cues.</span>
+<span class="a">+    if index &lt; self.retry_from_index then return end</span>
+<span class="a">+</span>
+<span class="a">+    local pos0, pos1 = self:_locate(index)</span>
+<span class="a">+    if not pos0 then</span>
+<span class="a">+        self.miss_streak = self.miss_streak + 1</span>
+<span class="a">+        local step = math.floor(2 ^ (self.miss_streak - 1))</span>
+<span class="a">+        if step &gt; MISS_BACKOFF_MAX then step = MISS_BACKOFF_MAX end</span>
+<span class="a">+        self.retry_from_index = index + step</span>
+<span class="a">+        logger.dbg(&quot;SubRead: cue&quot;, index, &quot;not found, next try at&quot;, self.retry_from_index)</span>
+<span class="a">+        return</span>
+<span class="a">+    end</span>
+<span class="a">+    self.miss_streak = 0</span>
+<span class="a">+    self.retry_from_index = 0</span>
+<span class="a">+    self.last_xpointer = pos0</span>
+<span class="a">+    self:drawCue(pos0, pos1)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Turns the page if needed and draws the mark.</span>
+<span class="a">+-- The mark is the crengine selection, the same one that KOReader draws for a</span>
+<span class="a">+-- full text search hit (readersearch.lua:946). crengine draws it itself, so</span>
+<span class="a">+-- it costs no extra widget, it survives a page turn, and it is never written</span>
+<span class="a">+-- into the book&#x27;s annotations.</span>
+<span class="a">+function SubRead:drawCue(pos0, pos1)</span>
+<span class="a">+    local document = self.ui.document</span>
+<span class="a">+    local was_visible = document:isXPointerInCurrentPage(pos0)</span>
+<span class="a">+    if not was_visible then</span>
+<span class="a">+        self.ui.rolling:onGotoXPointer(pos0)</span>
+<span class="a">+    end</span>
+<span class="a">+    if pos1 then</span>
+<span class="a">+        document:getTextFromXPointers(pos0, pos1, true)</span>
+<span class="a">+    end</span>
+<span class="a">+    -- A page turn needs a partial refresh. A mark that moves inside the same</span>
+<span class="a">+    -- page only needs the light &quot;ui&quot; refresh.</span>
+<span class="a">+    UIManager:setDirty(self.view.dialog, was_visible and &quot;ui&quot; or &quot;partial&quot;)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Draws the cue that is on again, after something else used the selection.</span>
+<span class="a">+function SubRead:redrawCurrentCue()</span>
+<span class="a">+    if not self.current_index then return end</span>
+<span class="a">+    local pos0, pos1 = self:_locate(self.current_index)</span>
+<span class="a">+    if pos0 then self:drawCue(pos0, pos1) end</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- Page and time ]]--</span>
+<span class="a">+</span>
+<span class="a">+--- Returns the text of the current page, or nil.</span>
+<span class="a">+function SubRead:currentPageText()</span>
+<span class="a">+    local document = self.ui.document</span>
+<span class="a">+    local page = document:getCurrentPage()</span>
+<span class="a">+    if not page then return nil end</span>
+<span class="a">+    -- getPageXPointer gives the xpointer of the first line of a page</span>
+<span class="a">+    -- (credocument.lua:888).</span>
+<span class="a">+    local from_xpointer = document:getPageXPointer(page)</span>
+<span class="a">+    local to_xpointer = document:getPageXPointer(page + 1)</span>
+<span class="a">+    if not from_xpointer or not to_xpointer then return nil end</span>
+<span class="a">+    return document:getTextFromXPointers(from_xpointer, to_xpointer, false)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Returns the index of the first cue on the current page, or nil.</span>
+<span class="a">+function SubRead:cueIndexForCurrentPage()</span>
+<span class="a">+    if not self.cues then return nil end</span>
+<span class="a">+    local page_text = self:currentPageText()</span>
+<span class="a">+    if not page_text or page_text == &quot;&quot; then return nil end</span>
+<span class="a">+    local index = self.cues:findIndexForText(page_text)</span>
+<span class="a">+    -- getTextFromXPointers with draw_selection false can drop the mark, so</span>
+<span class="a">+    -- put it back.</span>
+<span class="a">+    if self.clock:isRunning() then self:redrawCurrentCue() end</span>
+<span class="a">+    return index</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:showPageTime()</span>
+<span class="a">+    if not self:checkSupported() then return end</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    local index = self:cueIndexForCurrentPage()</span>
+<span class="a">+    if not index then</span>
+<span class="a">+        self:showMessage(_(&quot;No cue of the subtitle file was found on this page.&quot;))</span>
+<span class="a">+        return</span>
+<span class="a">+    end</span>
+<span class="a">+    local cue = self.cues:get(index)</span>
+<span class="a">+    local player_time = cue.start + self.clock.offset</span>
+<span class="a">+    self:showMessage(T(_(&quot;This page starts at %1 in the audio.\n\n%2&quot;),</span>
+<span class="a">+        datetime.secondsToClock(player_time, false),</span>
+<span class="a">+        Text.ellipsize(cue.text, TITLE_CHARS)))</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:syncToPage()</span>
+<span class="a">+    if not self:checkSupported() then return end</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    local index = self:cueIndexForCurrentPage()</span>
+<span class="a">+    if not index then</span>
+<span class="a">+        self:showMessage(_(&quot;No cue of the subtitle file was found on this page.&quot;))</span>
+<span class="a">+        return</span>
+<span class="a">+    end</span>
+<span class="a">+    self:syncToCue(index)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Sets the clock to the start of a cue.</span>
+<span class="a">+function SubRead:syncToCue(index)</span>
+<span class="a">+    local cue = self.cues:get(index)</span>
+<span class="a">+    if not cue then return end</span>
+<span class="a">+    local now = self:_now()</span>
+<span class="a">+    self.clock:seekCueTime(cue.start, now)</span>
+<span class="a">+    self:_manualSeek()</span>
+<span class="a">+    self:_tick()</span>
+<span class="a">+    self:showNotification(T(_(&quot;Synced to %1&quot;),</span>
+<span class="a">+        datetime.secondsToClock(cue.start + self.clock.offset, false)))</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Sets the clock from a piece of text that the user selected.</span>
+<span class="a">+function SubRead:syncToSelectedText(selected)</span>
+<span class="a">+    if not self:checkSupported() then return end</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    local needle = Text.normalize(selected or &quot;&quot;)</span>
+<span class="a">+    if Text.len(needle) &lt; 4 then</span>
+<span class="a">+        self:showMessage(_(&quot;Select a few more words, so the line can be found.&quot;))</span>
+<span class="a">+        return</span>
+<span class="a">+    end</span>
+<span class="a">+    -- A long selection can hold text of more than one cue, so cut it down.</span>
+<span class="a">+    if Text.len(needle) &gt; SYNC_NEEDLE_CHARS then</span>
+<span class="a">+        needle = Text.sub(needle, 1, SYNC_NEEDLE_CHARS)</span>
+<span class="a">+    end</span>
+<span class="a">+    local index = self.cues:findIndexContaining(needle)</span>
+<span class="a">+    if not index then</span>
+<span class="a">+        self:showMessage(_(&quot;That text was not found in the subtitle file.&quot;))</span>
+<span class="a">+        return</span>
+<span class="a">+    end</span>
+<span class="a">+    self:syncToCue(index)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:addToHighlightDialog()</span>
+<span class="a">+    -- &quot;13_&quot; sorts after the last button that KOReader itself adds</span>
+<span class="a">+    -- (readerhighlight.lua:246-261, qrclipboard.koplugin/main.lua:30).</span>
+<span class="a">+    self.ui.highlight:addToHighlightDialog(&quot;13_subread_sync&quot;, function(this)</span>
+<span class="a">+        return {</span>
+<span class="a">+            text = _(&quot;SubRead: sync here&quot;),</span>
+<span class="a">+            callback = function()</span>
+<span class="a">+                local selected = this.selected_text and this.selected_text.text</span>
+<span class="a">+                this:onClose(true)</span>
+<span class="a">+                self:syncToSelectedText(selected)</span>
+<span class="a">+            end,</span>
+<span class="a">+        }</span>
+<span class="a">+    end)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- Dialogs ]]--</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:checkSupported()</span>
+<span class="a">+    if self:isSupported() then return true end</span>
+<span class="a">+    self:showMessage(_(&quot;SubRead read-along needs an EPUB, FB2, TXT or HTML book. PDF and DjVu are not supported.&quot;))</span>
+<span class="a">+    return false</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:showMessage(text)</span>
+<span class="a">+    UIManager:show(InfoMessage:new{ text = text })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:showNotification(text)</span>
+<span class="a">+    UIManager:show(Notification:new{ text = text, timeout = 2 })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:statusText()</span>
+<span class="a">+    local now = self:_now()</span>
+<span class="a">+    local clock_text = datetime.secondsToClock(self.clock:getPosition(now), false)</span>
+<span class="a">+    local line = self.clock:isRunning() and T(_(&quot;Clock: %1, running&quot;), clock_text)</span>
+<span class="a">+                                         or T(_(&quot;Clock: %1, paused&quot;), clock_text)</span>
+<span class="a">+    if self.cues and self.current_index then</span>
+<span class="a">+        local cue = self.cues:get(self.current_index)</span>
+<span class="a">+        if cue then</span>
+<span class="a">+            line = line .. &quot;\n&quot; .. Text.ellipsize(cue.text, TITLE_CHARS)</span>
+<span class="a">+        end</span>
+<span class="a">+    end</span>
+<span class="a">+    return line</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:closeControls()</span>
+<span class="a">+    if self.controls_dialog then</span>
+<span class="a">+        UIManager:close(self.controls_dialog)</span>
+<span class="a">+        self.controls_dialog = nil</span>
+<span class="a">+    end</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--- Shows the read-along controls. The dialog is built again after each</span>
+<span class="a">+--- button, so the title always shows the clock as it is now.</span>
+<span class="a">+function SubRead:showControls()</span>
+<span class="a">+    if not self:checkSupported() then return end</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    self:closeControls()</span>
+<span class="a">+</span>
+<span class="a">+    local function again(action)</span>
+<span class="a">+        return function()</span>
+<span class="a">+            action()</span>
+<span class="a">+            self:showControls()</span>
+<span class="a">+        end</span>
+<span class="a">+    end</span>
+<span class="a">+</span>
+<span class="a">+    self.controls_dialog = ButtonDialog:new{</span>
+<span class="a">+        title = self:statusText(),</span>
+<span class="a">+        title_align = &quot;center&quot;,</span>
+<span class="a">+        buttons = {</span>
+<span class="a">+            {</span>
+<span class="a">+                { text = _(&quot;Prev. cue&quot;),</span>
+<span class="a">+                  callback = again(function() self:skipCues(-1) end) },</span>
+<span class="a">+                { text = _(&quot;-10 s&quot;),</span>
+<span class="a">+                  callback = again(function() self:seekAndShow(self.clock:getPosition(self:_now()) - 10) end) },</span>
+<span class="a">+                { text = _(&quot;+10 s&quot;),</span>
+<span class="a">+                  callback = again(function() self:seekAndShow(self.clock:getPosition(self:_now()) + 10) end) },</span>
+<span class="a">+                { text = _(&quot;Next cue&quot;),</span>
+<span class="a">+                  callback = again(function() self:skipCues(1) end) },</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                { text = self.clock:isRunning() and _(&quot;Pause&quot;) or _(&quot;Start&quot;),</span>
+<span class="a">+                  callback = again(function() self:toggle() end) },</span>
+<span class="a">+                { text = _(&quot;Stop&quot;),</span>
+<span class="a">+                  callback = function()</span>
+<span class="a">+                      self:stop()</span>
+<span class="a">+                      self:closeControls()</span>
+<span class="a">+                  end },</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                { text = _(&quot;Sync to this page&quot;),</span>
+<span class="a">+                  callback = again(function() self:syncToPage() end) },</span>
+<span class="a">+                { text = _(&quot;Go to time…&quot;),</span>
+<span class="a">+                  callback = function()</span>
+<span class="a">+                      self:closeControls()</span>
+<span class="a">+                      self:showGoToTime()</span>
+<span class="a">+                  end },</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                { text = T(_(&quot;Speed: %1&quot;), string.format(&quot;%.2f&quot;, self.clock.speed)),</span>
+<span class="a">+                  callback = function()</span>
+<span class="a">+                      self:closeControls()</span>
+<span class="a">+                      self:showSpeed()</span>
+<span class="a">+                  end },</span>
+<span class="a">+                { text = T(_(&quot;Offset: %1 s&quot;), string.format(&quot;%+d&quot;, self.clock.offset)),</span>
+<span class="a">+                  callback = function()</span>
+<span class="a">+                      self:closeControls()</span>
+<span class="a">+                      self:showOffset()</span>
+<span class="a">+                  end },</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                { text = _(&quot;What time is this page?&quot;),</span>
+<span class="a">+                  callback = again(function() self:showPageTime() end) },</span>
+<span class="a">+            },</span>
+<span class="a">+        },</span>
+<span class="a">+    }</span>
+<span class="a">+    UIManager:show(self.controls_dialog)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:showGoToTime()</span>
+<span class="a">+    if not self:checkSupported() then return end</span>
+<span class="a">+    if not self:loadSubtitles() then return end</span>
+<span class="a">+    local position = self.clock:getPosition(self:_now())</span>
+<span class="a">+    local hour = math.floor(position / 3600)</span>
+<span class="a">+    local minute = math.floor(position / 60) % 60</span>
+<span class="a">+    local second = math.floor(position) % 60</span>
+<span class="a">+    UIManager:show(DateTimeWidget:new{</span>
+<span class="a">+        title_text = _(&quot;Go to time&quot;),</span>
+<span class="a">+        info_text = _(&quot;Enter the position of the audio player.&quot;),</span>
+<span class="a">+        hour = hour,</span>
+<span class="a">+        hour_max = 99,</span>
+<span class="a">+        min = minute,</span>
+<span class="a">+        sec = second,</span>
+<span class="a">+        ok_text = _(&quot;Go&quot;),</span>
+<span class="a">+        callback = function(widget)</span>
+<span class="a">+            -- The widget writes the picked values back into itself before it</span>
+<span class="a">+            -- calls us (datetimewidget.lua:396-406).</span>
+<span class="a">+            self:seekAndShow(widget.hour * 3600 + widget.min * 60 + widget.sec)</span>
+<span class="a">+            self:saveState()</span>
+<span class="a">+        end,</span>
+<span class="a">+    })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:showSpeed()</span>
+<span class="a">+    UIManager:show(SpinWidget:new{</span>
+<span class="a">+        title_text = _(&quot;Player speed&quot;),</span>
+<span class="a">+        info_text = _(&quot;Set this to the speed of your audio player.&quot;),</span>
+<span class="a">+        value = self.clock.speed,</span>
+<span class="a">+        value_min = Clock.SPEED_MIN,</span>
+<span class="a">+        value_max = Clock.SPEED_MAX,</span>
+<span class="a">+        value_step = 0.05,</span>
+<span class="a">+        value_hold_step = 0.25,</span>
+<span class="a">+        precision = &quot;%.2f&quot;,</span>
+<span class="a">+        default_value = 1.0,</span>
+<span class="a">+        callback = function(widget)</span>
+<span class="a">+            self.clock:setSpeed(widget.value, self:_now())</span>
+<span class="a">+            self:saveState()</span>
+<span class="a">+            self:_tick()</span>
+<span class="a">+        end,</span>
+<span class="a">+    })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:showOffset()</span>
+<span class="a">+    UIManager:show(SpinWidget:new{</span>
+<span class="a">+        title_text = _(&quot;Audio offset&quot;),</span>
+<span class="a">+        info_text = _(&quot;Seconds to add to the subtitle times. Use a positive value when the audio file starts with an intro.&quot;),</span>
+<span class="a">+        value = self.clock.offset,</span>
+<span class="a">+        value_min = -600,</span>
+<span class="a">+        value_max = 600,</span>
+<span class="a">+        value_step = 1,</span>
+<span class="a">+        value_hold_step = 10,</span>
+<span class="a">+        default_value = 0,</span>
+<span class="a">+        unit = C_(&quot;Time&quot;, &quot;s&quot;),</span>
+<span class="a">+        callback = function(widget)</span>
+<span class="a">+            self.clock:setOffset(widget.value)</span>
+<span class="a">+            self:saveState()</span>
+<span class="a">+            self:_tick()</span>
+<span class="a">+        end,</span>
+<span class="a">+    })</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- Events from a gesture or a key ]]--</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onSubReadShowControls()</span>
+<span class="a">+    self:showControls()</span>
+<span class="a">+    return true</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onSubReadToggle()</span>
+<span class="a">+    if not self:checkSupported() then return true end</span>
+<span class="a">+    if not self:loadSubtitles() then return true end</span>
+<span class="a">+    self:toggle()</span>
+<span class="a">+    self:showNotification(self.clock:isRunning() and _(&quot;Read-along running&quot;) or _(&quot;Read-along paused&quot;))</span>
+<span class="a">+    return true</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:onSubReadSyncToPage()</span>
+<span class="a">+    self:syncToPage()</span>
+<span class="a">+    return true</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+--[[-- Menu ]]--</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:subtitleMenuText()</span>
+<span class="a">+    if not self.srt_path then</span>
+<span class="a">+        return _(&quot;Subtitle file: none&quot;)</span>
+<span class="a">+    end</span>
+<span class="a">+    local _directory, file_name = util.splitFilePathName(self.srt_path)</span>
+<span class="a">+    return T(_(&quot;Subtitle file: %1&quot;), file_name)</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+function SubRead:addToMainMenu(menu_items)</span>
+<span class="a">+    menu_items.subread = {</span>
+<span class="a">+        -- The key is not in reader_menu_order.lua, so MenuSorter puts the</span>
+<span class="a">+        -- entry where the hint says (menusorter.lua:161-182).</span>
+<span class="a">+        sorting_hint = &quot;tools&quot;,</span>
+<span class="a">+        text = _(&quot;SubRead read-along&quot;),</span>
+<span class="a">+        sub_item_table = {</span>
+<span class="a">+            {</span>
+<span class="a">+                text_func = function() return self:subtitleMenuText() end,</span>
+<span class="a">+                keep_menu_open = true,</span>
+<span class="a">+                callback = function(touchmenu_instance)</span>
+<span class="a">+                    if self:checkSupported() then</span>
+<span class="a">+                        self:chooseSubtitleFile(touchmenu_instance)</span>
+<span class="a">+                    end</span>
+<span class="a">+                end,</span>
+<span class="a">+                hold_callback = function(touchmenu_instance)</span>
+<span class="a">+                    self:setSubtitleFile(nil)</span>
+<span class="a">+                    touchmenu_instance:updateItems()</span>
+<span class="a">+                end,</span>
+<span class="a">+                separator = true,</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                text_func = function()</span>
+<span class="a">+                    return self.clock:isRunning() and _(&quot;Read-along controls&quot;)</span>
+<span class="a">+                                                  or _(&quot;Start read-along&quot;)</span>
+<span class="a">+                end,</span>
+<span class="a">+                callback = function(touchmenu_instance)</span>
+<span class="a">+                    touchmenu_instance:onClose()</span>
+<span class="a">+                    if not self:checkSupported() then return end</span>
+<span class="a">+                    if not self.clock:isRunning() then</span>
+<span class="a">+                        self:start()</span>
+<span class="a">+                        if not self.clock:isRunning() then return end</span>
+<span class="a">+                    end</span>
+<span class="a">+                    self:showControls()</span>
+<span class="a">+                end,</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                text = _(&quot;Go to time…&quot;),</span>
+<span class="a">+                keep_menu_open = true,</span>
+<span class="a">+                callback = function() self:showGoToTime() end,</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                text = _(&quot;What time is this page?&quot;),</span>
+<span class="a">+                keep_menu_open = true,</span>
+<span class="a">+                callback = function() self:showPageTime() end,</span>
+<span class="a">+                separator = true,</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                text_func = function()</span>
+<span class="a">+                    return T(_(&quot;Player speed: %1&quot;), string.format(&quot;%.2f&quot;, self.clock.speed))</span>
+<span class="a">+                end,</span>
+<span class="a">+                keep_menu_open = true,</span>
+<span class="a">+                callback = function(touchmenu_instance)</span>
+<span class="a">+                    self:showSpeed()</span>
+<span class="a">+                    if touchmenu_instance then touchmenu_instance:updateItems() end</span>
+<span class="a">+                end,</span>
+<span class="a">+            },</span>
+<span class="a">+            {</span>
+<span class="a">+                text_func = function()</span>
+<span class="a">+                    return T(_(&quot;Audio offset: %1 s&quot;), string.format(&quot;%+d&quot;, self.clock.offset))</span>
+<span class="a">+                end,</span>
+<span class="a">+                keep_menu_open = true,</span>
+<span class="a">+                callback = function(touchmenu_instance)</span>
+<span class="a">+                    self:showOffset()</span>
+<span class="a">+                    if touchmenu_instance then touchmenu_instance:updateItems() end</span>
+<span class="a">+                end,</span>
+<span class="a">+            },</span>
+<span class="a">+        },</span>
+<span class="a">+    }</span>
+<span class="a">+end</span>
+<span class="a">+</span>
+<span class="a">+return SubRead</span></pre>
+</div></body></html>

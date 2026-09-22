@@ -1,0 +1,1068 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine 2f026cce - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../ideamine/index.html">Log</a> | <a href="../../ideamine/files.html">Files</a> | <a href="../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 2f026cce0259c72ccc730161c4a17f36bc339c43
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-09-21 01:13:39 -0700
+
+ideamine 0.2.0: one /ideas command with shell verbs
+
+/ideas now takes a verb first, as in a shell:
+- ls [lane|-a] [here], cat N..., rm N..., done|start|reopen|drop N:
+  the hook answers these with no model call. rm deletes ideas for good.
+- go [N]: triages new ideas first, then builds. It does not ask
+  questions. It takes a &quot;maybe&quot; idea when no &quot;do&quot; idea is left.
+- all: Claude reads every idea, takes out the ideas that fit the
+  current chat, and does them. The other ideas stay in the queue.
+- sort: triages the inbox now and shows the queue.
+
+/ideas go and /ideas sort replace /idea-go and /idea-triage. The CLI
+uses the same verbs: cat replaces show, sort replaces triage, and rm
+is new.
+
+go now runs its subagent in the foreground. Before, the subagent ran
+in the background, and its result came back in a later turn. The
+permission for idea_update had ended then, so the idea stayed &quot;doing&quot;.
+
+Ideas come from any session, so the recorded folder can be wrong or
+gone. idea_next now tells if the folder exists and lists the whole
+queue. The skill tells Claude to judge which ideas fit the chat, and
+where to build each one.
+
+New MCP tool: idea_remove. idea_next takes triage=true, and idea_list
+takes full=true.
+
+</pre><pre> .claude-plugin/marketplace.json |   2 +-
+ .claude-plugin/plugin.json      |   2 +-
+ README.md                       |  56 ++++++++++++---------
+ bin/ideamine.js                 |  35 +++++++------
+ package.json                    |   2 +-
+ skills/idea-go/SKILL.md         |  14 ------
+ skills/idea-triage/SKILL.md     |  12 -----
+ skills/ideas/SKILL.md           |  28 +++++++++--
+ src/claude.js                   |  22 +++++++--
+ src/hook.js                     |  70 ++++++++++++++++----------
+ src/mcp.js                      | 107 ++++++++++++++++++++++++++++++++--------
+ src/render.js                   |   7 ++-
+ src/rubric.js                   |   2 +-
+ src/store.js                    |  24 +++++++--
+ tests/cli.test.js               |  33 +++++++++++++
+ tests/hook.test.js              |  48 +++++++++++++++---
+ tests/mcp.test.js               |  41 +++++++++++++--
+ tests/store.test.js             |  45 +++++++++++++++++
+ tests/triage.test.js            |   8 +++
+ 19 files changed, 418 insertions(+), 140 deletions(-)
+</pre><pre>diff --git a/.claude-plugin/marketplace.json b/.claude-plugin/marketplace.json
+index c44bedd..9f41517 100644
+--- a/.claude-plugin/marketplace.json
++++ b/.claude-plugin/marketplace.json
+<span class="h">@@ -10,7 +10,7 @@</span>
+     {
+       &quot;name&quot;: &quot;ideamine&quot;,
+       &quot;description&quot;: &quot;An idea inbox for Claude Code. /idea saves an idea without a model call. Claude triages the ideas and picks the cheapest model that can build each one.&quot;,
+<span class="d">-      &quot;version&quot;: &quot;0.1.1&quot;,</span>
+<span class="a">+      &quot;version&quot;: &quot;0.2.0&quot;,</span>
+       &quot;author&quot;: {
+         &quot;name&quot;: &quot;equwal&quot;
+       },
+diff --git a/.claude-plugin/plugin.json b/.claude-plugin/plugin.json
+index f66d7c7..82ae732 100644
+--- a/.claude-plugin/plugin.json
++++ b/.claude-plugin/plugin.json
+<span class="h">@@ -1,6 +1,6 @@</span>
+ {
+   &quot;name&quot;: &quot;ideamine&quot;,
+<span class="d">-  &quot;version&quot;: &quot;0.1.1&quot;,</span>
+<span class="a">+  &quot;version&quot;: &quot;0.2.0&quot;,</span>
+   &quot;description&quot;: &quot;An idea inbox for Claude Code. /idea saves an idea without a model call, so it works at any time, even at your usage limit. Claude triages the ideas and picks the cheapest model that can build each one.&quot;,
+   &quot;author&quot;: {
+     &quot;name&quot;: &quot;equwal&quot;,
+diff --git a/README.md b/README.md
+index b4e321e..09dbde7 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -13,7 +13,7 @@ That line did not call the model. A hook answers `/idea` on your machine before</span>
+ - **does not interrupt the current task.** Claude never sees the idea, so it cannot get distracted by it.
+ - **works on any model, in any session, and when you are out of usage.** Nothing is sent, so there is nothing to rate-limit.
+ 
+<span class="d">-Every session writes to one archive, `~/.ideamine/ideas.json`, whatever project or model it uses. When you are ready, Claude triages the pile. It decides which ideas are worth doing and picks the **cheapest model that can build each one**: Haiku for a typo, Sonnet for a feature, Opus for a redesign. Fable is only for the hardest problems.</span>
+<span class="a">+Every session writes to one archive, `~/.ideamine/ideas.json`, whatever project or model it uses. The archive is a queue. Claude triages new ideas to put the queue in order: it decides which ideas are worth doing and picks the **cheapest model that can build each one**: Haiku for a typo, Sonnet for a feature, Opus for a redesign. Fable is only for the hardest problems. `/ideas go` takes the idea that fits your chat, else the first one, and builds it.</span>
+ 
+ ## Install
+ 
+<span class="h">@@ -35,22 +35,28 @@ Marketplaces you add yourself do not auto-update. To upgrade, run `claude plugin</span>
+ 
+ | Command | What it does | Calls the model? |
+ |---|---|---|
+<span class="d">-| `/idea &lt;text&gt;` | Save an idea. A pasted bulleted list saves one idea per bullet. `#tags` are recorded. | **No** |</span>
+<span class="d">-| `/ideas` | Show the board: doing, do (best first), maybe, inbox | **No** |</span>
+<span class="d">-| `/ideas #12` | Show one idea in full: brief, model, notes | **No** |</span>
+<span class="d">-| `/ideas done 12 shipped it` | Quick edit. Also `drop`, `start`, `reopen` | **No** |</span>
+<span class="d">-| `/ideas inbox` · `do` · `maybe` · `skip` · `done` · `all` · `here` | Filter the board. `here` = this project only | **No** |</span>
+<span class="a">+| `/idea &lt;text&gt;` | Add an idea. A pasted bulleted list adds one idea per bullet. `#tags` are recorded. | **No** |</span>
+<span class="a">+| `/ideas` or `/ideas ls` | List the queue: doing, do (best first), maybe, inbox | **No** |</span>
+<span class="a">+| `/ideas ls done` · `ls -a` · `ls here` | List one lane, every lane, or only this project | **No** |</span>
+<span class="a">+| `/ideas cat 12` | Show idea #12 in full: brief, model, notes | **No** |</span>
+<span class="a">+| `/ideas rm 12 14` | Delete ideas for good | **No** |</span>
+<span class="a">+| `/ideas done 12 shipped it` | Mark an idea done, with a note. Also `start`, `reopen`, `drop` | **No** |</span>
+<span class="a">+| `/ideas go [12]` | Build the idea that fits this chat, else the first in the queue, or #12, on its recommended model. New ideas are triaged first. | Yes, this is the build |</span>
+<span class="a">+| `/ideas all` | Claude reads every idea, takes the ones that fit this chat out of the queue, and does them. The others stay in the queue. | Yes, this is the build |</span>
+<span class="a">+| `/ideas sort` | Triage the inbox now and show the queue. You do not have to: `go` triages when it must. | Yes, briefly |</span>
+ | `/ideas &lt;question&gt;` | Ask about your ideas, e.g. &quot;which ones fit in an hour?&quot; | Yes, briefly |
+<span class="d">-| `/idea-triage` | Score the inbox and choose a model for each idea | Yes, briefly |</span>
+<span class="d">-| `/idea-go [id]` | Build the top idea (or `#id`) with its recommended model | Yes, this is the build |</span>
+ 
+<span class="d">-In the plugin menu the commands also appear as `/ideamine:idea` and so on. Both forms work.</span>
+<span class="a">+The verb comes first, as in a shell. `/ideas all` is a command, not a view: to see every lane, use `/ideas ls -a`. `/ideas help` shows the usage. In the plugin menu the commands also appear as `/ideamine:idea` and `/ideamine:ideas`. Both forms work.</span>
+<span class="a">+</span>
+<span class="a">+`go` does not ask questions. The queue puts the best `do` ideas first, then the best `maybe` ideas. Ideas that the triage marks `skip` stay out of the queue until you `reopen` or `rm` them.</span>
+<span class="a">+</span>
+<span class="a">+You save ideas from any session, so the project that ideamine records is only the folder you were in. That can be a scratch folder that is gone. For this reason, `go` and `all` let Claude judge by the text which ideas fit the current chat, and where to build each one. `go` builds in the current project when the idea fits it. Else it uses the recorded folder if that folder exists, or finds the project that the idea is about. If it cannot find the project, it stops and tells you.</span>
+ 
+ Claude can also save ideas by itself. If you write &quot;idea: dark mode for the popup&quot; or &quot;save that for later&quot;, it calls the `idea_add` tool and continues the current task.
+ 
+ ## Model routing
+ 
+<span class="d">-`/idea-triage` gives each idea a verdict (`do`, `maybe`, `skip`), an impact from 1 to 5, a size from `xs` to `xl`, a one-line reason, and a short brief that an agent can act on without the original chat. It also picks the cheapest model that is likely to finish the idea in one pass. If a weaker model fails and has to retry, that costs more than using the right model once.</span>
+<span class="a">+The triage gives each idea a verdict (`do`, `maybe`, `skip`), an impact from 1 to 5, a size from `xs` to `xl`, a one-line reason, and a short brief that an agent can act on without the original chat. It also picks the cheapest model that is likely to finish the idea in one pass. If a weaker model fails and has to retry, that costs more than using the right model once.</span>
+ 
+ | Model | $ in / out per 1M tokens | Gets ideas like |
+ |---|---|---|
+<span class="h">@@ -59,17 +65,17 @@ Claude can also save ideas by itself. If you write &quot;idea: dark mode for the popu</span>
+ | `opus` (Opus 5) | $5 / $25 | ambiguous or cross-cutting work: architecture, hard debugging, performance, security |
+ | `fable` (Fable 5.1) | $10 / $50 | only the hardest long-horizon or research-grade problems |
+ 
+<span class="d">-The triage does not run on your session&#x27;s model. `/idea-triage` makes one tool call, and the MCP server hands the work to a separate, minimal `claude -p` run on Sonnet (see below). A session on Opus or Fable therefore pays the same few cents as a session on Haiku. If that CLI is not available, Claude does the triage itself.</span>
+<span class="a">+The triage does not run on your session&#x27;s model. `/ideas go` and `/ideas sort` make one tool call, and the MCP server hands the work to a separate, minimal `claude -p` run on Sonnet (see below). Only new ideas are triaged, once each. A session on Opus or Fable therefore pays the same few cents as a session on Haiku. If that CLI is not available, Claude does the triage itself.</span>
+ 
+<span class="d">-Recommendations are stored as aliases, so they stay valid when a newer model ships under the same name. `/idea-go` gives the build to a subagent on the recommended model. The subagent starts with a clean context, so the build does not also re-read your whole conversation. To override a recommendation, run `ideamine model 12 opus` or ask Claude.</span>
+<span class="a">+Recommendations are stored as aliases, so they stay valid when a newer model ships under the same name. `/ideas go` gives the build to a subagent on the recommended model. The subagent starts with a clean context, so the build does not also re-read your whole conversation. To override a recommendation, run `ideamine model 12 opus` or ask Claude.</span>
+ 
+ ## Headless triage
+ 
+ ```bash
+<span class="d">-ideamine triage</span>
+<span class="a">+ideamine sort</span>
+ ```
+ 
+<span class="d">-`/idea-triage` uses this same engine. It is one `claude -p` call on your normal Claude Code login, with no tools, no MCP servers, no settings, a two-line system prompt, and a JSON schema for the output. Four ideas take about 1,700 input tokens, roughly two cents on Sonnet. A normal model turn in a setup with a few MCP servers can re-read tens of thousands of tokens. To keep the inbox sorted while you sleep, schedule the command with cron or Task Scheduler. `--model haiku` makes it cheaper, and `--dry-run` shows the exact prompt.</span>
+<span class="a">+`/ideas go` and `/ideas sort` use this same engine. It is one `claude -p` call on your normal Claude Code login, with no tools, no MCP servers, no settings, a two-line system prompt, and a JSON schema for the output. Four ideas take about 1,700 input tokens, roughly two cents on Sonnet. A normal model turn in a setup with a few MCP servers can re-read tens of thousands of tokens. To keep the inbox sorted while you sleep, schedule the command with cron or Task Scheduler. `--model haiku` makes it cheaper, and `--dry-run` shows the exact prompt.</span>
+ 
+ ## Command line
+ 
+<span class="h">@@ -79,12 +85,13 @@ npm install -g github:equwal/ideamine</span>
+ 
+ ```
+ ideamine add &quot;support vim keys in the popup&quot;      # &quot;-&quot; reads stdin
+<span class="d">-ideamine ls [inbox|do|maybe|skip|doing|done|all] [here]</span>
+<span class="d">-ideamine show 12</span>
+<span class="a">+ideamine ls [inbox|do|maybe|skip|doing|done|-a] [here]</span>
+<span class="a">+ideamine cat 12</span>
+<span class="a">+ideamine rm 12                                    # delete for good</span>
+ ideamine done 12 &quot;shipped in v1.4&quot;                # also: drop, start, reopen, note
+ ideamine next                                     # what to build next
+ ideamine go 12                                    # opens Claude Code on the right model, in the idea&#x27;s project
+<span class="d">-ideamine triage                                   # headless triage (see above)</span>
+<span class="a">+ideamine sort                                     # headless triage (see above)</span>
+ ideamine export IDEAS.md                          # Markdown copy of everything
+ ```
+ 
+<span class="h">@@ -100,7 +107,7 @@ The MCP server works without the plugin. For Claude Desktop, Cursor, or any stdi</span>
+ }
+ ```
+ 
+<span class="d">-Tools: `idea_add`, `idea_list`, `idea_triage`, `idea_update`, `idea_next`. Outside the plugin, the slash commands are MCP prompts. Without the hook, saving goes through the model, which costs a few tokens.</span>
+<span class="a">+Tools: `idea_add`, `idea_list`, `idea_triage`, `idea_update`, `idea_next`, `idea_remove`. Outside the plugin, the slash commands are MCP prompts. Without the hook, saving goes through the model, which costs a few tokens.</span>
+ 
+ ## Where your ideas live
+ 
+<span class="h">@@ -109,22 +116,23 @@ Tools: `idea_add`, `idea_list`, `idea_triage`, `idea_update`, `idea_next`. Outsi</span>
+ | Variable | Default | Purpose |
+ |---|---|---|
+ | `IDEAMINE_HOME` | `~/.ideamine` | archive location |
+<span class="d">-| `IDEAMINE_TRIAGE_MODEL` | `sonnet` | model for `ideamine triage` |</span>
+<span class="a">+| `IDEAMINE_TRIAGE_MODEL` | `sonnet` | model for the headless triage |</span>
+ | `IDEAMINE_CLAUDE_BIN` | `claude` | Claude Code executable |
+ | `IDEAMINE_SETTING_SOURCES` | *(empty)* | set to `user` if your login needs `settings.json` (e.g. `apiKeyHelper`) |
+ 
+ ## How it works
+ 
+ ```
+<span class="d">-/idea …       ──► UserPromptSubmit hook ──► ~/.ideamine/ideas.json ──► &quot;💡 Saved #43&quot;   (model never called)</span>
+<span class="d">-/ideas        ──► same hook, renders the board locally</span>
+<span class="a">+/idea …          ──► UserPromptSubmit hook ──► ~/.ideamine/ideas.json ──► &quot;💡 Saved #43&quot;   (model never called)</span>
+<span class="a">+/ideas ls|cat|rm ──► same hook, answers locally</span>
+ 
+<span class="d">-/idea-triage  ──► Claude ──► MCP idea_triage ──► claude -p (Sonnet, minimal context)</span>
+<span class="a">+/ideas go        ──► Claude ──► MCP idea_next ──► claude -p (Sonnet, minimal context), for new ideas only</span>
+                                               ──► verdict · impact · size · cheapest capable model · brief
+<span class="d">-/idea-go      ──► Claude ──► subagent on that model ──► builds it ──► idea_update: done</span>
+<span class="a">+                            ──► subagent on that model ──► builds it ──► idea_update: done</span>
+<span class="a">+/ideas all       ──► Claude ──► MCP idea_list (full) ──► idea_remove for the ideas that fit this chat ──► builds them</span>
+ ```
+ 
+<span class="d">-The plugin contains a Node MCP server with no dependencies, four skills (the slash commands), and one hook. The hook ignores every prompt except `/idea` and `/ideas`, and those end before any API call. The hook runs directly, not through a shell, and takes about 130 ms per prompt on Windows. The skills are user-only, so their descriptions add no tokens to your sessions. If the archive cannot be read, the hook lets the prompt through, so the `/idea` skill can still save it with the MCP tool. Your text is never dropped.</span>
+<span class="a">+The plugin contains a Node MCP server with no dependencies, two skills (the slash commands), and one hook. The hook ignores every prompt except `/idea` and the local `/ideas` commands, and those end before any API call. The hook runs directly, not through a shell, and takes about 130 ms per prompt on Windows. The skills are user-only, so their descriptions add no tokens to your sessions. If the archive cannot be read, the hook lets the prompt through, so the `/idea` skill can still save it with the MCP tool. Your text is never dropped.</span>
+ 
+ ## Development
+ 
+diff --git a/bin/ideamine.js b/bin/ideamine.js
+index 5a38928..6fab023 100644
+--- a/bin/ideamine.js
++++ b/bin/ideamine.js
+<span class="h">@@ -6,15 +6,16 @@ import fs from &#x27;node:fs&#x27;;</span>
+ const HELP = `ideamine: an idea inbox for Claude Code
+ 
+   ideamine add &lt;idea...&gt;          save an idea (&quot;-&quot; reads stdin; a bulleted list = one idea per bullet)
+<span class="d">-  ideamine ls [filter] [here]     board. filters: open inbox do maybe skip doing done dropped all</span>
+<span class="d">-  ideamine show &lt;id&gt;              one idea in full</span>
+<span class="a">+  ideamine ls [lane|-a] [here]    the queue. lanes: open inbox do maybe skip doing done dropped all</span>
+<span class="a">+  ideamine cat &lt;id...&gt;            ideas in full</span>
+<span class="a">+  ideamine rm &lt;id...&gt;             delete ideas for good</span>
+   ideamine done|drop|start|reopen &lt;id&gt; [note...]
+   ideamine note &lt;id&gt; &lt;text...&gt;    append a note
+   ideamine model &lt;id&gt; &lt;haiku|sonnet|opus|fable&gt;   override the recommended model
+   ideamine next [--here]          the idea to build next
+   ideamine go [id] [--print]      open Claude Code on the idea&#x27;s recommended model, in its project
+<span class="d">-  ideamine triage [--model sonnet] [--limit 20] [--dry-run]</span>
+<span class="d">-                                  score the inbox with one headless \`claude -p\` call</span>
+<span class="a">+  ideamine sort [--model sonnet] [--limit 20] [--dry-run]</span>
+<span class="a">+                                  triage the inbox with one headless \`claude -p\` call</span>
+   ideamine export [file.md]       Markdown export of the whole archive
+   ideamine path                   where the archive lives (override with IDEAMINE_HOME)
+   ideamine mcp                    run the MCP server on stdio
+<span class="h">@@ -67,19 +68,23 @@ async function main() {</span>
+       console.log(render.renderAdded(results, store.load()));
+       break;
+     }
+<span class="d">-    case &#x27;ls&#x27;:</span>
+<span class="d">-    case &#x27;list&#x27;:</span>
+<span class="d">-    case &#x27;board&#x27;: {</span>
+<span class="d">-      const lower = words.map((w) =&gt; w.toLowerCase());</span>
+<span class="a">+    case &#x27;ls&#x27;: {</span>
+<span class="a">+      const lower = words.map((w) =&gt; (w === &#x27;-a&#x27; ? &#x27;all&#x27; : w.toLowerCase()));</span>
+       const filter = lower.find((w) =&gt; store.FILTERS.includes(w)) || &#x27;open&#x27;;
+       const here = lower.includes(&#x27;here&#x27;) || flags.here;
+       console.log(render.renderBoard(store.load(), { filter, project: here ? cwd : null, query: flags.query || &#x27;&#x27;, cwd }));
+       break;
+     }
+<span class="d">-    case &#x27;show&#x27;: {</span>
+<span class="d">-      const idea = store.findIdea(store.load(), needId());</span>
+<span class="d">-      if (!idea) fail(`no idea #${words[0]}`);</span>
+<span class="d">-      console.log(render.renderIdea(idea));</span>
+<span class="a">+    case &#x27;cat&#x27;: {</span>
+<span class="a">+      needId();</span>
+<span class="a">+      const db = store.load();</span>
+<span class="a">+      const ideas = words.map((id) =&gt; store.findIdea(db, id) || fail(`no idea #${id.replace(/^#/, &#x27;&#x27;)}`));</span>
+<span class="a">+      console.log(ideas.map(render.renderIdea).join(&#x27;\n\n&#x27;));</span>
+<span class="a">+      break;</span>
+<span class="a">+    }</span>
+<span class="a">+    case &#x27;rm&#x27;: {</span>
+<span class="a">+      needId();</span>
+<span class="a">+      for (const idea of store.removeIdeas(words)) console.log(`Removed #${idea.id} ${clip(idea.title, 60)}`);</span>
+       break;
+     }
+     case &#x27;done&#x27;:
+<span class="h">@@ -107,7 +112,7 @@ async function main() {</span>
+     case &#x27;next&#x27;: {
+       const idea = store.pickNext(store.load(), { project: cwd, only: !!flags.here });
+       if (!idea) {
+<span class="d">-        console.log(&#x27;Nothing is ready to build. Triage the inbox first: ideamine triage&#x27;);</span>
+<span class="a">+        console.log(&#x27;Nothing is ready to build. Triage the inbox first: ideamine sort&#x27;);</span>
+         break;
+       }
+       console.log(render.renderIdea(idea));
+<span class="h">@@ -117,7 +122,7 @@ async function main() {</span>
+       const { buildPrompt, launchSession } = await import(&#x27;../src/claude.js&#x27;);
+       const db = store.load();
+       const idea = words[0] ? store.findIdea(db, words[0]) : store.pickNext(db, { project: cwd });
+<span class="d">-      if (!idea) fail(words[0] ? `no idea #${words[0]}` : &#x27;nothing is ready to build; run: ideamine triage&#x27;);</span>
+<span class="a">+      if (!idea) fail(words[0] ? `no idea #${words[0]}` : &#x27;nothing is ready to build; run: ideamine sort&#x27;);</span>
+       const model = idea.triage?.model || &#x27;sonnet&#x27;;
+       const dir = idea.project &amp;&amp; fs.existsSync(idea.project) ? idea.project : cwd;
+       const prompt = buildPrompt(idea);
+<span class="h">@@ -130,7 +135,7 @@ async function main() {</span>
+       process.exitCode = launchSession({ model, prompt, cwd: dir });
+       break;
+     }
+<span class="d">-    case &#x27;triage&#x27;: {</span>
+<span class="a">+    case &#x27;sort&#x27;: {</span>
+       const { headlessTriage } = await import(&#x27;../src/claude.js&#x27;);
+       const out = await headlessTriage({
+         model: typeof flags.model === &#x27;string&#x27; ? flags.model : undefined,
+diff --git a/package.json b/package.json
+index 16f02c8..ecb6cd4 100644
+--- a/package.json
++++ b/package.json
+<span class="h">@@ -1,6 +1,6 @@</span>
+ {
+   &quot;name&quot;: &quot;ideamine&quot;,
+<span class="d">-  &quot;version&quot;: &quot;0.1.1&quot;,</span>
+<span class="a">+  &quot;version&quot;: &quot;0.2.0&quot;,</span>
+   &quot;description&quot;: &quot;An idea inbox for Claude Code. /idea saves an idea without calling the model; Claude later triages each idea and picks the cheapest model that can build it.&quot;,
+   &quot;type&quot;: &quot;module&quot;,
+   &quot;bin&quot;: {
+diff --git a/skills/idea-go/SKILL.md b/skills/idea-go/SKILL.md
+deleted file mode 100644
+index 2f928f6..0000000
+--- a/skills/idea-go/SKILL.md
++++ /dev/null
+<span class="h">@@ -1,14 +0,0 @@</span>
+----
+<span class="d">-name: idea-go</span>
+<span class="d">-description: Build the top ideamine idea, or a given #id, with the Claude model it was triaged for.</span>
+<span class="d">-argument-hint: &quot;[id]&quot;</span>
+<span class="d">-disable-model-invocation: true</span>
+<span class="d">-allowed-tools: mcp__plugin_ideamine_ideamine__idea_next, mcp__plugin_ideamine_ideamine__idea_update</span>
+----
+<span class="d">-</span>
+<span class="d">-Build one idea from the archive, using the model recommended for it. Requested idea: $ARGUMENTS (empty means the best pick).</span>
+<span class="d">-</span>
+<span class="d">-1. Call `idea_next`. Pass `id` if an id is given. If nothing is ready, say so and suggest /idea-triage. If the idea has no triage yet, ask whether to triage it first, then stop.</span>
+<span class="d">-2. Tell the user the title and the recommended model in one line. Then call `idea_update` with status &quot;doing&quot;.</span>
+<span class="d">-3. Give the build to ONE subagent (Agent tool, general-purpose). Set its `model` to the recommended model (haiku, sonnet, opus, or fable). The purpose of this command is to send each idea to the cheapest model that can do it. In the subagent prompt, include the brief, the original note, and the project directory. Tell the subagent to work only in that directory, and to report what it changed and what is left to do.</span>
+<span class="d">-4. When the subagent returns, call `idea_update`. Use status &quot;done&quot; with a one-line note. If work remains, keep status &quot;doing&quot; and write a note that says what remains. Then summarize in 2-3 lines.</span>
+diff --git a/skills/idea-triage/SKILL.md b/skills/idea-triage/SKILL.md
+deleted file mode 100644
+index 93cc9de..0000000
+--- a/skills/idea-triage/SKILL.md
++++ /dev/null
+<span class="h">@@ -1,12 +0,0 @@</span>
+----
+<span class="d">-name: idea-triage</span>
+<span class="d">-description: Triage the ideamine inbox. Decide which ideas are worth doing, and pick the cheapest Claude model that can build each one.</span>
+<span class="d">-argument-hint: &quot;[max ideas]&quot;</span>
+<span class="d">-disable-model-invocation: true</span>
+<span class="d">-allowed-tools: mcp__plugin_ideamine_ideamine__idea_triage</span>
+----
+<span class="d">-</span>
+<span class="d">-1. Call `idea_triage` with `headless: true`. If a number is given here, pass it as `limit`: $ARGUMENTS</span>
+<span class="d">-   This runs the triage in a separate, minimal Claude Code call. It does not use your context, so it costs little whatever model you are on.</span>
+<span class="d">-2. If the call succeeds, show its summary as returned and name the single best pick. Stop.</span>
+<span class="d">-3. If the call fails (for example, the Claude Code CLI cannot be found), do the triage yourself. Call `idea_triage` with no verdicts to get the rubric and the ideas. Judge every idea. Save all verdicts in ONE `idea_triage` call, with your model name as `by`. Then show the summary.</span>
+diff --git a/skills/ideas/SKILL.md b/skills/ideas/SKILL.md
+index 7e0e539..dae9e9b 100644
+--- a/skills/ideas/SKILL.md
++++ b/skills/ideas/SKILL.md
+<span class="h">@@ -1,11 +1,31 @@</span>
+ ---
+ name: ideas
+<span class="d">-description: Show the ideamine board or one idea, or answer a question about your saved ideas. The ideamine hook answers board and edit requests instantly, with no model call.</span>
+<span class="d">-argument-hint: &quot;[open|inbox|do|maybe|done|all|here] | #id | done|drop|start|reopen &lt;id&gt; | a question&quot;</span>
+<span class="a">+description: The ideamine queue. ls, cat, rm, and done run on your machine with no model call. go builds the next idea on the cheapest model that can do it, all does every idea that fits this chat, and sort triages the inbox.</span>
+<span class="a">+argument-hint: &quot;ls [lane|-a|here] | cat N | rm N | go [N] | all | sort | done|start|reopen N | a question&quot;</span>
+ disable-model-invocation: true
+<span class="d">-allowed-tools: mcp__plugin_ideamine_ideamine__idea_list, mcp__plugin_ideamine_ideamine__idea_update</span>
+<span class="a">+allowed-tools: mcp__plugin_ideamine_ideamine__idea_list, mcp__plugin_ideamine_ideamine__idea_update, mcp__plugin_ideamine_ideamine__idea_next, mcp__plugin_ideamine_ideamine__idea_triage, mcp__plugin_ideamine_ideamine__idea_remove</span>
+ ---
+ 
+ Request: $ARGUMENTS
+ 
+<span class="d">-Call `idea_list`. Pass `filter`, `id`, `query`, or `here` when the request asks for them. Then answer the request from the result. If the request is empty or names only a filter, show the board exactly as returned. To change a status, use `idea_update`. Keep the answer short. Do not start building an idea.</span>
+<span class="a">+The first word of the request is the command. Do not ask the user anything. Do the command.</span>
+<span class="a">+</span>
+<span class="a">+The user saves ideas from any session. Thus the project that an idea records is only the folder the user was in, and that folder can be wrong or gone. Judge by the text of the idea which ideas fit this chat, and where each idea belongs.</span>
+<span class="a">+</span>
+<span class="a">+**go [N]**: build one idea with the model recommended for it.</span>
+<span class="a">+1. Call `idea_next` with `triage: true`. Pass `id` if N is given. The tool triages new ideas first. If it says that the queue is empty, say so in one line and stop. If the triage failed and no idea came back, call `idea_triage` with no verdicts, judge those ideas, save all verdicts in ONE `idea_triage` call with your model name as `by`, and then call `idea_next` again.</span>
+<span class="a">+2. If N is not given, the tool also returns the whole queue. If an idea in the queue clearly fits this chat (the current project or this conversation), call `idea_next` with its `id`, and build that idea. Else build the first idea.</span>
+<span class="a">+3. Choose the directory for the build. Use the current project if the idea fits it. Else use the project directory of the idea if it exists and fits the idea (the tool tells if it exists). Else find the project that the idea is about. If you cannot find it, say so in one line and stop.</span>
+<span class="a">+4. Tell the user the title, the recommended model, and the directory in one line. Then call `idea_update` with status &quot;doing&quot; and `project` set to that directory.</span>
+<span class="a">+5. Give the build to ONE subagent (Agent tool, general-purpose). Set its `model` to the recommended model (haiku, sonnet, opus, or fable). This sends each idea to the cheapest model that can do it. Set `run_in_background` to false. Step 6 must run in this turn, because the permission to use the ideamine tools ends with the turn. In the subagent prompt, include the brief, the original note, and the directory. Tell the subagent to work only in that directory, and to report what it changed and what is left to do.</span>
+<span class="a">+6. When the subagent returns, call `idea_update`. Use status &quot;done&quot; with a one-line note. If work remains, keep status &quot;doing&quot; and write a note that says what remains. Then summarize in 2-3 lines.</span>
+<span class="a">+</span>
+<span class="a">+**all**: do every idea that fits this chat.</span>
+<span class="a">+1. Call `idea_list` with `full: true`. It returns every idea in the queue, in full.</span>
+<span class="a">+2. Choose the ideas that fit this chat: the current project or this conversation. If no idea fits, say so in one line and stop.</span>
+<span class="a">+3. Call `idea_remove` with the `ids` of the ideas that fit. This takes them out of the queue. The other ideas stay in the queue for a chat that they fit.</span>
+<span class="a">+4. Show the user the ideas that you took, one line each, and how many stay in the queue. Then do the ideas that you took, one at a time, as the user&#x27;s request.</span>
+<span class="a">+</span>
+<span class="a">+**sort**: call `idea_triage` with `headless: true`. If that call fails, call `idea_triage` with no verdicts, judge every idea, and save all verdicts in ONE `idea_triage` call with your model name as `by`. Show the result exactly as returned: the verdicts, then the queue.</span>
+<span class="a">+</span>
+<span class="a">+**Anything else** (ls, cat, rm, done, start, reopen, drop, or a question): answer from `idea_list`. Pass `filter`, `id`, `query`, or `here` when the request asks for them. Show a board exactly as returned. To change a status, use `idea_update`. To delete ideas, use `idea_remove`. Keep the answer short. Do not start to build an idea.</span>
+diff --git a/src/claude.js b/src/claude.js
+index cc2bb15..b662934 100644
+--- a/src/claude.js
++++ b/src/claude.js
+<span class="h">@@ -2,7 +2,7 @@</span>
+ 
+ import { spawn, spawnSync } from &#x27;node:child_process&#x27;;
+ import { BATCH_SCHEMA, pendingIdeas, triagePrompt } from &#x27;./rubric.js&#x27;;
+<span class="d">-import { applyTriage, load, normalizeModel } from &#x27;./store.js&#x27;;</span>
+<span class="a">+import { applyTriage, counts, findIdea, load, normalizeModel } from &#x27;./store.js&#x27;;</span>
+ 
+ /** Claude Code executable: explicit override, else the one running us (desktop app), else PATH. */
+ export function claudeBin() {
+<span class="h">@@ -71,12 +71,13 @@ function run(args, input, timeoutMs) {</span>
+ /**
+  * Triage the inbox with a one-shot `claude -p` call: no tools, no MCP servers, no settings, a
+  * two-line system prompt, and JSON-schema output. Runs on the user&#x27;s normal Claude Code login and
+<span class="d">- * costs about 400 tokens per idea, whatever model the calling session uses.</span>
+<span class="a">+ * costs about 400 tokens per idea, whatever model the calling session uses. `ids` triages those</span>
+<span class="a">+ * ideas instead of the inbox.</span>
+  */
+<span class="d">-export async function headlessTriage({ model = process.env.IDEAMINE_TRIAGE_MODEL || &#x27;sonnet&#x27;, limit = 20, dryRun = false, budget = 1 } = {}) {</span>
+<span class="a">+export async function headlessTriage({ model = process.env.IDEAMINE_TRIAGE_MODEL || &#x27;sonnet&#x27;, ids = null, limit = 20, dryRun = false, budget = 1 } = {}) {</span>
+   const alias = normalizeModel(model) || model;
+   const db = load();
+<span class="d">-  const pending = pendingIdeas(db, { limit });</span>
+<span class="a">+  const pending = pendingIdeas(db, { ids, limit });</span>
+   if (!pending.length) return { message: &#x27;Nothing to triage: the inbox is empty.&#x27; };
+ 
+   const prompt = `${triagePrompt(db, pending)}\n\nReturn one verdict for every idea listed above.`;
+<span class="h">@@ -117,6 +118,19 @@ export async function headlessTriage({ model = process.env.IDEAMINE_TRIAGE_MODEL</span>
+   return { results, model: alias, cost: out.total_cost_usd, tokens: { input, output: u.output_tokens || 0 } };
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * The triage that `go` needs before it picks: the idea `id` when it has no verdict, else the whole</span>
+<span class="a">+ * inbox. Returns the headlessTriage result, or null when every candidate has a verdict already.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function triageFirst({ id = null, model } = {}) {</span>
+<span class="a">+  const db = load();</span>
+<span class="a">+  if (id != null) {</span>
+<span class="a">+    const idea = findIdea(db, id);</span>
+<span class="a">+    return idea &amp;&amp; !idea.triage ? headlessTriage({ model, ids: [idea.id] }) : null;</span>
+<span class="a">+  }</span>
+<span class="a">+  return counts(db).inbox ? headlessTriage({ model }) : null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The opening prompt for a fresh session that builds one idea. */
+ export function buildPrompt(idea) {
+   const t = idea.triage;
+diff --git a/src/hook.js b/src/hook.js
+index c5b6025..bd8e5d2 100644
+--- a/src/hook.js
++++ b/src/hook.js
+<span class="h">@@ -1,18 +1,28 @@</span>
+<span class="d">-// UserPromptSubmit hook: answers /idea and /ideas locally and blocks the prompt, so the model is</span>
+<span class="d">-// never called. That makes capture free, instant, and possible even when the session is out of</span>
+<span class="d">-// usage. Every other prompt passes through untouched.</span>
+<span class="a">+// UserPromptSubmit hook: answers /idea and the local /ideas commands (ls, cat, rm, done, ...) and</span>
+<span class="a">+// blocks the prompt, so the model is never called. That makes capture free, instant, and possible</span>
+<span class="a">+// even when the session is out of usage. Every other prompt passes through untouched, including</span>
+<span class="a">+// /ideas go, all, sort, and questions, which the /ideas skill answers.</span>
+ 
+ import { renderAdded, renderBoard, renderIdea } from &#x27;./render.js&#x27;;
+<span class="d">-import { addIdeas, FILTERS, findIdea, lane, load, updateIdea } from &#x27;./store.js&#x27;;</span>
+<span class="a">+import { addIdeas, FILTERS, findIdea, lane, load, removeIdeas, updateIdea } from &#x27;./store.js&#x27;;</span>
+ import { clip, splitIdeas } from &#x27;./text.js&#x27;;
+ 
+ // `/idea ...`, `/ideas ...`, and the plugin-qualified `/ideamine:idea ...` forms.
+ const COMMAND = /^\s*\/(?:ideamine:)?(ideas?)(?=\s|$)([\s\S]*)$/i;
+ const EDIT_VERBS = { done: &#x27;done&#x27;, finish: &#x27;done&#x27;, drop: &#x27;dropped&#x27;, doing: &#x27;doing&#x27;, start: &#x27;doing&#x27;, reopen: &#x27;reopen&#x27; };
+<span class="a">+const ID = /^#?\d+$/;</span>
+ 
+<span class="d">-const USAGE =</span>
+<span class="d">-  &#x27;Usage: /idea &lt;your idea&gt;   saves it without calling the model (a bulleted list saves one idea per bullet)\n&#x27; +</span>
+<span class="d">-  &#x27;       /ideas [open|inbox|do|maybe|skip|doing|done|dropped|all|here] · /ideas #12 · /ideas done|drop|start|reopen 12 [note]&#x27;;</span>
+<span class="a">+const USAGE = `Usage: /idea &lt;text&gt;                  add an idea (a bulleted list adds one idea per bullet)</span>
+<span class="a">+       /ideas [ls [lane|-a] [here]]   list the queue. Lanes: inbox do maybe skip doing done dropped</span>
+<span class="a">+       /ideas cat N...                show ideas in full</span>
+<span class="a">+       /ideas rm N...                 delete ideas for good</span>
+<span class="a">+       /ideas done|start|reopen|drop N [note]</span>
+<span class="a">+These call the model:</span>
+<span class="a">+       /ideas go [N]                  build the next idea, or #N, on its model. New ideas are triaged first.</span>
+<span class="a">+       /ideas all                     do every idea that fits this chat. The others stay in the queue.</span>
+<span class="a">+       /ideas sort                    triage the inbox now and show the queue`;</span>
+<span class="a">+</span>
+<span class="a">+const noIdea = (ids) =&gt; `No idea ${ids.map((id) =&gt; `#${String(id).replace(/^#/, &#x27;&#x27;)}`).join(&#x27;, &#x27;)}.`;</span>
+ 
+ function readStdin() {
+   return new Promise((resolve) =&gt; {
+<span class="h">@@ -38,33 +48,43 @@ export function handlePrompt(prompt, { cwd = process.cwd(), session = null } = {</span>
+     return renderAdded(results, load());
+   }
+ 
+<span class="d">-  // /ideas</span>
+<span class="d">-  const words = arg.split(/\s+/).filter(Boolean);</span>
+<span class="a">+  // /ideas &lt;verb&gt; [args]. The verb comes first, as in a shell, so &quot;all&quot; is never a view.</span>
+<span class="a">+  const [first = &#x27;ls&#x27;, ...rest] = arg.split(/\s+/).filter(Boolean);</span>
+<span class="a">+  const verb = first.toLowerCase();</span>
+<span class="a">+  const ids = ID.test(first) ? [first, ...rest] : rest;</span>
+<span class="a">+  const allIds = ids.length &gt; 0 &amp;&amp; ids.every((w) =&gt; ID.test(w));</span>
+   const db = load();
+ 
+<span class="d">-  if (!words.length) return renderBoard(db, { cwd, hints: true });</span>
+<span class="a">+  if (verb === &#x27;ls&#x27;) {</span>
+<span class="a">+    const lower = rest.map((w) =&gt; (w === &#x27;-a&#x27; ? &#x27;all&#x27; : w.toLowerCase()));</span>
+<span class="a">+    const filters = lower.filter((w) =&gt; FILTERS.includes(w));</span>
+<span class="a">+    const here = lower.includes(&#x27;here&#x27;);</span>
+<span class="a">+    if (filters.length + (here ? 1 : 0) === lower.length &amp;&amp; filters.length &lt;= 1) {</span>
+<span class="a">+      return renderBoard(db, { filter: filters[0] || &#x27;open&#x27;, project: here ? cwd : null, cwd, hints: true });</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+ 
+<span class="d">-  if (words.length === 1 &amp;&amp; /^#?\d+$/.test(words[0])) {</span>
+<span class="d">-    const idea = findIdea(db, words[0]);</span>
+<span class="d">-    return idea ? renderIdea(idea) : `No idea ${words[0].startsWith(&#x27;#&#x27;) ? words[0] : &#x27;#&#x27; + words[0]}.`;</span>
+<span class="a">+  if ((verb === &#x27;cat&#x27; || ID.test(first)) &amp;&amp; allIds) {</span>
+<span class="a">+    const missing = ids.filter((id) =&gt; !findIdea(db, id));</span>
+<span class="a">+    return missing.length ? noIdea(missing) : ids.map((id) =&gt; renderIdea(findIdea(db, id))).join(&#x27;\n\n&#x27;);</span>
+   }
+ 
+<span class="d">-  const verb = EDIT_VERBS[words[0]?.toLowerCase()];</span>
+<span class="d">-  if (verb &amp;&amp; words[1] &amp;&amp; /^#?\d+$/.test(words[1])) {</span>
+<span class="d">-    const note = words.slice(2).join(&#x27; &#x27;);</span>
+<span class="d">-    const idea = updateIdea(words[1], { status: verb, note: note || undefined });</span>
+<span class="d">-    return `✓ #${idea.id} ${clip(idea.title, 60)} → ${lane(idea)}${note ? &#x27; (note added)&#x27; : &#x27;&#x27;}`;</span>
+<span class="a">+  if (verb === &#x27;rm&#x27; &amp;&amp; allIds) {</span>
+<span class="a">+    const missing = ids.filter((id) =&gt; !findIdea(db, id));</span>
+<span class="a">+    if (missing.length) return noIdea(missing);</span>
+<span class="a">+    return removeIdeas(ids).map((i) =&gt; `✗ Removed #${i.id} · ${clip(i.title, 60)}`).join(&#x27;\n&#x27;);</span>
+   }
+ 
+<span class="d">-  const lower = words.map((w) =&gt; w.toLowerCase());</span>
+<span class="d">-  const filters = lower.filter((w) =&gt; FILTERS.includes(w));</span>
+<span class="d">-  const here = lower.includes(&#x27;here&#x27;);</span>
+<span class="d">-  if (filters.length + (here ? 1 : 0) === lower.length &amp;&amp; filters.length &lt;= 1) {</span>
+<span class="d">-    return renderBoard(db, { filter: filters[0] || &#x27;open&#x27;, project: here ? cwd : null, cwd, hints: true });</span>
+<span class="a">+  const status = EDIT_VERBS[verb];</span>
+<span class="a">+  if (status &amp;&amp; rest[0] &amp;&amp; ID.test(rest[0])) {</span>
+<span class="a">+    const note = rest.slice(1).join(&#x27; &#x27;);</span>
+<span class="a">+    const idea = updateIdea(rest[0], { status, note: note || undefined });</span>
+<span class="a">+    return `✓ #${idea.id} ${clip(idea.title, 60)} → ${lane(idea)}${note ? &#x27; (note added)&#x27; : &#x27;&#x27;}`;</span>
+   }
+<span class="d">-  if (lower[0] === &#x27;help&#x27;) return USAGE;</span>
+ 
+<span class="d">-  return null; // a question about the ideas: let the model answer it (via the /ideas skill)</span>
+<span class="a">+  if (verb === &#x27;help&#x27;) return USAGE;</span>
+<span class="a">+</span>
+<span class="a">+  return null; // go, all, sort, or a question: the /ideas skill answers it with the model</span>
+ }
+ 
+ export async function runHook() {
+diff --git a/src/mcp.js b/src/mcp.js
+index d41e83f..5a5a4ee 100644
+--- a/src/mcp.js
++++ b/src/mcp.js
+<span class="h">@@ -4,10 +4,23 @@</span>
+ import fs from &#x27;node:fs&#x27;;
+ import readline from &#x27;node:readline&#x27;;
+ import { fileURLToPath } from &#x27;node:url&#x27;;
+<span class="d">-import { headlessTriage } from &#x27;./claude.js&#x27;;</span>
+<span class="a">+import { headlessTriage, triageFirst } from &#x27;./claude.js&#x27;;</span>
+ import { renderAdded, renderBoard, renderIdea } from &#x27;./render.js&#x27;;
+ import { BATCH_SCHEMA, MODELS, pendingIdeas, triagePrompt } from &#x27;./rubric.js&#x27;;
+<span class="d">-import { addIdeas, applyTriage, counts, FILTERS, findIdea, lane, load, pickNext, STATUSES, updateIdea } from &#x27;./store.js&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  addIdeas,</span>
+<span class="a">+  applyTriage,</span>
+<span class="a">+  counts,</span>
+<span class="a">+  FILTERS,</span>
+<span class="a">+  findIdea,</span>
+<span class="a">+  lane,</span>
+<span class="a">+  listIdeas,</span>
+<span class="a">+  load,</span>
+<span class="a">+  pickNext,</span>
+<span class="a">+  removeIdeas,</span>
+<span class="a">+  STATUSES,</span>
+<span class="a">+  updateIdea,</span>
+<span class="a">+} from &#x27;./store.js&#x27;;</span>
+ import { clip, splitIdeas } from &#x27;./text.js&#x27;;
+ 
+ const ROOT = new URL(&#x27;..&#x27;, import.meta.url);
+<span class="h">@@ -43,7 +56,7 @@ const TOOLS = [</span>
+   },
+   {
+     name: &#x27;idea_list&#x27;,
+<span class="d">-    description: &#x27;Show the idea board, or one idea in full when id is given.&#x27;,</span>
+<span class="a">+    description: &#x27;Show the idea board, or one idea in full when id is given. full=true shows every listed idea in full.&#x27;,</span>
+     inputSchema: {
+       type: &#x27;object&#x27;,
+       properties: {
+<span class="h">@@ -52,6 +65,7 @@ const TOOLS = [</span>
+         query: { type: &#x27;string&#x27;, description: &#x27;Only ideas containing all of these words.&#x27; },
+         here: { type: &#x27;boolean&#x27;, description: &#x27;Only ideas from the current project.&#x27; },
+         limit: { type: &#x27;integer&#x27; },
+<span class="a">+        full: { type: &#x27;boolean&#x27;, description: &#x27;Every listed idea in full (brief, text, notes), not one line each.&#x27; },</span>
+       },
+       additionalProperties: false,
+     },
+<span class="h">@@ -100,17 +114,35 @@ const TOOLS = [</span>
+   {
+     name: &#x27;idea_next&#x27;,
+     description:
+<span class="d">-      &#x27;Pick the idea to build next (verdict &quot;do&quot;, best value per effort, current project first), or fetch one &#x27; +</span>
+<span class="d">-      &#x27;by id. Returns its brief, project, and the model recommended to build it.&#x27;,</span>
+<span class="a">+      &#x27;Pick the idea to build next (verdict &quot;do&quot; before &quot;maybe&quot;, current project first, then best value per &#x27; +</span>
+<span class="a">+      &#x27;effort), or fetch one by id. Returns its brief, project, and the model recommended to build it. Without &#x27; +</span>
+<span class="a">+      &#x27;id, it also returns the whole queue. triage=true first triages the untriaged candidates (the inbox, or &#x27; +</span>
+<span class="a">+      &#x27;the given id) in one headless call.&#x27;,</span>
+     inputSchema: {
+       type: &#x27;object&#x27;,
+       properties: {
+         id: { type: &#x27;integer&#x27; },
+         here: { type: &#x27;boolean&#x27;, description: &#x27;Only consider ideas from the current project.&#x27; },
+<span class="a">+        triage: { type: &#x27;boolean&#x27;, description: &#x27;Triage untriaged candidates first, so the pick and the model are current.&#x27; },</span>
+       },
+       additionalProperties: false,
+     },
+<span class="d">-    annotations: { title: &#x27;Next idea&#x27;, readOnlyHint: true, openWorldHint: false },</span>
+<span class="a">+    annotations: { title: &#x27;Next idea&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },</span>
+<span class="a">+  },</span>
+<span class="a">+  {</span>
+<span class="a">+    name: &#x27;idea_remove&#x27;,</span>
+<span class="a">+    description:</span>
+<span class="a">+      &#x27;Take ideas out of the queue: delete them from the archive for good, and return each one in full. &#x27; +</span>
+<span class="a">+      &#x27;An unknown id is an error, and then nothing is deleted.&#x27;,</span>
+<span class="a">+    inputSchema: {</span>
+<span class="a">+      type: &#x27;object&#x27;,</span>
+<span class="a">+      properties: {</span>
+<span class="a">+        ids: { type: &#x27;array&#x27;, items: { type: &#x27;integer&#x27; }, description: &#x27;The ideas to delete.&#x27; },</span>
+<span class="a">+      },</span>
+<span class="a">+      required: [&#x27;ids&#x27;],</span>
+<span class="a">+      additionalProperties: false,</span>
+<span class="a">+    },</span>
+<span class="a">+    annotations: { title: &#x27;Remove ideas&#x27;, readOnlyHint: false, destructiveHint: true, openWorldHint: false },</span>
+   },
+ ];
+ 
+<span class="h">@@ -118,10 +150,7 @@ const TOOLS = [</span>
+ // The prompt text is the matching SKILL.md body, so both stay in sync.
+ const PROMPTS = [
+   { name: &#x27;idea&#x27;, skill: &#x27;idea&#x27;, description: &#x27;Save an idea for later&#x27;, arguments: [{ name: &#x27;text&#x27;, required: true }] },
+<span class="d">-  { name: &#x27;ideas&#x27;, skill: &#x27;ideas&#x27;, description: &#x27;Show the idea board&#x27;, arguments: [{ name: &#x27;request&#x27;, required: false }] },</span>
+<span class="d">-  { name: &#x27;idea-triage&#x27;, skill: &#x27;idea-triage&#x27;, description: &#x27;Score the untriaged ideas&#x27;, arguments: [] },</span>
+<span class="d">-  { name: &#x27;idea-go&#x27;, skill: &#x27;idea-go&#x27;, description: &#x27;Build the top idea with its model&#x27;, arguments: [{ name: &#x27;id&#x27;, required: false }] },</span>
+<span class="d">-];</span>
+<span class="a">+  { name: &#x27;ideas&#x27;, skill: &#x27;ideas&#x27;, description: &#x27;The idea queue: ls, cat, rm, go, all, sort&#x27;, arguments: [{ name: &#x27;request&#x27;, required: false }] },];</span>
+ 
+ function skillBody(name, args) {
+   const file = new URL(`skills/${name}/SKILL.md`, ROOT);
+<span class="h">@@ -140,6 +169,15 @@ function summarizeTriage(results, how = &#x27;&#x27;) {</span>
+   return lines.join(&#x27;\n&#x27;);
+ }
+ 
+<span class="a">+function headlessSummary(out) {</span>
+<span class="a">+  return out.message || summarizeTriage(out.results, `${out.model}, ${out.tokens.input} in / ${out.tokens.output} out tokens`);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The board after a triage, so the user sees every idea in its new place. */</span>
+<span class="a">+function withBoard(text) {</span>
+<span class="a">+  return `${text}\n\n${renderBoard(load(), { cwd: currentProject(), hints: true })}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // ---------------------------------------------------------------------------------------------
+ // Tool handlers return plain text for the model.
+ 
+<span class="h">@@ -149,23 +187,27 @@ const handlers = {</span>
+     return renderAdded(results, load());
+   },
+ 
+<span class="d">-  idea_list({ id, filter = &#x27;open&#x27;, query = &#x27;&#x27;, here = false, limit = 0 }) {</span>
+<span class="a">+  idea_list({ id, filter = &#x27;open&#x27;, query = &#x27;&#x27;, here = false, limit = 0, full = false }) {</span>
+     const db = load();
+     if (id != null) {
+       const idea = findIdea(db, id);
+       if (!idea) throw new Error(`no idea #${id}`);
+       return renderIdea(idea);
+     }
+<span class="d">-    return renderBoard(db, { filter, query, limit, project: here ? currentProject() : null, cwd: currentProject() });</span>
+<span class="a">+    const project = here ? currentProject() : null;</span>
+<span class="a">+    if (full) {</span>
+<span class="a">+      const ideas = listIdeas(db, { filter, query, limit, project });</span>
+<span class="a">+      return ideas.length ? ideas.map(renderIdea).join(&#x27;\n\n&#x27;) : &#x27;No ideas match.&#x27;;</span>
+<span class="a">+    }</span>
+<span class="a">+    return renderBoard(db, { filter, query, limit, project, cwd: currentProject() });</span>
+   },
+ 
+   async idea_triage({ verdicts, ids, limit, by, headless = false, model }) {
+     if (headless) {
+<span class="d">-      const out = await headlessTriage({ model, limit: limit || 20 });</span>
+<span class="d">-      return out.message || summarizeTriage(out.results, `${out.model}, ${out.tokens.input} in / ${out.tokens.output} out tokens`);</span>
+<span class="a">+      return withBoard(headlessSummary(await headlessTriage({ model, limit: limit || 20 })));</span>
+     }
+     if (Array.isArray(verdicts) &amp;&amp; verdicts.length) {
+<span class="d">-      return summarizeTriage(applyTriage(verdicts, { by: by ? clip(by, 40) : &#x27;claude&#x27; }));</span>
+<span class="a">+      return withBoard(summarizeTriage(applyTriage(verdicts, { by: by ? clip(by, 40) : &#x27;claude&#x27; })));</span>
+     }
+     limit ||= 30;
+     const db = load();
+<span class="h">@@ -186,7 +228,16 @@ const handlers = {</span>
+     return `Updated ${bits.join(&#x27; · &#x27;)}`;
+   },
+ 
+<span class="d">-  idea_next({ id, here = false }) {</span>
+<span class="a">+  async idea_next({ id, here = false, triage = false }) {</span>
+<span class="a">+    const out = [];</span>
+<span class="a">+    if (triage) {</span>
+<span class="a">+      try {</span>
+<span class="a">+        const res = await triageFirst({ id });</span>
+<span class="a">+        if (res) out.push(headlessSummary(res));</span>
+<span class="a">+      } catch (e) {</span>
+<span class="a">+        out.push(`Triage failed: ${e.message}`);</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+     const db = load();
+     let idea;
+     if (id != null) {
+<span class="h">@@ -197,16 +248,30 @@ const handlers = {</span>
+     }
+     if (!idea) {
+       const c = counts(db);
+<span class="d">-      return c.inbox</span>
+<span class="d">-        ? `No idea is ready to build. ${c.inbox} untriaged in the inbox: triage them first.`</span>
+<span class="d">-        : &#x27;No idea is ready to build, and the inbox is empty.&#x27;;</span>
+<span class="a">+      out.push(</span>
+<span class="a">+        c.inbox</span>
+<span class="a">+          ? `No idea is ready: ${c.inbox} untriaged in the inbox.${triage ? &#x27;&#x27; : &#x27; Pass triage: true to triage them first.&#x27;}`</span>
+<span class="a">+          : `The queue is empty${here ? &#x27; for this project&#x27; : &#x27;&#x27;}.`,</span>
+<span class="a">+      );</span>
+<span class="a">+      return out.join(&#x27;\n\n&#x27;);</span>
+     }
+     const t = idea.triage;
+     const lines = [renderIdea(idea), &#x27;&#x27;];
+     if (!t) lines.push(&#x27;recommended model: none yet (untriaged)&#x27;);
+     else lines.push(`recommended model: ${t.model}`);
+<span class="d">-    lines.push(`project dir: ${idea.project || &#x27;(none recorded)&#x27;}`);</span>
+<span class="d">-    return lines.join(&#x27;\n&#x27;);</span>
+<span class="a">+    // Ideas are saved from any session, so the recorded folder can be a scratch folder that is gone.</span>
+<span class="a">+    const dir = idea.project;</span>
+<span class="a">+    lines.push(`project dir: ${dir ? `${dir} (${fs.existsSync(dir) ? &#x27;exists&#x27; : &#x27;does not exist&#x27;})` : &#x27;(none recorded)&#x27;}`);</span>
+<span class="a">+    out.push(lines.join(&#x27;\n&#x27;));</span>
+<span class="a">+    // The whole queue, so the caller can choose an idea that fits its chat better than the first one.</span>
+<span class="a">+    if (id == null) out.push(`The queue:\n${renderBoard(db, { cwd: currentProject() })}`);</span>
+<span class="a">+    return out.join(&#x27;\n\n&#x27;);</span>
+<span class="a">+  },</span>
+<span class="a">+</span>
+<span class="a">+  idea_remove({ ids = [] }) {</span>
+<span class="a">+    if (!ids.length) throw new Error(&#x27;pass the ids to delete&#x27;);</span>
+<span class="a">+    const gone = removeIdeas(ids);</span>
+<span class="a">+    return [`Removed ${gone.length} idea${gone.length === 1 ? &#x27;&#x27; : &#x27;s&#x27;}.`, ...gone.map(renderIdea)].join(&#x27;\n\n&#x27;);</span>
+   },
+ };
+ 
+diff --git a/src/render.js b/src/render.js
+index 32b121a..23279d6 100644
+--- a/src/render.js
++++ b/src/render.js
+<span class="h">@@ -62,10 +62,9 @@ export function renderBoard(db, { filter = &#x27;open&#x27;, project = null, query = &#x27;&#x27;, c</span>
+     out.push(ideaLine(idea, { cwd }));
+   }
+   if (hints) {
+<span class="d">-    const c = counts(db);</span>
+<span class="d">-    const tips = [&#x27;/idea &lt;text&gt; to add&#x27;, &#x27;/ideas #N for details&#x27;];</span>
+<span class="d">-    if (c.inbox) tips.push(&#x27;/idea-triage to score the inbox&#x27;);</span>
+<span class="d">-    if (c.do) tips.push(&#x27;/idea-go to build the top pick&#x27;);</span>
+<span class="a">+    const tips = [&#x27;/idea &lt;text&gt; add&#x27;];</span>
+<span class="a">+    if (counts(db).open) tips.push(&#x27;/ideas go build next&#x27;, &#x27;/ideas all do all that fit here&#x27;);</span>
+<span class="a">+    if (db.ideas.length) tips.push(&#x27;/ideas cat N show&#x27;, &#x27;/ideas rm N delete&#x27;, &#x27;/ideas help&#x27;);</span>
+     out.push(&#x27;&#x27;, tips.join(&#x27; · &#x27;));
+   }
+   return out.join(&#x27;\n&#x27;);
+diff --git a/src/rubric.js b/src/rubric.js
+index c28fb33..1de0e18 100644
+--- a/src/rubric.js
++++ b/src/rubric.js
+<span class="h">@@ -1,5 +1,5 @@</span>
+ // How ideas are judged and which model builds them. Both triage paths (the MCP tool used by
+<span class="d">-// /idea-triage and the headless `ideamine triage`) read this file.</span>
+<span class="a">+// /ideas go and /ideas sort, and the headless `ideamine sort`) read this file.</span>
+ 
+ import path from &#x27;node:path&#x27;;
+ import { lane, listIdeas } from &#x27;./store.js&#x27;;
+diff --git a/src/store.js b/src/store.js
+index 56742c3..d863332 100644
+--- a/src/store.js
++++ b/src/store.js
+<span class="h">@@ -202,14 +202,19 @@ export function counts(db) {</span>
+   return c;
+ }
+ 
+<span class="d">-/** Best idea to build next: verdict &quot;do&quot;, not started, current project first, then value per effort. */</span>
+<span class="a">+const READY_LANES = [&#x27;do&#x27;, &#x27;maybe&#x27;];</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Best idea to build next: verdict &quot;do&quot; before &quot;maybe&quot;, not started, current project first, then</span>
+<span class="a">+ * value per effort. A &quot;maybe&quot; idea is still in the queue, so /ideas go builds it when no &quot;do&quot; is left.</span>
+<span class="a">+ */</span>
+ export function pickNext(db, { project = null, only = false } = {}) {
+<span class="d">-  let ready = db.ideas.filter((i) =&gt; lane(i) === &#x27;do&#x27;);</span>
+<span class="a">+  let ready = db.ideas.filter((i) =&gt; READY_LANES.includes(lane(i)));</span>
+   if (only) ready = ready.filter((i) =&gt; samePath(i.project, project));
+   ready.sort((a, b) =&gt; {
+     const pa = project &amp;&amp; samePath(a.project, project) ? 1 : 0;
+     const pb = project &amp;&amp; samePath(b.project, project) ? 1 : 0;
+<span class="d">-    return pb - pa || priority(b) - priority(a) || a.id - b.id;</span>
+<span class="a">+    return READY_LANES.indexOf(lane(a)) - READY_LANES.indexOf(lane(b)) || pb - pa || priority(b) - priority(a) || a.id - b.id;</span>
+   });
+   return ready[0] || null;
+ }
+<span class="h">@@ -299,6 +304,19 @@ export function applyTriage(verdicts, { by = null } = {}) {</span>
+   );
+ }
+ 
+<span class="a">+/** Delete ideas for good and return them. An unknown id is an error, and then nothing is deleted. */</span>
+<span class="a">+export function removeIdeas(ids) {</span>
+<span class="a">+  return mutate((db) =&gt; {</span>
+<span class="a">+    const gone = ids.map((id) =&gt; {</span>
+<span class="a">+      const idea = findIdea(db, id);</span>
+<span class="a">+      if (!idea) throw new Error(`no idea #${String(id).replace(/^#/, &#x27;&#x27;)}`);</span>
+<span class="a">+      return idea;</span>
+<span class="a">+    });</span>
+<span class="a">+    db.ideas = db.ideas.filter((i) =&gt; !gone.includes(i));</span>
+<span class="a">+    return [...new Set(gone)];</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ const STATUS_ALIASES = { start: &#x27;doing&#x27;, started: &#x27;doing&#x27;, finish: &#x27;done&#x27;, finished: &#x27;done&#x27;, drop: &#x27;dropped&#x27; };
+ 
+ export function updateIdea(id, patch = {}) {
+diff --git a/tests/cli.test.js b/tests/cli.test.js
+new file mode 100644
+index 0000000..56b856f
+--- /dev/null
++++ b/tests/cli.test.js
+<span class="h">@@ -0,0 +1,33 @@</span>
+<span class="a">+import assert from &#x27;node:assert/strict&#x27;;</span>
+<span class="a">+import { spawnSync } from &#x27;node:child_process&#x27;;</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import os from &#x27;node:os&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import { beforeEach, test } from &#x27;node:test&#x27;;</span>
+<span class="a">+import { fileURLToPath } from &#x27;node:url&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const BIN = fileURLToPath(new URL(&#x27;../bin/ideamine.js&#x27;, import.meta.url));</span>
+<span class="a">+</span>
+<span class="a">+beforeEach(() =&gt; {</span>
+<span class="a">+  process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-cli-&#x27;));</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+function cli(...args) {</span>
+<span class="a">+  const r = spawnSync(process.execPath, [BIN, ...args], { encoding: &#x27;utf8&#x27;, env: process.env });</span>
+<span class="a">+  return { out: r.stdout, err: r.stderr, code: r.status };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;the CLI uses the same unix verbs as /ideas: ls, cat, rm, sort&#x27;, () =&gt; {</span>
+<span class="a">+  for (const idea of [&#x27;alpha&#x27;, &#x27;beta&#x27;, &#x27;gamma&#x27;]) assert.equal(cli(&#x27;add&#x27;, idea).code, 0);</span>
+<span class="a">+  assert.match(cli(&#x27;cat&#x27;, &#x27;1&#x27;, &#x27;#3&#x27;).out, /^#1 alpha\n[\s\S]*\n\n#3 gamma\n/);</span>
+<span class="a">+  assert.equal(cli(&#x27;rm&#x27;, &#x27;2&#x27;).out, &#x27;Removed #2 beta\n&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+  const missing = cli(&#x27;rm&#x27;, &#x27;1&#x27;, &#x27;9&#x27;);</span>
+<span class="a">+  assert.equal(missing.code, 1);</span>
+<span class="a">+  assert.match(missing.err, /no idea #9/); // and #1 is still there</span>
+<span class="a">+</span>
+<span class="a">+  const all = cli(&#x27;ls&#x27;, &#x27;-a&#x27;).out;</span>
+<span class="a">+  assert.match(all, /\[showing: all\][\s\S]*#3[\s\S]*#1/);</span>
+<span class="a">+  assert.doesNotMatch(all, /#2 /);</span>
+<span class="a">+  assert.match(cli(&#x27;sort&#x27;, &#x27;--dry-run&#x27;).out, / -p --model sonnet [\s\S]*Ideas to triage \(2\)/);</span>
+<span class="a">+});</span>
+diff --git a/tests/hook.test.js b/tests/hook.test.js
+index 8265a4c..df9690f 100644
+--- a/tests/hook.test.js
++++ b/tests/hook.test.js
+<span class="h">@@ -39,27 +39,61 @@ test(&#x27;plugin-qualified and multi-line forms work&#x27;, () =&gt; {</span>
+   assert.match(runHook(&#x27;/idea - two\n- three&#x27;).reason, /Saved 2 ideas: #2, #3/);
+ });
+ 
+<span class="d">-test(&#x27;ordinary prompts, other commands, and questions pass straight through&#x27;, () =&gt; {</span>
+<span class="d">-  for (const p of [&#x27;fix the tests&#x27;, &#x27;/idea-triage&#x27;, &#x27;/idea-go 3&#x27;, &#x27;/ideasx&#x27;, &#x27;an /idea in the middle&#x27;, &#x27;/ideas what should I build today?&#x27;]) {</span>
+<span class="d">-    assert.equal(runHook(p), null, p);</span>
+<span class="d">-  }</span>
+<span class="a">+test(&#x27;ordinary prompts, model commands, and questions pass straight through&#x27;, () =&gt; {</span>
+<span class="a">+  const prompts = [</span>
+<span class="a">+    &#x27;fix the tests&#x27;,</span>
+<span class="a">+    &#x27;/ideasx&#x27;,</span>
+<span class="a">+    &#x27;an /idea in the middle&#x27;,</span>
+<span class="a">+    &#x27;/ideas go&#x27;,</span>
+<span class="a">+    &#x27;/ideamine:ideas go 3&#x27;,</span>
+<span class="a">+    &#x27;/ideas all&#x27;, // a command, never a view: a view is &quot;ls all&quot;</span>
+<span class="a">+    &#x27;/ideas sort&#x27;,</span>
+<span class="a">+    &#x27;/ideas inbox&#x27;, // the verb comes first, so a bare lane is a request for the model</span>
+<span class="a">+    &#x27;/ideas cat&#x27;,</span>
+<span class="a">+    &#x27;/ideas ls ideas about scrolling&#x27;,</span>
+<span class="a">+    &#x27;/ideas rm the vague one&#x27;,</span>
+<span class="a">+    &#x27;/ideas what should I build today?&#x27;,</span>
+<span class="a">+  ];</span>
+<span class="a">+  for (const p of prompts) assert.equal(runHook(p), null, p);</span>
+   assert.equal(store.load().ideas.length, 0);
+ });
+ 
+<span class="d">-test(&#x27;/ideas shows the board, details, and applies quick edits&#x27;, () =&gt; {</span>
+<span class="a">+test(&#x27;/ideas lists the queue, shows ideas, and applies quick edits&#x27;, () =&gt; {</span>
+   store.addIdeas([&#x27;alpha&#x27;, &#x27;beta&#x27;], { project: &#x27;/work/app&#x27; });
+   assert.match(runHook(&#x27;/ideas&#x27;).reason, /2 open[\s\S]*#2 {3}beta[\s\S]*#1 {3}alpha/);
+<span class="a">+  assert.equal(runHook(&#x27;/ideas ls&#x27;).reason, runHook(&#x27;/ideas&#x27;).reason);</span>
+   assert.match(runHook(&#x27;/ideas #1&#x27;).reason, /^#1 alpha/);
+<span class="a">+  assert.match(runHook(&#x27;/ideas cat 1 2&#x27;).reason, /^#1 alpha\n[\s\S]*\n\n#2 beta\n/);</span>
+   assert.match(runHook(&#x27;/ideas done 1 shipped it&#x27;).reason, /#1 alpha → done/);
+<span class="d">-  assert.match(runHook(&#x27;/ideas done&#x27;).reason, /DONE[\s\S]*#1/);</span>
+<span class="a">+  assert.match(runHook(&#x27;/ideas ls done&#x27;).reason, /DONE[\s\S]*#1/);</span>
+<span class="a">+  assert.match(runHook(&#x27;/ideas ls -a&#x27;).reason, /\[showing: all\][\s\S]*#2[\s\S]*#1/);</span>
+   assert.match(runHook(&#x27;/ideas 9&#x27;).reason, /No idea #9/);
+<span class="a">+  assert.match(runHook(&#x27;/ideas cat 1 8 9&#x27;).reason, /^No idea #8, #9\.$/);</span>
+<span class="a">+  assert.match(runHook(&#x27;/ideas help&#x27;).reason, /^Usage[\s\S]*\/ideas rm N/);</span>
+   assert.match(runHook(&#x27;/idea&#x27;).reason, /^Usage/);
+ });
+ 
+<span class="a">+test(&#x27;/ideas rm deletes ideas for good, without a model call&#x27;, () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;alpha&#x27;, &#x27;beta&#x27;, &#x27;gamma&#x27;, &#x27;delta&#x27;]);</span>
+<span class="a">+  const out = runHook(&#x27;/ideas rm 1 #3&#x27;);</span>
+<span class="a">+  assert.equal(out.decision, &#x27;block&#x27;);</span>
+<span class="a">+  assert.match(out.reason, /Removed #1 · alpha\n.*Removed #3 · gamma$/);</span>
+<span class="a">+  assert.equal(runHook(&#x27;/ideas rm 2 9&#x27;).reason, &#x27;No idea #9.&#x27;); // an unknown id deletes nothing</span>
+<span class="a">+  assert.match(runHook(&#x27;/ideamine:ideas rm 4&#x27;).reason, /Removed #4 · delta/);</span>
+<span class="a">+  assert.deepEqual(store.load().ideas.map((i) =&gt; i.text), [&#x27;beta&#x27;]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;the board tells how to build, take, and remove ideas, and does not send you to a triage&#x27;, () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;alpha&#x27;]);</span>
+<span class="a">+  const board = runHook(&#x27;/ideas&#x27;).reason;</span>
+<span class="a">+  for (const tip of [/\/ideas go/, /\/ideas all/, /\/ideas rm N/]) assert.match(board, tip);</span>
+<span class="a">+  assert.doesNotMatch(board, /\/idea-triage|\/ideas sort/);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ test(&#x27;handlePrompt filters by project with &quot;here&quot;&#x27;, () =&gt; {
+   store.addIdeas([&#x27;mine&#x27;], { project: &#x27;/a&#x27; });
+   store.addIdeas([&#x27;theirs&#x27;], { project: &#x27;/b&#x27; });
+<span class="d">-  const board = handlePrompt(&#x27;/ideas here&#x27;, { cwd: &#x27;/a&#x27; });</span>
+<span class="a">+  const board = handlePrompt(&#x27;/ideas ls here&#x27;, { cwd: &#x27;/a&#x27; });</span>
+   assert.match(board, /mine/);
+   assert.doesNotMatch(board, /theirs/);
+ });
+diff --git a/tests/mcp.test.js b/tests/mcp.test.js
+index 68197cf..147081d 100644
+--- a/tests/mcp.test.js
++++ b/tests/mcp.test.js
+<span class="h">@@ -49,9 +49,9 @@ before(async () =&gt; {</span>
+ 
+ after(() =&gt; server.kill());
+ 
+<span class="d">-test(&#x27;lists the five tools with schemas&#x27;, async () =&gt; {</span>
+<span class="a">+test(&#x27;lists the six tools with schemas&#x27;, async () =&gt; {</span>
+   const res = await request(&#x27;tools/list&#x27;);
+<span class="d">-  assert.deepEqual(res.result.tools.map((t) =&gt; t.name), [&#x27;idea_add&#x27;, &#x27;idea_list&#x27;, &#x27;idea_triage&#x27;, &#x27;idea_update&#x27;, &#x27;idea_next&#x27;]);</span>
+<span class="a">+  assert.deepEqual(res.result.tools.map((t) =&gt; t.name), [&#x27;idea_add&#x27;, &#x27;idea_list&#x27;, &#x27;idea_triage&#x27;, &#x27;idea_update&#x27;, &#x27;idea_next&#x27;, &#x27;idea_remove&#x27;]);</span>
+   for (const t of res.result.tools) assert.equal(t.inputSchema.type, &#x27;object&#x27;);
+ });
+ 
+<span class="h">@@ -107,10 +107,45 @@ test(&#x27;tool errors come back as isError results, not protocol errors&#x27;, async () =</span>
+ 
+ test(&#x27;prompts mirror the skills&#x27;, async () =&gt; {
+   const list = await request(&#x27;prompts/list&#x27;);
+<span class="d">-  assert.deepEqual(list.result.prompts.map((p) =&gt; p.name), [&#x27;idea&#x27;, &#x27;ideas&#x27;, &#x27;idea-triage&#x27;, &#x27;idea-go&#x27;]);</span>
+<span class="a">+  assert.deepEqual(list.result.prompts.map((p) =&gt; p.name), [&#x27;idea&#x27;, &#x27;ideas&#x27;]);</span>
+<span class="a">+  const ideas = await request(&#x27;prompts/get&#x27;, { name: &#x27;ideas&#x27;, arguments: { request: &#x27;go 12&#x27; } });</span>
+<span class="a">+  assert.match(ideas.result.messages[0].content.text, /^Request: go 12\n[\s\S]*idea_next[\s\S]*idea_remove/);</span>
+   const got = await request(&#x27;prompts/get&#x27;, { name: &#x27;idea&#x27;, arguments: { text: &#x27;teleport the cat&#x27; } });
+   const text = got.result.messages[0].content.text;
+   assert.match(text, /teleport the cat/);
+   assert.doesNotMatch(text, /^---/);
+   assert.match(text, /idea_add/);
+ });
+<span class="a">+</span>
+<span class="a">+// The tests below continue from the archive that the tests above left: #1, #3, #4 do; #2 done.</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;idea_list full shows the queue in full, so /ideas all can judge each idea; idea_remove deletes ideas&#x27;, async () =&gt; {</span>
+<span class="a">+  assert.match((await call(&#x27;idea_list&#x27;, { full: true })).text, /^#3 Idea 3\n[^]*\n\n#4 Idea 4\n[^]*\n\n#1 Cache API responses\n/);</span>
+<span class="a">+  const none = await call(&#x27;idea_remove&#x27;, { ids: [] });</span>
+<span class="a">+  assert.equal(none.isError, true);</span>
+<span class="a">+  assert.match((await call(&#x27;idea_remove&#x27;, { ids: [1, 3, 4] })).text, /^Removed 3 ideas\.\n\n#1 Cache API responses\n[^]*\n\n#3 Idea 3\n/);</span>
+<span class="a">+  assert.match((await call(&#x27;idea_list&#x27;)).text, /^ideamine: 0 open · 1 done/);</span>
+<span class="a">+  assert.equal((await call(&#x27;idea_list&#x27;, { full: true })).text, &#x27;No ideas match.&#x27;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;idea_next with triage: true triages first, so /ideas go never has to stop&#x27;, async () =&gt; {</span>
+<span class="a">+  await call(&#x27;idea_add&#x27;, { text: &#x27;- first\n- second\n- third&#x27; }); // #5 #6 #7</span>
+<span class="a">+  assert.match((await call(&#x27;idea_next&#x27;)).text, /^No idea is ready: 3 untriaged in the inbox\. Pass triage: true/);</span>
+<span class="a">+  const next = await call(&#x27;idea_next&#x27;, { triage: true });</span>
+<span class="a">+  assert.match(next.text, /^Saved 3 verdicts: 2 do · 0 maybe · 1 skip/);</span>
+<span class="a">+  assert.match(next.text, /\n\n#5 Idea 5\n[^]*recommended model: sonnet\nproject dir: [^\n]*ideamine-proj-\w+ \(exists\)\n/);</span>
+<span class="a">+  assert.match(next.text, /\n\nThe queue:\nideamine: 2 open \(2 do\)[^]*#5[^]*#6/); // to choose an idea that fits the chat</span>
+<span class="a">+</span>
+<span class="a">+  // An explicit id triages only that idea. A saved folder that is gone is marked.</span>
+<span class="a">+  await call(&#x27;idea_add&#x27;, { text: &#x27;- eighth\n- ninth&#x27;, project: path.join(project, &#x27;gone&#x27;) }); // #8 #9</span>
+<span class="a">+  const nine = (await call(&#x27;idea_next&#x27;, { id: 9, triage: true })).text;</span>
+<span class="a">+  assert.match(nine, /^Saved 1 verdict: 1 do[^]*\n\n#9 Idea 9\n/);</span>
+<span class="a">+  assert.match(nine, /project dir: [^\n]*gone \(does not exist\)$/);</span>
+<span class="a">+  assert.match((await call(&#x27;idea_list&#x27;, { filter: &#x27;inbox&#x27; })).text, /#8 +eighth/);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;a manual triage shows the whole queue afterwards&#x27;, async () =&gt; {</span>
+<span class="a">+  const out = await call(&#x27;idea_triage&#x27;, { headless: true }); // #8, the last one in the inbox</span>
+<span class="a">+  assert.match(out.text, /^Saved 1 verdict: 1 do[^]*\n\nideamine: 4 open \(4 do\) · 1 done\n\nDO \(best first\)\n[^]*#8 +sonnet/);</span>
+<span class="a">+  assert.match((await call(&#x27;idea_triage&#x27;, { headless: true })).text, /^Nothing to triage: the inbox is empty\.\n\nideamine: 4 open/);</span>
+<span class="a">+});</span>
+diff --git a/tests/store.test.js b/tests/store.test.js
+index e17631b..f52abd1 100644
+--- a/tests/store.test.js
++++ b/tests/store.test.js
+<span class="h">@@ -29,6 +29,51 @@ test(&#x27;add, triage, and list ideas by lane and priority&#x27;, () =&gt; {</span>
+   assert.deepEqual(store.counts(db), { inbox: 1, do: 2, maybe: 0, skip: 1, doing: 0, done: 0, dropped: 0, open: 3 });
+ });
+ 
+<span class="a">+test(&#x27;pickNext takes the best &quot;do&quot; idea, else the best &quot;maybe&quot;, and never an idea from another lane&#x27;, () =&gt; {</span>
+<span class="a">+  // Every combination of lanes, so that no lane can get into or out of the queue unseen.</span>
+<span class="a">+  const LANES = [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;, &#x27;inbox&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;, &#x27;dropped&#x27;];</span>
+<span class="a">+  const VERDICTS = [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;];</span>
+<span class="a">+  const make = (lane, id) =&gt; ({</span>
+<span class="a">+    id,</span>
+<span class="a">+    title: lane,</span>
+<span class="a">+    status: VERDICTS.includes(lane) ? &#x27;triaged&#x27; : lane,</span>
+<span class="a">+    triage: lane === &#x27;inbox&#x27; ? null : { verdict: VERDICTS.includes(lane) ? lane : &#x27;do&#x27;, impact: 3, size: &#x27;m&#x27;, model: &#x27;sonnet&#x27; },</span>
+<span class="a">+  });</span>
+<span class="a">+  for (let mask = 0; mask &lt; 1 &lt;&lt; LANES.length; mask++) {</span>
+<span class="a">+    const present = LANES.filter((_, bit) =&gt; mask &amp; (1 &lt;&lt; bit));</span>
+<span class="a">+    const db = { ideas: present.map((lane, i) =&gt; make(lane, i + 1)) };</span>
+<span class="a">+    const want = present.includes(&#x27;do&#x27;) ? &#x27;do&#x27; : present.includes(&#x27;maybe&#x27;) ? &#x27;maybe&#x27; : null;</span>
+<span class="a">+    assert.equal(store.pickNext(db)?.title ?? null, want, `lanes: ${present.join(&#x27;, &#x27;)}`);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // The verdict counts before the project: a &quot;do&quot; idea elsewhere beats a &quot;maybe&quot; idea here.</span>
+<span class="a">+  const db = {</span>
+<span class="a">+    ideas: [</span>
+<span class="a">+      { id: 1, status: &#x27;triaged&#x27;, project: &#x27;/here&#x27;, triage: { verdict: &#x27;maybe&#x27;, impact: 5, size: &#x27;xs&#x27;, model: &#x27;haiku&#x27; } },</span>
+<span class="a">+      { id: 2, status: &#x27;triaged&#x27;, project: &#x27;/there&#x27;, triage: { verdict: &#x27;do&#x27;, impact: 1, size: &#x27;xl&#x27;, model: &#x27;opus&#x27; } },</span>
+<span class="a">+    ],</span>
+<span class="a">+  };</span>
+<span class="a">+  assert.equal(store.pickNext(db, { project: &#x27;/here&#x27; }).id, 2);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;regression: after a triage of &quot;0 do · 1 maybe · 1 skip&quot;, /ideas go still has an idea to build&#x27;, () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;tes&#x27;, &#x27;redesign the AssistKey UI for a premium e-ink feel&#x27;]);</span>
+<span class="a">+  store.applyTriage([</span>
+<span class="a">+    { id: 1, verdict: &#x27;skip&#x27;, impact: 1, size: &#x27;xs&#x27;, model: &#x27;haiku&#x27;, title: &quot;Clarify vague &#x27;tes&#x27; idea&quot;, why: &#x27;w&#x27;, brief: &#x27;&#x27; },</span>
+<span class="a">+    { id: 2, verdict: &#x27;maybe&#x27;, impact: 3, size: &#x27;l&#x27;, model: &#x27;opus&#x27;, title: &#x27;Redesign AssistKey UI&#x27;, why: &#x27;w&#x27;, brief: &#x27;b&#x27; },</span>
+<span class="a">+  ]);</span>
+<span class="a">+  assert.equal(store.pickNext(store.load()).id, 2);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;removeIdeas deletes ideas for good, all or nothing, and never reuses an id&#x27;, () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;one&#x27;, &#x27;two&#x27;, &#x27;three&#x27;]);</span>
+<span class="a">+  assert.throws(() =&gt; store.removeIdeas([1, 99]), /no idea #99/);</span>
+<span class="a">+  assert.equal(store.load().ideas.length, 3); // an unknown id deletes nothing</span>
+<span class="a">+  assert.deepEqual(store.removeIdeas([&#x27;#2&#x27;, 3, &#x27;3&#x27;]).map((i) =&gt; i.id), [2, 3]);</span>
+<span class="a">+  assert.deepEqual(store.load().ideas.map((i) =&gt; i.id), [1]);</span>
+<span class="a">+  assert.equal(store.addIdeas([&#x27;four&#x27;])[0].idea.id, 4);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ test(&#x27;bad verdicts are reported per item, not fatal&#x27;, () =&gt; {
+   store.addIdeas([&#x27;one&#x27;]);
+   const res = store.applyTriage([{ id: 1, verdict: &#x27;yes&#x27; }, { id: 99, verdict: &#x27;do&#x27; }]);
+diff --git a/tests/triage.test.js b/tests/triage.test.js
+index 50a5f3f..914a550 100644
+--- a/tests/triage.test.js
++++ b/tests/triage.test.js
+<span class="h">@@ -60,6 +60,14 @@ test(&#x27;haiku gets no effort flag, and an empty inbox makes no call&#x27;, async () =&gt;</span>
+   assert.ok(!call.args.includes(&#x27;--effort&#x27;));
+ });
+ 
+<span class="a">+test(&#x27;headless triage of given ids judges only those ideas&#x27;, async () =&gt; {</span>
+<span class="a">+  store.addIdeas([&#x27;one&#x27;, &#x27;two&#x27;, &#x27;three&#x27;]);</span>
+<span class="a">+  const out = await headlessTriage({ ids: [3] });</span>
+<span class="a">+  assert.deepEqual(out.results.map((r) =&gt; r.id), [3]);</span>
+<span class="a">+  assert.deepEqual(store.load().ideas.map((i) =&gt; i.status), [&#x27;inbox&#x27;, &#x27;inbox&#x27;, &#x27;triaged&#x27;]);</span>
+<span class="a">+  assert.match(JSON.parse(fs.readFileSync(log, &#x27;utf8&#x27;)).input, /Ideas to triage \(1\):\n#3: three\n/);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ test(&#x27;a missing CLI gives a clear error&#x27;, async () =&gt; {
+   store.addIdeas([&#x27;one&#x27;]);
+   process.env.IDEAMINE_CLAUDE_BIN = path.join(os.tmpdir(), &#x27;definitely-not-claude-xyz&#x27;);</pre>
+</div></body></html>

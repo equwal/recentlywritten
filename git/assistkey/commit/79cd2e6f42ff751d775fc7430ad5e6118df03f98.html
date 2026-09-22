@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey 79cd2e6f - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../assistkey/index.html">Log</a> | <a href="../../assistkey/files.html">Files</a> | <a href="../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 79cd2e6f42ff751d775fc7430ad5e6118df03f98
+truex &lt;truex@equwal.com&gt;
+2026-09-20 15:28:39 -0700
+
+Handle hidden power settings being unreadable, not just unwritable
+
+Android 12 blocks non-system apps from reading settings keys annotated
+@hide, and holding WRITE_SECURE_SETTINGS does not exempt you - reading
+power_button_short_press threw SecurityException and took the main
+screen down on first launch.
+
+Every read now returns null on refusal, the UI says unknown instead of
+inventing a value, and the two gesture switches became explicit On/Off
+pickers because there is nothing to toggle away from when the current
+value cannot be read. Writes are unaffected and still work.
+
+</pre><pre> .../dev/equwal/assistkey/native/PowerNative.kt     |  76 +++++++++-----
+ .../java/dev/equwal/assistkey/ui/MainActivity.kt   |   6 +-
+ .../java/dev/equwal/assistkey/ui/PowerActivity.kt  | 112 +++++++++++++--------
+ 3 files changed, 127 insertions(+), 67 deletions(-)
+</pre><pre>diff --git a/app/src/main/java/dev/equwal/assistkey/native/PowerNative.kt b/app/src/main/java/dev/equwal/assistkey/native/PowerNative.kt
+index f227fe3..ffb5e3c 100644
+--- a/app/src/main/java/dev/equwal/assistkey/native/PowerNative.kt
++++ b/app/src/main/java/dev/equwal/assistkey/native/PowerNative.kt
+<span class="h">@@ -10,33 +10,38 @@ import android.provider.Settings</span>
+  * Settings.Secure rather than in anything an app can intercept.
+  *
+  * This is the only way to touch short-press Power at all: no app ever sees that
+<span class="d">- * event. Writing here needs WRITE_SECURE_SETTINGS, which is not grantable from</span>
+<span class="d">- * a settings screen - it has to come over adb - so every write is attempted and</span>
+<span class="d">- * reported rather than assumed.</span>
+<span class="a">+ * event.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Two separate restrictions apply, and they are not symmetric. Writing needs</span>
+<span class="a">+ * WRITE_SECURE_SETTINGS, which is not grantable from a settings screen - it has</span>
+<span class="a">+ * to come over adb. Reading is blocked outright: since Android 12 a settings</span>
+<span class="a">+ * key annotated @hide throws SecurityException for any non-system caller, and</span>
+<span class="a">+ * holding WRITE_SECURE_SETTINGS does not exempt you. So every read here returns</span>
+<span class="a">+ * null on refusal and the UI says &quot;unknown&quot; rather than inventing a value.</span>
+  */
+ object PowerNative {
+ 
+     const val GRANT_COMMAND =
+         &quot;adb shell pm grant dev.equwal.assistkey android.permission.WRITE_SECURE_SETTINGS&quot;
+ 
+<span class="d">-    private const val SHORT_PRESS = &quot;power_button_short_press&quot;</span>
+<span class="d">-    private const val LONG_PRESS = &quot;power_button_long_press&quot;</span>
+<span class="d">-    private const val LONG_PRESS_MS = &quot;power_button_long_press_duration_ms&quot;</span>
+<span class="d">-    private const val CHORD_VOL_UP = &quot;key_chord_power_volume_up&quot;</span>
+<span class="d">-    private const val CAMERA_DOUBLE_TAP = &quot;camera_double_tap_power_gesture_disabled&quot;</span>
+<span class="d">-    private const val DOUBLE_TAP = &quot;double_tap_power_button_gesture_enabled&quot;</span>
+<span class="a">+    const val SHORT_PRESS = &quot;power_button_short_press&quot;</span>
+<span class="a">+    const val LONG_PRESS = &quot;power_button_long_press&quot;</span>
+<span class="a">+    const val LONG_PRESS_MS = &quot;power_button_long_press_duration_ms&quot;</span>
+<span class="a">+    const val CHORD_VOL_UP = &quot;key_chord_power_volume_up&quot;</span>
+<span class="a">+    const val CAMERA_DOUBLE_TAP = &quot;camera_double_tap_power_gesture_disabled&quot;</span>
+<span class="a">+    const val DOUBLE_TAP = &quot;double_tap_power_button_gesture_enabled&quot;</span>
+ 
+     /** A firmware behaviour with its raw value, for a plain radio list. */
+     data class Option(val value: Int, val label: String, val note: String = &quot;&quot;)
+ 
+     /**
+      * SHORT_PRESS_POWER_* in PhoneWindowManager. 6 and above only exist on
+<span class="d">-     * newer builds; an unsupported value is simply ignored by the framework,</span>
+<span class="d">-     * so they are offered with a warning rather than hidden.</span>
+<span class="a">+     * newer builds; an unsupported value is ignored by the framework, so they</span>
+<span class="a">+     * are offered with a warning rather than hidden.</span>
+      */
+     val shortPress = listOf(
+         Option(1, &quot;Sleep&quot;, &quot;Stock behaviour&quot;),
+<span class="d">-        Option(0, &quot;Nothing&quot;, &quot;Power becomes a free button - use with a long-press binding&quot;),</span>
+<span class="a">+        Option(0, &quot;Nothing&quot;, &quot;Power becomes a free button - pair with a hold binding&quot;),</span>
+         Option(4, &quot;Home&quot;),
+         Option(5, &quot;Close keyboard, else Home&quot;),
+         Option(2, &quot;Sleep immediately&quot;),
+<span class="h">@@ -62,34 +67,58 @@ object PowerNative {</span>
+         Option(0, &quot;Nothing&quot;)
+     )
+ 
+<span class="a">+    val onOff = listOf(Option(1, &quot;On&quot;), Option(0, &quot;Off&quot;))</span>
+<span class="a">+</span>
+     fun canWriteSecure(c: Context): Boolean =
+         c.checkSelfPermission(android.Manifest.permission.WRITE_SECURE_SETTINGS) ==
+             PackageManager.PERMISSION_GRANTED
+ 
+<span class="d">-    // ---- reads (always allowed) -------------------------------------------</span>
+<span class="a">+    // ---- reads: null means unset or refused --------------------------------</span>
+ 
+     private fun cr(c: Context): ContentResolver = c.contentResolver
+ 
+<span class="d">-    fun shortPressValue(c: Context): Int = Settings.Global.getInt(cr(c), SHORT_PRESS, 1)</span>
+<span class="d">-    fun longPressValue(c: Context): Int = Settings.Global.getInt(cr(c), LONG_PRESS, 1)</span>
+<span class="d">-    fun longPressMs(c: Context): Int = Settings.Global.getInt(cr(c), LONG_PRESS_MS, 500)</span>
+<span class="d">-    fun chordVolumeUpValue(c: Context): Int = Settings.Global.getInt(cr(c), CHORD_VOL_UP, 2)</span>
+<span class="a">+    private fun globalInt(c: Context, key: String): Int? =</span>
+<span class="a">+        runCatching { Settings.Global.getString(cr(c), key)?.trim()?.toIntOrNull() }.getOrNull()</span>
+<span class="a">+</span>
+<span class="a">+    private fun secureInt(c: Context, key: String): Int? =</span>
+<span class="a">+        runCatching { Settings.Secure.getString(cr(c), key)?.trim()?.toIntOrNull() }.getOrNull()</span>
+<span class="a">+</span>
+<span class="a">+    fun shortPressValue(c: Context): Int? = globalInt(c, SHORT_PRESS)</span>
+<span class="a">+    fun longPressValue(c: Context): Int? = globalInt(c, LONG_PRESS)</span>
+<span class="a">+    fun longPressMs(c: Context): Int? = globalInt(c, LONG_PRESS_MS)</span>
+<span class="a">+    fun chordVolumeUpValue(c: Context): Int? = globalInt(c, CHORD_VOL_UP)</span>
+ 
+     /** Inverted in the framework: the setting records &quot;disabled&quot;. */
+<span class="d">-    fun cameraDoubleTapEnabled(c: Context): Boolean =</span>
+<span class="d">-        Settings.Secure.getInt(cr(c), CAMERA_DOUBLE_TAP, 0) == 0</span>
+<span class="a">+    fun cameraDoubleTapEnabled(c: Context): Boolean? =</span>
+<span class="a">+        secureInt(c, CAMERA_DOUBLE_TAP)?.let { it == 0 }</span>
+ 
+<span class="d">-    fun doubleTapGestureEnabled(c: Context): Boolean =</span>
+<span class="d">-        Settings.Secure.getInt(cr(c), DOUBLE_TAP, 0) == 1</span>
+<span class="a">+    fun doubleTapGestureEnabled(c: Context): Boolean? =</span>
+<span class="a">+        secureInt(c, DOUBLE_TAP)?.let { it == 1 }</span>
+ 
+<span class="d">-    // ---- writes (need the adb grant) --------------------------------------</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Whether this build lets us read these at all. Used to explain an</span>
+<span class="a">+     * &quot;unknown&quot; rather than leaving the user wondering.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun canRead(c: Context): Boolean =</span>
+<span class="a">+        runCatching { Settings.Global.getString(cr(c), LONG_PRESS); true }.getOrDefault(false)</span>
+<span class="a">+</span>
+<span class="a">+    /** Renders a value against a list, coping with unknown and with junk. */</span>
+<span class="a">+    fun describe(options: List&lt;Option&gt;, value: Int?): String = when {</span>
+<span class="a">+        value == null -&gt; &quot;Unknown&quot;</span>
+<span class="a">+        else -&gt; options.firstOrNull { it.value == value }?.label ?: (&quot;Unknown (&quot; + value + &quot;)&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- writes: need the adb grant ----------------------------------------</span>
+ 
+     fun setShortPress(c: Context, v: Int) = putGlobal(c, SHORT_PRESS, v)
+     fun setLongPress(c: Context, v: Int) = putGlobal(c, LONG_PRESS, v)
+     fun setLongPressMs(c: Context, v: Int) = putGlobal(c, LONG_PRESS_MS, v)
+     fun setChordVolumeUp(c: Context, v: Int) = putGlobal(c, CHORD_VOL_UP, v)
+<span class="a">+</span>
+<span class="a">+    /** Takes the user-facing sense; the stored value is inverted. */</span>
+     fun setCameraDoubleTapEnabled(c: Context, on: Boolean) =
+         putSecure(c, CAMERA_DOUBLE_TAP, if (on) 0 else 1)
+<span class="a">+</span>
+     fun setDoubleTapGestureEnabled(c: Context, on: Boolean) =
+         putSecure(c, DOUBLE_TAP, if (on) 1 else 0)
+ 
+<span class="h">@@ -102,7 +131,4 @@ object PowerNative {</span>
+     /** So the user can paste the exact command when a write is refused. */
+     fun adbFallback(scope: String, key: String, value: Int): String =
+         &quot;adb shell settings put &quot; + scope + &quot; &quot; + key + &quot; &quot; + value
+<span class="d">-</span>
+<span class="d">-    fun shortPressAdb(v: Int) = adbFallback(&quot;global&quot;, SHORT_PRESS, v)</span>
+<span class="d">-    fun longPressAdb(v: Int) = adbFallback(&quot;global&quot;, LONG_PRESS, v)</span>
+ }
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+index bf9849b..55e2aac 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+<span class="h">@@ -125,8 +125,10 @@ class MainActivity : Activity() {</span>
+     private fun powerSummary(): String {
+         val b = Store.bindings(this)
+         val parts = ArrayList&lt;String&gt;()
+<span class="d">-        PowerNative.shortPress.firstOrNull { it.value == PowerNative.shortPressValue(this) }</span>
+<span class="d">-            ?.let { parts.add(&quot;short → &quot; + it.label.lowercase()) }</span>
+<span class="a">+        PowerNative.shortPressValue(this)?.let { v -&gt;</span>
+<span class="a">+            PowerNative.shortPress.firstOrNull { it.value == v }</span>
+<span class="a">+                ?.let { parts.add(&quot;short → &quot; + it.label.lowercase()) }</span>
+<span class="a">+        }</span>
+         b[Channel.POWER_DOUBLE]?.let { parts.add(&quot;double → &quot; + it.describe()) }
+         b[Channel.POWER_HOLD]?.let { parts.add(&quot;hold → &quot; + it.describe()) }
+         return if (parts.isEmpty()) &quot;Default behaviour&quot; else parts.joinToString(&quot;, &quot;)
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt
+index f4a6754..65a5fb4 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt
+<span class="h">@@ -24,25 +24,35 @@ import dev.equwal.assistkey.ui.Ui.title</span>
+  */
+ class PowerActivity : Activity() {
+ 
+<span class="a">+    private var readable = true</span>
+<span class="a">+</span>
+     override fun onResume() {
+         super.onResume()
+         build()
+     }
+ 
+     private fun build() {
+<span class="a">+        readable = PowerNative.canRead(this)</span>
+         val col = Ui.page(this)
+         col.title(&quot;Power button&quot;)
+         col.note(
+             &quot;The system eats the power key before any app can filter it, so &quot; +
+                 &quot;these three slots are everything that is reachable.&quot;
+         )
+<span class="a">+</span>
+         if (!PowerNative.canWriteSecure(this)) {
+             col.note(
+<span class="d">-                &quot;Short press and the firmware gesture switches below need a &quot; +</span>
+<span class="a">+                &quot;The firmware switches below cannot be changed without a &quot; +</span>
+                     &quot;permission that only adb can grant. Run this once with the &quot; +
+                     &quot;device plugged in:&quot;
+             )
+             col.code(PowerNative.GRANT_COMMAND)
+<span class="a">+        } else if (!readable) {</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;Android blocks apps from reading these particular settings, so &quot; +</span>
+<span class="a">+                    &quot;the current values show as unknown. Writing them still &quot; +</span>
+<span class="a">+                    &quot;works - pick a value and it is applied.&quot;</span>
+<span class="a">+            )</span>
+         }
+ 
+         shortPress(col)
+<span class="h">@@ -56,16 +66,14 @@ class PowerActivity : Activity() {</span>
+     private fun shortPress(col: LinearLayout) {
+         col.header(&quot;Short press&quot;)
+         val cur = PowerNative.shortPressValue(this)
+<span class="d">-        val label = PowerNative.shortPress.firstOrNull { it.value == cur }?.label</span>
+<span class="d">-            ?: (&quot;Unknown (&quot; + cur + &quot;)&quot;)</span>
+         col.row(
+<span class="d">-            &quot;Currently: &quot; + label,</span>
+<span class="a">+            &quot;Currently: &quot; + PowerNative.describe(PowerNative.shortPress, cur),</span>
+             &quot;Handled entirely by the firmware - this rewrites its setting&quot;
+         ) {
+             pickNative(&quot;Short press&quot;, PowerNative.shortPress, cur) { v -&gt;
+                 apply(
+                     PowerNative.setShortPress(this, v),
+<span class="d">-                    &quot;global&quot;, &quot;power_button_short_press&quot;, v</span>
+<span class="a">+                    &quot;global&quot;, PowerNative.SHORT_PRESS, v</span>
+                 )
+             }
+         }
+<span class="h">@@ -95,27 +103,27 @@ class PowerActivity : Activity() {</span>
+             startActivity(ActionPickerActivity.intent(this, Channel.POWER_DOUBLE))
+         }
+ 
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Firmware double-press gesture: &quot; +</span>
+<span class="d">-                if (PowerNative.doubleTapGestureEnabled(this)) &quot;on&quot; else &quot;off&quot;,</span>
+<span class="a">+        onOffRow(</span>
+<span class="a">+            col,</span>
+<span class="a">+            &quot;Firmware double-press gesture&quot;,</span>
+<span class="a">+            PowerNative.doubleTapGestureEnabled(this),</span>
+             &quot;Must be on for double press to do anything at all&quot;
+<span class="d">-        ) {</span>
+<span class="d">-            val on = !PowerNative.doubleTapGestureEnabled(this)</span>
+<span class="a">+        ) { on -&gt;</span>
+             apply(
+                 PowerNative.setDoubleTapGestureEnabled(this, on),
+<span class="d">-                &quot;secure&quot;, &quot;double_tap_power_button_gesture_enabled&quot;, if (on) 1 else 0</span>
+<span class="a">+                &quot;secure&quot;, PowerNative.DOUBLE_TAP, if (on) 1 else 0</span>
+             )
+         }
+ 
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Camera double-press gesture: &quot; +</span>
+<span class="d">-                if (PowerNative.cameraDoubleTapEnabled(this)) &quot;on&quot; else &quot;off&quot;,</span>
+<span class="a">+        onOffRow(</span>
+<span class="a">+            col,</span>
+<span class="a">+            &quot;Camera double-press gesture&quot;,</span>
+<span class="a">+            PowerNative.cameraDoubleTapEnabled(this),</span>
+             &quot;The older camera-specific route, still live on this firmware&quot;
+<span class="d">-        ) {</span>
+<span class="d">-            val on = !PowerNative.cameraDoubleTapEnabled(this)</span>
+<span class="a">+        ) { on -&gt;</span>
+             apply(
+                 PowerNative.setCameraDoubleTapEnabled(this, on),
+<span class="d">-                &quot;secure&quot;, &quot;camera_double_tap_power_gesture_disabled&quot;, if (on) 0 else 1</span>
+<span class="a">+                &quot;secure&quot;, PowerNative.CAMERA_DOUBLE_TAP, if (on) 0 else 1</span>
+             )
+         }
+     }
+<span class="h">@@ -125,16 +133,20 @@ class PowerActivity : Activity() {</span>
+     private fun longPress(col: LinearLayout) {
+         col.header(&quot;Press and hold&quot;)
+         val cur = PowerNative.longPressValue(this)
+<span class="d">-        val assistant = cur == 5</span>
+         val held = Channels.isSatisfied(this, Channel.ASSISTANT)
+ 
+         col.note(
+             when {
+<span class="d">-                assistant &amp;&amp; held -&gt;</span>
+<span class="a">+                cur == 5 &amp;&amp; held -&gt;</span>
+                     &quot;Routed here: the firmware sends hold to the assistant, and that is us.&quot;
+<span class="d">-                assistant -&gt;</span>
+<span class="a">+                cur == 5 -&gt;</span>
+                     &quot;The firmware sends hold to the assistant, but this app does not &quot; +
+                         &quot;hold that role yet.&quot;
+<span class="a">+                cur == null &amp;&amp; held -&gt;</span>
+<span class="a">+                    &quot;This app holds the assistant role. Whether the firmware sends &quot; +</span>
+<span class="a">+                        &quot;hold to the assistant cannot be read, so try it and see.&quot;</span>
+<span class="a">+                cur == null -&gt;</span>
+<span class="a">+                    &quot;Neither the firmware setting nor the role is in place yet.&quot;</span>
+                 else -&gt;
+                     &quot;The firmware does not send hold to the assistant, so nothing &quot; +
+                         &quot;reaches this app.&quot;
+<span class="h">@@ -146,28 +158,27 @@ class PowerActivity : Activity() {</span>
+             startActivity(ActionPickerActivity.intent(this, Channel.POWER_HOLD))
+         }
+ 
+<span class="d">-        val label = PowerNative.longPress.firstOrNull { it.value == cur }?.label</span>
+<span class="d">-            ?: (&quot;Unknown (&quot; + cur + &quot;)&quot;)</span>
+<span class="d">-        col.row(&quot;Firmware behaviour: &quot; + label, &quot;Set this to Digital assistant&quot;) {</span>
+<span class="a">+        col.row(</span>
+<span class="a">+            &quot;Firmware behaviour: &quot; + PowerNative.describe(PowerNative.longPress, cur),</span>
+<span class="a">+            &quot;Set this to Digital assistant&quot;</span>
+<span class="a">+        ) {</span>
+             pickNative(&quot;Press and hold&quot;, PowerNative.longPress, cur) { v -&gt;
+<span class="d">-                apply(</span>
+<span class="d">-                    PowerNative.setLongPress(this, v),</span>
+<span class="d">-                    &quot;global&quot;, &quot;power_button_long_press&quot;, v</span>
+<span class="d">-                )</span>
+<span class="a">+                apply(PowerNative.setLongPress(this, v), &quot;global&quot;, PowerNative.LONG_PRESS, v)</span>
+             }
+         }
+ 
+<span class="a">+        val ms = PowerNative.longPressMs(this)</span>
+<span class="a">+        val opts = listOf(250, 350, 500, 650, 800, 1000).map {</span>
+<span class="a">+            PowerNative.Option(it, it.toString() + &quot; ms&quot;)</span>
+<span class="a">+        }</span>
+         col.row(
+<span class="d">-            &quot;Hold time: &quot; + PowerNative.longPressMs(this) + &quot; ms&quot;,</span>
+<span class="a">+            &quot;Hold time: &quot; + PowerNative.describe(opts, ms),</span>
+             &quot;How long the button must be down before it counts as a hold&quot;
+         ) {
+<span class="d">-            val opts = listOf(250, 350, 500, 650, 800, 1000).map {</span>
+<span class="d">-                PowerNative.Option(it, it.toString() + &quot; ms&quot;)</span>
+<span class="d">-            }</span>
+<span class="d">-            pickNative(&quot;Hold time&quot;, opts, PowerNative.longPressMs(this)) { v -&gt;</span>
+<span class="a">+            pickNative(&quot;Hold time&quot;, opts, ms) { v -&gt;</span>
+                 apply(
+                     PowerNative.setLongPressMs(this, v),
+<span class="d">-                    &quot;global&quot;, &quot;power_button_long_press_duration_ms&quot;, v</span>
+<span class="a">+                    &quot;global&quot;, PowerNative.LONG_PRESS_MS, v</span>
+                 )
+             }
+         }
+<span class="h">@@ -176,16 +187,14 @@ class PowerActivity : Activity() {</span>
+     private fun escapeHatch(col: LinearLayout) {
+         col.header(&quot;Escape hatch&quot;)
+         val cur = PowerNative.chordVolumeUpValue(this)
+<span class="d">-        val label = PowerNative.chordVolumeUp.firstOrNull { it.value == cur }?.label</span>
+<span class="d">-            ?: (&quot;Unknown (&quot; + cur + &quot;)&quot;)</span>
+         col.row(
+<span class="d">-            &quot;Power + Volume up: &quot; + label,</span>
+<span class="a">+            &quot;Power + Volume up: &quot; + PowerNative.describe(PowerNative.chordVolumeUp, cur),</span>
+             &quot;Keep this on the power menu so you can always shut down&quot;
+         ) {
+             pickNative(&quot;Power + Volume up&quot;, PowerNative.chordVolumeUp, cur) { v -&gt;
+                 apply(
+                     PowerNative.setChordVolumeUp(this, v),
+<span class="d">-                    &quot;global&quot;, &quot;key_chord_power_volume_up&quot;, v</span>
+<span class="a">+                    &quot;global&quot;, PowerNative.CHORD_VOL_UP, v</span>
+                 )
+             }
+         }
+<span class="h">@@ -193,14 +202,37 @@ class PowerActivity : Activity() {</span>
+ 
+     // ---- helpers -----------------------------------------------------------
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * An explicit On/Off choice rather than a toggle, because when the current</span>
+<span class="a">+     * value cannot be read there is nothing to toggle away from.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun onOffRow(</span>
+<span class="a">+        col: LinearLayout,</span>
+<span class="a">+        title: String,</span>
+<span class="a">+        current: Boolean?,</span>
+<span class="a">+        blurb: String,</span>
+<span class="a">+        onPick: (Boolean) -&gt; Unit</span>
+<span class="a">+    ) {</span>
+<span class="a">+        val shown = when (current) {</span>
+<span class="a">+            true -&gt; &quot;on&quot;</span>
+<span class="a">+            false -&gt; &quot;off&quot;</span>
+<span class="a">+            null -&gt; &quot;unknown&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+        col.row(title + &quot;: &quot; + shown, blurb) {</span>
+<span class="a">+            pickNative(title, PowerNative.onOff, current?.let { if (it) 1 else 0 }) { v -&gt;</span>
+<span class="a">+                onPick(v == 1)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     private fun pickNative(
+         title: String,
+         options: List&lt;PowerNative.Option&gt;,
+<span class="d">-        current: Int,</span>
+<span class="a">+        current: Int?,</span>
+         onPick: (Int) -&gt; Unit
+     ) {
+         val labels = options.map { o -&gt;
+<span class="d">-            val mark = if (o.value == current) &quot;* &quot; else &quot;   &quot;</span>
+<span class="a">+            val mark = if (current != null &amp;&amp; o.value == current) &quot;* &quot; else &quot;   &quot;</span>
+             mark + o.label + if (o.note.isBlank()) &quot;&quot; else &quot;  -  &quot; + o.note
+         }
+         Ui.pick(this, title, labels) { i -&gt; onPick(options[i].value) }
+<span class="h">@@ -213,7 +245,7 @@ class PowerActivity : Activity() {</span>
+         } else {
+             Toast.makeText(
+                 this,
+<span class="d">-                &quot;Refused - run: adb shell settings put &quot; + scope + &quot; &quot; + key + &quot; &quot; + value,</span>
+<span class="a">+                &quot;Refused - run: &quot; + PowerNative.adbFallback(scope, key, value),</span>
+                 Toast.LENGTH_LONG
+             ).show()
+         }</pre>
+</div></body></html>

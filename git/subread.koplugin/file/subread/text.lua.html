@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread.koplugin/subread/text.lua - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subread.koplugin</h1><span class="desc">KOReader plugin: the book follows the narration of an audiobook, from an .srt made by subread.space</span><p class="url">git clone https://github.com/equwal/subread.koplugin</p><p><a href="../../../subread.koplugin/index.html">Log</a> | <a href="../../../subread.koplugin/files.html">Files</a> | <a href="../../../subread.koplugin/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>subread/text.lua (5668 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> --[[--
+<a id="l2" href="#l2">2</a> Text normalisation for SubRead.
+<a id="l3" href="#l3">3</a> 
+<a id="l4" href="#l4">4</a> Pure Lua. No KOReader dependency, so it can be unit tested on a PC.
+<a id="l5" href="#l5">5</a> 
+<a id="l6" href="#l6">6</a> The cue text of a SubRead subtitle is a slice of the book text, but the
+<a id="l7" href="#l7">7</a> white space is not always the same. This module makes a canonical form of a
+<a id="l8" href="#l8">8</a> string, so cue text and book text can be compared.
+<a id="l9" href="#l9">9</a> --]]--
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> local Text = {}
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> -- Byte sequences of the space characters that UTF-8 books use.
+<a id="l14" href="#l14">14</a> -- Lua patterns do not know UTF-8, so the sequences are listed.
+<a id="l15" href="#l15">15</a> local UNICODE_SPACES = {
+<a id="l16" href="#l16">16</a>     &quot;\194\160&quot;,      -- U+00A0 no-break space
+<a id="l17" href="#l17">17</a>     &quot;\226\128\128&quot;,  -- U+2000 en quad
+<a id="l18" href="#l18">18</a>     &quot;\226\128\129&quot;,  -- U+2001 em quad
+<a id="l19" href="#l19">19</a>     &quot;\226\128\130&quot;,  -- U+2002 en space
+<a id="l20" href="#l20">20</a>     &quot;\226\128\131&quot;,  -- U+2003 em space
+<a id="l21" href="#l21">21</a>     &quot;\226\128\132&quot;,  -- U+2004 three-per-em space
+<a id="l22" href="#l22">22</a>     &quot;\226\128\133&quot;,  -- U+2005 four-per-em space
+<a id="l23" href="#l23">23</a>     &quot;\226\128\134&quot;,  -- U+2006 six-per-em space
+<a id="l24" href="#l24">24</a>     &quot;\226\128\135&quot;,  -- U+2007 figure space
+<a id="l25" href="#l25">25</a>     &quot;\226\128\136&quot;,  -- U+2008 punctuation space
+<a id="l26" href="#l26">26</a>     &quot;\226\128\137&quot;,  -- U+2009 thin space
+<a id="l27" href="#l27">27</a>     &quot;\226\128\138&quot;,  -- U+200A hair space
+<a id="l28" href="#l28">28</a>     &quot;\226\128\139&quot;,  -- U+200B zero width space
+<a id="l29" href="#l29">29</a>     &quot;\226\128\168&quot;,  -- U+2028 line separator
+<a id="l30" href="#l30">30</a>     &quot;\226\128\169&quot;,  -- U+2029 paragraph separator
+<a id="l31" href="#l31">31</a>     &quot;\227\128\128&quot;,  -- U+3000 ideographic space
+<a id="l32" href="#l32">32</a>     &quot;\239\187\191&quot;,  -- U+FEFF byte order mark / zero width no-break space
+<a id="l33" href="#l33">33</a> }
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> -- Byte sequences that are removed, not replaced by a space.
+<a id="l36" href="#l36">36</a> local REMOVED = {
+<a id="l37" href="#l37">37</a>     &quot;\194\173&quot;,      -- U+00AD soft hyphen
+<a id="l38" href="#l38">38</a>     &quot;\226\128\140&quot;,  -- U+200C zero width non-joiner
+<a id="l39" href="#l39">39</a>     &quot;\226\128\141&quot;,  -- U+200D zero width joiner
+<a id="l40" href="#l40">40</a> }
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> -- A cue that starts with this character has no place in the book.
+<a id="l43" href="#l43">43</a> Text.NO_PLACE_MARK = &quot;\239\188\138&quot; -- U+FF0A fullwidth asterisk
+<a id="l44" href="#l44">44</a> 
+<a id="l45" href="#l45">45</a> --- Removes a UTF-8 byte order mark from the start of a string.
+<a id="l46" href="#l46">46</a> function Text.stripBOM(s)
+<a id="l47" href="#l47">47</a>     if s:sub(1, 3) == &quot;\239\187\191&quot; then
+<a id="l48" href="#l48">48</a>         return s:sub(4)
+<a id="l49" href="#l49">49</a>     end
+<a id="l50" href="#l50">50</a>     return s
+<a id="l51" href="#l51">51</a> end
+<a id="l52" href="#l52">52</a> 
+<a id="l53" href="#l53">53</a> --- Makes the canonical form of a string.
+<a id="l54" href="#l54">54</a> -- All space characters become one ASCII space. The ends are trimmed.
+<a id="l55" href="#l55">55</a> function Text.normalize(s)
+<a id="l56" href="#l56">56</a>     if not s or s == &quot;&quot; then return &quot;&quot; end
+<a id="l57" href="#l57">57</a>     s = Text.stripBOM(s)
+<a id="l58" href="#l58">58</a>     for _, seq in ipairs(REMOVED) do
+<a id="l59" href="#l59">59</a>         s = s:gsub(seq, &quot;&quot;)
+<a id="l60" href="#l60">60</a>     end
+<a id="l61" href="#l61">61</a>     for _, seq in ipairs(UNICODE_SPACES) do
+<a id="l62" href="#l62">62</a>         s = s:gsub(seq, &quot; &quot;)
+<a id="l63" href="#l63">63</a>     end
+<a id="l64" href="#l64">64</a>     s = s:gsub(&quot;%s+&quot;, &quot; &quot;)
+<a id="l65" href="#l65">65</a>     s = s:gsub(&quot;^ &quot;, &quot;&quot;):gsub(&quot; $&quot;, &quot;&quot;)
+<a id="l66" href="#l66">66</a>     return s
+<a id="l67" href="#l67">67</a> end
+<a id="l68" href="#l68">68</a> 
+<a id="l69" href="#l69">69</a> --- Returns the byte offset of each UTF-8 character, plus the end offset.
+<a id="l70" href="#l70">70</a> -- offsets[i] is the first byte of character i. offsets[#offsets] is #s + 1.
+<a id="l71" href="#l71">71</a> -- The loop does not use a Lua pattern, because an embedded zero byte in a
+<a id="l72" href="#l72">72</a> -- pattern is not safe in Lua 5.1.
+<a id="l73" href="#l73">73</a> function Text.charOffsets(s)
+<a id="l74" href="#l74">74</a>     local offsets = {}
+<a id="l75" href="#l75">75</a>     local i, n = 1, #s
+<a id="l76" href="#l76">76</a>     while i &lt;= n do
+<a id="l77" href="#l77">77</a>         offsets[#offsets + 1] = i
+<a id="l78" href="#l78">78</a>         local b = s:byte(i)
+<a id="l79" href="#l79">79</a>         local size = 1
+<a id="l80" href="#l80">80</a>         if b &gt;= 0xF0 then size = 4
+<a id="l81" href="#l81">81</a>         elseif b &gt;= 0xE0 then size = 3
+<a id="l82" href="#l82">82</a>         elseif b &gt;= 0xC0 then size = 2
+<a id="l83" href="#l83">83</a>         end
+<a id="l84" href="#l84">84</a>         i = i + size
+<a id="l85" href="#l85">85</a>     end
+<a id="l86" href="#l86">86</a>     offsets[#offsets + 1] = n + 1
+<a id="l87" href="#l87">87</a>     return offsets
+<a id="l88" href="#l88">88</a> end
+<a id="l89" href="#l89">89</a> 
+<a id="l90" href="#l90">90</a> --- Counts the UTF-8 characters in a string.
+<a id="l91" href="#l91">91</a> function Text.len(s)
+<a id="l92" href="#l92">92</a>     return #Text.charOffsets(s) - 1
+<a id="l93" href="#l93">93</a> end
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a> --- Returns characters first..last of a string. Both limits are inclusive.
+<a id="l96" href="#l96">96</a> function Text.sub(s, first, last)
+<a id="l97" href="#l97">97</a>     local offsets = Text.charOffsets(s)
+<a id="l98" href="#l98">98</a>     local count = #offsets - 1
+<a id="l99" href="#l99">99</a>     if first &lt; 1 then first = 1 end
+<a id="l100" href="#l100">100</a>     if last &gt; count then last = count end
+<a id="l101" href="#l101">101</a>     if first &gt; last then return &quot;&quot; end
+<a id="l102" href="#l102">102</a>     return s:sub(offsets[first], offsets[last + 1] - 1)
+<a id="l103" href="#l103">103</a> end
+<a id="l104" href="#l104">104</a> 
+<a id="l105" href="#l105">105</a> --- True if the cue text has no place in the book.
+<a id="l106" href="#l106">106</a> function Text.hasNoPlace(s)
+<a id="l107" href="#l107">107</a>     local n = Text.normalize(s)
+<a id="l108" href="#l108">108</a>     return n == &quot;&quot; or n:sub(1, #Text.NO_PLACE_MARK) == Text.NO_PLACE_MARK
+<a id="l109" href="#l109">109</a> end
+<a id="l110" href="#l110">110</a> 
+<a id="l111" href="#l111">111</a> -- Lengths, in characters, of the search anchors.
+<a id="l112" href="#l112">112</a> -- A long anchor is more unique, but a small difference between the cue text
+<a id="l113" href="#l113">113</a> -- and the book text makes it fail. A short anchor almost always matches, and
+<a id="l114" href="#l114">114</a> -- the caller keeps the document order, so a wrong hit is improbable.
+<a id="l115" href="#l115">115</a> -- Two anchors only: each failed search reads the book to its end, so the
+<a id="l116" href="#l116">116</a> -- number of tries controls the worst case cost.
+<a id="l117" href="#l117">117</a> Text.ANCHOR_LENGTHS = { 24, 12 }
+<a id="l118" href="#l118">118</a> Text.ANCHOR_MIN_LENGTH = 6
+<a id="l119" href="#l119">119</a> 
+<a id="l120" href="#l120">120</a> --- Returns the search anchors for a cue text, longest first.
+<a id="l121" href="#l121">121</a> -- The result never holds the same string two times.
+<a id="l122" href="#l122">122</a> function Text.anchors(s, lengths)
+<a id="l123" href="#l123">123</a>     lengths = lengths or Text.ANCHOR_LENGTHS
+<a id="l124" href="#l124">124</a>     local norm = Text.normalize(s)
+<a id="l125" href="#l125">125</a>     if norm == &quot;&quot; then return {} end
+<a id="l126" href="#l126">126</a>     local count = Text.len(norm)
+<a id="l127" href="#l127">127</a>     if count &lt; Text.ANCHOR_MIN_LENGTH then
+<a id="l128" href="#l128">128</a>         return { norm }
+<a id="l129" href="#l129">129</a>     end
+<a id="l130" href="#l130">130</a>     local out, seen = {}, {}
+<a id="l131" href="#l131">131</a>     for _, want in ipairs(lengths) do
+<a id="l132" href="#l132">132</a>         local take = want
+<a id="l133" href="#l133">133</a>         if take &gt; count then take = count end
+<a id="l134" href="#l134">134</a>         if take &gt;= Text.ANCHOR_MIN_LENGTH then
+<a id="l135" href="#l135">135</a>             local anchor = Text.sub(norm, 1, take)
+<a id="l136" href="#l136">136</a>             if not seen[anchor] then
+<a id="l137" href="#l137">137</a>                 seen[anchor] = true
+<a id="l138" href="#l138">138</a>                 out[#out + 1] = anchor
+<a id="l139" href="#l139">139</a>             end
+<a id="l140" href="#l140">140</a>         end
+<a id="l141" href="#l141">141</a>     end
+<a id="l142" href="#l142">142</a>     if #out == 0 then out[1] = norm end
+<a id="l143" href="#l143">143</a>     return out
+<a id="l144" href="#l144">144</a> end
+<a id="l145" href="#l145">145</a> 
+<a id="l146" href="#l146">146</a> -- Length, in characters, of the tail that finds the end of a cue.
+<a id="l147" href="#l147">147</a> Text.TAIL_LENGTH = 12
+<a id="l148" href="#l148">148</a> 
+<a id="l149" href="#l149">149</a> --- Returns the last characters of a cue text, to find its end in the book.
+<a id="l150" href="#l150">150</a> -- Returns nil when the text is not longer than the tail: the anchor then
+<a id="l151" href="#l151">151</a> -- already covers the whole cue.
+<a id="l152" href="#l152">152</a> function Text.tail(s, length)
+<a id="l153" href="#l153">153</a>     length = length or Text.TAIL_LENGTH
+<a id="l154" href="#l154">154</a>     local norm = Text.normalize(s)
+<a id="l155" href="#l155">155</a>     local count = Text.len(norm)
+<a id="l156" href="#l156">156</a>     if count &lt;= length then return nil end
+<a id="l157" href="#l157">157</a>     return Text.sub(norm, count - length + 1, count)
+<a id="l158" href="#l158">158</a> end
+<a id="l159" href="#l159">159</a> 
+<a id="l160" href="#l160">160</a> --- Cuts a string to a maximum number of characters, for a dialog title.
+<a id="l161" href="#l161">161</a> function Text.ellipsize(s, max_chars)
+<a id="l162" href="#l162">162</a>     local norm = Text.normalize(s)
+<a id="l163" href="#l163">163</a>     if Text.len(norm) &lt;= max_chars then return norm end
+<a id="l164" href="#l164">164</a>     return Text.sub(norm, 1, max_chars) .. &quot;\226\128\166&quot; -- U+2026 ellipsis
+<a id="l165" href="#l165">165</a> end
+<a id="l166" href="#l166">166</a> 
+<a id="l167" href="#l167">167</a> return Text</pre>
+</div></body></html>

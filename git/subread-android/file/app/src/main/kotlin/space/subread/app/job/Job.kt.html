@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android/app/src/main/kotlin/space/subread/app/job/Job.kt - Recently Written</title>
+<link rel="stylesheet" href="../../../../../../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../../../../../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../../../../../../../../../subread-android/index.html">Log</a> | <a href="../../../../../../../../../../subread-android/files.html">Files</a> | <a href="../../../../../../../../../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>app/src/main/kotlin/space/subread/app/job/Job.kt (6106 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package space.subread.app.job
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import android.content.Context
+<a id="l4" href="#l4">4</a> import android.net.Uri
+<a id="l5" href="#l5">5</a> import android.os.SystemClock
+<a id="l6" href="#l6">6</a> import kotlinx.coroutines.flow.MutableStateFlow
+<a id="l7" href="#l7">7</a> import kotlinx.coroutines.flow.StateFlow
+<a id="l8" href="#l8">8</a> import space.subread.app.audio.AudioDecoder
+<a id="l9" href="#l9">9</a> import space.subread.app.whisper.TranscriptionCancelled
+<a id="l10" href="#l10">10</a> import space.subread.app.whisper.Whisper
+<a id="l11" href="#l11">11</a> import space.subread.core.BookAligner
+<a id="l12" href="#l12">12</a> import space.subread.core.BookText
+<a id="l13" href="#l13">13</a> import space.subread.core.Language
+<a id="l14" href="#l14">14</a> import space.subread.core.Srt
+<a id="l15" href="#l15">15</a> import java.io.File
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> enum class Phase { IDLE, PREPARING, TRANSCRIBING, ALIGNING, DONE, FAILED, CANCELLED }
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> data class JobStatus(
+<a id="l20" href="#l20">20</a>     val phase: Phase = Phase.IDLE,
+<a id="l21" href="#l21">21</a>     val detail: String = &quot;&quot;,
+<a id="l22" href="#l22">22</a>     /** 0..1 over the whole job. */
+<a id="l23" href="#l23">23</a>     val fraction: Float = 0f,
+<a id="l24" href="#l24">24</a>     val etaSeconds: Long? = null,
+<a id="l25" href="#l25">25</a>     /** Audio seconds transcribed per wall-clock second. */
+<a id="l26" href="#l26">26</a>     val speed: Double? = null,
+<a id="l27" href="#l27">27</a>     val srt: File? = null,
+<a id="l28" href="#l28">28</a>     val cues: Int = 0,
+<a id="l29" href="#l29">29</a>     val matchRate: Double? = null,
+<a id="l30" href="#l30">30</a>     val paragraphsDropped: Int = 0,
+<a id="l31" href="#l31">31</a> ) {
+<a id="l32" href="#l32">32</a>     val running: Boolean get() = phase == Phase.PREPARING || phase == Phase.TRANSCRIBING || phase == Phase.ALIGNING
+<a id="l33" href="#l33">33</a> }
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> /** The one job this app runs at a time, observable from the UI and the service alike. */
+<a id="l36" href="#l36">36</a> object Job {
+<a id="l37" href="#l37">37</a>     private val state = MutableStateFlow(JobStatus())
+<a id="l38" href="#l38">38</a>     val status: StateFlow&lt;JobStatus&gt; = state
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a>     @Volatile private var cancelled = false
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a>     fun cancel() {
+<a id="l43" href="#l43">43</a>         // The stack shows who asked. A stop with no visible cause is hard to find without it.
+<a id="l44" href="#l44">44</a>         android.util.Log.i(&quot;SubRead&quot;, &quot;stop requested&quot;, Throwable())
+<a id="l45" href="#l45">45</a>         cancelled = true
+<a id="l46" href="#l46">46</a>         Whisper.cancel()
+<a id="l47" href="#l47">47</a>     }
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a>     fun clear() { if (!state.value.running) state.value = JobStatus() }
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a>     /**
+<a id="l52" href="#l52">52</a>      * Transcribe (or resume transcribing) [audio], align it to [book], write
+<a id="l53" href="#l53">53</a>      * the subtitles. Blocks for as long as that takes; call from a worker thread.
+<a id="l54" href="#l54">54</a>      *
+<a id="l55" href="#l55">55</a>      * @param language a whisper language code, or &quot;auto&quot;
+<a id="l56" href="#l56">56</a>      */
+<a id="l57" href="#l57">57</a>     fun run(context: Context, audio: Uri, book: Uri, language: String) {
+<a id="l58" href="#l58">58</a>         cancelled = false
+<a id="l59" href="#l59">59</a>         state.value = JobStatus(Phase.PREPARING, &quot;Loading the speech model&quot;)
+<a id="l60" href="#l60">60</a>         try {
+<a id="l61" href="#l61">61</a>             val store = TranscriptStore.forAudio(context, audio)
+<a id="l62" href="#l62">62</a>             var lang = if (language == &quot;auto&quot;) store.language ?: &quot;auto&quot; else language
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a>             if (!store.complete) transcribe(context, audio, store, lang) { lang = it }
+<a id="l65" href="#l65">65</a>             if (lang == &quot;auto&quot;) lang = store.language ?: &quot;en&quot;
+<a id="l66" href="#l66">66</a> 
+<a id="l67" href="#l67">67</a>             state.value = state.value.copy(phase = Phase.ALIGNING, detail = &quot;Matching the book to the narration&quot;,
+<a id="l68" href="#l68">68</a>                 fraction = 0.97f, etaSeconds = null)
+<a id="l69" href="#l69">69</a>             val (bookName, _) = TranscriptStore.describe(context, book)
+<a id="l70" href="#l70">70</a>             val paragraphs = context.contentResolver.openInputStream(book)!!.use { BookText.read(it, bookName) }
+<a id="l71" href="#l71">71</a>             if (paragraphs.isEmpty()) throw IllegalStateException(&quot;No text could be read from $bookName.&quot;)
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a>             val result = BookAligner.align(store.segments(), paragraphs, Language.of(lang))
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a>             val (audioName, _) = TranscriptStore.describe(context, audio)
+<a id="l76" href="#l76">76</a>             val out = File(context.filesDir, &quot;subtitles&quot;).apply { mkdirs() }
+<a id="l77" href="#l77">77</a>                 .resolve(audioName.substringBeforeLast(&#x27;.&#x27;) + &quot;.$lang.srt&quot;)
+<a id="l78" href="#l78">78</a>             out.writeText(Srt.write(result.cues))
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a>             state.value = JobStatus(
+<a id="l81" href="#l81">81</a>                 Phase.DONE, &quot;Done&quot;, 1f, srt = out, cues = result.cues.size,
+<a id="l82" href="#l82">82</a>                 matchRate = BookAligner.matchRate(result.cues), paragraphsDropped = result.paragraphsDropped,
+<a id="l83" href="#l83">83</a>             )
+<a id="l84" href="#l84">84</a>         } catch (e: TranscriptionCancelled) {
+<a id="l85" href="#l85">85</a>             state.value = JobStatus(Phase.CANCELLED, &quot;Stopped. Progress is saved; start again to continue.&quot;)
+<a id="l86" href="#l86">86</a>         } catch (e: Throwable) {
+<a id="l87" href="#l87">87</a>             state.value = JobStatus(Phase.FAILED, e.message ?: e.javaClass.simpleName)
+<a id="l88" href="#l88">88</a>         }
+<a id="l89" href="#l89">89</a>     }
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a>     private fun transcribe(
+<a id="l92" href="#l92">92</a>         context: Context, audio: Uri, store: TranscriptStore, language: String, onLanguage: (String) -&gt; Unit,
+<a id="l93" href="#l93">93</a>     ) {
+<a id="l94" href="#l94">94</a>         var lang = language
+<a id="l95" href="#l95">95</a>         Whisper.open(context).use { whisper -&gt;
+<a id="l96" href="#l96">96</a>             AudioDecoder(context, audio, startAtSeconds = store.doneUntil).use { decoder -&gt;
+<a id="l97" href="#l97">97</a>                 val total = decoder.durationSeconds
+<a id="l98" href="#l98">98</a>                 val resumedAt = store.doneUntil
+<a id="l99" href="#l99">99</a>                 val started = SystemClock.elapsedRealtime()
+<a id="l100" href="#l100">100</a> 
+<a id="l101" href="#l101">101</a>                 while (true) {
+<a id="l102" href="#l102">102</a>                     if (cancelled) throw TranscriptionCancelled()
+<a id="l103" href="#l103">103</a>                     val chunk = decoder.next() ?: break
+<a id="l104" href="#l104">104</a>                     report(chunk.startSeconds, total, resumedAt, started)
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a>                     val segments = whisper.transcribe(chunk.samples, lang, chunk.startSeconds)
+<a id="l107" href="#l107">107</a>                     // Detect once, then hold it: a stretch of music must not be
+<a id="l108" href="#l108">108</a>                     // allowed to flip the rest of the book into another language.
+<a id="l109" href="#l109">109</a>                     if (lang == &quot;auto&quot;) {
+<a id="l110" href="#l110">110</a>                         lang = whisper.detectedLanguage.ifEmpty { &quot;en&quot; }
+<a id="l111" href="#l111">111</a>                         onLanguage(lang)
+<a id="l112" href="#l112">112</a>                     }
+<a id="l113" href="#l113">113</a>                     store.append(segments, chunk.endSeconds, lang)
+<a id="l114" href="#l114">114</a>                     report(chunk.endSeconds, total, resumedAt, started)
+<a id="l115" href="#l115">115</a>                 }
+<a id="l116" href="#l116">116</a>                 store.finish()
+<a id="l117" href="#l117">117</a>             }
+<a id="l118" href="#l118">118</a>         }
+<a id="l119" href="#l119">119</a>     }
+<a id="l120" href="#l120">120</a> 
+<a id="l121" href="#l121">121</a>     private fun report(at: Double, total: Double, resumedAt: Double, startedMs: Long) {
+<a id="l122" href="#l122">122</a>         val elapsed = (SystemClock.elapsedRealtime() - startedMs) / 1000.0
+<a id="l123" href="#l123">123</a>         val done = at - resumedAt
+<a id="l124" href="#l124">124</a>         val speed = if (elapsed &gt; 5 &amp;&amp; done &gt; 0) done / elapsed else null
+<a id="l125" href="#l125">125</a>         val eta = if (speed != null &amp;&amp; total &gt; 0) ((total - at) / speed).toLong().coerceAtLeast(0) else null
+<a id="l126" href="#l126">126</a>         state.value = JobStatus(
+<a id="l127" href="#l127">127</a>             Phase.TRANSCRIBING,
+<a id="l128" href="#l128">128</a>             &quot;Listening: ${clock(at)}&quot; + if (total &gt; 0) &quot; of ${clock(total)}&quot; else &quot;&quot;,
+<a id="l129" href="#l129">129</a>             // Alignment takes seconds; nearly all of the bar is transcription.
+<a id="l130" href="#l130">130</a>             fraction = if (total &gt; 0) (at / total * 0.96).toFloat().coerceIn(0f, 0.96f) else 0f,
+<a id="l131" href="#l131">131</a>             etaSeconds = eta, speed = speed,
+<a id="l132" href="#l132">132</a>         )
+<a id="l133" href="#l133">133</a>     }
+<a id="l134" href="#l134">134</a> 
+<a id="l135" href="#l135">135</a>     fun clock(seconds: Double): String {
+<a id="l136" href="#l136">136</a>         val s = seconds.toLong()
+<a id="l137" href="#l137">137</a>         return if (s &gt;= 3600) &quot;%d:%02d:%02d&quot;.format(s / 3600, s / 60 % 60, s % 60)
+<a id="l138" href="#l138">138</a>         else &quot;%d:%02d&quot;.format(s / 60, s % 60)
+<a id="l139" href="#l139">139</a>     }
+<a id="l140" href="#l140">140</a> }</pre>
+</div></body></html>

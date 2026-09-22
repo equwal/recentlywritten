@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey 4de4826a - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../assistkey/index.html">Log</a> | <a href="../../assistkey/files.html">Files</a> | <a href="../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 4de4826a7e15c5f7fb14cd763c7a2aa951596e3e
+truex &lt;truex@equwal.com&gt;
+2026-09-20 23:59:54 -0700
+
+Recent apps: a row of swipe cards in place of the list (0.0.5-alpha)
+
+RecentsActivity now shows the recent apps as cards, like the Android switcher.
+Swipe sideways through the cards, tap a card to open the app, swipe a card up
+to close it. The cards are drawn for e-ink: black outlines on white, no fling,
+and the row moves one card for each swipe with no animation.
+
+With shell access the cards are the real tasks of the system. A swipe up runs
+`am stack remove &lt;task id&gt;`, which the shell user may do. Where the shell is
+root, each card shows the picture the system keeps of the task, read from
+/data/system_ce/0/snapshots. Those files belong to `system`, so a plain shell
+cannot read them, and the card then shows the app icon.
+
+The task list parser now accepts both forms of a task line: `A=&lt;uid&gt;:&lt;package&gt;`
+and `I=&lt;package&gt;/&lt;class&gt;`.
+
+The list view is deleted; the cards replace it.
+
+</pre><pre> CHANGELOG.md                                       |  11 +
+ README.md                                          |   5 +-
+ .../main/java/dev/equwal/assistkey/home/Apps.kt    |  36 +++-
+ .../dev/equwal/assistkey/home/RecentsActivity.kt   | 230 +++++++++++++++++----
+ .../equwal/assistkey/ui/ActionPickerActivity.kt    |   2 +-
+ .../java/dev/equwal/assistkey/ui/MainActivity.kt   |   2 +-
+ gradle.properties                                  |   4 +-
+ play/LISTING.md                                    |   2 +-
+ 8 files changed, 233 insertions(+), 59 deletions(-)
+</pre><pre>diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c7b6c3b..bee96fb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+<span class="h">@@ -1,5 +1,16 @@</span>
+ # Changelog
+ 
+<span class="a">+## 0.0.5-alpha - 2026-09-21</span>
+<span class="a">+</span>
+<span class="a">+Version code 5.</span>
+<span class="a">+</span>
+<span class="a">+- **Recent apps as cards.** The list is now a row of cards, like the Android</span>
+<span class="a">+  switcher: swipe sideways, tap a card to open it, swipe a card up to close it.</span>
+<span class="a">+  It is drawn for e-ink: outlines only, and the row jumps from card to card with</span>
+<span class="a">+  no animation. With shell access a card is a real task and can be closed</span>
+<span class="a">+  (`am stack remove`). Where the shell is root, a card shows the picture the</span>
+<span class="a">+  system keeps of the task. Otherwise a card shows the app icon.</span>
+<span class="a">+</span>
+ ## 0.0.4-alpha - 2026-09-20
+ 
+ Version code 4.
+diff --git a/README.md b/README.md
+index f8a28c0..a629b54 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -117,7 +117,10 @@ the whole chain can be tested on a bench with no voice.</span>
+ app list is hidden until you type, and a single match opens itself. It is
+ original code: the idea is shared with CLauncher/Olauncher, which are GPL-3.0
+ and therefore cannot be copied into this app. Disabled in the manifest until
+<span class="d">-switched on. Recent apps is a text list in place of the screenshot carousel.</span>
+<span class="a">+switched on. Recent apps is a row of cards like the Android switcher, drawn for</span>
+<span class="a">+e-ink: outlines, no animation, one jump per card. A card closes with a swipe up</span>
+<span class="a">+when there is shell access, and shows the task picture the system keeps when</span>
+<span class="a">+the shell is root (`/data/system_ce/0/snapshots`, owned by `system`).</span>
+ 
+ ## Why it is shaped like this
+ 
+diff --git a/app/src/main/java/dev/equwal/assistkey/home/Apps.kt b/app/src/main/java/dev/equwal/assistkey/home/Apps.kt
+index f58f534..20e7420 100644
+--- a/app/src/main/java/dev/equwal/assistkey/home/Apps.kt
++++ b/app/src/main/java/dev/equwal/assistkey/home/Apps.kt
+<span class="h">@@ -96,17 +96,37 @@ object Apps {</span>
+         return rank(c, last.entries.sortedByDescending { it.value }.map { it.key }, limit)
+     }
+ 
+<span class="d">-    /** Most recent first, from the system&#x27;s real task list. Needs shell access. */</span>
+<span class="d">-    fun recentFromShell(c: Context, limit: Int = 12, done: (List&lt;App&gt;?) -&gt; Unit) {</span>
+<span class="a">+    /** One entry of the recent-apps list. [taskId] is known only with shell access. */</span>
+<span class="a">+    data class Recent(val app: App, val taskId: Int?)</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Most recent first, from the real task list of the system. Needs shell</span>
+<span class="a">+     * access. A task line names its app as `A=&lt;uid&gt;:&lt;package&gt;` or, for some</span>
+<span class="a">+     * tasks, as `I=&lt;package&gt;/&lt;class&gt;`.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun recentFromShell(c: Context, limit: Int = 12, done: (List&lt;Recent&gt;?) -&gt; Unit) {</span>
+         if (!Shell.ready) return done(null)
+         Shell.run(&quot;dumpsys activity recents&quot;) { r -&gt;
+             if (!r.ok) return@run done(null)
+<span class="d">-            val task = Regex(&quot;&quot;&quot;Recent #\d+: Task\{\S+ #\d+ type=(\w+) A=\d+:(\S+)&quot;&quot;&quot;)</span>
+<span class="d">-            val pkgs = task.findAll(r.output)</span>
+<span class="d">-                .filter { it.groupValues[1] == &quot;standard&quot; }</span>
+<span class="d">-                .map { it.groupValues[2].trimEnd(&#x27;}&#x27;) }</span>
+<span class="d">-                .toList()</span>
+<span class="d">-            done(rank(c, pkgs, limit))</span>
+<span class="a">+            val task = Regex(&quot;&quot;&quot;Recent #\d+: Task\{\S+ #(\d+) type=(\w+) (?:A=\d+:|I=)([^\s/}]+)&quot;&quot;&quot;)</span>
+<span class="a">+            val ids = LinkedHashMap&lt;String, Int&gt;()</span>
+<span class="a">+            task.findAll(r.output)</span>
+<span class="a">+                .filter { it.groupValues[2] == &quot;standard&quot; }</span>
+<span class="a">+                .forEach { ids.putIfAbsent(it.groupValues[3], it.groupValues[1].toInt()) }</span>
+<span class="a">+            done(rank(c, ids.keys.toList(), limit).map { Recent(it, ids[it.pkg]) })</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The picture the system keeps of a task. The files belong to `system`, so</span>
+<span class="a">+     * this works only where the shell is root, or may use `su`. Null otherwise.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun snapshot(taskId: Int, done: (android.graphics.Bitmap?) -&gt; Unit) {</span>
+<span class="a">+        val dir = &quot;/data/system_ce/0/snapshots/&quot;</span>
+<span class="a">+        val pick = &quot;f=$dir${taskId}_reduced.jpg; [ -e \$f ] || f=$dir$taskId.jpg; &quot;</span>
+<span class="a">+        Shell.run(pick + &quot;base64 -w 0 \$f 2&gt;/dev/null || su 0 base64 -w 0 \$f 2&gt;/dev/null&quot;) { r -&gt;</span>
+<span class="a">+            val bytes = runCatching { android.util.Base64.decode(r.output.trim(), android.util.Base64.DEFAULT) }.getOrNull()</span>
+<span class="a">+            done(bytes?.takeIf { it.size &gt; 100 }?.let { android.graphics.BitmapFactory.decodeByteArray(it, 0, it.size) })</span>
+         }
+     }
+ 
+diff --git a/app/src/main/java/dev/equwal/assistkey/home/RecentsActivity.kt b/app/src/main/java/dev/equwal/assistkey/home/RecentsActivity.kt
+index 422afc5..93a35e5 100644
+--- a/app/src/main/java/dev/equwal/assistkey/home/RecentsActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/home/RecentsActivity.kt
+<span class="h">@@ -1,35 +1,53 @@</span>
+ package dev.equwal.assistkey.home
+ 
+ import android.app.Activity
+<span class="d">-import android.app.AlertDialog</span>
+ import android.content.Intent
+<span class="d">-import android.net.Uri</span>
+<span class="a">+import android.graphics.Color</span>
+<span class="a">+import android.graphics.Typeface</span>
+<span class="a">+import android.graphics.drawable.GradientDrawable</span>
+ import android.provider.Settings
+<span class="a">+import android.util.TypedValue</span>
+<span class="a">+import android.view.GestureDetector</span>
+<span class="a">+import android.view.Gravity</span>
+<span class="a">+import android.view.MotionEvent</span>
+<span class="a">+import android.view.View</span>
+<span class="a">+import android.view.ViewGroup.LayoutParams.MATCH_PARENT</span>
+<span class="a">+import android.view.ViewGroup.LayoutParams.WRAP_CONTENT</span>
+<span class="a">+import android.view.WindowInsets</span>
+<span class="a">+import android.widget.HorizontalScrollView</span>
+<span class="a">+import android.widget.ImageView</span>
+ import android.widget.LinearLayout
+<span class="a">+import android.widget.TextView</span>
+ import dev.equwal.assistkey.shell.Shell
+ import dev.equwal.assistkey.ui.ShellActivity
+ import dev.equwal.assistkey.ui.Ui
+ import dev.equwal.assistkey.ui.Ui.button
+<span class="d">-import dev.equwal.assistkey.ui.Ui.header</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.dp</span>
+ import dev.equwal.assistkey.ui.Ui.note
+<span class="d">-import dev.equwal.assistkey.ui.Ui.row</span>
+ import dev.equwal.assistkey.ui.Ui.title
+<span class="a">+import kotlin.math.abs</span>
+ 
+ /**
+<span class="d">- * Recent apps, as a list.</span>
+<span class="a">+ * Recent apps, as a row of cards.</span>
+  *
+<span class="d">- * The stock switcher is a carousel of screenshots - the worst thing an e-ink</span>
+<span class="d">- * panel can be asked to draw. This is the same information as text: most recent</span>
+<span class="d">- * first, one tap to go back to it.</span>
+<span class="a">+ * It works like the Android switcher: swipe sideways through the cards, tap a</span>
+<span class="a">+ * card to go to that app, swipe a card up to close it. It is drawn for e-ink:</span>
+<span class="a">+ * black outlines on white, and the row jumps from card to card with no</span>
+<span class="a">+ * animation.</span>
+  *
+<span class="d">- * Android does not tell apps what is running. With shell access the list is the</span>
+<span class="d">- * real task list of the system, and an app can be closed from it. Without, it</span>
+<span class="d">- * is rebuilt from the usage log, which needs the usage-access grant.</span>
+<span class="a">+ * Android does not tell apps what is running. With shell access the cards are</span>
+<span class="a">+ * the real tasks of the system, a card can be closed, and where the shell is</span>
+<span class="a">+ * root each card shows the picture the system keeps of the task. Without shell</span>
+<span class="a">+ * access the order comes from the usage log and a card shows the app icon.</span>
+  *
+<span class="d">- * Bind it to a key from any action list: Navigation &gt; Recent apps (list).</span>
+<span class="a">+ * Bind it to a key from any action list: AssistKey &gt; Recent apps.</span>
+  */
+ class RecentsActivity : Activity() {
+ 
+<span class="a">+    private var row: LinearLayout? = null</span>
+<span class="a">+    private var scroller: HorizontalScrollView? = null</span>
+<span class="a">+    private var cardStep = 0</span>
+<span class="a">+</span>
+     override fun onResume() {
+         super.onResume()
+         load()
+<span class="h">@@ -40,58 +58,180 @@ class RecentsActivity : Activity() {</span>
+             if (isFinishing) return@recentFromShell
+             when {
+                 fromShell != null -&gt; show(fromShell, closable = true)
+<span class="d">-                Apps.hasUsageAccess(this) -&gt; show(Apps.recentFromUsage(this), closable = false)</span>
+<span class="a">+                Apps.hasUsageAccess(this) -&gt;</span>
+<span class="a">+                    show(Apps.recentFromUsage(this).map { Apps.Recent(it, null) }, closable = false)</span>
+                 else -&gt; askForAccess()
+             }
+         }
+     }
+ 
+<span class="d">-    private fun show(apps: List&lt;Apps.App&gt;, closable: Boolean) {</span>
+<span class="d">-        val col = Ui.page(this)</span>
+<span class="d">-        col.title(&quot;Recent apps&quot;)</span>
+<span class="d">-        if (apps.isEmpty()) col.note(&quot;Nothing recent.&quot;)</span>
+<span class="d">-        apps.forEach { app -&gt; entry(col, app, closable) }</span>
+<span class="d">-        if (closable &amp;&amp; apps.isNotEmpty()) {</span>
+<span class="d">-            col.header(&quot;All of them&quot;)</span>
+<span class="d">-            col.button(&quot;Close all&quot;) {</span>
+<span class="d">-                Shell.runAll(apps.map { &quot;am force-stop &quot; + it.pkg }) { load() }</span>
+<span class="a">+    // ---- the cards -------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private fun show(recents: List&lt;Apps.Recent&gt;, closable: Boolean) {</span>
+<span class="a">+        val screenW = resources.displayMetrics.widthPixels</span>
+<span class="a">+        val screenH = resources.displayMetrics.heightPixels</span>
+<span class="a">+        val cardW = (screenW * 0.72f).toInt()</span>
+<span class="a">+        val cardH = (screenH * 0.62f).toInt()</span>
+<span class="a">+        val gap = dp(16)</span>
+<span class="a">+        cardStep = cardW + gap</span>
+<span class="a">+</span>
+<span class="a">+        val root = LinearLayout(this).apply {</span>
+<span class="a">+            orientation = LinearLayout.VERTICAL</span>
+<span class="a">+            setBackgroundColor(Color.WHITE)</span>
+<span class="a">+            setOnApplyWindowInsetsListener { v, insets -&gt;</span>
+<span class="a">+                val bars = insets.getInsets(WindowInsets.Type.systemBars())</span>
+<span class="a">+                v.setPadding(bars.left, bars.top, bars.right, bars.bottom)</span>
+<span class="a">+                insets</span>
+             }
+<span class="d">-            col.note(&quot;Press and hold an app to close just that one.&quot;)</span>
+         }
+<span class="d">-        if (!closable &amp;&amp; Shell.SUPPORTED) {</span>
+<span class="d">-            col.note(&quot;With shell access this list is exact, and apps can be closed from it.&quot;)</span>
+<span class="a">+        root.addView(TextView(this).apply {</span>
+<span class="a">+            text = if (recents.isEmpty()) &quot;Nothing recent&quot; else &quot;Recent apps&quot;</span>
+<span class="a">+            setTextColor(Color.BLACK)</span>
+<span class="a">+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)</span>
+<span class="a">+            typeface = Typeface.DEFAULT_BOLD</span>
+<span class="a">+            setPadding(dp(20), dp(16), dp(20), dp(12))</span>
+<span class="a">+        })</span>
+<span class="a">+</span>
+<span class="a">+        val cards = LinearLayout(this).apply {</span>
+<span class="a">+            orientation = LinearLayout.HORIZONTAL</span>
+<span class="a">+            // Side padding puts the first and the last card in the middle too.</span>
+<span class="a">+            val side = (screenW - cardW) / 2</span>
+<span class="a">+            setPadding(side, 0, side, 0)</span>
+<span class="a">+        }</span>
+<span class="a">+        recents.forEach { r -&gt;</span>
+<span class="a">+            cards.addView(</span>
+<span class="a">+                card(r, closable),</span>
+<span class="a">+                LinearLayout.LayoutParams(cardW, cardH).apply { marginEnd = gap }</span>
+<span class="a">+            )</span>
+         }
+<span class="d">-    }</span>
+<span class="a">+        row = cards</span>
+ 
+<span class="d">-    private fun entry(col: LinearLayout, app: Apps.App, closable: Boolean) {</span>
+<span class="d">-        val row = col.row(app.label, null) {</span>
+<span class="d">-            Apps.launch(this, app)</span>
+<span class="d">-            finish()</span>
+<span class="a">+        val scroll = object : HorizontalScrollView(this) {</span>
+<span class="a">+            override fun onTouchEvent(ev: MotionEvent): Boolean {</span>
+<span class="a">+                val handled = super.onTouchEvent(ev)</span>
+<span class="a">+                if (ev.actionMasked == MotionEvent.ACTION_UP || ev.actionMasked == MotionEvent.ACTION_CANCEL) snap()</span>
+<span class="a">+                return handled</span>
+<span class="a">+            }</span>
+<span class="a">+</span>
+<span class="a">+            /** No fling and no glide: e-ink shows every frame of one as a smear. */</span>
+<span class="a">+            override fun fling(velocityX: Int) = Unit</span>
+<span class="a">+        }.apply {</span>
+<span class="a">+            isHorizontalScrollBarEnabled = false</span>
+<span class="a">+            overScrollMode = View.OVER_SCROLL_NEVER</span>
+<span class="a">+            addView(cards, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))</span>
+         }
+<span class="d">-        if (!closable) return</span>
+<span class="d">-        row.setOnLongClickListener {</span>
+<span class="d">-            AlertDialog.Builder(this).setTitle(app.label)</span>
+<span class="d">-                .setItems(arrayOf(&quot;Close&quot;, &quot;App info&quot;)) { _, which -&gt;</span>
+<span class="d">-                    if (which == 0) {</span>
+<span class="d">-                        Shell.run(&quot;am force-stop &quot; + app.pkg) { load() }</span>
+<span class="d">-                    } else {</span>
+<span class="d">-                        runCatching {</span>
+<span class="d">-                            startActivity(</span>
+<span class="d">-                                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse(&quot;package:&quot; + app.pkg))</span>
+<span class="d">-                            )</span>
+<span class="d">-                        }</span>
+<span class="a">+        scroller = scroll</span>
+<span class="a">+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))</span>
+<span class="a">+</span>
+<span class="a">+        root.addView(TextView(this).apply {</span>
+<span class="a">+            text = if (closable) &quot;Tap a card to open it. Swipe a card up to close it.&quot;</span>
+<span class="a">+            else &quot;Tap a card to open it.&quot;</span>
+<span class="a">+            setTextColor(Color.rgb(70, 70, 70))</span>
+<span class="a">+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)</span>
+<span class="a">+            gravity = Gravity.CENTER_HORIZONTAL</span>
+<span class="a">+            setPadding(dp(20), dp(14), dp(20), dp(6))</span>
+<span class="a">+        })</span>
+<span class="a">+        if (closable &amp;&amp; recents.isNotEmpty()) {</span>
+<span class="a">+            root.addView(</span>
+<span class="a">+                android.widget.Button(this).apply {</span>
+<span class="a">+                    text = &quot;Close all&quot;</span>
+<span class="a">+                    setOnClickListener {</span>
+<span class="a">+                        Shell.runAll(recents.mapNotNull { it.taskId }.map { &quot;am stack remove $it&quot; }) { load() }</span>
+                     }
+<span class="d">-                }.show()</span>
+<span class="d">-            true</span>
+<span class="a">+                },</span>
+<span class="a">+                LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { gravity = Gravity.CENTER_HORIZONTAL }</span>
+<span class="a">+            )</span>
+         }
+<span class="a">+        setContentView(root)</span>
+     }
+ 
+<span class="a">+    /** Puts the nearest card in the middle, in one step. */</span>
+<span class="a">+    private fun snap() {</span>
+<span class="a">+        val s = scroller ?: return</span>
+<span class="a">+        if (cardStep &lt;= 0) return</span>
+<span class="a">+        val index = ((s.scrollX + cardStep / 2) / cardStep).coerceIn(0, (row?.childCount ?: 1) - 1)</span>
+<span class="a">+        s.scrollTo(index * cardStep, 0)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun card(r: Apps.Recent, closable: Boolean): View {</span>
+<span class="a">+        val box = LinearLayout(this).apply {</span>
+<span class="a">+            orientation = LinearLayout.VERTICAL</span>
+<span class="a">+            background = GradientDrawable().apply {</span>
+<span class="a">+                setColor(Color.WHITE)</span>
+<span class="a">+                setStroke(dp(2), Color.BLACK)</span>
+<span class="a">+                cornerRadius = dp(14).toFloat()</span>
+<span class="a">+            }</span>
+<span class="a">+            val p = dp(3)</span>
+<span class="a">+            setPadding(p, p, p, p)</span>
+<span class="a">+            clipToOutline = true</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        val icon = runCatching { packageManager.getApplicationIcon(r.app.pkg) }.getOrNull()</span>
+<span class="a">+        box.addView(LinearLayout(this).apply {</span>
+<span class="a">+            orientation = LinearLayout.HORIZONTAL</span>
+<span class="a">+            gravity = Gravity.CENTER_VERTICAL</span>
+<span class="a">+            setPadding(dp(12), dp(10), dp(12), dp(10))</span>
+<span class="a">+            addView(ImageView(context).apply { setImageDrawable(icon) }, LinearLayout.LayoutParams(dp(32), dp(32)))</span>
+<span class="a">+            addView(TextView(context).apply {</span>
+<span class="a">+                text = r.app.label</span>
+<span class="a">+                setTextColor(Color.BLACK)</span>
+<span class="a">+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)</span>
+<span class="a">+                setSingleLine()</span>
+<span class="a">+                setPadding(dp(10), 0, 0, 0)</span>
+<span class="a">+            })</span>
+<span class="a">+        })</span>
+<span class="a">+        box.addView(View(this).apply { setBackgroundColor(Color.BLACK) }, LinearLayout.LayoutParams(MATCH_PARENT, dp(1)))</span>
+<span class="a">+</span>
+<span class="a">+        // The body: the app icon now, the task picture when and if it arrives.</span>
+<span class="a">+        val body = ImageView(this).apply {</span>
+<span class="a">+            setImageDrawable(icon)</span>
+<span class="a">+            scaleType = ImageView.ScaleType.CENTER_INSIDE</span>
+<span class="a">+            val p = dp(64)</span>
+<span class="a">+            setPadding(p, p, p, p)</span>
+<span class="a">+        }</span>
+<span class="a">+        box.addView(body, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))</span>
+<span class="a">+        r.taskId?.let { id -&gt;</span>
+<span class="a">+            Apps.snapshot(id) { picture -&gt;</span>
+<span class="a">+                if (picture != null &amp;&amp; !isFinishing) {</span>
+<span class="a">+                    body.setPadding(0, 0, 0, 0)</span>
+<span class="a">+                    body.scaleType = ImageView.ScaleType.FIT_START</span>
+<span class="a">+                    body.setImageBitmap(picture)</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {</span>
+<span class="a">+            override fun onDown(e: MotionEvent): Boolean = true</span>
+<span class="a">+</span>
+<span class="a">+            override fun onSingleTapUp(e: MotionEvent): Boolean {</span>
+<span class="a">+                Apps.launch(this@RecentsActivity, r.app)</span>
+<span class="a">+                finish()</span>
+<span class="a">+                return true</span>
+<span class="a">+            }</span>
+<span class="a">+</span>
+<span class="a">+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {</span>
+<span class="a">+                val up = e1 != null &amp;&amp; e1.y - e2.y &gt; box.height / 5 &amp;&amp; abs(vy) &gt; abs(vx)</span>
+<span class="a">+                if (!up || !closable || r.taskId == null) return false</span>
+<span class="a">+                Shell.run(&quot;am stack remove &quot; + r.taskId) { load() }</span>
+<span class="a">+                return true</span>
+<span class="a">+            }</span>
+<span class="a">+        })</span>
+<span class="a">+        box.setOnTouchListener { v, e -&gt;</span>
+<span class="a">+            if (e.actionMasked == MotionEvent.ACTION_UP) v.performClick()</span>
+<span class="a">+            gestures.onTouchEvent(e)</span>
+<span class="a">+        }</span>
+<span class="a">+        return box</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- no access yet ---------------------------------------------------------------------</span>
+<span class="a">+</span>
+     private fun askForAccess() {
+         val col = Ui.page(this)
+         col.title(&quot;Recent apps&quot;)
+         col.note(
+             &quot;Android does not tell apps what has been used recently. Give AssistKey &quot; +
+<span class="d">-                &quot;usage access and it can put your apps in order of last use.&quot; +</span>
+<span class="a">+                &quot;usage access and it can put your apps in order of last use. On some &quot; +</span>
+<span class="a">+                &quot;devices the setting is named App usage data.&quot; +</span>
+                 if (Shell.SUPPORTED) &quot; Shell access gives the exact list the system keeps.&quot; else &quot;&quot;
+         )
+         col.button(&quot;Give usage access&quot;) {
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/ActionPickerActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/ActionPickerActivity.kt
+index e3c200f..8af03ea 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/ActionPickerActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/ActionPickerActivity.kt
+<span class="h">@@ -79,7 +79,7 @@ class ActionPickerActivity : Activity() {</span>
+     private fun own(col: LinearLayout) {
+         col.header(&quot;AssistKey&quot;)
+         listOf(
+<span class="d">-            &quot;Recent apps (list)&quot; to &quot;dev.equwal.assistkey.home.RecentsActivity&quot;,</span>
+<span class="a">+            &quot;Recent apps (cards)&quot; to &quot;dev.equwal.assistkey.home.RecentsActivity&quot;,</span>
+             &quot;App search&quot; to &quot;dev.equwal.assistkey.home.HomeActivity&quot;
+         ).filter { (_, cls) -&gt;
+             // The home screen is switched off until asked for; a disabled
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+index bf389c6..db55f8a 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+<span class="h">@@ -241,7 +241,7 @@ class MainActivity : Activity() {</span>
+         col.row(&quot;Home screen&quot;, &quot;A plain, fast launcher made for e-ink&quot;) {
+             startActivity(Intent(this, dev.equwal.assistkey.home.HomeSettingsActivity::class.java))
+         }
+<span class="d">-        col.row(&quot;Recent apps&quot;, &quot;A plain app switcher, bindable to any key&quot;) {</span>
+<span class="a">+        col.row(&quot;Recent apps&quot;, &quot;Card switcher made for e-ink, bindable to any key&quot;) {</span>
+             startActivity(Intent(this, dev.equwal.assistkey.home.RecentsActivity::class.java))
+         }
+ 
+diff --git a/gradle.properties b/gradle.properties
+index 985c935..2aaf277 100644
+--- a/gradle.properties
++++ b/gradle.properties
+<span class="h">@@ -6,8 +6,8 @@ android.nonTransitiveRClass=true</span>
+ kotlin.code.style=official
+ 
+ # Release identity. versionCode must rise with every upload to Play.
+<span class="d">-assistkey.versionName=0.0.4-alpha</span>
+<span class="d">-assistkey.versionCode=4</span>
+<span class="a">+assistkey.versionName=0.0.5-alpha</span>
+<span class="a">+assistkey.versionCode=5</span>
+ 
+ # The free beta ends on this date (UTC) at the latest. It is the backstop for
+ # installs that cannot reach Google Play; the real switch is the
+diff --git a/play/LISTING.md b/play/LISTING.md
+index a66c0f5..50a404d 100644
+--- a/play/LISTING.md
++++ b/play/LISTING.md
+<span class="h">@@ -52,7 +52,7 @@ Bind a key to Voice typing: press, speak, and the words appear where the cursor</span>
+ 
+ MORE FOR E-INK
+ • A plain text home screen: a clock, a few apps, type to find the rest
+<span class="d">-• Recent apps as a list instead of a slow screenshot carousel</span>
+<span class="a">+• Recent apps as swipe cards, drawn for e-ink with no animation</span>
+ 
+ BUILT FOR E-INK
+ </pre>
+</div></body></html>

@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-suckless/bm-sync - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-suckless</h1><span class="desc">sbm before the rewrite: bookmarks in a plain file, picked with dmenu. Suckless style.</span><p class="url">git clone https://github.com/equwal/sbm-suckless</p><p><a href="../../sbm-suckless/index.html">Log</a> | <a href="../../sbm-suckless/files.html">Files</a> | <a href="../../sbm-suckless/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>bm-sync (7107 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> #!/bin/sh
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> # bm-sync: keep $BOOKMARKS the same on all your devices through an sbm-sync
+<a id="l4" href="#l4">4</a> # server (https://github.com/equwal/sbm-sync). bm runs it after each add.
+<a id="l5" href="#l5">5</a> #
+<a id="l6" href="#l6">6</a> # bm-sync sends the file and the version of the last sync. The server merges
+<a id="l7" href="#l7">7</a> # the changes into its copy. Then it sends back the result and its version.
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> CONFIG=${SBM_SYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sbm/sync}
+<a id="l10" href="#l10">10</a> SERVER=https://sbm.subread.space
+<a id="l11" href="#l11">11</a> STATE=$BOOKMARKS.sync   # the version of the last sync
+<a id="l12" href="#l12">12</a> LOCK=$BOOKMARKS.sync.lock
+<a id="l13" href="#l13">13</a> WLOCK=$BOOKMARKS.lock   # the write lock of bm
+<a id="l14" href="#l14">14</a> quiet=
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> usage () {
+<a id="l17" href="#l17">17</a>     cat &lt;&lt;&#x27;EOF&#x27;
+<a id="l18" href="#l18">18</a> usage: bm-sync [-q] [login [server] | logout | status]
+<a id="l19" href="#l19">19</a> Without a command, bm-sync syncs $BOOKMARKS.
+<a id="l20" href="#l20">20</a>   login   sign in and sync (default server: https://sbm.subread.space)
+<a id="l21" href="#l21">21</a>   logout  sign out on this device
+<a id="l22" href="#l22">22</a>   status  show the server and the time of the last sync
+<a id="l23" href="#l23">23</a>   -q      print only errors
+<a id="l24" href="#l24">24</a> EOF
+<a id="l25" href="#l25">25</a> }
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> die () {
+<a id="l28" href="#l28">28</a>     printf &#x27;bm-sync: %s\n&#x27; &quot;$*&quot; &gt;&amp;2
+<a id="l29" href="#l29">29</a>     exit 1
+<a id="l30" href="#l30">30</a> }
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> say () {
+<a id="l33" href="#l33">33</a>     [ -n &quot;$quiet&quot; ] || printf &#x27;bm-sync: %s\n&#x27; &quot;$*&quot;
+<a id="l34" href="#l34">34</a> }
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> # setting &lt;name&gt;: the value of &lt;name&gt; in the config file.
+<a id="l37" href="#l37">37</a> setting () {
+<a id="l38" href="#l38">38</a>     sed -n &quot;s/^$1=//p&quot; &quot;$CONFIG&quot; 2&gt;/dev/null | head -n 1
+<a id="l39" href="#l39">39</a> }
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> cleanup () {
+<a id="l42" href="#l42">42</a>     rm -rf &quot;$work&quot;
+<a id="l43" href="#l43">43</a>     [ -z &quot;$locked&quot; ] || rm -rf &quot;$LOCK&quot;
+<a id="l44" href="#l44">44</a>     wunlock
+<a id="l45" href="#l45">45</a> }
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a> # wlock: take the write lock of bm, as bm does, so that neither writes over
+<a id="l48" href="#l48">48</a> # a change of the other. After $SBM_LOCK_WAIT seconds (default 10) bm-sync
+<a id="l49" href="#l49">49</a> # stops, and the next add in bm syncs again.
+<a id="l50" href="#l50">50</a> wlock () {
+<a id="l51" href="#l51">51</a>     waited=0
+<a id="l52" href="#l52">52</a>     until mkdir &quot;$WLOCK&quot; 2&gt;/dev/null; do
+<a id="l53" href="#l53">53</a>         pid=$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)
+<a id="l54" href="#l54">54</a>         if [ -n &quot;$pid&quot; ] &amp;&amp; ! kill -0 &quot;$pid&quot; 2&gt;/dev/null; then
+<a id="l55" href="#l55">55</a>             [ &quot;$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)&quot; != &quot;$pid&quot; ] || rm -rf &quot;$WLOCK&quot;
+<a id="l56" href="#l56">56</a>             continue
+<a id="l57" href="#l57">57</a>         fi
+<a id="l58" href="#l58">58</a>         [ &quot;$waited&quot; -lt &quot;${SBM_LOCK_WAIT:-10}&quot; ] \
+<a id="l59" href="#l59">59</a>             || die &quot;$BOOKMARKS is in use: sync again later&quot;
+<a id="l60" href="#l60">60</a>         sleep 1
+<a id="l61" href="#l61">61</a>         waited=$((waited + 1))
+<a id="l62" href="#l62">62</a>     done
+<a id="l63" href="#l63">63</a>     echo $$ &gt; &quot;$WLOCK/pid&quot;
+<a id="l64" href="#l64">64</a>     wlocked=1
+<a id="l65" href="#l65">65</a> }
+<a id="l66" href="#l66">66</a> 
+<a id="l67" href="#l67">67</a> wunlock () {
+<a id="l68" href="#l68">68</a>     [ -z &quot;$wlocked&quot; ] || rm -rf &quot;$WLOCK&quot;
+<a id="l69" href="#l69">69</a>     wlocked=
+<a id="l70" href="#l70">70</a> }
+<a id="l71" href="#l71">71</a> 
+<a id="l72" href="#l72">72</a> login () {
+<a id="l73" href="#l73">73</a>     server=${1:-$SERVER}
+<a id="l74" href="#l74">74</a>     server=${server%/}
+<a id="l75" href="#l75">75</a>     printf &#x27;email: &#x27; &gt;&amp;2
+<a id="l76" href="#l76">76</a>     read -r email || exit 1
+<a id="l77" href="#l77">77</a>     printf &#x27;password: &#x27; &gt;&amp;2
+<a id="l78" href="#l78">78</a>     stty -echo 2&gt;/dev/null
+<a id="l79" href="#l79">79</a>     IFS= read -r password
+<a id="l80" href="#l80">80</a>     rc=$?
+<a id="l81" href="#l81">81</a>     stty echo 2&gt;/dev/null
+<a id="l82" href="#l82">82</a>     printf &#x27;\n&#x27; &gt;&amp;2
+<a id="l83" href="#l83">83</a>     [ $rc -eq 0 ] || exit 1
+<a id="l84" href="#l84">84</a> 
+<a id="l85" href="#l85">85</a>     # curl gets the password through stdin and the token through a file.
+<a id="l86" href="#l86">86</a>     # Other users can see command lines with ps.
+<a id="l87" href="#l87">87</a>     code=$(printf &#x27;%s&#x27; &quot;$password&quot; | curl -sS -o &quot;$work/out&quot; -w &#x27;%{http_code}&#x27; \
+<a id="l88" href="#l88">88</a>         --data-urlencode &quot;email=$email&quot; --data-urlencode &#x27;password@-&#x27; \
+<a id="l89" href="#l89">89</a>         -- &quot;$server/api/login&quot;) || die &quot;cannot reach $server&quot;
+<a id="l90" href="#l90">90</a>     [ &quot;$code&quot; = 200 ] || die &quot;$(cat &quot;$work/out&quot;)&quot;
+<a id="l91" href="#l91">91</a> 
+<a id="l92" href="#l92">92</a>     # The config file holds the token, so only you can read it.
+<a id="l93" href="#l93">93</a>     mkdir -p &quot;$(dirname &quot;$CONFIG&quot;)&quot; &amp;&amp; : &gt; &quot;$CONFIG&quot; &amp;&amp; chmod 600 &quot;$CONFIG&quot; || exit 1
+<a id="l94" href="#l94">94</a>     printf &#x27;server=%s\ntoken=%s\n&#x27; &quot;$server&quot; &quot;$(tr -d &#x27;\r\n&#x27; &lt; &quot;$work/out&quot;)&quot; &gt; &quot;$CONFIG&quot;
+<a id="l95" href="#l95">95</a>     rm -f &quot;$STATE&quot;
+<a id="l96" href="#l96">96</a>     say &quot;signed in to $server&quot;
+<a id="l97" href="#l97">97</a>     sync
+<a id="l98" href="#l98">98</a> }
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> logout () {
+<a id="l101" href="#l101">101</a>     if [ -e &quot;$CONFIG&quot; ]; then
+<a id="l102" href="#l102">102</a>         printf &#x27;Authorization: Bearer %s\n&#x27; &quot;$(setting token)&quot; &gt; &quot;$work/auth&quot;
+<a id="l103" href="#l103">103</a>         curl -sS -o /dev/null -X POST -H &quot;@$work/auth&quot; -- &quot;$(setting server)/api/logout&quot; \
+<a id="l104" href="#l104">104</a>             2&gt;/dev/null
+<a id="l105" href="#l105">105</a>         rm -f &quot;$CONFIG&quot; &quot;$STATE&quot;
+<a id="l106" href="#l106">106</a>     fi
+<a id="l107" href="#l107">107</a>     say &#x27;signed out&#x27;
+<a id="l108" href="#l108">108</a> }
+<a id="l109" href="#l109">109</a> 
+<a id="l110" href="#l110">110</a> status () {
+<a id="l111" href="#l111">111</a>     if [ ! -e &quot;$CONFIG&quot; ]; then
+<a id="l112" href="#l112">112</a>         echo &#x27;not signed in: run bm-sync login&#x27;
+<a id="l113" href="#l113">113</a>         return
+<a id="l114" href="#l114">114</a>     fi
+<a id="l115" href="#l115">115</a>     echo &quot;server: $(setting server)&quot;
+<a id="l116" href="#l116">116</a>     if [ -e &quot;$STATE&quot; ]; then
+<a id="l117" href="#l117">117</a>         echo &quot;last sync: $(ls -l &quot;$STATE&quot; | awk &#x27;{ print $6, $7, $8 }&#x27;)&quot;
+<a id="l118" href="#l118">118</a>     else
+<a id="l119" href="#l119">119</a>         echo &#x27;last sync: never&#x27;
+<a id="l120" href="#l120">120</a>     fi
+<a id="l121" href="#l121">121</a> }
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a> sync () {
+<a id="l124" href="#l124">124</a>     [ -e &quot;$CONFIG&quot; ] || die &#x27;not signed in: run bm-sync login&#x27;
+<a id="l125" href="#l125">125</a>     server=$(setting server)
+<a id="l126" href="#l126">126</a>     token=$(setting token)
+<a id="l127" href="#l127">127</a>     [ -n &quot;$server&quot; ] &amp;&amp; [ -n &quot;$token&quot; ] || die &quot;$CONFIG is damaged: run bm-sync login&quot;
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a>     # One sync at a time. A second bm-sync leaves a note and stops. The
+<a id="l130" href="#l130">130</a>     # first bm-sync then syncs again.
+<a id="l131" href="#l131">131</a>     if ! mkdir &quot;$LOCK&quot; 2&gt;/dev/null; then
+<a id="l132" href="#l132">132</a>         pid=$(cat &quot;$LOCK/pid&quot; 2&gt;/dev/null)
+<a id="l133" href="#l133">133</a>         if [ -n &quot;$pid&quot; ] &amp;&amp; kill -0 &quot;$pid&quot; 2&gt;/dev/null; then
+<a id="l134" href="#l134">134</a>             : &gt; &quot;$LOCK/again&quot;
+<a id="l135" href="#l135">135</a>             say &quot;bm-sync $pid syncs now, and then syncs again&quot;
+<a id="l136" href="#l136">136</a>             exit 0
+<a id="l137" href="#l137">137</a>         fi
+<a id="l138" href="#l138">138</a>         rm -rf &quot;$LOCK&quot;   # a killed bm-sync left the lock
+<a id="l139" href="#l139">139</a>         mkdir &quot;$LOCK&quot; 2&gt;/dev/null || die &quot;cannot lock $LOCK&quot;
+<a id="l140" href="#l140">140</a>     fi
+<a id="l141" href="#l141">141</a>     locked=1
+<a id="l142" href="#l142">142</a>     echo $$ &gt; &quot;$LOCK/pid&quot;
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a>     printf &#x27;Authorization: Bearer %s\n&#x27; &quot;$token&quot; &gt; &quot;$work/auth&quot;
+<a id="l145" href="#l145">145</a>     : &gt;&gt; &quot;$BOOKMARKS&quot; || exit 1   # a new device has no file yet
+<a id="l146" href="#l146">146</a>     tries=0
+<a id="l147" href="#l147">147</a>     while :; do
+<a id="l148" href="#l148">148</a>         rm -f &quot;$LOCK/again&quot;
+<a id="l149" href="#l149">149</a>         wlock
+<a id="l150" href="#l150">150</a>         cat &quot;$BOOKMARKS&quot; &gt; &quot;$work/sent&quot; || die &quot;cannot read $BOOKMARKS&quot;
+<a id="l151" href="#l151">151</a>         wunlock
+<a id="l152" href="#l152">152</a>         # An empty file with a version tells the server to delete all
+<a id="l153" href="#l153">153</a>         # bookmarks. Without a version, the server deletes nothing.
+<a id="l154" href="#l154">154</a>         [ -s &quot;$work/sent&quot; ] || rm -f &quot;$STATE&quot;
+<a id="l155" href="#l155">155</a>         base=$(cat &quot;$STATE&quot; 2&gt;/dev/null)
+<a id="l156" href="#l156">156</a>         code=$(curl -sS --max-time 60 -o &quot;$work/out&quot; -D &quot;$work/head&quot; -w &#x27;%{http_code}&#x27; \
+<a id="l157" href="#l157">157</a>             -H &quot;@$work/auth&quot; -H &#x27;Content-Type: text/plain; charset=utf-8&#x27; \
+<a id="l158" href="#l158">158</a>             --data-binary &quot;@$work/sent&quot; -- &quot;$server/api/sync?base=$base&quot;) \
+<a id="l159" href="#l159">159</a>             || die &quot;cannot reach $server&quot;
+<a id="l160" href="#l160">160</a>         case $code in
+<a id="l161" href="#l161">161</a>             200) ;;
+<a id="l162" href="#l162">162</a>             401) die &#x27;not signed in: run bm-sync login&#x27; ;;
+<a id="l163" href="#l163">163</a>             *)   die &quot;$(cat &quot;$work/out&quot;)&quot; ;;
+<a id="l164" href="#l164">164</a>         esac
+<a id="l165" href="#l165">165</a>         version=$(tr -d &#x27;\r&#x27; &lt; &quot;$work/head&quot; | sed -n &#x27;s/^[Ss][Bb][Mm]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]: *//p&#x27;)
+<a id="l166" href="#l166">166</a>         [ -n &quot;$version&quot; ] || die &#x27;the server gave no version&#x27;
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a>         # Hold the lock from the check to the write, so that no add of bm
+<a id="l169" href="#l169">169</a>         # comes between them.
+<a id="l170" href="#l170">170</a>         wlock
+<a id="l171" href="#l171">171</a>         # bm changed the file during the request: send the new file.
+<a id="l172" href="#l172">172</a>         if ! cmp -s &quot;$work/sent&quot; &quot;$BOOKMARKS&quot;; then
+<a id="l173" href="#l173">173</a>             wunlock
+<a id="l174" href="#l174">174</a>             tries=$((tries + 1))
+<a id="l175" href="#l175">175</a>             [ $tries -lt 5 ] || die &#x27;the file changes all the time: try again later&#x27;
+<a id="l176" href="#l176">176</a>             continue
+<a id="l177" href="#l177">177</a>         fi
+<a id="l178" href="#l178">178</a>         if ! cmp -s &quot;$work/out&quot; &quot;$BOOKMARKS&quot;; then
+<a id="l179" href="#l179">179</a>             # Forget the version first. If the write fails, the next sync
+<a id="l180" href="#l180">180</a>             # then deletes nothing on the server.
+<a id="l181" href="#l181">181</a>             rm -f &quot;$STATE&quot;
+<a id="l182" href="#l182">182</a>             # Write through cat, not mv: a symlink stays a symlink.
+<a id="l183" href="#l183">183</a>             cat &quot;$work/out&quot; &gt; &quot;$BOOKMARKS&quot; || die &quot;cannot write $BOOKMARKS&quot;
+<a id="l184" href="#l184">184</a>         fi
+<a id="l185" href="#l185">185</a>         printf &#x27;%s\n&#x27; &quot;$version&quot; &gt; &quot;$STATE&quot;
+<a id="l186" href="#l186">186</a>         wunlock
+<a id="l187" href="#l187">187</a>         [ -e &quot;$LOCK/again&quot; ] || break
+<a id="l188" href="#l188">188</a>     done
+<a id="l189" href="#l189">189</a>     say &quot;in sync: $(grep -c . &quot;$BOOKMARKS&quot;) bookmarks&quot;
+<a id="l190" href="#l190">190</a> }
+<a id="l191" href="#l191">191</a> 
+<a id="l192" href="#l192">192</a> while [ $# -gt 0 ]; do
+<a id="l193" href="#l193">193</a>     case $1 in
+<a id="l194" href="#l194">194</a>         -q) quiet=1 ;;
+<a id="l195" href="#l195">195</a>         -h|--help) usage; exit 0 ;;
+<a id="l196" href="#l196">196</a>         -*) usage &gt;&amp;2; exit 2 ;;
+<a id="l197" href="#l197">197</a>         *)  break ;;
+<a id="l198" href="#l198">198</a>     esac
+<a id="l199" href="#l199">199</a>     shift
+<a id="l200" href="#l200">200</a> done
+<a id="l201" href="#l201">201</a> 
+<a id="l202" href="#l202">202</a> [ -n &quot;$BOOKMARKS&quot; ] || die &#x27;BOOKMARKS is not set: set it to your bookmark file, as the README says&#x27;
+<a id="l203" href="#l203">203</a> command -v curl &gt;/dev/null 2&gt;&amp;1 || die &#x27;curl is not installed&#x27;
+<a id="l204" href="#l204">204</a> # mkdir fails when the directory exists. Thus bm-sync does not use a
+<a id="l205" href="#l205">205</a> # directory that another user made.
+<a id="l206" href="#l206">206</a> work=${TMPDIR:-/tmp}/bm-sync.$$
+<a id="l207" href="#l207">207</a> mkdir -m 700 &quot;$work&quot; || die &quot;cannot create $work&quot;
+<a id="l208" href="#l208">208</a> locked=
+<a id="l209" href="#l209">209</a> wlocked=
+<a id="l210" href="#l210">210</a> trap cleanup EXIT
+<a id="l211" href="#l211">211</a> trap &#x27;exit 1&#x27; HUP INT TERM
+<a id="l212" href="#l212">212</a> 
+<a id="l213" href="#l213">213</a> case ${1:-sync} in
+<a id="l214" href="#l214">214</a>     login)  shift; login &quot;$@&quot; ;;
+<a id="l215" href="#l215">215</a>     logout) logout ;;
+<a id="l216" href="#l216">216</a>     status) status ;;
+<a id="l217" href="#l217">217</a>     sync)   sync ;;
+<a id="l218" href="#l218">218</a>     *)      usage &gt;&amp;2; exit 2 ;;
+<a id="l219" href="#l219">219</a> esac</pre>
+</div></body></html>

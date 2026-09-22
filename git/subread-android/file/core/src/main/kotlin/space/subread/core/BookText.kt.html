@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android/core/src/main/kotlin/space/subread/core/BookText.kt - Recently Written</title>
+<link rel="stylesheet" href="../../../../../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../../../../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../../../../../../../../subread-android/index.html">Log</a> | <a href="../../../../../../../../../subread-android/files.html">Files</a> | <a href="../../../../../../../../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>core/src/main/kotlin/space/subread/core/BookText.kt (6862 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package space.subread.core
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import org.jsoup.Jsoup
+<a id="l4" href="#l4">4</a> import org.jsoup.parser.Parser
+<a id="l5" href="#l5">5</a> import java.io.File
+<a id="l6" href="#l6">6</a> import java.io.InputStream
+<a id="l7" href="#l7">7</a> import java.nio.charset.Charset
+<a id="l8" href="#l8">8</a> import java.util.zip.ZipInputStream
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> /**
+<a id="l11" href="#l11">11</a>  * A book as a flat list of paragraphs, in reading order.
+<a id="l12" href="#l12">12</a>  *
+<a id="l13" href="#l13">13</a>  * Reads epubs straight off the zip with a tolerant HTML parser rather than an
+<a id="l14" href="#l14">14</a>  * epub library: converted and scraped epubs are malformed more often than not,
+<a id="l15" href="#l15">15</a>  * and all that is needed from one is its text in spine order.
+<a id="l16" href="#l16">16</a>  */
+<a id="l17" href="#l17">17</a> object BookText {
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a>     private val BLOCKS = &quot;p, li, blockquote, h1, h2, h3, h4, h5, h6&quot;
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a>     fun read(file: File): List&lt;String&gt; = file.inputStream().use { read(it, file.name) }
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a>     fun read(input: InputStream, name: String): List&lt;String&gt; = when {
+<a id="l24" href="#l24">24</a>         name.endsWith(&quot;.epub&quot;, ignoreCase = true) -&gt; epub(input)
+<a id="l25" href="#l25">25</a>         name.endsWith(&quot;.zip&quot;, ignoreCase = true) -&gt; aozoraZip(input)
+<a id="l26" href="#l26">26</a>         else -&gt; plain(decode(input.readBytes()))
+<a id="l27" href="#l27">27</a>     }
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a>     // ------------------------------------------------------------------ epub
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a>     fun epub(input: InputStream): List&lt;String&gt; {
+<a id="l32" href="#l32">32</a>         val entries = LinkedHashMap&lt;String, ByteArray&gt;()
+<a id="l33" href="#l33">33</a>         ZipInputStream(input).use { zip -&gt;
+<a id="l34" href="#l34">34</a>             while (true) {
+<a id="l35" href="#l35">35</a>                 val e = zip.nextEntry ?: break
+<a id="l36" href="#l36">36</a>                 if (!e.isDirectory) entries[e.name] = zip.readBytes()
+<a id="l37" href="#l37">37</a>             }
+<a id="l38" href="#l38">38</a>         }
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a>         val order = spine(entries) ?: entries.keys.filter(::isPage).sorted()
+<a id="l41" href="#l41">41</a>         return order.flatMap { path -&gt; entries[path]?.let(::page) ?: emptyList() }
+<a id="l42" href="#l42">42</a>     }
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a>     /**
+<a id="l45" href="#l45">45</a>      * The cover of an epub: the image with &quot;cover&quot; in its name, or else the
+<a id="l46" href="#l46">46</a>      * largest image. This works on malformed epubs too, where the package file
+<a id="l47" href="#l47">47</a>      * does not name a cover. Null for a book that is not an epub.
+<a id="l48" href="#l48">48</a>      */
+<a id="l49" href="#l49">49</a>     fun cover(input: InputStream): ByteArray? {
+<a id="l50" href="#l50">50</a>         var best: ByteArray? = null
+<a id="l51" href="#l51">51</a>         var named: ByteArray? = null
+<a id="l52" href="#l52">52</a>         ZipInputStream(input).use { zip -&gt;
+<a id="l53" href="#l53">53</a>             while (true) {
+<a id="l54" href="#l54">54</a>                 val e = zip.nextEntry ?: break
+<a id="l55" href="#l55">55</a>                 val name = e.name.lowercase()
+<a id="l56" href="#l56">56</a>                 if (e.isDirectory || !(name.endsWith(&quot;.jpg&quot;) || name.endsWith(&quot;.jpeg&quot;) || name.endsWith(&quot;.png&quot;) || name.endsWith(&quot;.webp&quot;))) continue
+<a id="l57" href="#l57">57</a>                 val bytes = zip.readBytes()
+<a id="l58" href="#l58">58</a>                 if (bytes.size &gt; (best?.size ?: 1023)) best = bytes
+<a id="l59" href="#l59">59</a>                 if (&quot;cover&quot; in name.substringAfterLast(&#x27;/&#x27;) &amp;&amp; bytes.size &gt; (named?.size ?: 1023)) named = bytes
+<a id="l60" href="#l60">60</a>             }
+<a id="l61" href="#l61">61</a>         }
+<a id="l62" href="#l62">62</a>         return named ?: best
+<a id="l63" href="#l63">63</a>     }
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a>     private fun isPage(name: String) =
+<a id="l66" href="#l66">66</a>         name.endsWith(&quot;.xhtml&quot;, true) || name.endsWith(&quot;.html&quot;, true) || name.endsWith(&quot;.htm&quot;, true)
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a>     /** Document paths in spine order, or null when the package file cannot be followed. */
+<a id="l69" href="#l69">69</a>     private fun spine(entries: Map&lt;String, ByteArray&gt;): List&lt;String&gt;? {
+<a id="l70" href="#l70">70</a>         val container = entries[&quot;META-INF/container.xml&quot;] ?: return null
+<a id="l71" href="#l71">71</a>         val opfPath = Jsoup.parse(String(container), &quot;&quot;, Parser.xmlParser())
+<a id="l72" href="#l72">72</a>             .selectFirst(&quot;rootfile&quot;)?.attr(&quot;full-path&quot;)?.takeIf { it.isNotEmpty() } ?: return null
+<a id="l73" href="#l73">73</a>         val opf = Jsoup.parse(String(entries[opfPath] ?: return null), &quot;&quot;, Parser.xmlParser())
+<a id="l74" href="#l74">74</a>         val base = opfPath.substringBeforeLast(&#x27;/&#x27;, &quot;&quot;)
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a>         val hrefs = opf.select(&quot;manifest &gt; item&quot;).associate { it.attr(&quot;id&quot;) to it.attr(&quot;href&quot;) }
+<a id="l77" href="#l77">77</a>         val paths = opf.select(&quot;spine &gt; itemref&quot;)
+<a id="l78" href="#l78">78</a>             // linear=&quot;no&quot; is auxiliary content (notes, answers) outside the reading order.
+<a id="l79" href="#l79">79</a>             .filter { it.attr(&quot;linear&quot;) != &quot;no&quot; }
+<a id="l80" href="#l80">80</a>             .mapNotNull { hrefs[it.attr(&quot;idref&quot;)] }
+<a id="l81" href="#l81">81</a>             .map { resolve(base, java.net.URLDecoder.decode(it.substringBefore(&#x27;#&#x27;), &quot;UTF-8&quot;)) }
+<a id="l82" href="#l82">82</a>             .filter { it in entries }
+<a id="l83" href="#l83">83</a>         return paths.ifEmpty { null }
+<a id="l84" href="#l84">84</a>     }
+<a id="l85" href="#l85">85</a> 
+<a id="l86" href="#l86">86</a>     private fun resolve(base: String, href: String): String {
+<a id="l87" href="#l87">87</a>         val parts = ArrayDeque(if (base.isEmpty()) emptyList() else base.split(&#x27;/&#x27;))
+<a id="l88" href="#l88">88</a>         for (seg in href.split(&#x27;/&#x27;)) when (seg) {
+<a id="l89" href="#l89">89</a>             &quot;&quot;, &quot;.&quot; -&gt; {}
+<a id="l90" href="#l90">90</a>             &quot;..&quot; -&gt; parts.removeLastOrNull()
+<a id="l91" href="#l91">91</a>             else -&gt; parts.addLast(seg)
+<a id="l92" href="#l92">92</a>         }
+<a id="l93" href="#l93">93</a>         return parts.joinToString(&quot;/&quot;)
+<a id="l94" href="#l94">94</a>     }
+<a id="l95" href="#l95">95</a> 
+<a id="l96" href="#l96">96</a>     private fun page(bytes: ByteArray): List&lt;String&gt; {
+<a id="l97" href="#l97">97</a>         // An epub page is XHTML, so read it as XML first. To an HTML parser a
+<a id="l98" href="#l98">98</a>         // self-closing &lt;title/&gt; never closes, and it takes the whole page as the
+<a id="l99" href="#l99">99</a>         // title text. The HTML parser stays as the fallback for malformed pages.
+<a id="l100" href="#l100">100</a>         val source = String(bytes, Charsets.UTF_8)
+<a id="l101" href="#l101">101</a>         val xml = Jsoup.parse(source, &quot;&quot;, Parser.xmlParser())
+<a id="l102" href="#l102">102</a>         val doc = if (xml.selectFirst(&quot;body&quot;) != null) xml else Jsoup.parse(source)
+<a id="l103" href="#l103">103</a>         // Furigana would otherwise be read twice: once as kanji, once as kana.
+<a id="l104" href="#l104">104</a>         doc.select(&quot;rt, rp&quot;).remove()
+<a id="l105" href="#l105">105</a>         val body = doc.selectFirst(&quot;body&quot;) ?: doc
+<a id="l106" href="#l106">106</a>         val blocks = body.select(BLOCKS)
+<a id="l107" href="#l107">107</a>             // A quote holding paragraphs would yield its text twice; keep the leaves.
+<a id="l108" href="#l108">108</a>             .filter { it.select(BLOCKS).size == 1 }
+<a id="l109" href="#l109">109</a>         val parts = if (blocks.isEmpty()) listOf(body) else blocks
+<a id="l110" href="#l110">110</a>         return parts.map { it.text().trim() }.filter { it.isNotEmpty() }
+<a id="l111" href="#l111">111</a>     }
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a>     // ---------------------------------------------------------------- aozora
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a>     /** An Aozora Bunko download: a zip holding one Shift_JIS text with ruby markup. */
+<a id="l116" href="#l116">116</a>     fun aozoraZip(input: InputStream): List&lt;String&gt; {
+<a id="l117" href="#l117">117</a>         ZipInputStream(input).use { zip -&gt;
+<a id="l118" href="#l118">118</a>             while (true) {
+<a id="l119" href="#l119">119</a>                 val e = zip.nextEntry ?: break
+<a id="l120" href="#l120">120</a>                 if (e.name.endsWith(&quot;.txt&quot;, true)) return aozora(decode(zip.readBytes()))
+<a id="l121" href="#l121">121</a>             }
+<a id="l122" href="#l122">122</a>         }
+<a id="l123" href="#l123">123</a>         return emptyList()
+<a id="l124" href="#l124">124</a>     }
+<a id="l125" href="#l125">125</a> 
+<a id="l126" href="#l126">126</a>     private val annotation = Regex(&quot;［＃[^］]*］&quot;)
+<a id="l127" href="#l127">127</a>     private val ruby = Regex(&quot;《[^》]*》&quot;)
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a>     fun aozora(raw: String): List&lt;String&gt; {
+<a id="l130" href="#l130">130</a>         var lines = raw.replace(&quot;\r\n&quot;, &quot;\n&quot;).split(&#x27;\n&#x27;)
+<a id="l131" href="#l131">131</a>         // Title block, then a legend fenced by two dashed rules; then the text.
+<a id="l132" href="#l132">132</a>         val rules = lines.indices.filter { lines[it].startsWith(&quot;-----&quot;) }
+<a id="l133" href="#l133">133</a>         if (rules.size &gt;= 2) lines = lines.drop(rules[1] + 1)
+<a id="l134" href="#l134">134</a>         // The colophon.
+<a id="l135" href="#l135">135</a>         val colophon = lines.indexOfFirst { it.startsWith(&quot;底本：&quot;) }
+<a id="l136" href="#l136">136</a>         if (colophon &gt;= 0) lines = lines.take(colophon)
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a>         return lines.map { ruby.replace(annotation.replace(it, &quot;&quot;), &quot;&quot;).replace(&quot;｜&quot;, &quot;&quot;).trim() }
+<a id="l139" href="#l139">139</a>             .filter { it.isNotEmpty() }
+<a id="l140" href="#l140">140</a>     }
+<a id="l141" href="#l141">141</a> 
+<a id="l142" href="#l142">142</a>     // ----------------------------------------------------------------- plain
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a>     fun plain(text: String): List&lt;String&gt; {
+<a id="l145" href="#l145">145</a>         if (&quot;《&quot; in text &amp;&amp; &quot;底本：&quot; in text) return aozora(text)
+<a id="l146" href="#l146">146</a>         return text.replace(&quot;\r\n&quot;, &quot;\n&quot;).split(&#x27;\n&#x27;).map { it.trim() }.filter { it.isNotEmpty() }
+<a id="l147" href="#l147">147</a>     }
+<a id="l148" href="#l148">148</a> 
+<a id="l149" href="#l149">149</a>     /** UTF-8 unless it plainly is not, then Shift_JIS - the two a text file here will be. */
+<a id="l150" href="#l150">150</a>     private fun decode(bytes: ByteArray): String {
+<a id="l151" href="#l151">151</a>         val utf8 = String(bytes, Charsets.UTF_8)
+<a id="l152" href="#l152">152</a>         if (&#x27;�&#x27; !in utf8) return utf8.removePrefix(&quot;﻿&quot;)
+<a id="l153" href="#l153">153</a>         return String(bytes, Charset.forName(&quot;Shift_JIS&quot;))
+<a id="l154" href="#l154">154</a>     }
+<a id="l155" href="#l155">155</a> }</pre>
+</div></body></html>

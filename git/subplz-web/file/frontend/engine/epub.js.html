@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/frontend/engine/epub.js - Recently Written</title>
+<link rel="stylesheet" href="../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../../subplz-web/index.html">Log</a> | <a href="../../../../subplz-web/files.html">Files</a> | <a href="../../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>frontend/engine/epub.js (17282 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> /* A read-along book: the epub, with the narration inside it and each line of
+<a id="l2" href="#l2">2</a>  * text tied to its stretch of audio (EPUB 3 Media Overlays). Thorium,
+<a id="l3" href="#l3">3</a>  * Storyteller and other EPUB 3 readers play it and highlight the text.
+<a id="l4" href="#l4">4</a>  *
+<a id="l5" href="#l5">5</a>  * The cues say what was read and when, but not where in the book&#x27;s pages the
+<a id="l6" href="#l6">6</a>  * words are. That is found again by text: a cue&#x27;s words, without white space,
+<a id="l7" href="#l7">7</a>  * are looked for in the book&#x27;s words, from the end of the cue before. Each
+<a id="l8" href="#l8">8</a>  * find is wrapped in &lt;span id&gt;. A cue that crosses markup (&lt;em&gt;, ruby, the end
+<a id="l9" href="#l9">9</a>  * of a paragraph) gets several spans, and its time is divided among them by
+<a id="l10" href="#l10">10</a>  * their length.
+<a id="l11" href="#l11">11</a>  *
+<a id="l12" href="#l12">12</a>  * Made in the browser, like everything else: nothing is uploaded.
+<a id="l13" href="#l13">13</a>  */
+<a id="l14" href="#l14">14</a> import { zipEntries, leafBlocks, page, resolve, decode } from &#x27;./book.js&#x27;;
+<a id="l15" href="#l15">15</a> import { UNMATCHED } from &#x27;./align.js&#x27;;
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> const XHTML = &#x27;http://www.w3.org/1999/xhtml&#x27;;
+<a id="l18" href="#l18">18</a> const OPF = &#x27;http://www.idpf.org/2007/opf&#x27;;
+<a id="l19" href="#l19">19</a> const ACTIVE = &#x27;-epub-media-overlay-active&#x27;;
+<a id="l20" href="#l20">20</a> const DIR = &#x27;subread&#x27;;                       // what this adds, beside the package file
+<a id="l21" href="#l21">21</a> const SHOW_TEXT = 4;
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> // A jump this far ahead is believed only from a cue this long: a short line
+<a id="l24" href="#l24">24</a> // (&quot;Yes.&quot;) is found by chance somewhere in any book.
+<a id="l25" href="#l25">25</a> const FAR = 4000;
+<a id="l26" href="#l26">26</a> const LONG_ENOUGH = 12;
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> /** Audio an EPUB 3 reader must play, by codec: file extension and media type. */
+<a id="l29" href="#l29">29</a> const AUDIO = { mp3: [&#x27;mp3&#x27;, &#x27;audio/mpeg&#x27;], aac: [&#x27;m4a&#x27;, &#x27;audio/mp4&#x27;] };
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> export class NotAnEpub extends Error {}
+<a id="l32" href="#l32">32</a> 
+<a id="l33" href="#l33">33</a> /**
+<a id="l34" href="#l34">34</a>  * @param book   the epub, a File
+<a id="l35" href="#l35">35</a>  * @param cues   [{ text, start, end }], seconds on the clock of all the audio
+<a id="l36" href="#l36">36</a>  * @param parts  [{ file, duration, codec }], in playback order
+<a id="l37" href="#l37">37</a>  * @returns {{ file: File, located: number, of: number }}
+<a id="l38" href="#l38">38</a>  */
+<a id="l39" href="#l39">39</a> export async function syncedEpub({ book, cues, parts, stem }) {
+<a id="l40" href="#l40">40</a>   for (const p of parts) {
+<a id="l41" href="#l41">41</a>     if (!AUDIO[p.codec]) throw new Error(`A read-along book needs MP3 or AAC (m4a, m4b) audio; this is ${p.codec}.`);
+<a id="l42" href="#l42">42</a>   }
+<a id="l43" href="#l43">43</a>   const entries = zipEntries(new Uint8Array(await book.arrayBuffer()));
+<a id="l44" href="#l44">44</a>   const text = async (name) =&gt; decode(await entries.get(name)());
+<a id="l45" href="#l45">45</a>   const xml = (s) =&gt; new DOMParser().parseFromString(s, &#x27;application/xml&#x27;);
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a>   if (!entries.has(&#x27;META-INF/container.xml&#x27;)) throw new NotAnEpub(&#x27;This epub has no package file.&#x27;);
+<a id="l48" href="#l48">48</a>   const opfPath = xml(await text(&#x27;META-INF/container.xml&#x27;)).querySelector(&#x27;rootfile&#x27;)?.getAttribute(&#x27;full-path&#x27;);
+<a id="l49" href="#l49">49</a>   if (!opfPath || !entries.has(opfPath)) throw new NotAnEpub(&#x27;This epub has no package file.&#x27;);
+<a id="l50" href="#l50">50</a>   const opf = xml(await text(opfPath));
+<a id="l51" href="#l51">51</a>   if (opf.querySelector(&#x27;parsererror&#x27;)) throw new NotAnEpub(&#x27;The package file of this epub cannot be read.&#x27;);
+<a id="l52" href="#l52">52</a>   const base = opfPath.includes(&#x27;/&#x27;) ? opfPath.slice(0, opfPath.lastIndexOf(&#x27;/&#x27;)) : &#x27;&#x27;;
+<a id="l53" href="#l53">53</a>   const inBase = (p) =&gt; (base ? `${base}/${p}` : p);
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a>   const items = new Map();                   // zip path -&gt; manifest item
+<a id="l56" href="#l56">56</a>   for (const item of opf.querySelectorAll(&#x27;manifest &gt; item&#x27;)) {
+<a id="l57" href="#l57">57</a>     items.set(resolve(base, decodeURIComponent((item.getAttribute(&#x27;href&#x27;) ?? &#x27;&#x27;).split(&#x27;#&#x27;)[0])), item);
+<a id="l58" href="#l58">58</a>   }
+<a id="l59" href="#l59">59</a>   const byId = new Map([...items].map(([p, item]) =&gt; [item.getAttribute(&#x27;id&#x27;), p]));
+<a id="l60" href="#l60">60</a>   const order = [...opf.querySelectorAll(&#x27;spine &gt; itemref&#x27;)]
+<a id="l61" href="#l61">61</a>     .filter((r) =&gt; r.getAttribute(&#x27;linear&#x27;) !== &#x27;no&#x27;)
+<a id="l62" href="#l62">62</a>     .map((r) =&gt; byId.get(r.getAttribute(&#x27;idref&#x27;)))
+<a id="l63" href="#l63">63</a>     .filter((p) =&gt; p &amp;&amp; entries.has(p));
+<a id="l64" href="#l64">64</a>   if (!order.length) throw new NotAnEpub(&#x27;This epub has no reading order.&#x27;);
+<a id="l65" href="#l65">65</a> 
+<a id="l66" href="#l66">66</a>   // The book&#x27;s words, without white space, and where each one is.
+<a id="l67" href="#l67">67</a>   const pages = [];
+<a id="l68" href="#l68">68</a>   const runs = [];
+<a id="l69" href="#l69">69</a>   const words = [];
+<a id="l70" href="#l70">70</a>   let g = 0;
+<a id="l71" href="#l71">71</a>   for (const path of order) {
+<a id="l72" href="#l72">72</a>     const doc = page(await text(path));
+<a id="l73" href="#l73">73</a>     const pg = { path, doc, spans: [] };
+<a id="l74" href="#l74">74</a>     pages.push(pg);
+<a id="l75" href="#l75">75</a>     for (const node of textNodes(doc)) {
+<a id="l76" href="#l76">76</a>       const offsets = [];
+<a id="l77" href="#l77">77</a>       for (let i = 0; i &lt; node.data.length; i++) if (/\S/.test(node.data[i])) offsets.push(i);
+<a id="l78" href="#l78">78</a>       if (!offsets.length) continue;
+<a id="l79" href="#l79">79</a>       runs.push({ page: pg, node, g0: g, offsets, wraps: [] });
+<a id="l80" href="#l80">80</a>       words.push(offsets.map((i) =&gt; node.data[i]).join(&#x27;&#x27;));
+<a id="l81" href="#l81">81</a>       g += offsets.length;
+<a id="l82" href="#l82">82</a>     }
+<a id="l83" href="#l83">83</a>   }
+<a id="l84" href="#l84">84</a>   const all = words.join(&#x27;&#x27;);
+<a id="l85" href="#l85">85</a> 
+<a id="l86" href="#l86">86</a>   // Where each cue is.
+<a id="l87" href="#l87">87</a>   let cursor = 0, r = 0, located = 0, of = 0;
+<a id="l88" href="#l88">88</a>   cues.forEach((cue, index) =&gt; {
+<a id="l89" href="#l89">89</a>     if (cue.text.startsWith(UNMATCHED) || !(cue.end &gt; cue.start)) return;
+<a id="l90" href="#l90">90</a>     const want = cue.text.replace(/\s+/g, &#x27;&#x27;);
+<a id="l91" href="#l91">91</a>     if (!want) return;
+<a id="l92" href="#l92">92</a>     of++;
+<a id="l93" href="#l93">93</a>     const at = all.indexOf(want, cursor);
+<a id="l94" href="#l94">94</a>     if (at &lt; 0 || (at - cursor &gt; FAR &amp;&amp; want.length &lt; LONG_ENOUGH)) return;
+<a id="l95" href="#l95">95</a>     located++;
+<a id="l96" href="#l96">96</a>     cursor = at + want.length;
+<a id="l97" href="#l97">97</a> 
+<a id="l98" href="#l98">98</a>     while (runs[r].g0 + runs[r].offsets.length &lt;= at) r++;
+<a id="l99" href="#l99">99</a>     const pieces = [];
+<a id="l100" href="#l100">100</a>     for (let k = r; k &lt; runs.length &amp;&amp; runs[k].g0 &lt; cursor; k++) {
+<a id="l101" href="#l101">101</a>       const run = runs[k];
+<a id="l102" href="#l102">102</a>       const s = Math.max(at, run.g0) - run.g0, e = Math.min(cursor, run.g0 + run.offsets.length) - run.g0;
+<a id="l103" href="#l103">103</a>       pieces.push({ run, from: run.offsets[s], to: run.offsets[e - 1] + 1, chars: e - s });
+<a id="l104" href="#l104">104</a>     }
+<a id="l105" href="#l105">105</a>     let t = cue.start;
+<a id="l106" href="#l106">106</a>     pieces.forEach((piece, k) =&gt; {
+<a id="l107" href="#l107">107</a>       const id = `subread-${index}${k ? `-${k}` : &#x27;&#x27;}`;
+<a id="l108" href="#l108">108</a>       const until = k === pieces.length - 1 ? cue.end : t + (cue.end - cue.start) * piece.chars / want.length;
+<a id="l109" href="#l109">109</a>       piece.run.wraps.push({ from: piece.from, to: piece.to, id });
+<a id="l110" href="#l110">110</a>       piece.run.page.spans.push({ id, start: t, end: until });
+<a id="l111" href="#l111">111</a>       t = until;
+<a id="l112" href="#l112">112</a>     });
+<a id="l113" href="#l113">113</a>   });
+<a id="l114" href="#l114">114</a>   if (!located) throw new Error(&#x27;None of the subtitles could be found in the pages of this epub.&#x27;);
+<a id="l115" href="#l115">115</a> 
+<a id="l116" href="#l116">116</a>   for (const run of runs) if (run.wraps.length) wrap(run);
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a>   // The new files.
+<a id="l119" href="#l119">119</a>   const out = new Map();                     // zip path -&gt; Uint8Array | Blob
+<a id="l120" href="#l120">120</a>   const manifest = opf.querySelector(&#x27;manifest&#x27;);
+<a id="l121" href="#l121">121</a>   const metadata = opf.querySelector(&#x27;metadata&#x27;);
+<a id="l122" href="#l122">122</a>   const add = (parent, name, attributes, content) =&gt; {
+<a id="l123" href="#l123">123</a>     const el = opf.createElementNS(OPF, name);
+<a id="l124" href="#l124">124</a>     for (const [k, v] of Object.entries(attributes)) el.setAttribute(k, v);
+<a id="l125" href="#l125">125</a>     if (content != null) el.textContent = content;
+<a id="l126" href="#l126">126</a>     parent.appendChild(el);
+<a id="l127" href="#l127">127</a>     return el;
+<a id="l128" href="#l128">128</a>   };
+<a id="l129" href="#l129">129</a>   const encoder = new TextEncoder();
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a>   const audio = parts.map((p, i) =&gt; {
+<a id="l132" href="#l132">132</a>     const [extension, type] = AUDIO[p.codec];
+<a id="l133" href="#l133">133</a>     const path = `${DIR}/audio-${i + 1}.${extension}`;
+<a id="l134" href="#l134">134</a>     out.set(inBase(path), p.file);
+<a id="l135" href="#l135">135</a>     add(manifest, &#x27;item&#x27;, { id: `subread-audio-${i + 1}`, href: path, &#x27;media-type&#x27;: type });
+<a id="l136" href="#l136">136</a>     return path;
+<a id="l137" href="#l137">137</a>   });
+<a id="l138" href="#l138">138</a>   out.set(inBase(`${DIR}/overlay.css`), encoder.encode(`.${ACTIVE} { background: #ffe08a; color: #000; }\n`));
+<a id="l139" href="#l139">139</a>   add(manifest, &#x27;item&#x27;, { id: &#x27;subread-css&#x27;, href: `${DIR}/overlay.css`, &#x27;media-type&#x27;: &#x27;text/css&#x27; });
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a>   let total = 0;
+<a id="l142" href="#l142">142</a>   pages.forEach((pg, n) =&gt; {
+<a id="l143" href="#l143">143</a>     if (!pg.spans.length) return;
+<a id="l144" href="#l144">144</a>     const smilPath = `${DIR}/page-${n + 1}.smil`;
+<a id="l145" href="#l145">145</a>     const smilDir = inBase(DIR);
+<a id="l146" href="#l146">146</a>     const lines = pg.spans.map((s, k) =&gt; {
+<a id="l147" href="#l147">147</a>       const clip = clipOf(s, parts);
+<a id="l148" href="#l148">148</a>       total += clip.end - clip.begin;
+<a id="l149" href="#l149">149</a>       return `&lt;par id=&quot;par-${k + 1}&quot;&gt;&lt;text src=&quot;${attr(relative(smilDir, pg.path))}#${s.id}&quot;/&gt;` +
+<a id="l150" href="#l150">150</a>         `&lt;audio src=&quot;${attr(relative(smilDir, inBase(audio[clip.part])))}&quot; clipBegin=&quot;${clip.begin.toFixed(3)}s&quot; clipEnd=&quot;${clip.end.toFixed(3)}s&quot;/&gt;&lt;/par&gt;`;
+<a id="l151" href="#l151">151</a>     });
+<a id="l152" href="#l152">152</a>     out.set(inBase(smilPath), encoder.encode(
+<a id="l153" href="#l153">153</a>       &#x27;&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;\n&#x27; +
+<a id="l154" href="#l154">154</a>       &#x27;&lt;smil xmlns=&quot;http://www.w3.org/ns/SMIL&quot; xmlns:epub=&quot;http://www.idpf.org/2007/ops&quot; version=&quot;3.0&quot;&gt;\n&lt;body&gt;\n&#x27; +
+<a id="l155" href="#l155">155</a>       `&lt;seq id=&quot;seq&quot; epub:textref=&quot;${attr(relative(smilDir, pg.path))}&quot; epub:type=&quot;bodymatter&quot;&gt;\n${lines.join(&#x27;\n&#x27;)}\n&lt;/seq&gt;\n&lt;/body&gt;\n&lt;/smil&gt;\n`));
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a>     const id = `subread-smil-${n + 1}`;
+<a id="l158" href="#l158">158</a>     add(manifest, &#x27;item&#x27;, { id, href: smilPath, &#x27;media-type&#x27;: &#x27;application/smil+xml&#x27; });
+<a id="l159" href="#l159">159</a>     items.get(pg.path).setAttribute(&#x27;media-overlay&#x27;, id);
+<a id="l160" href="#l160">160</a>     const seconds = pg.spans.reduce((sum, s) =&gt; { const c = clipOf(s, parts); return sum + c.end - c.begin; }, 0);
+<a id="l161" href="#l161">161</a>     add(metadata, &#x27;meta&#x27;, { property: &#x27;media:duration&#x27;, refines: `#${id}` }, clock(seconds));
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a>     const head = pg.doc.querySelector(&#x27;head&#x27;);
+<a id="l164" href="#l164">164</a>     if (head) {
+<a id="l165" href="#l165">165</a>       const link = pg.doc.createElementNS(XHTML, &#x27;link&#x27;);
+<a id="l166" href="#l166">166</a>       link.setAttribute(&#x27;rel&#x27;, &#x27;stylesheet&#x27;);
+<a id="l167" href="#l167">167</a>       link.setAttribute(&#x27;type&#x27;, &#x27;text/css&#x27;);
+<a id="l168" href="#l168">168</a>       link.setAttribute(&#x27;href&#x27;, relative(dirOf(pg.path), inBase(`${DIR}/overlay.css`)));
+<a id="l169" href="#l169">169</a>       head.appendChild(link);
+<a id="l170" href="#l170">170</a>     }
+<a id="l171" href="#l171">171</a>     out.set(pg.path, encoder.encode(serialize(pg.doc)));
+<a id="l172" href="#l172">172</a>   });
+<a id="l173" href="#l173">173</a>   add(metadata, &#x27;meta&#x27;, { property: &#x27;media:duration&#x27; }, clock(total));
+<a id="l174" href="#l174">174</a>   add(metadata, &#x27;meta&#x27;, { property: &#x27;media:active-class&#x27; }, ACTIVE);
+<a id="l175" href="#l175">175</a> 
+<a id="l176" href="#l176">176</a>   await toEpub3(opf, { entries, items, order, pages, base, out, add, text });
+<a id="l177" href="#l177">177</a>   out.set(opfPath, encoder.encode(serialize(opf)));
+<a id="l178" href="#l178">178</a> 
+<a id="l179" href="#l179">179</a>   // mimetype first and not compressed: that is how a reader knows an epub.
+<a id="l180" href="#l180">180</a>   const files = [{ name: &#x27;mimetype&#x27;, data: encoder.encode(&#x27;application/epub+zip&#x27;) }];
+<a id="l181" href="#l181">181</a>   for (const [name, read] of entries) {
+<a id="l182" href="#l182">182</a>     if (name !== &#x27;mimetype&#x27; &amp;&amp; !out.has(name)) files.push({ name, data: await read() });
+<a id="l183" href="#l183">183</a>   }
+<a id="l184" href="#l184">184</a>   for (const [name, data] of out) files.push({ name, data });
+<a id="l185" href="#l185">185</a>   const zip = await writeZip(files);
+<a id="l186" href="#l186">186</a>   return { file: new File([zip], `${stem}.read-along.epub`, { type: &#x27;application/epub+zip&#x27; }), located, of };
+<a id="l187" href="#l187">187</a> }
+<a id="l188" href="#l188">188</a> 
+<a id="l189" href="#l189">189</a> /* --------------------------------------------------------------------- pages */
+<a id="l190" href="#l190">190</a> 
+<a id="l191" href="#l191">191</a> /** The text nodes that readBook() reads, in its order: leaf blocks, without furigana. */
+<a id="l192" href="#l192">192</a> function textNodes(doc) {
+<a id="l193" href="#l193">193</a>   const body = doc.querySelector(&#x27;body&#x27;) ?? doc.documentElement;
+<a id="l194" href="#l194">194</a>   const out = [];
+<a id="l195" href="#l195">195</a>   for (const b of leafBlocks(body)) {
+<a id="l196" href="#l196">196</a>     const walker = doc.createTreeWalker(b, SHOW_TEXT);
+<a id="l197" href="#l197">197</a>     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+<a id="l198" href="#l198">198</a>       if (!n.parentElement?.closest(&#x27;rt, rp&#x27;)) out.push(n);
+<a id="l199" href="#l199">199</a>     }
+<a id="l200" href="#l200">200</a>   }
+<a id="l201" href="#l201">201</a>   return out;
+<a id="l202" href="#l202">202</a> }
+<a id="l203" href="#l203">203</a> 
+<a id="l204" href="#l204">204</a> /** Replaces the text node with its pieces: plain text, and a &lt;span id&gt; for each find. */
+<a id="l205" href="#l205">205</a> function wrap({ node, wraps }) {
+<a id="l206" href="#l206">206</a>   const doc = node.ownerDocument, parent = node.parentNode, data = node.data;
+<a id="l207" href="#l207">207</a>   let at = 0;
+<a id="l208" href="#l208">208</a>   for (const w of wraps) {
+<a id="l209" href="#l209">209</a>     if (w.from &gt; at) parent.insertBefore(doc.createTextNode(data.slice(at, w.from)), node);
+<a id="l210" href="#l210">210</a>     const span = doc.createElementNS(XHTML, &#x27;span&#x27;);
+<a id="l211" href="#l211">211</a>     span.setAttribute(&#x27;id&#x27;, w.id);
+<a id="l212" href="#l212">212</a>     span.textContent = data.slice(w.from, w.to);
+<a id="l213" href="#l213">213</a>     parent.insertBefore(span, node);
+<a id="l214" href="#l214">214</a>     at = w.to;
+<a id="l215" href="#l215">215</a>   }
+<a id="l216" href="#l216">216</a>   if (at &lt; data.length) parent.insertBefore(doc.createTextNode(data.slice(at)), node);
+<a id="l217" href="#l217">217</a>   parent.removeChild(node);
+<a id="l218" href="#l218">218</a> }
+<a id="l219" href="#l219">219</a> 
+<a id="l220" href="#l220">220</a> function serialize(doc) {
+<a id="l221" href="#l221">221</a>   const s = new XMLSerializer().serializeToString(doc);
+<a id="l222" href="#l222">222</a>   return s.startsWith(&#x27;&lt;?xml&#x27;) ? s : `&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;\n${s}`;
+<a id="l223" href="#l223">223</a> }
+<a id="l224" href="#l224">224</a> 
+<a id="l225" href="#l225">225</a> /** The stretch of one audio file that a span is read in. */
+<a id="l226" href="#l226">226</a> function clipOf(span, parts) {
+<a id="l227" href="#l227">227</a>   let base = 0, part = 0;
+<a id="l228" href="#l228">228</a>   while (part &lt; parts.length - 1 &amp;&amp; span.start &gt;= base + parts[part].duration) base += parts[part++].duration;
+<a id="l229" href="#l229">229</a>   const begin = Math.max(0, span.start - base);
+<a id="l230" href="#l230">230</a>   // A line that runs past the end of its file stops there.
+<a id="l231" href="#l231">231</a>   const end = Math.max(begin + 0.001, Math.min(span.end - base, parts[part].duration || Infinity));
+<a id="l232" href="#l232">232</a>   return { part, begin, end };
+<a id="l233" href="#l233">233</a> }
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> export function clock(seconds) {
+<a id="l236" href="#l236">236</a>   const ms = Math.round(seconds * 1000);
+<a id="l237" href="#l237">237</a>   const p = (n, w = 2) =&gt; String(n).padStart(w, &#x27;0&#x27;);
+<a id="l238" href="#l238">238</a>   return `${Math.floor(ms / 3600000)}:${p(Math.floor(ms / 60000) % 60)}:${p(Math.floor(ms / 1000) % 60)}.${p(ms % 1000, 3)}`;
+<a id="l239" href="#l239">239</a> }
+<a id="l240" href="#l240">240</a> 
+<a id="l241" href="#l241">241</a> const dirOf = (p) =&gt; (p.includes(&#x27;/&#x27;) ? p.slice(0, p.lastIndexOf(&#x27;/&#x27;)) : &#x27;&#x27;);
+<a id="l242" href="#l242">242</a> const attr = (s) =&gt; s.replace(/&amp;/g, &#x27;&amp;amp;&#x27;).replace(/&quot;/g, &#x27;&amp;quot;&#x27;).replace(/&lt;/g, &#x27;&amp;lt;&#x27;);
+<a id="l243" href="#l243">243</a> 
+<a id="l244" href="#l244">244</a> /** The way from a directory to a file, both as zip paths. */
+<a id="l245" href="#l245">245</a> export function relative(fromDir, to) {
+<a id="l246" href="#l246">246</a>   const a = fromDir ? fromDir.split(&#x27;/&#x27;) : [], b = to.split(&#x27;/&#x27;);
+<a id="l247" href="#l247">247</a>   while (a.length &amp;&amp; b.length &gt; 1 &amp;&amp; a[0] === b[0]) { a.shift(); b.shift(); }
+<a id="l248" href="#l248">248</a>   return encodeURI(&#x27;../&#x27;.repeat(a.length) + b.join(&#x27;/&#x27;));
+<a id="l249" href="#l249">249</a> }
+<a id="l250" href="#l250">250</a> 
+<a id="l251" href="#l251">251</a> /* ----------------------------------------------------------- EPUB 2 to EPUB 3 */
+<a id="l252" href="#l252">252</a> 
+<a id="l253" href="#l253">253</a> /**
+<a id="l254" href="#l254">254</a>  * Media overlays are EPUB 3. Most epubs in the wild are EPUB 2, and an EPUB 3
+<a id="l255" href="#l255">255</a>  * package must have two things that those do not: a modification date and a
+<a id="l256" href="#l256">256</a>  * navigation document. The old table of contents (NCX) is kept too.
+<a id="l257" href="#l257">257</a>  */
+<a id="l258" href="#l258">258</a> async function toEpub3(opf, { entries, items, order, pages, base, out, add, text }) {
+<a id="l259" href="#l259">259</a>   const pkg = opf.documentElement;
+<a id="l260" href="#l260">260</a>   const metadata = opf.querySelector(&#x27;metadata&#x27;);
+<a id="l261" href="#l261">261</a>   if (!(parseFloat(pkg.getAttribute(&#x27;version&#x27;)) &gt;= 3)) {
+<a id="l262" href="#l262">262</a>     pkg.setAttribute(&#x27;version&#x27;, &#x27;3.0&#x27;);
+<a id="l263" href="#l263">263</a>     // EPUB 2 attributes that EPUB 3 does not have.
+<a id="l264" href="#l264">264</a>     for (const el of metadata.querySelectorAll(&#x27;*&#x27;)) {
+<a id="l265" href="#l265">265</a>       for (const a of [...el.attributes]) if (a.name.startsWith(&#x27;opf:&#x27;)) el.removeAttribute(a.name);
+<a id="l266" href="#l266">266</a>     }
+<a id="l267" href="#l267">267</a>     const dates = [...metadata.children].filter((el) =&gt; el.localName === &#x27;date&#x27;);
+<a id="l268" href="#l268">268</a>     dates.slice(1).forEach((el) =&gt; el.remove());
+<a id="l269" href="#l269">269</a>     // EPUB 3 wants to be told which pages hold these.
+<a id="l270" href="#l270">270</a>     for (const pg of pages) {
+<a id="l271" href="#l271">271</a>       const has = { svg: &#x27;svg&#x27;, mathml: &#x27;math&#x27;, scripted: &#x27;script&#x27; };
+<a id="l272" href="#l272">272</a>       const found = Object.keys(has).filter((k) =&gt; pg.doc.getElementsByTagName(has[k]).length);
+<a id="l273" href="#l273">273</a>       const item = items.get(pg.path);
+<a id="l274" href="#l274">274</a>       const was = (item.getAttribute(&#x27;properties&#x27;) ?? &#x27;&#x27;).split(/\s+/).filter(Boolean);
+<a id="l275" href="#l275">275</a>       const now = [...new Set([...was, ...found])];
+<a id="l276" href="#l276">276</a>       if (now.length) item.setAttribute(&#x27;properties&#x27;, now.join(&#x27; &#x27;));
+<a id="l277" href="#l277">277</a>     }
+<a id="l278" href="#l278">278</a>   }
+<a id="l279" href="#l279">279</a>   if (![...metadata.querySelectorAll(&#x27;meta&#x27;)].some((m) =&gt; m.getAttribute(&#x27;property&#x27;) === &#x27;dcterms:modified&#x27;)) {
+<a id="l280" href="#l280">280</a>     add(metadata, &#x27;meta&#x27;, { property: &#x27;dcterms:modified&#x27; }, new Date().toISOString().replace(/\.\d+Z$/, &#x27;Z&#x27;));
+<a id="l281" href="#l281">281</a>   }
+<a id="l282" href="#l282">282</a>   if ([...items.values()].some((i) =&gt; (i.getAttribute(&#x27;properties&#x27;) ?? &#x27;&#x27;).split(/\s+/).includes(&#x27;nav&#x27;))) return;
+<a id="l283" href="#l283">283</a> 
+<a id="l284" href="#l284">284</a>   // The contents: from the NCX when there is one, else one line for each page.
+<a id="l285" href="#l285">285</a>   let contents = [];
+<a id="l286" href="#l286">286</a>   const ncxPath = [...items].find(([, i]) =&gt; i.getAttribute(&#x27;media-type&#x27;) === &#x27;application/x-dtbncx+xml&#x27;)?.[0];
+<a id="l287" href="#l287">287</a>   if (ncxPath &amp;&amp; entries.has(ncxPath)) {
+<a id="l288" href="#l288">288</a>     const ncx = new DOMParser().parseFromString(await text(ncxPath), &#x27;application/xml&#x27;);
+<a id="l289" href="#l289">289</a>     contents = [...ncx.querySelectorAll(&#x27;navPoint&#x27;)].map((p) =&gt; ({
+<a id="l290" href="#l290">290</a>       label: p.querySelector(&#x27;navLabel &gt; text&#x27;)?.textContent.trim(),
+<a id="l291" href="#l291">291</a>       path: resolve(dirOf(ncxPath), decodeURIComponent(p.querySelector(&#x27;content&#x27;)?.getAttribute(&#x27;src&#x27;) ?? &#x27;&#x27;)),
+<a id="l292" href="#l292">292</a>     })).filter((c) =&gt; c.label &amp;&amp; c.path);
+<a id="l293" href="#l293">293</a>   }
+<a id="l294" href="#l294">294</a>   if (!contents.length) contents = order.map((path, n) =&gt; ({ label: `Part ${n + 1}`, path }));
+<a id="l295" href="#l295">295</a> 
+<a id="l296" href="#l296">296</a>   const navPath = `${DIR}/nav.xhtml`;
+<a id="l297" href="#l297">297</a>   const dir = base ? `${base}/${DIR}` : DIR;
+<a id="l298" href="#l298">298</a>   const esc = (s) =&gt; s.replace(/&amp;/g, &#x27;&amp;amp;&#x27;).replace(/&lt;/g, &#x27;&amp;lt;&#x27;);
+<a id="l299" href="#l299">299</a>   out.set(`${dir}/nav.xhtml`, new TextEncoder().encode(
+<a id="l300" href="#l300">300</a>     &#x27;&lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;\n&#x27; +
+<a id="l301" href="#l301">301</a>     `&lt;html xmlns=&quot;${XHTML}&quot; xmlns:epub=&quot;http://www.idpf.org/2007/ops&quot;&gt;&lt;head&gt;&lt;title&gt;Contents&lt;/title&gt;&lt;/head&gt;&lt;body&gt;\n` +
+<a id="l302" href="#l302">302</a>     &#x27;&lt;nav epub:type=&quot;toc&quot;&gt;&lt;h1&gt;Contents&lt;/h1&gt;&lt;ol&gt;\n&#x27; +
+<a id="l303" href="#l303">303</a>     contents.map((c) =&gt; {
+<a id="l304" href="#l304">304</a>       const [file, fragment] = c.path.split(&#x27;#&#x27;);
+<a id="l305" href="#l305">305</a>       return `&lt;li&gt;&lt;a href=&quot;${attr(relative(dir, file))}${fragment ? `#${attr(fragment)}` : &#x27;&#x27;}&quot;&gt;${esc(c.label)}&lt;/a&gt;&lt;/li&gt;`;
+<a id="l306" href="#l306">306</a>     }).join(&#x27;\n&#x27;) +
+<a id="l307" href="#l307">307</a>     &#x27;\n&lt;/ol&gt;&lt;/nav&gt;\n&lt;/body&gt;&lt;/html&gt;\n&#x27;));
+<a id="l308" href="#l308">308</a>   add(opf.querySelector(&#x27;manifest&#x27;), &#x27;item&#x27;,
+<a id="l309" href="#l309">309</a>     { id: &#x27;subread-nav&#x27;, href: navPath, &#x27;media-type&#x27;: &#x27;application/xhtml+xml&#x27;, properties: &#x27;nav&#x27; });
+<a id="l310" href="#l310">310</a> }
+<a id="l311" href="#l311">311</a> 
+<a id="l312" href="#l312">312</a> /* ----------------------------------------------------------------------- zip */
+<a id="l313" href="#l313">313</a> 
+<a id="l314" href="#l314">314</a> const CRC = (() =&gt; {
+<a id="l315" href="#l315">315</a>   const t = new Uint32Array(256);
+<a id="l316" href="#l316">316</a>   for (let n = 0; n &lt; 256; n++) {
+<a id="l317" href="#l317">317</a>     let c = n;
+<a id="l318" href="#l318">318</a>     for (let k = 0; k &lt; 8; k++) c = c &amp; 1 ? 0xedb88320 ^ (c &gt;&gt;&gt; 1) : c &gt;&gt;&gt; 1;
+<a id="l319" href="#l319">319</a>     t[n] = c &gt;&gt;&gt; 0;
+<a id="l320" href="#l320">320</a>   }
+<a id="l321" href="#l321">321</a>   return t;
+<a id="l322" href="#l322">322</a> })();
+<a id="l323" href="#l323">323</a> 
+<a id="l324" href="#l324">324</a> function crc32(bytes, crc = 0) {
+<a id="l325" href="#l325">325</a>   let c = ~crc;
+<a id="l326" href="#l326">326</a>   for (let i = 0; i &lt; bytes.length; i++) c = CRC[(c ^ bytes[i]) &amp; 0xff] ^ (c &gt;&gt;&gt; 8);
+<a id="l327" href="#l327">327</a>   return ~c &gt;&gt;&gt; 0;
+<a id="l328" href="#l328">328</a> }
+<a id="l329" href="#l329">329</a> 
+<a id="l330" href="#l330">330</a> /**
+<a id="l331" href="#l331">331</a>  * A zip with nothing compressed: the audio, which is nearly all of it, is
+<a id="l332" href="#l332">332</a>  * compressed already. A Blob of parts, so a book of audio is never copied
+<a id="l333" href="#l333">333</a>  * into memory.
+<a id="l334" href="#l334">334</a>  *
+<a id="l335" href="#l335">335</a>  * @param files [{ name, data: Uint8Array | Blob }]
+<a id="l336" href="#l336">336</a>  */
+<a id="l337" href="#l337">337</a> export async function writeZip(files) {
+<a id="l338" href="#l338">338</a>   const parts = [], directory = [];
+<a id="l339" href="#l339">339</a>   let offset = 0;
+<a id="l340" href="#l340">340</a>   for (const { name, data } of files) {
+<a id="l341" href="#l341">341</a>     const size = data instanceof Blob ? data.size : data.length;
+<a id="l342" href="#l342">342</a>     let crc = 0;
+<a id="l343" href="#l343">343</a>     if (data instanceof Blob) {
+<a id="l344" href="#l344">344</a>       const reader = data.stream().getReader();
+<a id="l345" href="#l345">345</a>       for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) crc = crc32(chunk.value, crc);
+<a id="l346" href="#l346">346</a>     } else crc = crc32(data);
+<a id="l347" href="#l347">347</a> 
+<a id="l348" href="#l348">348</a>     const nameBytes = new TextEncoder().encode(name);
+<a id="l349" href="#l349">349</a>     const header = (signature, extra) =&gt; {
+<a id="l350" href="#l350">350</a>       const b = new DataView(new ArrayBuffer(extra ? 46 : 30));
+<a id="l351" href="#l351">351</a>       let o = 0;
+<a id="l352" href="#l352">352</a>       const u16 = (v) =&gt; { b.setUint16(o, v, true); o += 2; };
+<a id="l353" href="#l353">353</a>       const u32 = (v) =&gt; { b.setUint32(o, v, true); o += 4; };
+<a id="l354" href="#l354">354</a>       u32(signature);
+<a id="l355" href="#l355">355</a>       if (extra) u16(20);                    // version made by
+<a id="l356" href="#l356">356</a>       u16(20); u16(0x0800); u16(0);          // version needed; UTF-8 names; stored
+<a id="l357" href="#l357">357</a>       u16(0); u16(0x21);                     // 1980-01-01 00:00
+<a id="l358" href="#l358">358</a>       u32(crc); u32(size); u32(size);
+<a id="l359" href="#l359">359</a>       u16(nameBytes.length); u16(0);
+<a id="l360" href="#l360">360</a>       if (extra) { u16(0); u16(0); u16(0); u32(0); u32(offset); }
+<a id="l361" href="#l361">361</a>       return new Uint8Array(b.buffer);
+<a id="l362" href="#l362">362</a>     };
+<a id="l363" href="#l363">363</a>     directory.push(header(0x02014b50, true), nameBytes);
+<a id="l364" href="#l364">364</a>     parts.push(header(0x04034b50, false), nameBytes, data);
+<a id="l365" href="#l365">365</a>     offset += 30 + nameBytes.length + size;
+<a id="l366" href="#l366">366</a>     if (offset &gt; 0xffffffff) throw new Error(&#x27;The book and its audio are over 4 GB, which is more than an epub can hold.&#x27;);
+<a id="l367" href="#l367">367</a>   }
+<a id="l368" href="#l368">368</a>   const directorySize = directory.reduce((n, p) =&gt; n + p.length, 0);
+<a id="l369" href="#l369">369</a>   const end = new DataView(new ArrayBuffer(22));
+<a id="l370" href="#l370">370</a>   end.setUint32(0, 0x06054b50, true);
+<a id="l371" href="#l371">371</a>   end.setUint16(8, files.length, true);
+<a id="l372" href="#l372">372</a>   end.setUint16(10, files.length, true);
+<a id="l373" href="#l373">373</a>   end.setUint32(12, directorySize, true);
+<a id="l374" href="#l374">374</a>   end.setUint32(16, offset, true);
+<a id="l375" href="#l375">375</a>   return new Blob([...parts, ...directory, new Uint8Array(end.buffer)]);
+<a id="l376" href="#l376">376</a> }</pre>
+</div></body></html>

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/tests/test_billing.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tests/test_billing.py (12003 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Tiers, credits, Stripe fulfilment. The rules under test:
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a>   free   a job in the visitor&#x27;s browser: no price, no limit, each output
+<a id="l4" href="#l4">4</a>   cloud  a job on this server: one credit (or a recurring plan, if one is sold)
+<a id="l5" href="#l5">5</a> &quot;&quot;&quot;
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> from __future__ import annotations
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> import json
+<a id="l10" href="#l10">10</a> import time
+<a id="l11" href="#l11">11</a> from dataclasses import asdict
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> import pytest
+<a id="l14" href="#l14">14</a> import stripe
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> from backend import pricing, runner
+<a id="l17" href="#l17">17</a> from backend.db import JobStatus
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> from .conftest import (
+<a id="l20" href="#l20">20</a>     FakeStripeObject, account_id, checkout_event, checkout_object,
+<a id="l21" href="#l21">21</a>     get_account_row, get_job_row, make_job, post_webhook,
+<a id="l22" href="#l22">22</a> )
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> def start(client, job_id):
+<a id="l26" href="#l26">26</a>     &quot;&quot;&quot;Start a job on the server: a cloud job.&quot;&quot;&quot;
+<a id="l27" href="#l27">27</a>     return client.post(f&quot;/api/jobs/{job_id}/start&quot;, json={&quot;language&quot;: &quot;en&quot;})
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> 
+<a id="l30" href="#l30">30</a> @pytest.fixture
+<a id="l31" href="#l31">31</a> def monthly_plan(monkeypatch):
+<a id="l32" href="#l32">32</a>     &quot;&quot;&quot;The default catalogue sells no recurring plan. An operator can add one.&quot;&quot;&quot;
+<a id="l33" href="#l33">33</a>     plans = [asdict(p) for p in pricing.DEFAULT_PLANS]
+<a id="l34" href="#l34">34</a>     plans.append({&quot;id&quot;: &quot;monthly&quot;, &quot;name&quot;: &quot;Monthly&quot;, &quot;credits&quot;: None, &quot;price_cents&quot;: 1500, &quot;recurring&quot;: True})
+<a id="l35" href="#l35">35</a>     monkeypatch.setenv(&quot;SUBPLZ_WEB_PLANS_JSON&quot;, json.dumps(plans))
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a> 
+<a id="l38" href="#l38">38</a> def buy(client, plan=&quot;pack5&quot;, session_id=None, **kw):
+<a id="l39" href="#l39">39</a>     session_id = session_id or f&quot;cs_{time.time_ns()}&quot;
+<a id="l40" href="#l40">40</a>     r = post_webhook(client, checkout_event(session_id, account_id(client), plan, **kw))
+<a id="l41" href="#l41">41</a>     assert r.status_code == 200, r.text
+<a id="l42" href="#l42">42</a>     return session_id
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> 
+<a id="l45" href="#l45">45</a> # --- the cloud tier ----------------------------------------------------------
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a> def test_new_visitor_is_anonymous_and_has_no_credits(client):
+<a id="l48" href="#l48">48</a>     a = client.get(&quot;/api/account&quot;).json()
+<a id="l49" href="#l49">49</a>     assert a[&quot;signed_in&quot;] is False and a[&quot;email&quot;] is None
+<a id="l50" href="#l50">50</a>     assert a[&quot;credits&quot;] == 0 and a[&quot;subscribed&quot;] is False
+<a id="l51" href="#l51">51</a>     assert a[&quot;cloud_allowed&quot;] is False
+<a id="l52" href="#l52">52</a>     assert &quot;free in your browser&quot; in a[&quot;free_tier_summary&quot;]
+<a id="l53" href="#l53">53</a> 
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> def test_nothing_is_for_sale_until_the_cloud_is_connected(client, monkeypatch):
+<a id="l56" href="#l56">56</a>     &quot;&quot;&quot;Billing can be on while fast conversion is not yet on offer. The page
+<a id="l57" href="#l57">57</a>     reads this flag, and shows no way to buy credits that would buy nothing.&quot;&quot;&quot;
+<a id="l58" href="#l58">58</a>     from backend.settings import settings
+<a id="l59" href="#l59">59</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;cloud_available&quot;] is False
+<a id="l60" href="#l60">60</a>     monkeypatch.setattr(settings, &quot;cloud_enabled&quot;, True)
+<a id="l61" href="#l61">61</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;cloud_available&quot;] is True
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> def test_a_server_job_needs_a_credit(client):
+<a id="l65" href="#l65">65</a>     r = start(client, make_job(client))
+<a id="l66" href="#l66">66</a>     assert r.status_code == 402
+<a id="l67" href="#l67">67</a>     assert &quot;one credit&quot; in r.json()[&quot;detail&quot;] and &quot;free&quot; in r.json()[&quot;detail&quot;]
+<a id="l68" href="#l68">68</a> 
+<a id="l69" href="#l69">69</a> 
+<a id="l70" href="#l70">70</a> def test_each_output_of_a_job_can_be_downloaded(client):
+<a id="l71" href="#l71">71</a>     job_id = make_job(client, JobStatus.succeeded, with_files=True)
+<a id="l72" href="#l72">72</a>     arts = client.get(f&quot;/api/jobs/{job_id}&quot;).json()[&quot;artifacts&quot;]
+<a id="l73" href="#l73">73</a>     assert {a[&quot;kind&quot;] for a in arts} &gt;= {&quot;srt&quot;, &quot;video&quot;, &quot;video_embedded&quot;}
+<a id="l74" href="#l74">74</a>     assert all(&quot;locked&quot; not in a for a in arts)
+<a id="l75" href="#l75">75</a>     for kind in (&quot;srt&quot;, &quot;video_embedded&quot;, &quot;video&quot;):
+<a id="l76" href="#l76">76</a>         assert client.get(f&quot;/api/jobs/{job_id}/files/{kind}&quot;).status_code == 200
+<a id="l77" href="#l77">77</a> 
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a> # --- credits -----------------------------------------------------------------
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a> def test_purchase_credits_the_account_and_signs_it_in(client):
+<a id="l82" href="#l82">82</a>     buy(client, &quot;pack5&quot;, email=&quot;Reader@Example.com&quot;)
+<a id="l83" href="#l83">83</a>     a = client.get(&quot;/api/account&quot;).json()
+<a id="l84" href="#l84">84</a>     assert a[&quot;credits&quot;] == 5
+<a id="l85" href="#l85">85</a>     assert a[&quot;signed_in&quot;] is True and a[&quot;email&quot;] == &quot;reader@example.com&quot;
+<a id="l86" href="#l86">86</a>     assert a[&quot;cloud_allowed&quot;] is True
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a> 
+<a id="l89" href="#l89">89</a> def test_webhook_redelivery_does_not_credit_twice(client):
+<a id="l90" href="#l90">90</a>     sid = buy(client, &quot;pack5&quot;, email=&quot;twice@example.com&quot;)
+<a id="l91" href="#l91">91</a>     buy(client, &quot;pack5&quot;, session_id=sid, email=&quot;twice@example.com&quot;)
+<a id="l92" href="#l92">92</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 5
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a> def test_unpaid_checkout_credits_nothing(client):
+<a id="l96" href="#l96">96</a>     buy(client, &quot;pack5&quot;, email=&quot;pending@example.com&quot;, payment_status=&quot;unpaid&quot;)
+<a id="l97" href="#l97">97</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> def test_webhook_rejects_a_bad_signature(client):
+<a id="l101" href="#l101">101</a>     event = checkout_event(&quot;cs_forged&quot;, account_id(client), &quot;pack20&quot;)
+<a id="l102" href="#l102">102</a>     assert post_webhook(client, event, secret=&quot;whsec_wrong&quot;).status_code == 400
+<a id="l103" href="#l103">103</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0
+<a id="l104" href="#l104">104</a> 
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a> def test_a_server_job_spends_a_credit(client):
+<a id="l107" href="#l107">107</a>     buy(client, &quot;single&quot;, email=&quot;cloud@example.com&quot;)
+<a id="l108" href="#l108">108</a>     job_id = make_job(client, with_files=True)
+<a id="l109" href="#l109">109</a>     assert start(client, job_id).status_code == 200
+<a id="l110" href="#l110">110</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0
+<a id="l111" href="#l111">111</a>     assert client.get(f&quot;/api/jobs/{job_id}&quot;).json()[&quot;tier&quot;] == &quot;cloud&quot;
+<a id="l112" href="#l112">112</a>     assert get_job_row(job_id).credit_spent == 1
+<a id="l113" href="#l113">113</a> 
+<a id="l114" href="#l114">114</a>     # And with the credit gone, the next one is refused again.
+<a id="l115" href="#l115">115</a>     assert start(client, make_job(client)).status_code == 402
+<a id="l116" href="#l116">116</a> 
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a> def test_failed_server_job_returns_the_credit(client):
+<a id="l119" href="#l119">119</a>     buy(client, &quot;single&quot;, email=&quot;refund@example.com&quot;)
+<a id="l120" href="#l120">120</a>     job_id = make_job(client)
+<a id="l121" href="#l121">121</a>     assert start(client, job_id).status_code == 200
+<a id="l122" href="#l122">122</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a>     runner.run_job(job_id)  # fails: nothing was staged
+<a id="l125" href="#l125">125</a> 
+<a id="l126" href="#l126">126</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 1
+<a id="l127" href="#l127">127</a>     assert get_job_row(job_id).credit_spent == 0
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a> 
+<a id="l130" href="#l130">130</a> def test_cancelled_server_job_returns_the_credit(client):
+<a id="l131" href="#l131">131</a>     buy(client, &quot;single&quot;, email=&quot;cancel@example.com&quot;)
+<a id="l132" href="#l132">132</a>     job_id = make_job(client)
+<a id="l133" href="#l133">133</a>     assert start(client, job_id).status_code == 200
+<a id="l134" href="#l134">134</a>     assert client.post(f&quot;/api/jobs/{job_id}/cancel&quot;).status_code == 200
+<a id="l135" href="#l135">135</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 1
+<a id="l136" href="#l136">136</a> 
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a> def test_cannot_touch_someone_elses_job(client, second_client):
+<a id="l139" href="#l139">139</a>     job_id = make_job(client, JobStatus.succeeded, with_files=True)
+<a id="l140" href="#l140">140</a>     assert second_client.get(f&quot;/api/jobs/{job_id}/files/srt&quot;).status_code == 404
+<a id="l141" href="#l141">141</a>     assert second_client.post(f&quot;/api/jobs/{job_id}/cancel&quot;).status_code == 404
+<a id="l142" href="#l142">142</a> 
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> # --- checkout ----------------------------------------------------------------
+<a id="l145" href="#l145">145</a> 
+<a id="l146" href="#l146">146</a> def test_checkout_sends_stripe_the_right_order(client, monkeypatch):
+<a id="l147" href="#l147">147</a>     seen = {}
+<a id="l148" href="#l148">148</a> 
+<a id="l149" href="#l149">149</a>     def create(**params):
+<a id="l150" href="#l150">150</a>         seen.update(params)
+<a id="l151" href="#l151">151</a>         return FakeStripeObject({&quot;id&quot;: &quot;cs_new&quot;, &quot;url&quot;: &quot;https://stripe.test/pay&quot;})
+<a id="l152" href="#l152">152</a> 
+<a id="l153" href="#l153">153</a>     monkeypatch.setattr(stripe.checkout.Session, &quot;create&quot;, create)
+<a id="l154" href="#l154">154</a>     r = client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;pack5&quot;})
+<a id="l155" href="#l155">155</a>     assert r.status_code == 200 and r.json()[&quot;url&quot;] == &quot;https://stripe.test/pay&quot;
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a>     assert seen[&quot;mode&quot;] == &quot;payment&quot;
+<a id="l158" href="#l158">158</a>     assert seen[&quot;client_reference_id&quot;] == account_id(client)
+<a id="l159" href="#l159">159</a>     assert seen[&quot;metadata&quot;][&quot;plan_id&quot;] == &quot;pack5&quot;
+<a id="l160" href="#l160">160</a>     item = seen[&quot;line_items&quot;][0][&quot;price_data&quot;]
+<a id="l161" href="#l161">161</a>     assert item[&quot;unit_amount&quot;] == 1699 and item[&quot;currency&quot;] == &quot;usd&quot;
+<a id="l162" href="#l162">162</a>     assert &quot;recurring&quot; not in item
+<a id="l163" href="#l163">163</a>     assert seen[&quot;success_url&quot;].startswith(
+<a id="l164" href="#l164">164</a>         &quot;https://example.test/api/billing/return?session_id={CHECKOUT_SESSION_ID}&quot;)
+<a id="l165" href="#l165">165</a>     assert seen[&quot;customer_creation&quot;] == &quot;always&quot;
+<a id="l166" href="#l166">166</a> 
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a> def test_no_unlimited_plan_is_sold_by_default(client):
+<a id="l169" href="#l169">169</a>     plans = client.get(&quot;/api/pricing&quot;).json()[&quot;plans&quot;]
+<a id="l170" href="#l170">170</a>     assert [p[&quot;id&quot;] for p in plans] == [&quot;single&quot;, &quot;pack5&quot;, &quot;pack20&quot;]
+<a id="l171" href="#l171">171</a>     assert [p[&quot;price_cents&quot;] for p in plans] == [499, 1699, 3900]
+<a id="l172" href="#l172">172</a>     assert not any(p[&quot;recurring&quot;] for p in plans)
+<a id="l173" href="#l173">173</a> 
+<a id="l174" href="#l174">174</a> 
+<a id="l175" href="#l175">175</a> def test_subscription_checkout_is_recurring(client, monkeypatch, monthly_plan):
+<a id="l176" href="#l176">176</a>     seen = {}
+<a id="l177" href="#l177">177</a>     monkeypatch.setattr(
+<a id="l178" href="#l178">178</a>         stripe.checkout.Session, &quot;create&quot;,
+<a id="l179" href="#l179">179</a>         lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),
+<a id="l180" href="#l180">180</a>     )
+<a id="l181" href="#l181">181</a>     assert client.post(&quot;/api/billing/checkout&quot;,
+<a id="l182" href="#l182">182</a>                        json={&quot;plan_id&quot;: &quot;monthly&quot;}).status_code == 200
+<a id="l183" href="#l183">183</a>     assert seen[&quot;mode&quot;] == &quot;subscription&quot;
+<a id="l184" href="#l184">184</a>     assert seen[&quot;line_items&quot;][0][&quot;price_data&quot;][&quot;recurring&quot;] == {&quot;interval&quot;: &quot;month&quot;}
+<a id="l185" href="#l185">185</a>     assert seen[&quot;subscription_data&quot;][&quot;metadata&quot;][&quot;account_id&quot;] == account_id(client)
+<a id="l186" href="#l186">186</a>     assert &quot;customer_creation&quot; not in seen  # not allowed in subscription mode
+<a id="l187" href="#l187">187</a> 
+<a id="l188" href="#l188">188</a> 
+<a id="l189" href="#l189">189</a> def test_unknown_plan_is_refused(client):
+<a id="l190" href="#l190">190</a>     assert client.post(&quot;/api/billing/checkout&quot;,
+<a id="l191" href="#l191">191</a>                        json={&quot;plan_id&quot;: &quot;nope&quot;}).status_code == 404
+<a id="l192" href="#l192">192</a> 
+<a id="l193" href="#l193">193</a> 
+<a id="l194" href="#l194">194</a> def test_return_trip_fulfils_and_the_webhook_then_adds_nothing(client, monkeypatch):
+<a id="l195" href="#l195">195</a>     acct = account_id(client)
+<a id="l196" href="#l196">196</a>     paid = checkout_object(&quot;cs_return&quot;, acct, &quot;pack20&quot;, email=&quot;return@example.com&quot;)
+<a id="l197" href="#l197">197</a>     monkeypatch.setattr(stripe.checkout.Session, &quot;retrieve&quot;,
+<a id="l198" href="#l198">198</a>                         lambda sid: FakeStripeObject(paid))
+<a id="l199" href="#l199">199</a> 
+<a id="l200" href="#l200">200</a>     r = client.get(&quot;/api/billing/return?session_id=cs_return&quot;, follow_redirects=False)
+<a id="l201" href="#l201">201</a>     assert r.status_code == 303 and r.headers[&quot;location&quot;] == &quot;/?checkout=paid&quot;
+<a id="l202" href="#l202">202</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 20
+<a id="l203" href="#l203">203</a> 
+<a id="l204" href="#l204">204</a>     assert post_webhook(client, checkout_event(
+<a id="l205" href="#l205">205</a>         &quot;cs_return&quot;, acct, &quot;pack20&quot;, email=&quot;return@example.com&quot;)).status_code == 200
+<a id="l206" href="#l206">206</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 20
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a> 
+<a id="l209" href="#l209">209</a> def test_return_trip_does_not_trust_an_unpaid_session(client, monkeypatch):
+<a id="l210" href="#l210">210</a>     unpaid = checkout_object(&quot;cs_unpaid&quot;, account_id(client), &quot;pack20&quot;,
+<a id="l211" href="#l211">211</a>                              payment_status=&quot;unpaid&quot;)
+<a id="l212" href="#l212">212</a>     monkeypatch.setattr(stripe.checkout.Session, &quot;retrieve&quot;,
+<a id="l213" href="#l213">213</a>                         lambda sid: FakeStripeObject(unpaid))
+<a id="l214" href="#l214">214</a>     r = client.get(&quot;/api/billing/return?session_id=cs_unpaid&quot;, follow_redirects=False)
+<a id="l215" href="#l215">215</a>     assert r.headers[&quot;location&quot;] == &quot;/?checkout=pending&quot;
+<a id="l216" href="#l216">216</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a> 
+<a id="l219" href="#l219">219</a> # --- subscription ------------------------------------------------------------
+<a id="l220" href="#l220">220</a> 
+<a id="l221" href="#l221">221</a> def subscription_event(kind, account, status, ends_in=30 * 86400, sub_id=&quot;sub_1&quot;):
+<a id="l222" href="#l222">222</a>     return {
+<a id="l223" href="#l223">223</a>         &quot;id&quot;: f&quot;evt_{kind}_{time.time_ns()}&quot;,
+<a id="l224" href="#l224">224</a>         &quot;type&quot;: f&quot;customer.subscription.{kind}&quot;,
+<a id="l225" href="#l225">225</a>         &quot;data&quot;: {&quot;object&quot;: {
+<a id="l226" href="#l226">226</a>             &quot;id&quot;: sub_id, &quot;object&quot;: &quot;subscription&quot;, &quot;status&quot;: status,
+<a id="l227" href="#l227">227</a>             &quot;customer&quot;: &quot;cus_sub&quot;, &quot;metadata&quot;: {&quot;account_id&quot;: account},
+<a id="l228" href="#l228">228</a>             # Where newer API versions put it; _period_end reads both places.
+<a id="l229" href="#l229">229</a>             &quot;items&quot;: {&quot;data&quot;: [{&quot;current_period_end&quot;: int(time.time()) + ends_in}]},
+<a id="l230" href="#l230">230</a>         }},
+<a id="l231" href="#l231">231</a>     }
+<a id="l232" href="#l232">232</a> 
+<a id="l233" href="#l233">233</a> 
+<a id="l234" href="#l234">234</a> def test_subscription_lifts_every_limit_then_lapses(client):
+<a id="l235" href="#l235">235</a>     acct = account_id(client)
+<a id="l236" href="#l236">236</a>     assert post_webhook(client, subscription_event(&quot;created&quot;, acct, &quot;active&quot;)).status_code == 200
+<a id="l237" href="#l237">237</a> 
+<a id="l238" href="#l238">238</a>     a = client.get(&quot;/api/account&quot;).json()
+<a id="l239" href="#l239">239</a>     assert a[&quot;subscribed&quot;] is True and a[&quot;cloud_allowed&quot;] is True
+<a id="l240" href="#l240">240</a>     assert a[&quot;subscription_ends&quot;]
+<a id="l241" href="#l241">241</a> 
+<a id="l242" href="#l242">242</a>     # Server jobs start, and no credits are spent.
+<a id="l243" href="#l243">243</a>     for _ in range(3):
+<a id="l244" href="#l244">244</a>         job_id = make_job(client, with_files=True)
+<a id="l245" href="#l245">245</a>         assert start(client, job_id).status_code == 200
+<a id="l246" href="#l246">246</a>     assert get_job_row(job_id).credit_spent == 0
+<a id="l247" href="#l247">247</a> 
+<a id="l248" href="#l248">248</a>     post_webhook(client, subscription_event(&quot;deleted&quot;, acct, &quot;canceled&quot;))
+<a id="l249" href="#l249">249</a>     a = client.get(&quot;/api/account&quot;).json()
+<a id="l250" href="#l250">250</a>     assert a[&quot;subscribed&quot;] is False
+<a id="l251" href="#l251">251</a>     assert start(client, make_job(client)).status_code == 402
+<a id="l252" href="#l252">252</a> 
+<a id="l253" href="#l253">253</a> 
+<a id="l254" href="#l254">254</a> def test_subscription_past_its_paid_period_does_not_count(client):
+<a id="l255" href="#l255">255</a>     acct = account_id(client)
+<a id="l256" href="#l256">256</a>     post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;active&quot;, ends_in=-3 * 86400))
+<a id="l257" href="#l257">257</a>     assert client.get(&quot;/api/account&quot;).json()[&quot;subscribed&quot;] is False
+<a id="l258" href="#l258">258</a> 
+<a id="l259" href="#l259">259</a> 
+<a id="l260" href="#l260">260</a> def test_cannot_subscribe_twice(client, monkeypatch, monthly_plan):
+<a id="l261" href="#l261">261</a>     post_webhook(client, subscription_event(&quot;created&quot;, account_id(client), &quot;active&quot;))
+<a id="l262" href="#l262">262</a>     monkeypatch.setattr(stripe.checkout.Session, &quot;create&quot;,
+<a id="l263" href="#l263">263</a>                         lambda **p: FakeStripeObject({&quot;url&quot;: &quot;x&quot;}))
+<a id="l264" href="#l264">264</a>     r = client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;monthly&quot;})
+<a id="l265" href="#l265">265</a>     assert r.status_code == 400 and &quot;already&quot; in r.json()[&quot;detail&quot;]
+<a id="l266" href="#l266">266</a> 
+<a id="l267" href="#l267">267</a> 
+<a id="l268" href="#l268">268</a> # --- paying with an email that already has an account ------------------------
+<a id="l269" href="#l269">269</a> 
+<a id="l270" href="#l270">270</a> def test_paying_on_a_new_device_joins_the_existing_account(client, second_client):
+<a id="l271" href="#l271">271</a>     buy(client, &quot;pack5&quot;, email=&quot;same@example.com&quot;)
+<a id="l272" href="#l272">272</a>     original = account_id(client)
+<a id="l273" href="#l273">273</a> 
+<a id="l274" href="#l274">274</a>     # Second device, anonymous, converts a book, then pays with the same email.
+<a id="l275" href="#l275">275</a>     job_id = make_job(second_client, JobStatus.succeeded, with_files=True)
+<a id="l276" href="#l276">276</a>     device = account_id(second_client)
+<a id="l277" href="#l277">277</a>     assert device != original
+<a id="l278" href="#l278">278</a>     buy(second_client, &quot;single&quot;, email=&quot;same@example.com&quot;)
+<a id="l279" href="#l279">279</a> 
+<a id="l280" href="#l280">280</a>     # Its cookie now resolves to the original account, which holds everything.
+<a id="l281" href="#l281">281</a>     a = second_client.get(&quot;/api/account&quot;).json()
+<a id="l282" href="#l282">282</a>     assert a[&quot;id&quot;] == original and a[&quot;email&quot;] == &quot;same@example.com&quot;
+<a id="l283" href="#l283">283</a>     assert a[&quot;credits&quot;] == 6
+<a id="l284" href="#l284">284</a>     assert get_job_row(job_id).account_id == original
+<a id="l285" href="#l285">285</a>     assert get_account_row(device).merged_into == original
+<a id="l286" href="#l286">286</a>     # ...and both browsers see the same jobs.
+<a id="l287" href="#l287">287</a>     assert job_id in {j[&quot;id&quot;] for j in client.get(&quot;/api/jobs&quot;).json()}</pre>
+</div></body></html>

@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 3298922a - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 3298922ae53795654adf908ff46691bdb55c8a3d
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 15:38:12 -0700
+
+Custom cover image for the video, gated behind sign-in
+
+Drop a jpg/png alongside the audiobook and it becomes the video background
+instead of the epub&#x27;s own cover or a plain card.
+
+Signed-in only, and said so before anyone picks a file rather than after:
+the drop zone carries &quot;sign in required&quot;, the client refuses to attach the
+image and explains why, and the server repeats the refusal in
+cover_requires_sign_in as a backstop. A visitor who is not signed in still
+gets their free book - only the cover is withheld - and nobody waits through
+a render to discover the feature was not available.
+
+Account.signed_in is email-based, so it flips on as soon as real auth exists.
+
+</pre><pre> backend/api.py      | 28 ++++++++++++++++++++++++++--
+ backend/db.py       | 13 +++++++++++++
+ backend/detect.py   | 11 ++++++++++-
+ backend/runner.py   | 20 +++++++++++++++++++-
+ frontend/app.js     | 44 +++++++++++++++++++++++++++++++++++++++++---
+ frontend/index.html | 16 +++++++++++++---
+ 6 files changed, 122 insertions(+), 10 deletions(-)
+</pre><pre>diff --git a/backend/api.py b/backend/api.py
+index c0347e3..59ca4ea 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -27,8 +27,8 @@ from .aligner import aligner</span>
+ from .db import Account, Artifact, Job, JobStatus, SessionLocal, new_id, utcnow
+ from .queue import queue
+ from .runner import (
+<span class="d">-    Paths, input_prefix, probe_duration, staged_audio_path, staged_part_path,</span>
+<span class="d">-    staged_text_path,</span>
+<span class="a">+    Paths, input_prefix, probe_duration, staged_audio_path, staged_cover_path,</span>
+<span class="a">+    staged_part_path, staged_text_path,</span>
+ )
+ from .settings import settings
+ from .storage import LocalStorage, storage
+<span class="h">@@ -118,6 +118,7 @@ class JobOut(BaseModel):</span>
+     model: str
+     audio_filename: str
+     audio_parts: int
+<span class="a">+    cover_filename: str | None</span>
+     text_filename: str
+     audio_bytes: int
+     audio_duration_seconds: float | None
+<span class="h">@@ -129,6 +130,8 @@ class JobOut(BaseModel):</span>
+ class UploadOut(BaseModel):
+     job: JobOut
+     detected: DetectionOut
+<span class="a">+    # Set when an image was dropped but the visitor is not signed in.</span>
+<span class="a">+    cover_requires_sign_in: bool = False</span>
+     # How well the book scores against a sample of the audio, using the
+     # backend&#x27;s own rule. None when the check is disabled.
+     match: dict | None = None
+<span class="h">@@ -141,6 +144,8 @@ class StartIn(BaseModel):</span>
+ 
+ class AccountOut(BaseModel):
+     id: str
+<span class="a">+    signed_in: bool</span>
+<span class="a">+    email: str | None</span>
+     billing_enabled: bool
+     free_allowance: int
+     free_window_hours: int
+<span class="h">@@ -167,6 +172,7 @@ def _job_out(job: Job, arts: list[Artifact]) -&gt; JobOut:</span>
+         model=job.model,
+         audio_filename=job.audio_filename,
+         audio_parts=job.audio_parts or 1,
+<span class="a">+        cover_filename=job.cover_filename,</span>
+         text_filename=job.text_filename,
+         audio_bytes=job.audio_bytes,
+         audio_duration_seconds=job.audio_duration_seconds,
+<span class="h">@@ -221,6 +227,8 @@ def get_account_info(</span>
+     ent = billing.check(session, account)
+     return AccountOut(
+         id=account.id,
+<span class="a">+        signed_in=account.signed_in,</span>
+<span class="a">+        email=account.email,</span>
+         billing_enabled=settings.billing_enabled,
+         free_allowance=ent.free_allowance,
+         free_window_hours=ent.window_hours,
+<span class="h">@@ -304,6 +312,20 @@ async def create_upload(</span>
+         if not audio_paths:
+             raise HTTPException(400, &quot;Upload did not include any audio.&quot;)
+ 
+<span class="a">+        # Custom cover art is a signed-in feature. Say so plainly rather than</span>
+<span class="a">+        # accepting the file and quietly ignoring it: the UI labels the drop</span>
+<span class="a">+        # zone before anyone picks an image, and this is the backstop.</span>
+<span class="a">+        cover_name = None</span>
+<span class="a">+        cover_blocked = False</span>
+<span class="a">+        if pairing.cover_name:</span>
+<span class="a">+            if account.signed_in:</span>
+<span class="a">+                upload = by_name.get(pairing.cover_name)</span>
+<span class="a">+                if upload is not None:</span>
+<span class="a">+                    await _save(upload, staged_cover_path(job_id, pairing.cover_name))</span>
+<span class="a">+                    cover_name = pairing.cover_name</span>
+<span class="a">+            else:</span>
+<span class="a">+                cover_blocked = True</span>
+<span class="a">+</span>
+         detection = detect.detect_language(detect.extract_text_sample(text_path))
+         # Parts are merged at run time, so total the durations here.
+         durations = [probe_duration(p) for p in audio_paths]
+<span class="h">@@ -331,6 +353,7 @@ async def create_upload(</span>
+             audio_filename=pairing.display_name,
+             text_filename=pairing.text_name,
+             audio_parts=len(audio_paths),
+<span class="a">+            cover_filename=cover_name,</span>
+             audio_bytes=sum(p.stat().st_size for p in audio_paths),
+             audio_duration_seconds=duration,
+             stage=&quot;Ready to start&quot;,
+<span class="h">@@ -356,6 +379,7 @@ async def create_upload(</span>
+             supported=detection.supported,
+         ),
+         match=match.as_dict(),
+<span class="a">+        cover_requires_sign_in=cover_blocked,</span>
+     )
+ 
+ 
+diff --git a/backend/db.py b/backend/db.py
+index da6f9fe..6167d4d 100644
+--- a/backend/db.py
++++ b/backend/db.py
+<span class="h">@@ -74,6 +74,16 @@ class Account(Base):</span>
+ 
+     jobs: Mapped[list[&quot;Job&quot;]] = relationship(back_populates=&quot;account&quot;)
+ 
+<span class="a">+    @property</span>
+<span class="a">+    def signed_in(self) -&gt; bool:</span>
+<span class="a">+        &quot;&quot;&quot;Whether this is a real account rather than an anonymous cookie.</span>
+<span class="a">+</span>
+<span class="a">+        Gates the features that cost us money or need someone to bill. An</span>
+<span class="a">+        anonymous visitor still gets their free book; they just cannot attach</span>
+<span class="a">+        a custom cover.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        return bool(self.email)</span>
+<span class="a">+</span>
+ 
+ class Job(Base):
+     __tablename__ = &quot;jobs&quot;
+<span class="h">@@ -96,6 +106,9 @@ class Job(Base):</span>
+     # 1 for a single file; higher when the book arrived as per-chapter parts
+     # that get merged before alignment.
+     audio_parts: Mapped[int] = mapped_column(Integer, default=1)
+<span class="a">+    # Custom cover art for the rendered video. Requires a signed-in account;</span>
+<span class="a">+    # anonymous jobs fall back to the epub&#x27;s own cover.</span>
+<span class="a">+    cover_filename: Mapped[str | None] = mapped_column(String(512), nullable=True)</span>
+     audio_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+     audio_duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+ 
+diff --git a/backend/detect.py b/backend/detect.py
+index 152221c..d548d14 100644
+--- a/backend/detect.py
++++ b/backend/detect.py
+<span class="h">@@ -27,12 +27,18 @@ class DetectionError(ValueError):</span>
+     pass
+ 
+ 
+<span class="a">+# Cover art for the rendered video. Optional, and gated behind sign-in.</span>
+<span class="a">+IMAGE_SUFFIXES = {&quot;.jpg&quot;, &quot;.jpeg&quot;, &quot;.png&quot;, &quot;.webp&quot;, &quot;.bmp&quot;}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @dataclass(frozen=True)
+ class Pairing:
+     # One entry for a single-file audiobook, many for a per-chapter set, in
+     # playback order.
+     audio_names: list[str]
+     text_name: str
+<span class="a">+    # A picture to put behind the video, if one was dropped in.</span>
+<span class="a">+    cover_name: str | None = None</span>
+ 
+     @property
+     def is_multipart(self) -&gt; bool:
+<span class="h">@@ -56,9 +62,10 @@ def natural_key(name: str) -&gt; tuple:</span>
+ 
+ 
+ def classify(filenames: list[str]) -&gt; Pairing:
+<span class="d">-    &quot;&quot;&quot;Split dropped filenames into the audio part(s) and the one text file.&quot;&quot;&quot;</span>
+<span class="a">+    &quot;&quot;&quot;Split dropped filenames into the audio part(s), the text, and any cover.&quot;&quot;&quot;</span>
+     audio = [n for n in filenames if Path(n).suffix.lower() in AUDIO_SUFFIXES]
+     text = [n for n in filenames if Path(n).suffix.lower() in TEXT_SUFFIXES]
+<span class="a">+    images = [n for n in filenames if Path(n).suffix.lower() in IMAGE_SUFFIXES]</span>
+ 
+     if not audio:
+         raise DetectionError(
+<span class="h">@@ -84,6 +91,8 @@ def classify(filenames: list[str]) -&gt; Pairing:</span>
+     return Pairing(
+         audio_names=sorted(audio, key=natural_key),
+         text_name=text[0],
+<span class="a">+        # Last one wins, so re-dropping an image replaces the previous choice.</span>
+<span class="a">+        cover_name=images[-1] if images else None,</span>
+     )
+ 
+ 
+diff --git a/backend/runner.py b/backend/runner.py
+index 871a48a..2114220 100644
+--- a/backend/runner.py
++++ b/backend/runner.py
+<span class="h">@@ -109,6 +109,23 @@ def staged_text_path(job_id: str, original_name: str) -&gt; Path:</span>
+     return Paths.for_job(job_id).inp / f&quot;{STAGE_STEM}{text_suffix(original_name)}&quot;
+ 
+ 
+<span class="a">+def staged_cover_path(job_id: str, original_name: str) -&gt; Path:</span>
+<span class="a">+    &quot;&quot;&quot;Where a user-supplied cover image is staged.</span>
+<span class="a">+</span>
+<span class="a">+    Kept out of the `input/` root alongside audio and text so the aligner&#x27;s</span>
+<span class="a">+    directory scan cannot mistake a picture for content.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    inp = Paths.for_job(job_id).inp</span>
+<span class="a">+    return inp / &quot;cover&quot; / f&quot;cover{Path(original_name).suffix.lower()}&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def find_cover(job_id: str) -&gt; Path | None:</span>
+<span class="a">+    folder = Paths.for_job(job_id).inp / &quot;cover&quot;</span>
+<span class="a">+    if not folder.is_dir():</span>
+<span class="a">+        return None</span>
+<span class="a">+    return next((p for p in sorted(folder.iterdir()) if p.is_file()), None)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def staged_part_path(job_id: str, index: int, original_name: str) -&gt; Path:
+     &quot;&quot;&quot;Where chapter file `index` (1-based) of a multi-part audiobook is staged.
+ 
+<span class="h">@@ -504,7 +521,8 @@ def _collect_artifacts(job_id: str, paths: Paths, log_path: Path,</span>
+         try:
+             _set(job_id, stage=&quot;Rendering video&quot;, progress=0.94)
+             scratch = paths.root / &quot;video&quot;
+<span class="d">-            cover = render.extract_cover(request.text, scratch)</span>
+<span class="a">+            # A cover the user supplied wins over the one inside the epub.</span>
+<span class="a">+            cover = find_cover(job_id) or render.extract_cover(request.text, scratch)</span>
+             canvas = render.build_canvas(cover, scratch / &quot;canvas.png&quot;)
+ 
+             video_name = f&quot;{stem}.{language}.mp4&quot;
+diff --git a/frontend/app.js b/frontend/app.js
+index 1541fc1..ffe70d7 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+<span class="h">@@ -88,6 +88,14 @@ function setLanguage(code) {</span>
+ async function refreshQuota() {
+   try {
+     const a = await api(&#x27;/api/account&#x27;);
+<span class="a">+    signedIn = !!a.signed_in;</span>
+<span class="a">+    const hint = document.getElementById(&#x27;cover-hint&#x27;);</span>
+<span class="a">+    if (hint) {</span>
+<span class="a">+      hint.innerHTML = signedIn</span>
+<span class="a">+        ? &#x27;Optional: drop a jpg or png to use as the video background&#x27;</span>
+<span class="a">+        : &#x27;Optional: drop a jpg or png to use as the video background — &#x27; +</span>
+<span class="a">+          &#x27;&lt;strong&gt;sign in required&lt;/strong&gt;&#x27;;</span>
+<span class="a">+    }</span>
+     if (a.free_tier_summary &amp;&amp; el.freetier) {
+       el.freetier.textContent = a.free_tier_summary.replace(/^./, (c) =&gt; c.toUpperCase()) + &#x27;.&#x27;;
+     }
+<span class="h">@@ -110,16 +118,28 @@ async function refreshQuota() {</span>
+    inside audiobook folders. */
+ const AUDIO_RE = /\.(m4b|m4a|mp3|opus|ogg|oga|flac|wav|aac|wma|mka|mkv|mp4|webm|avi|mov)$/i;
+ const TEXT_RE = /(\.fb2\.zip|\.(epub|txt|srt|vtt|ass|fb2|mobi|azw|azw3|prc))$/i;
+<span class="a">+const IMAGE_RE = /\.(jpe?g|png|webp|bmp)$/i;</span>
+ 
+<span class="d">-const staged = { audio: [], text: null };</span>
+<span class="a">+const staged = { audio: [], text: null, cover: null };</span>
+<span class="a">+let signedIn = false;</span>
+ 
+ function addFiles(files) {
+   clearError();
+   const list = [...files];
+   const audio = list.filter((f) =&gt; AUDIO_RE.test(f.name));
+   const text = list.filter((f) =&gt; TEXT_RE.test(f.name));
+<span class="a">+  const images = list.filter((f) =&gt; IMAGE_RE.test(f.name));</span>
+<span class="a">+</span>
+<span class="a">+  // Say up front that a cover needs an account, rather than accepting the file</span>
+<span class="a">+  // and springing it on them after they have waited for a render.</span>
+<span class="a">+  if (images.length &amp;&amp; !signedIn) {</span>
+<span class="a">+    showError(&#x27;Using your own cover image needs an account — sign in first, &#x27; +</span>
+<span class="a">+              &#x27;and it will be applied to the video. The rest works without one.&#x27;);</span>
+<span class="a">+  } else if (images.length) {</span>
+<span class="a">+    staged.cover = images[images.length - 1];</span>
+<span class="a">+  }</span>
+ 
+<span class="d">-  if (!audio.length &amp;&amp; !text.length) {</span>
+<span class="a">+  if (!audio.length &amp;&amp; !text.length &amp;&amp; !images.length) {</span>
+     showError(&#x27;Nothing usable in that drop — expected an audiobook or an ebook.&#x27;);
+     return;
+   }
+<span class="h">@@ -134,6 +154,7 @@ function addFiles(files) {</span>
+   if (text.length) staged.text = text[text.length - 1];
+ 
+   renderStaged();
+<span class="a">+  if (!audio.length &amp;&amp; !text.length) return;  // an image alone is not a job</span>
+   if (staged.audio.length &amp;&amp; staged.text) {
+     uploadFiles([...staged.audio, staged.text]);
+   }
+<span class="h">@@ -151,6 +172,13 @@ function renderStaged() {</span>
+         : staged.audio[0].name)
+     : &#x27;Waiting for an audio file&#x27;;
+ 
+<span class="a">+  const cv = $(&#x27;slot-cover&#x27;);</span>
+<span class="a">+  cv.hidden = !staged.cover;</span>
+<span class="a">+  if (staged.cover) {</span>
+<span class="a">+    cv.classList.add(&#x27;filled&#x27;);</span>
+<span class="a">+    cv.querySelector(&#x27;.slot-value&#x27;).textContent = staged.cover.name;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+   const t = $(&#x27;slot-text&#x27;);
+   t.classList.toggle(&#x27;filled&#x27;, !!staged.text);
+   t.querySelector(&#x27;.slot-value&#x27;).textContent =
+<span class="h">@@ -169,12 +197,14 @@ function renderStaged() {</span>
+ function clearStaged() {
+   staged.audio = [];
+   staged.text = null;
+<span class="a">+  staged.cover = null;</span>
+   renderStaged();
+ }
+ 
+ document.querySelectorAll(&#x27;.slot-x&#x27;).forEach((btn) =&gt; {
+   btn.addEventListener(&#x27;click&#x27;, () =&gt; {
+     if (btn.dataset.slot === &#x27;audio&#x27;) staged.audio = [];
+<span class="a">+    else if (btn.dataset.slot === &#x27;cover&#x27;) staged.cover = null;</span>
+     else staged.text = null;
+     renderStaged();
+   });
+<span class="h">@@ -193,6 +223,7 @@ function uploadFiles(files) {</span>
+ 
+   const form = new FormData();
+   for (const f of list) form.append(&#x27;files&#x27;, f, f.name);
+<span class="a">+  if (staged.cover &amp;&amp; signedIn) form.append(&#x27;files&#x27;, staged.cover, staged.cover.name);</span>
+ 
+   // XHR rather than fetch: it reports upload progress, and these files are big.
+   const xhr = new XMLHttpRequest();
+<span class="h">@@ -211,7 +242,14 @@ function uploadFiles(files) {</span>
+   xhr.onload = () =&gt; {
+     el.uploading.hidden = true;
+     if (xhr.status &gt;= 200 &amp;&amp; xhr.status &lt; 300) {
+<span class="d">-      try { showConfirm(JSON.parse(xhr.responseText)); }</span>
+<span class="a">+      try {</span>
+<span class="a">+        const body = JSON.parse(xhr.responseText);</span>
+<span class="a">+        if (body.cover_requires_sign_in) {</span>
+<span class="a">+          showError(&#x27;Your cover image was not used — that needs an account. &#x27; +</span>
+<span class="a">+                    &#x27;Everything else ran normally.&#x27;);</span>
+<span class="a">+        }</span>
+<span class="a">+        showConfirm(body);</span>
+<span class="a">+      }</span>
+       catch { showError(&#x27;Server sent an unreadable response.&#x27;); resetToDrop(); }
+     } else {
+       let msg = `Upload failed (${xhr.status}).`;
+diff --git a/frontend/index.html b/frontend/index.html
+index 3a3bc72..1f03cdf 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+<span class="h">@@ -4,7 +4,7 @@</span>
+ &lt;meta charset=&quot;utf-8&quot;&gt;
+ &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+ &lt;title&gt;SubPlz — Audiobook to Subtitles&lt;/title&gt;
+<span class="d">-&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=6&quot;&gt;</span>
+<span class="a">+&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=8&quot;&gt;</span>
+ &lt;link rel=&quot;icon&quot; href=&quot;data:image/svg+xml,&lt;svg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 100 100&#x27;&gt;&lt;text y=&#x27;.9em&#x27; font-size=&#x27;90&#x27;&gt;🎧&lt;/text&gt;&lt;/svg&gt;&quot;&gt;
+ &lt;/head&gt;
+ &lt;body&gt;
+<span class="h">@@ -37,7 +37,7 @@</span>
+   &lt;section id=&quot;dropzone&quot; class=&quot;dropzone&quot; tabindex=&quot;0&quot; role=&quot;button&quot;
+            aria-label=&quot;Drop an audio file and an ebook, or click to choose files&quot;&gt;
+     &lt;input type=&quot;file&quot; id=&quot;filepicker&quot; multiple hidden
+<span class="d">-           accept=&quot;.m4b,.m4a,.mp3,.opus,.ogg,.oga,.flac,.wav,.aac,.wma,.mka,.mkv,.mp4,.webm,.avi,.mov,.epub,.txt,.srt,.vtt,.ass,.fb2,.zip,.mobi,.azw,.azw3,.prc&quot;&gt;</span>
+<span class="a">+           accept=&quot;.jpg,.jpeg,.png,.webp,.bmp,.m4b,.m4a,.mp3,.opus,.ogg,.oga,.flac,.wav,.aac,.wma,.mka,.mkv,.mp4,.webm,.avi,.mov,.epub,.txt,.srt,.vtt,.ass,.fb2,.zip,.mobi,.azw,.azw3,.prc&quot;&gt;</span>
+     &lt;div class=&quot;dz-inner&quot;&gt;
+       &lt;div class=&quot;dz-icon&quot; aria-hidden=&quot;true&quot;&gt;
+         &lt;svg viewBox=&quot;0 0 24 24&quot; fill=&quot;none&quot; stroke=&quot;currentColor&quot; stroke-width=&quot;1.5&quot;
+<span class="h">@@ -52,6 +52,8 @@</span>
+         Or &lt;button type=&quot;button&quot; id=&quot;browse&quot; class=&quot;linkbtn&quot;&gt;browse&lt;/button&gt;.&lt;/p&gt;
+       &lt;p class=&quot;dz-formats&quot;&gt;Audio: m4b · mp3 · m4a · opus · flac · wav · mkv
+         &amp;nbsp;|&amp;nbsp; Book: epub · fb2 · mobi · azw3 · txt&lt;/p&gt;
+<span class="a">+      &lt;p class=&quot;dz-formats&quot; id=&quot;cover-hint&quot;&gt;Optional: drop a jpg or png to use as the</span>
+<span class="a">+        video background — &lt;strong&gt;sign in required&lt;/strong&gt;&lt;/p&gt;</span>
+     &lt;/div&gt;
+   &lt;/section&gt;
+ 
+<span class="h">@@ -65,6 +67,14 @@</span>
+       &lt;/div&gt;
+       &lt;button type=&quot;button&quot; class=&quot;slot-x&quot; data-slot=&quot;audio&quot; title=&quot;Remove&quot;&gt;×&lt;/button&gt;
+     &lt;/div&gt;
+<span class="a">+    &lt;div class=&quot;slot&quot; id=&quot;slot-cover&quot; hidden&gt;</span>
+<span class="a">+      &lt;span class=&quot;slot-tick&quot; aria-hidden=&quot;true&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+      &lt;div class=&quot;slot-body&quot;&gt;</span>
+<span class="a">+        &lt;div class=&quot;slot-label&quot;&gt;Cover image&lt;/div&gt;</span>
+<span class="a">+        &lt;div class=&quot;slot-value&quot;&gt;Waiting for an image&lt;/div&gt;</span>
+<span class="a">+      &lt;/div&gt;</span>
+<span class="a">+      &lt;button type=&quot;button&quot; class=&quot;slot-x&quot; data-slot=&quot;cover&quot; title=&quot;Remove&quot;&gt;×&lt;/button&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+     &lt;div class=&quot;slot&quot; id=&quot;slot-text&quot;&gt;
+       &lt;span class=&quot;slot-tick&quot; aria-hidden=&quot;true&quot;&gt;&lt;/span&gt;
+       &lt;div class=&quot;slot-body&quot;&gt;
+<span class="h">@@ -130,6 +140,6 @@</span>
+   &lt;/p&gt;
+ &lt;/footer&gt;
+ 
+<span class="d">-&lt;script src=&quot;/app.js?v=7&quot;&gt;&lt;/script&gt;</span>
+<span class="a">+&lt;script src=&quot;/app.js?v=8&quot;&gt;&lt;/script&gt;</span>
+ &lt;/body&gt;
+ &lt;/html&gt;</pre>
+</div></body></html>

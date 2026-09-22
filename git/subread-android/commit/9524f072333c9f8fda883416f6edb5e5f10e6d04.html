@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android 9524f072 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../subread-android/index.html">Log</a> | <a href="../../subread-android/files.html">Files</a> | <a href="../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9524f072333c9f8fda883416f6edb5e5f10e6d04
+equwal &lt;truex@equwal.com&gt;
+2026-09-21 01:15:59 -0700
+
+Make a video + subtitles for any video player or YouTube
+
+After a job, the app writes name.mp4 and name.srt into a folder the user
+picks. The video is the cover of the book over the audio. The user picks
+the size (those the device has an encoder for) and 1 to 60 frames a
+second.
+
+The encoder makes one key frame. H264Still makes the other frames, so
+the frame rate costs about 20 bytes a frame. AAC audio is copied. Other
+audio is encoded to AAC; the decoder has its own thread, because on a
+slow device the cost of each codec call sets the speed (75 s of MP3:
+49 s before, 10 s now).
+
+The device test decodes the file with the platform decoder. It checks
+the tracks, the frame count, the picture against the source, and the
+size of the video track.
+
+</pre><pre> README.md                                          |  18 +
+ .../kotlin/space/subread/app/StartButtonTest.kt    |   2 +
+ .../kotlin/space/subread/app/VideoMakerTest.kt     | 171 ++++++++
+ .../main/kotlin/space/subread/app/MainActivity.kt  |  78 +++-
+ .../kotlin/space/subread/app/video/VideoExport.kt  |  51 +++
+ .../kotlin/space/subread/app/video/VideoMaker.kt   | 479 +++++++++++++++++++++
+ 6 files changed, 793 insertions(+), 6 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 6629fc6..9fcf1a6 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -4,6 +4,10 @@ Times an audiobook against its ebook, entirely on the phone, and writes the</span>
+ `.srt` that [Hoshi Reader](https://github.com/HuangAntimony/Hoshi-Reader-Android)&#x27;s
+ read-along uses. Nothing is uploaded.
+ 
+<span class="a">+It also makes **videos + subtitles which can be played with any video player or</span>
+<span class="a">+uploaded to YouTube**: an `.mp4` of the book&#x27;s cover and the audio, with the</span>
+<span class="a">+`.srt` beside it under the same name.</span>
+<span class="a">+</span>
+ It is the same method as [subread.space](https://subread.space) and
+ [SubPlz](https://github.com/kanjieater/SubPlz): a small speech model transcribes
+ the audio, roughly; the transcript is aligned against the book; the subtitles
+<span class="h">@@ -36,6 +40,20 @@ narrated - front matter, notes - instead of matching chapters.</span>
+ ./gradlew :core:test
+ ```
+ 
+<span class="a">+## The video</span>
+<span class="a">+</span>
+<span class="a">+The picture of the video does not change, so almost none of it is encoded.</span>
+<span class="a">+The device&#x27;s H.264 encoder makes one key frame. `H264Still` writes each frame</span>
+<span class="a">+after it by hand: a P slice in which each macroblock is skipped, about ten</span>
+<span class="a">+bytes. One minute of these frames is written again and again with new time</span>
+<span class="a">+stamps. AAC audio is copied; other audio is encoded to AAC once.</span>
+<span class="a">+</span>
+<span class="a">+The result for a 10-hour book is about 60 MB of video at 720p and one frame a</span>
+<span class="a">+second. The frame rate adds about 20 bytes for each frame. The size of the</span>
+<span class="a">+picture changes only the key frame, one each minute. The sizes on offer are</span>
+<span class="a">+those the device has an encoder for (1080p in software, more with a hardware</span>
+<span class="a">+encoder). No Android encoder makes 4K or 8K H.264 today.</span>
+<span class="a">+</span>
+ ## Building the app
+ 
+ CI builds it (`.github/workflows/build.yml`): the APK is an artifact of every
+diff --git a/app/src/androidTest/kotlin/space/subread/app/StartButtonTest.kt b/app/src/androidTest/kotlin/space/subread/app/StartButtonTest.kt
+index 8613872..9ba8a82 100644
+--- a/app/src/androidTest/kotlin/space/subread/app/StartButtonTest.kt
++++ b/app/src/androidTest/kotlin/space/subread/app/StartButtonTest.kt
+<span class="h">@@ -76,6 +76,8 @@ class StartButtonTest {</span>
+             assertEquals(Job.status.value.detail, Phase.DONE, Job.status.value.phase)
+             compose.waitUntil(10_000) { !keepScreenOn() }
+             compose.onNodeWithText(&quot;Save .srt&quot;).assertExists()
+<span class="a">+            compose.onNodeWithText(&quot;Save video + .srt&quot;).assertExists()</span>
+<span class="a">+            compose.onNodeWithText(&quot;720p&quot;).assertExists()</span>
+             assertTrue((Job.status.value.matchRate ?: 0.0) &gt; 0.8)
+         }
+     }
+diff --git a/app/src/androidTest/kotlin/space/subread/app/VideoMakerTest.kt b/app/src/androidTest/kotlin/space/subread/app/VideoMakerTest.kt
+new file mode 100644
+index 0000000..3c7eae1
+--- /dev/null
++++ b/app/src/androidTest/kotlin/space/subread/app/VideoMakerTest.kt
+<span class="h">@@ -0,0 +1,171 @@</span>
+<span class="a">+package space.subread.app</span>
+<span class="a">+</span>
+<span class="a">+import android.media.MediaCodec</span>
+<span class="a">+import android.media.MediaCodecInfo</span>
+<span class="a">+import android.media.MediaExtractor</span>
+<span class="a">+import android.media.MediaFormat</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import androidx.test.ext.junit.runners.AndroidJUnit4</span>
+<span class="a">+import androidx.test.platform.app.InstrumentationRegistry</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertTrue</span>
+<span class="a">+import org.junit.Assume.assumeTrue</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+import org.junit.runner.RunWith</span>
+<span class="a">+import space.subread.app.video.VideoMaker</span>
+<span class="a">+import space.subread.app.video.VideoSize</span>
+<span class="a">+import space.subread.core.BookText</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+import kotlin.math.abs</span>
+<span class="a">+import kotlin.math.log10</span>
+<span class="a">+import kotlin.math.roundToInt</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The video, made on a device and then read back with the platform&#x27;s own</span>
+<span class="a">+ * demuxer: the tracks a player will find, and how long each is.</span>
+<span class="a">+ * Uses the local media of OnDeviceJobTest, and skips without it.</span>
+<span class="a">+ */</span>
+<span class="a">+@RunWith(AndroidJUnit4::class)</span>
+<span class="a">+class VideoMakerTest {</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun fromAnMp3() = check(&quot;.mp3&quot;)      // encoded to AAC</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun fromAnM4b() = check(&quot;.m4b&quot;)      // AAC, copied</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun fullHdAtSixtyFramesASecond() = check(&quot;.m4b&quot;, VideoSize(1920, 1080), 60)</span>
+<span class="a">+</span>
+<span class="a">+    /** On most devices a hardware encoder makes this one. */</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun theLargestSizeOfThisDevice() = check(&quot;.m4b&quot;, VideoMaker.sizes().last(), 30)</span>
+<span class="a">+</span>
+<span class="a">+    private fun check(suffix: String, size: VideoSize = VideoMaker.sizes().first(), fps: Int = 1) {</span>
+<span class="a">+        val instrumentation = InstrumentationRegistry.getInstrumentation()</span>
+<span class="a">+        val names = instrumentation.context.assets.list(&quot;local&quot;).orEmpty()</span>
+<span class="a">+        val audioName = names.firstOrNull { it.endsWith(suffix) }</span>
+<span class="a">+        val bookName = names.firstOrNull { it.endsWith(&quot;.epub&quot;) }</span>
+<span class="a">+        assumeTrue(&quot;no local test media&quot;, audioName != null &amp;&amp; bookName != null)</span>
+<span class="a">+</span>
+<span class="a">+        val app = instrumentation.targetContext</span>
+<span class="a">+        fun stage(name: String): File = File(app.cacheDir, name).also { out -&gt;</span>
+<span class="a">+            instrumentation.context.assets.open(&quot;local/$name&quot;).use { src -&gt; out.outputStream().use { src.copyTo(it) } }</span>
+<span class="a">+        }</span>
+<span class="a">+        val audio = stage(audioName!!)</span>
+<span class="a">+        val cover = stage(bookName!!).inputStream().use { BookText.cover(it) }</span>
+<span class="a">+        assertTrue(&quot;the epub has a cover&quot;, cover != null &amp;&amp; cover.size &gt; 1024)</span>
+<span class="a">+</span>
+<span class="a">+        val tag = &quot;video$suffix ${size.label}$fps&quot;</span>
+<span class="a">+        val out = File(app.cacheDir, &quot;video$suffix.${size.label}$fps.mp4&quot;).apply { delete(); createNewFile() }</span>
+<span class="a">+        val started = System.nanoTime()</span>
+<span class="a">+        VideoMaker.make(app, Uri.fromFile(audio), cover, Uri.fromFile(out), size, fps) {}</span>
+<span class="a">+        val seconds = (System.nanoTime() - started) / 1e9</span>
+<span class="a">+</span>
+<span class="a">+        val ex = MediaExtractor()</span>
+<span class="a">+        ex.setDataSource(out.absolutePath)</span>
+<span class="a">+        val tracks = (0 until ex.trackCount).associate {</span>
+<span class="a">+            val f = ex.getTrackFormat(it)</span>
+<span class="a">+            f.getString(MediaFormat.KEY_MIME)!! to f.getLong(MediaFormat.KEY_DURATION)</span>
+<span class="a">+        }</span>
+<span class="a">+        ex.release()</span>
+<span class="a">+        Log.i(&quot;SubReadTest&quot;, &quot;$tag: ${out.length()} B (audio ${audio.length()} B) in %.1fs, tracks=$tracks&quot;.format(seconds))</span>
+<span class="a">+</span>
+<span class="a">+        assertEquals(setOf(&quot;video/avc&quot;, &quot;audio/mp4a-latm&quot;), tracks.keys)</span>
+<span class="a">+        val video = tracks.getValue(&quot;video/avc&quot;)</span>
+<span class="a">+        val sound = tracks.getValue(&quot;audio/mp4a-latm&quot;)</span>
+<span class="a">+        assertTrue(&quot;sound is ${sound / 1e6}s&quot;, sound in 70_000_000..80_000_000)</span>
+<span class="a">+        // The picture runs for the length of the sound, to within a frame.</span>
+<span class="a">+        assertTrue(&quot;video $video vs audio $sound&quot;, abs(video - sound) &lt;= 1_500_000 / fps + 100_000)</span>
+<span class="a">+</span>
+<span class="a">+        // Each frame decodes, and the last frame, many &quot;no change&quot; frames after</span>
+<span class="a">+        // the second key frame, is still the first picture.</span>
+<span class="a">+        val luma = decodeLuma(out)</span>
+<span class="a">+        assertEquals(&quot;frames&quot;, (video * fps / 1_000_000.0).roundToInt(), luma.count)</span>
+<span class="a">+        assertEquals(size.width to size.height, luma.width to luma.height)</span>
+<span class="a">+        assertTrue(&quot;the last frame is not the first frame&quot;, luma.first.contentEquals(luma.last))</span>
+<span class="a">+        val wanted = VideoMaker.Yuv(VideoMaker.picture(cover, size), size).y</span>
+<span class="a">+        val psnr = psnr(wanted, luma.last)</span>
+<span class="a">+        Log.i(&quot;SubReadTest&quot;, &quot;$tag: picture PSNR %.1f dB&quot;.format(psnr))</span>
+<span class="a">+        assertTrue(&quot;the picture is poor: PSNR $psnr dB&quot;, psnr &gt; 38)</span>
+<span class="a">+</span>
+<span class="a">+        // A still picture must cost next to nothing. Only the key frames cost: one each</span>
+<span class="a">+        // minute, in proportion to the picture size. The frame rate costs 20 bytes a frame.</span>
+<span class="a">+        val videoBytes = trackBytes(out, &quot;video/avc&quot;)</span>
+<span class="a">+        Log.i(&quot;SubReadTest&quot;, &quot;$tag: video track $videoBytes B, file ${out.length() - audio.length()} B over the audio&quot;)</span>
+<span class="a">+        val keyFrame = 150_000L * size.width * size.height / (1280 * 720)</span>
+<span class="a">+        assertTrue(&quot;picture costs $videoBytes B&quot;, videoBytes &lt; 2 * keyFrame + luma.count * 20)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private class Luma(val count: Int, val width: Int, val height: Int, val first: ByteArray, val last: ByteArray)</span>
+<span class="a">+</span>
+<span class="a">+    private fun trackBytes(file: File, mime: String): Long {</span>
+<span class="a">+        val ex = MediaExtractor()</span>
+<span class="a">+        ex.setDataSource(file.absolutePath)</span>
+<span class="a">+        ex.selectTrack((0 until ex.trackCount).first { ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME) == mime })</span>
+<span class="a">+        var total = 0L</span>
+<span class="a">+        while (ex.sampleSize &gt;= 0) { total += ex.sampleSize; ex.advance() }</span>
+<span class="a">+        ex.release()</span>
+<span class="a">+        return total</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun decodeLuma(file: File): Luma {</span>
+<span class="a">+        val ex = MediaExtractor()</span>
+<span class="a">+        ex.setDataSource(file.absolutePath)</span>
+<span class="a">+        val track = (0 until ex.trackCount).first { ex.getTrackFormat(it).getString(MediaFormat.KEY_MIME) == &quot;video/avc&quot; }</span>
+<span class="a">+        ex.selectTrack(track)</span>
+<span class="a">+        val format = ex.getTrackFormat(track)</span>
+<span class="a">+        val width = format.getInteger(MediaFormat.KEY_WIDTH)</span>
+<span class="a">+        val height = format.getInteger(MediaFormat.KEY_HEIGHT)</span>
+<span class="a">+        val duration = format.getLong(MediaFormat.KEY_DURATION)</span>
+<span class="a">+        // Needed to read frames as an Image.</span>
+<span class="a">+        format.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)</span>
+<span class="a">+        val codec = MediaCodec.createDecoderByType(&quot;video/avc&quot;)</span>
+<span class="a">+        codec.configure(format, null, null, 0)</span>
+<span class="a">+        codec.start()</span>
+<span class="a">+        val info = MediaCodec.BufferInfo()</span>
+<span class="a">+        var count = 0</span>
+<span class="a">+        var first: ByteArray? = null</span>
+<span class="a">+        var last = ByteArray(0)</span>
+<span class="a">+        var fed = false</span>
+<span class="a">+        var done = false</span>
+<span class="a">+        while (!done) {</span>
+<span class="a">+            if (!fed) {</span>
+<span class="a">+                val i = codec.dequeueInputBuffer(10_000)</span>
+<span class="a">+                if (i &gt;= 0) {</span>
+<span class="a">+                    val n = ex.readSampleData(codec.getInputBuffer(i)!!, 0)</span>
+<span class="a">+                    if (n &lt; 0) { codec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM); fed = true }</span>
+<span class="a">+                    else { codec.queueInputBuffer(i, 0, n, ex.sampleTime, 0); ex.advance() }</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+            val o = try { codec.dequeueOutputBuffer(info, 10_000) } catch (e: IllegalStateException) {</span>
+<span class="a">+                throw AssertionError(&quot;the decoder failed after $count frames, fed up to ${ex.sampleTime / 1_000_000}s&quot;, e)</span>
+<span class="a">+            }</span>
+<span class="a">+            if (o &lt; 0) continue</span>
+<span class="a">+            // Copy the first frame and the frames of the last second only: a copy of each frame takes minutes.</span>
+<span class="a">+            if (info.size &gt; 0 &amp;&amp; first != null &amp;&amp; info.presentationTimeUs &lt; duration - 1_000_000) count++</span>
+<span class="a">+            else if (info.size &gt; 0) {</span>
+<span class="a">+                val plane = codec.getOutputImage(o)!!.planes[0]</span>
+<span class="a">+                val y = ByteArray(width * height)</span>
+<span class="a">+                for (row in 0 until height) {</span>
+<span class="a">+                    plane.buffer.position(row * plane.rowStride)</span>
+<span class="a">+                    plane.buffer.get(y, row * width, width)</span>
+<span class="a">+                }</span>
+<span class="a">+                if (first == null) first = y</span>
+<span class="a">+                last = y</span>
+<span class="a">+                count++</span>
+<span class="a">+            }</span>
+<span class="a">+            done = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0</span>
+<span class="a">+            codec.releaseOutputBuffer(o, false)</span>
+<span class="a">+        }</span>
+<span class="a">+        codec.stop(); codec.release(); ex.release()</span>
+<span class="a">+        return Luma(count, width, height, first!!, last)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun psnr(a: ByteArray, b: ByteArray): Double {</span>
+<span class="a">+        var sum = 0.0</span>
+<span class="a">+        for (i in a.indices) { val d = (a[i].toInt() and 0xff) - (b[i].toInt() and 0xff); sum += d * d }</span>
+<span class="a">+        return 10 * log10(255.0 * 255.0 / (sum / a.size).coerceAtLeast(1e-9))</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/MainActivity.kt b/app/src/main/kotlin/space/subread/app/MainActivity.kt
+index 01360aa..e8aa732 100644
+--- a/app/src/main/kotlin/space/subread/app/MainActivity.kt
++++ b/app/src/main/kotlin/space/subread/app/MainActivity.kt
+<span class="h">@@ -41,11 +41,15 @@ import androidx.compose.ui.platform.LocalView</span>
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+ import androidx.core.content.FileProvider
+<span class="a">+import androidx.core.content.edit</span>
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import space.subread.app.job.Job
+ import space.subread.app.job.JobStatus
+ import space.subread.app.job.Phase
+ import space.subread.app.job.TranscriptStore
+<span class="a">+import space.subread.app.video.VideoExport</span>
+<span class="a">+import space.subread.app.video.VideoMaker</span>
+<span class="a">+import space.subread.app.video.VideoStatus</span>
+ import java.io.File
+ import kotlin.concurrent.thread
+ 
+<span class="h">@@ -110,12 +114,24 @@ private fun App() {</span>
+             context.contentResolver.openOutputStream(dest)?.use { out -&gt; srt.inputStream().use { it.copyTo(out) } }
+         }
+     }
+<span class="a">+    val video by VideoExport.status.collectAsStateWithLifecycle()</span>
+<span class="a">+    val sizes = remember { VideoMaker.sizes() }</span>
+<span class="a">+    var videoSize by remember { mutableStateOf(sizes.firstOrNull { it.label == prefs.getString(&quot;video_size&quot;, null) } ?: sizes.first()) }</span>
+<span class="a">+    var videoFps by remember { mutableStateOf(prefs.getInt(&quot;video_fps&quot;, 1).takeIf { it in VideoMaker.FRAME_RATES } ?: 1) }</span>
+<span class="a">+    val pickVideoFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { folder -&gt;</span>
+<span class="a">+        val a = audio</span>
+<span class="a">+        val srt = status.srt</span>
+<span class="a">+        if (folder != null &amp;&amp; a != null &amp;&amp; srt != null) {</span>
+<span class="a">+            val app = context.applicationContext</span>
+<span class="a">+            thread(name = &quot;subread-video&quot;) { VideoExport.run(app, a, book, srt, folder, videoSize, videoFps) }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+     // The job runs only while this screen is open. Keep the display on, or the
+     // system sleeps and stops the work. No background service: the job saves
+     // each finished chunk, so an interrupted run continues from that chunk.
+     val view = LocalView.current
+<span class="d">-    DisposableEffect(status.running) {</span>
+<span class="d">-        view.keepScreenOn = status.running</span>
+<span class="a">+    DisposableEffect(status.running || video.running) {</span>
+<span class="a">+        view.keepScreenOn = status.running || video.running</span>
+         onDispose { view.keepScreenOn = false }
+     }
+ 
+<span class="h">@@ -128,7 +144,8 @@ private fun App() {</span>
+                 Text(&quot;SubRead&quot;, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                 Text(
+                     &quot;Times an audiobook against its ebook, on this device. Nothing is uploaded. &quot; +
+<span class="d">-                        &quot;The result is an .srt for Hoshi Reader&#x27;s read-along.&quot;,</span>
+<span class="a">+                        &quot;The result is an .srt for Hoshi Reader&#x27;s read-along, or a video + subtitles &quot; +</span>
+<span class="a">+                        &quot;that any video player plays.&quot;,</span>
+                     style = MaterialTheme.typography.bodyMedium,
+                 )
+                 HorizontalDivider(color = Color.Black)
+<span class="h">@@ -172,9 +189,20 @@ private fun App() {</span>
+                             &quot;screen stays on while it works. If it is interrupted, Start continues from there.&quot;,
+                             style = MaterialTheme.typography.bodySmall)
+                     }
+<span class="d">-                    Outcome(status,</span>
+<span class="a">+                    Outcome(status, video,</span>
+<span class="a">+                        videoOptions = {</span>
+<span class="a">+                            Choice(&quot;Size&quot;, sizes.map { it to it.label }, videoSize) {</span>
+<span class="a">+                                videoSize = it</span>
+<span class="a">+                                prefs.edit { putString(&quot;video_size&quot;, it.label) }</span>
+<span class="a">+                            }</span>
+<span class="a">+                            Choice(&quot;Frames a second&quot;, VideoMaker.FRAME_RATES.map { it to &quot;$it&quot; }, videoFps) {</span>
+<span class="a">+                                videoFps = it</span>
+<span class="a">+                                prefs.edit { putInt(&quot;video_fps&quot;, it) }</span>
+<span class="a">+                            }</span>
+<span class="a">+                        },</span>
+                         onSave = { status.srt?.let { saveSrt.launch(it.name) } },
+<span class="d">-                        onShare = { status.srt?.let { share(context, it) } })</span>
+<span class="a">+                        onShare = { status.srt?.let { share(context, it) } },</span>
+<span class="a">+                        onVideo = { pickVideoFolder.launch(null) })</span>
+                 }
+ 
+             }
+<span class="h">@@ -212,6 +240,22 @@ private fun LanguagePick(code: String, enabled: Boolean, onPick: (String) -&gt; Uni</span>
+     }
+ }
+ 
+<span class="a">+@Composable</span>
+<span class="a">+private fun &lt;T&gt; Choice(label: String, options: List&lt;Pair&lt;T, String&gt;&gt;, chosen: T, onPick: (T) -&gt; Unit) {</span>
+<span class="a">+    var open by remember { mutableStateOf(false) }</span>
+<span class="a">+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {</span>
+<span class="a">+        Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)</span>
+<span class="a">+        Box {</span>
+<span class="a">+            OutlinedButton(onClick = { open = true }) { Text(options.first { it.first == chosen }.second) }</span>
+<span class="a">+            DropdownMenu(expanded = open, onDismissRequest = { open = false }) {</span>
+<span class="a">+                for ((value, name) in options) {</span>
+<span class="a">+                    DropdownMenuItem(text = { Text(name) }, onClick = { onPick(value); open = false })</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ @Composable
+ private fun Progress(status: JobStatus) {
+     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+<span class="h">@@ -231,7 +275,10 @@ private fun Progress(status: JobStatus) {</span>
+ }
+ 
+ @Composable
+<span class="d">-private fun Outcome(status: JobStatus, onSave: () -&gt; Unit, onShare: () -&gt; Unit) {</span>
+<span class="a">+private fun Outcome(</span>
+<span class="a">+    status: JobStatus, video: VideoStatus, videoOptions: @Composable () -&gt; Unit,</span>
+<span class="a">+    onSave: () -&gt; Unit, onShare: () -&gt; Unit, onVideo: () -&gt; Unit,</span>
+<span class="a">+) {</span>
+     when (status.phase) {
+         Phase.DONE -&gt; Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+             val rate = ((status.matchRate ?: 0.0) * 100).toInt()
+<span class="h">@@ -250,6 +297,25 @@ private fun Outcome(status: JobStatus, onSave: () -&gt; Unit, onShare: () -&gt; Unit)</span>
+             }
+             Text(&quot;In Hoshi Reader: long-press the book, Match, and choose the saved .srt.&quot;,
+                 style = MaterialTheme.typography.bodySmall)
+<span class="a">+</span>
+<span class="a">+            HorizontalDivider(color = Color.Black)</span>
+<span class="a">+            Text(&quot;Video + subtitles&quot;, fontWeight = FontWeight.Bold)</span>
+<span class="a">+            Text(&quot;An .mp4 of the cover and the audio, with the .srt beside it. It plays with subtitles &quot; +</span>
+<span class="a">+                &quot;in any video player, and you can upload it to YouTube.&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            if (video.running) {</span>
+<span class="a">+                LinearProgressIndicator(</span>
+<span class="a">+                    progress = { video.fraction },</span>
+<span class="a">+                    modifier = Modifier.fillMaxWidth(),</span>
+<span class="a">+                    color = Color.Black, trackColor = Color(0xFFCCCCCC),</span>
+<span class="a">+                )</span>
+<span class="a">+                Text(&quot;Making the video: ${(video.fraction * 100).toInt()}%&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            } else {</span>
+<span class="a">+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) { videoOptions() }</span>
+<span class="a">+                Text(&quot;The picture is still, so more frames a second add almost nothing to the file. &quot; +</span>
+<span class="a">+                    &quot;A larger size adds a little.&quot;, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+                OutlinedButton(onClick = onVideo) { Text(&quot;Save video + .srt&quot;) }</span>
+<span class="a">+                if (video.message.isNotEmpty()) Text(video.message, style = MaterialTheme.typography.bodySmall)</span>
+<span class="a">+            }</span>
+         }
+         Phase.FAILED -&gt; Text(&quot;Failed: ${status.detail}&quot;, fontWeight = FontWeight.Bold)
+         Phase.CANCELLED -&gt; Text(status.detail)
+diff --git a/app/src/main/kotlin/space/subread/app/video/VideoExport.kt b/app/src/main/kotlin/space/subread/app/video/VideoExport.kt
+new file mode 100644
+index 0000000..f321714
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/video/VideoExport.kt
+<span class="h">@@ -0,0 +1,51 @@</span>
+<span class="a">+package space.subread.app.video</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.provider.DocumentsContract</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import kotlinx.coroutines.flow.MutableStateFlow</span>
+<span class="a">+import kotlinx.coroutines.flow.StateFlow</span>
+<span class="a">+import space.subread.app.job.TranscriptStore</span>
+<span class="a">+import space.subread.core.BookText</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+data class VideoStatus(val running: Boolean = false, val fraction: Float = 0f, val message: String = &quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Writes the video and its subtitles into a folder the user picked. The two</span>
+<span class="a">+ * files have the same name, which is how a video player finds the subtitles.</span>
+<span class="a">+ */</span>
+<span class="a">+object VideoExport {</span>
+<span class="a">+    private val state = MutableStateFlow(VideoStatus())</span>
+<span class="a">+    val status: StateFlow&lt;VideoStatus&gt; = state</span>
+<span class="a">+</span>
+<span class="a">+    /** Blocks until the files are written; call from a worker thread. */</span>
+<span class="a">+    fun run(context: Context, audio: Uri, book: Uri?, srt: File, folder: Uri, size: VideoSize, fps: Int) {</span>
+<span class="a">+        state.value = VideoStatus(running = true)</span>
+<span class="a">+        val resolver = context.contentResolver</span>
+<span class="a">+        var video: Uri? = null</span>
+<span class="a">+        try {</span>
+<span class="a">+            val parent = DocumentsContract.buildDocumentUriUsingTree(folder, DocumentsContract.getTreeDocumentId(folder))</span>
+<span class="a">+            val base = TranscriptStore.describe(context, audio).first.substringBeforeLast(&#x27;.&#x27;)</span>
+<span class="a">+            video = DocumentsContract.createDocument(resolver, parent, &quot;video/mp4&quot;, &quot;$base.mp4&quot;)</span>
+<span class="a">+                ?: throw IllegalStateException(&quot;The folder did not accept a new file.&quot;)</span>
+<span class="a">+            // The folder can change the name (a file with this name is there already). The subtitles follow it.</span>
+<span class="a">+            val written = TranscriptStore.describe(context, video).first.substringBeforeLast(&#x27;.&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+            val cover = book?.let { uri -&gt; runCatching { resolver.openInputStream(uri)?.use(BookText::cover) }.getOrNull() }</span>
+<span class="a">+            VideoMaker.make(context, audio, cover, video, size, fps) { state.value = VideoStatus(true, it) }</span>
+<span class="a">+</span>
+<span class="a">+            val subtitles = DocumentsContract.createDocument(resolver, parent, &quot;application/x-subrip&quot;, &quot;$written.srt&quot;)</span>
+<span class="a">+                ?: throw IllegalStateException(&quot;The folder did not accept the subtitles file.&quot;)</span>
+<span class="a">+            resolver.openOutputStream(subtitles)!!.use { out -&gt; srt.inputStream().use { it.copyTo(out) } }</span>
+<span class="a">+</span>
+<span class="a">+            state.value = VideoStatus(message = &quot;Saved $written.mp4 and $written.srt.&quot;)</span>
+<span class="a">+        } catch (e: Throwable) {</span>
+<span class="a">+            Log.w(&quot;SubRead&quot;, &quot;video export failed&quot;, e)</span>
+<span class="a">+            // Half a video is of no use to anyone.</span>
+<span class="a">+            video?.let { runCatching { DocumentsContract.deleteDocument(resolver, it) } }</span>
+<span class="a">+            state.value = VideoStatus(message = &quot;The video failed: ${e.message ?: e.javaClass.simpleName}&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/kotlin/space/subread/app/video/VideoMaker.kt b/app/src/main/kotlin/space/subread/app/video/VideoMaker.kt
+new file mode 100644
+index 0000000..6bf56d7
+--- /dev/null
++++ b/app/src/main/kotlin/space/subread/app/video/VideoMaker.kt
+<span class="h">@@ -0,0 +1,479 @@</span>
+<span class="a">+package space.subread.app.video</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.graphics.Bitmap</span>
+<span class="a">+import android.graphics.BitmapFactory</span>
+<span class="a">+import android.graphics.Color</span>
+<span class="a">+import android.graphics.Paint</span>
+<span class="a">+import android.graphics.RectF</span>
+<span class="a">+import android.media.MediaCodec</span>
+<span class="a">+import android.media.MediaCodecInfo</span>
+<span class="a">+import android.media.MediaCodecList</span>
+<span class="a">+import android.media.MediaExtractor</span>
+<span class="a">+import android.media.MediaFormat</span>
+<span class="a">+import android.media.MediaMuxer</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import androidx.core.graphics.createBitmap</span>
+<span class="a">+import space.subread.core.H264Still</span>
+<span class="a">+import java.nio.ByteBuffer</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * A video of the book: a still picture over the audiobook&#x27;s own audio, as an</span>
+<span class="a">+ * MP4 that any player opens and YouTube accepts. The subtitles go beside it as</span>
+<span class="a">+ * an .srt with the same name, which players load by themselves.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A still picture is cheap if nothing is encoded twice. The encoder makes one</span>
+<span class="a">+ * key frame. The frames after it say &quot;no change&quot; in about ten bytes each; they</span>
+<span class="a">+ * are written by hand (see H264Still), because an encoder spends kilobytes on</span>
+<span class="a">+ * the same frame. That minute is written again and again with new time stamps.</span>
+<span class="a">+ * So the frame rate costs almost nothing, and the picture size costs only in</span>
+<span class="a">+ * the one key frame of each minute.</span>
+<span class="a">+ * AAC audio is copied as it is; other audio is encoded to AAC once, which the</span>
+<span class="a">+ * MP4 container needs.</span>
+<span class="a">+ */</span>
+<span class="a">+class VideoSize(val width: Int, val height: Int) {</span>
+<span class="a">+    val label: String get() = &quot;${height}p&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+object VideoMaker {</span>
+<span class="a">+    private const val TAG = &quot;SubRead&quot;</span>
+<span class="a">+</span>
+<span class="a">+    /** Sizes to offer. A device makes only those for which it has an encoder: see [sizes]. */</span>
+<span class="a">+    private val SIZES = listOf(VideoSize(1280, 720), VideoSize(1920, 1080), VideoSize(2560, 1440),</span>
+<span class="a">+        VideoSize(3840, 2160), VideoSize(7680, 4320))</span>
+<span class="a">+    val FRAME_RATES = listOf(1, 24, 30, 60)</span>
+<span class="a">+    private const val GOP_SECONDS = 60</span>
+<span class="a">+    private const val KEY_FRAME_QP = 26</span>
+<span class="a">+</span>
+<span class="a">+    private class Frame(val bytes: ByteArray, val key: Boolean)</span>
+<span class="a">+    private class Sample(val bytes: ByteArray, val ptsUs: Long)</span>
+<span class="a">+</span>
+<span class="a">+    /** The sizes this device can make, smallest first. The first one is the default. */</span>
+<span class="a">+    fun sizes(): List&lt;VideoSize&gt; = SIZES.filter { encoderFor(it) != null }.ifEmpty { SIZES.take(1) }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * @param cover image bytes, or null for a plain card</span>
+<span class="a">+     * @param size one of [sizes]</span>
+<span class="a">+     * @param fps frames in a second, 1 to 60</span>
+<span class="a">+     */</span>
+<span class="a">+    fun make(</span>
+<span class="a">+        context: Context, audio: Uri, cover: ByteArray?, dest: Uri,</span>
+<span class="a">+        size: VideoSize = SIZES[0], fps: Int = 1, onProgress: (Float) -&gt; Unit,</span>
+<span class="a">+    ) {</span>
+<span class="a">+        require(fps in 1..60) { &quot;fps $fps&quot; }</span>
+<span class="a">+        val yuv = Yuv(picture(cover, size), size)</span>
+<span class="a">+        var rate = fps</span>
+<span class="a">+        var (videoFormat, gop) = encodeStill(yuv, size, 1)</span>
+<span class="a">+        try {</span>
+<span class="a">+            val skips = H264Still.skipFrames(bytes(videoFormat, &quot;csd-0&quot;), bytes(videoFormat, &quot;csd-1&quot;), GOP_SECONDS * fps - 1)</span>
+<span class="a">+            gop = gop + skips.map { Frame(it, false) }</span>
+<span class="a">+        } catch (e: H264Still.Unsupported) {</span>
+<span class="a">+            // Bigger and at one frame a second, but correct: the encoder&#x27;s own frames.</span>
+<span class="a">+            Log.w(TAG, &quot;still: no hand-made frames for this stream (${e.message})&quot;)</span>
+<span class="a">+            rate = 1</span>
+<span class="a">+            encodeStill(yuv, size, GOP_SECONDS).let { videoFormat = it.first; gop = it.second }</span>
+<span class="a">+        }</span>
+<span class="a">+        val level = H264Still.level(size.width, size.height, rate)</span>
+<span class="a">+        videoFormat.setByteBuffer(&quot;csd-0&quot;, ByteBuffer.wrap(H264Still.withLevel(bytes(videoFormat, &quot;csd-0&quot;), level)))</span>
+<span class="a">+        Log.i(TAG, &quot;still: ${size.width}x${size.height} at $rate fps, level $level, ${gop.size} frames, &quot; +</span>
+<span class="a">+            &quot;key ${gop[0].bytes.size} B, the rest ${gop.drop(1).sumOf { it.bytes.size }} B&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        val extractor = MediaExtractor()</span>
+<span class="a">+        extractor.setDataSource(context, audio, null)</span>
+<span class="a">+        val track = (0 until extractor.trackCount).firstOrNull {</span>
+<span class="a">+            extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME).orEmpty().startsWith(&quot;audio/&quot;)</span>
+<span class="a">+        } ?: throw IllegalArgumentException(&quot;No audio track in this file.&quot;)</span>
+<span class="a">+        extractor.selectTrack(track)</span>
+<span class="a">+        val source = extractor.getTrackFormat(track)</span>
+<span class="a">+        val durationUs = if (source.containsKey(MediaFormat.KEY_DURATION)) source.getLong(MediaFormat.KEY_DURATION) else 0L</span>
+<span class="a">+</span>
+<span class="a">+        val sound: AudioSource =</span>
+<span class="a">+            if (source.getString(MediaFormat.KEY_MIME) == MediaFormat.MIMETYPE_AUDIO_AAC) Copy(extractor, source)</span>
+<span class="a">+            else Transcode(extractor, source)</span>
+<span class="a">+</span>
+<span class="a">+        context.contentResolver.openFileDescriptor(dest, &quot;rw&quot;)!!.use { pfd -&gt;</span>
+<span class="a">+            val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)</span>
+<span class="a">+            try {</span>
+<span class="a">+                val v = muxer.addTrack(videoFormat)</span>
+<span class="a">+                val a = muxer.addTrack(sound.format())</span>
+<span class="a">+                muxer.start()</span>
+<span class="a">+</span>
+<span class="a">+                val info = MediaCodec.BufferInfo()</span>
+<span class="a">+                var frame = 0L</span>
+<span class="a">+                var frameUs = 0L</span>
+<span class="a">+                fun picture() {</span>
+<span class="a">+                    val f = gop[(frame % gop.size).toInt()]</span>
+<span class="a">+                    info.set(0, f.bytes.size, frameUs, if (f.key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)</span>
+<span class="a">+                    muxer.writeSampleData(v, ByteBuffer.wrap(f.bytes), info)</span>
+<span class="a">+                    frame++</span>
+<span class="a">+                    frameUs = frame * 1_000_000 / rate</span>
+<span class="a">+                }</span>
+<span class="a">+</span>
+<span class="a">+                var lastUs = 0L</span>
+<span class="a">+                while (true) {</span>
+<span class="a">+                    val s = sound.next() ?: break</span>
+<span class="a">+                    // Keep the two tracks side by side in the file, so a player</span>
+<span class="a">+                    // does not have to jump about to find the next of either.</span>
+<span class="a">+                    while (frameUs &lt;= s.ptsUs) picture()</span>
+<span class="a">+                    info.set(0, s.bytes.size, s.ptsUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)</span>
+<span class="a">+                    muxer.writeSampleData(a, ByteBuffer.wrap(s.bytes), info)</span>
+<span class="a">+                    lastUs = s.ptsUs</span>
+<span class="a">+                    if (durationUs &gt; 0) onProgress((s.ptsUs.toFloat() / durationUs).coerceIn(0f, 1f))</span>
+<span class="a">+                }</span>
+<span class="a">+                while (frameUs &lt;= lastUs) picture()</span>
+<span class="a">+                muxer.stop()</span>
+<span class="a">+            } finally {</span>
+<span class="a">+                runCatching { muxer.release() }</span>
+<span class="a">+                sound.close()</span>
+<span class="a">+                extractor.release()</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private val AVC_LEVELS = mapOf(</span>
+<span class="a">+        31 to MediaCodecInfo.CodecProfileLevel.AVCLevel31, 32 to MediaCodecInfo.CodecProfileLevel.AVCLevel32,</span>
+<span class="a">+        40 to MediaCodecInfo.CodecProfileLevel.AVCLevel4, 42 to MediaCodecInfo.CodecProfileLevel.AVCLevel42,</span>
+<span class="a">+        50 to MediaCodecInfo.CodecProfileLevel.AVCLevel5, 51 to MediaCodecInfo.CodecProfileLevel.AVCLevel51,</span>
+<span class="a">+        52 to MediaCodecInfo.CodecProfileLevel.AVCLevel52,</span>
+<span class="a">+        // AVCLevel6, AVCLevel61 and AVCLevel62. The names are in API 29 and later; the values are the same on each version.</span>
+<span class="a">+        60 to 0x20000, 61 to 0x40000, 62 to 0x80000,</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+    private fun bytes(format: MediaFormat, key: String): ByteArray {</span>
+<span class="a">+        val buffer = format.getByteBuffer(key) ?: throw H264Still.Unsupported(&quot;no $key&quot;)</span>
+<span class="a">+        return ByteArray(buffer.remaining()).also { buffer.duplicate().get(it) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ------------------------------------------------------------------ audio</span>
+<span class="a">+</span>
+<span class="a">+    private interface AudioSource {</span>
+<span class="a">+        fun format(): MediaFormat</span>
+<span class="a">+        fun next(): Sample?</span>
+<span class="a">+        fun close() {}</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** AAC goes into the MP4 untouched. */</span>
+<span class="a">+    private class Copy(val extractor: MediaExtractor, val source: MediaFormat) : AudioSource {</span>
+<span class="a">+        private val buffer = ByteBuffer.allocate(1 shl 18)</span>
+<span class="a">+        override fun format() = source</span>
+<span class="a">+        override fun next(): Sample? {</span>
+<span class="a">+            val n = extractor.readSampleData(buffer, 0)</span>
+<span class="a">+            if (n &lt; 0) return null</span>
+<span class="a">+            val bytes = ByteArray(n)</span>
+<span class="a">+            buffer.position(0)</span>
+<span class="a">+            buffer.get(bytes, 0, n)</span>
+<span class="a">+            val s = Sample(bytes, extractor.sampleTime)</span>
+<span class="a">+            extractor.advance()</span>
+<span class="a">+            return s</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * MP3, Opus and the rest: decoded and encoded to AAC, once.</span>
+<span class="a">+     *</span>
+<span class="a">+     * Each call into a codec costs about a millisecond on a slow device, and</span>
+<span class="a">+     * that cost, not the arithmetic, sets the speed. So the decoder has its own</span>
+<span class="a">+     * thread and works while the encoder works, and the encoder gets the sound</span>
+<span class="a">+     * in large pieces: one call for many frames.</span>
+<span class="a">+     */</span>
+<span class="a">+    private class Transcode(val extractor: MediaExtractor, source: MediaFormat) : AudioSource {</span>
+<span class="a">+        private val decoder = MediaCodec.createDecoderByType(source.getString(MediaFormat.KEY_MIME)!!).apply {</span>
+<span class="a">+            configure(source, null, null, 0); start()</span>
+<span class="a">+        }</span>
+<span class="a">+        @Volatile private var rate = source.getInteger(MediaFormat.KEY_SAMPLE_RATE)</span>
+<span class="a">+        @Volatile private var channels = source.getInteger(MediaFormat.KEY_CHANNEL_COUNT)</span>
+<span class="a">+        @Volatile private var failure: Throwable? = null</span>
+<span class="a">+        @Volatile private var closed = false</span>
+<span class="a">+        private val pieces = java.util.concurrent.ArrayBlockingQueue&lt;ByteArray&gt;(8)</span>
+<span class="a">+        private val decoding = kotlin.concurrent.thread(name = &quot;subread-audio-decode&quot;) {</span>
+<span class="a">+            try { decode() } catch (e: Throwable) { if (!closed) failure = e }</span>
+<span class="a">+            runCatching { pieces.put(END) }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        private var encoder: MediaCodec? = null</span>
+<span class="a">+        private var outFormat: MediaFormat? = null</span>
+<span class="a">+        private val info = MediaCodec.BufferInfo()</span>
+<span class="a">+        private var piece: ByteArray? = null</span>
+<span class="a">+        private var pieceAt = 0</span>
+<span class="a">+        private var pcmEnded = false</span>
+<span class="a">+        private var encoderEnded = false</span>
+<span class="a">+        private var framesIn = 0L</span>
+<span class="a">+        private val ready = ArrayDeque&lt;Sample&gt;()</span>
+<span class="a">+        private var finished = false</span>
+<span class="a">+</span>
+<span class="a">+        override fun format(): MediaFormat {</span>
+<span class="a">+            while (outFormat == null &amp;&amp; !finished) pump()</span>
+<span class="a">+            return outFormat ?: throw IllegalStateException(&quot;The audio could not be encoded.&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        override fun next(): Sample? {</span>
+<span class="a">+            while (ready.isEmpty() &amp;&amp; !finished) pump()</span>
+<span class="a">+            return ready.removeFirstOrNull()</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /** The decoder&#x27;s thread: compressed audio in, PCM out in pieces of about [PIECE] bytes. */</span>
+<span class="a">+        private fun decode() {</span>
+<span class="a">+            val info = MediaCodec.BufferInfo()</span>
+<span class="a">+            val pcm = java.io.ByteArrayOutputStream(PIECE + (1 shl 14))</span>
+<span class="a">+            var extractorDone = false</span>
+<span class="a">+            while (!closed) {</span>
+<span class="a">+                // Each free input buffer gets a frame, so the decoder never waits for this loop.</span>
+<span class="a">+                while (!extractorDone) {</span>
+<span class="a">+                    val i = decoder.dequeueInputBuffer(0)</span>
+<span class="a">+                    if (i &lt; 0) break</span>
+<span class="a">+                    val n = extractor.readSampleData(decoder.getInputBuffer(i)!!, 0)</span>
+<span class="a">+                    if (n &lt; 0) {</span>
+<span class="a">+                        decoder.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)</span>
+<span class="a">+                        extractorDone = true</span>
+<span class="a">+                    } else {</span>
+<span class="a">+                        decoder.queueInputBuffer(i, 0, n, 0, 0)</span>
+<span class="a">+                        extractor.advance()</span>
+<span class="a">+                    }</span>
+<span class="a">+                }</span>
+<span class="a">+                val o = decoder.dequeueOutputBuffer(info, 10_000)</span>
+<span class="a">+                if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {</span>
+<span class="a">+                    // The container can be wrong about these; the decoder is not.</span>
+<span class="a">+                    rate = decoder.outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)</span>
+<span class="a">+                    channels = decoder.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)</span>
+<span class="a">+                }</span>
+<span class="a">+                if (o &lt; 0) continue</span>
+<span class="a">+                if (info.size &gt; 0) {</span>
+<span class="a">+                    val bytes = ByteArray(info.size)</span>
+<span class="a">+                    decoder.getOutputBuffer(o)!!.apply { position(info.offset); get(bytes) }</span>
+<span class="a">+                    pcm.write(bytes)</span>
+<span class="a">+                }</span>
+<span class="a">+                val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0</span>
+<span class="a">+                decoder.releaseOutputBuffer(o, false)</span>
+<span class="a">+                if (pcm.size() &gt;= PIECE || (end &amp;&amp; pcm.size() &gt; 0)) {</span>
+<span class="a">+                    pieces.put(pcm.toByteArray())</span>
+<span class="a">+                    pcm.reset()</span>
+<span class="a">+                }</span>
+<span class="a">+                if (end) return</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        private fun startEncoder(): MediaCodec {</span>
+<span class="a">+            val f = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, rate, channels).apply {</span>
+<span class="a">+                setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)</span>
+<span class="a">+                setInteger(MediaFormat.KEY_BIT_RATE, if (channels == 1) 80_000 else 128_000)</span>
+<span class="a">+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, PIECE)</span>
+<span class="a">+            }</span>
+<span class="a">+            return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {</span>
+<span class="a">+                configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); start()</span>
+<span class="a">+            }.also { encoder = it }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /** One step of the encoder&#x27;s side: take encoded audio out, or put PCM in. */</span>
+<span class="a">+        private fun pump() {</span>
+<span class="a">+            encoder?.let { enc -&gt;</span>
+<span class="a">+                // Wait only when there is nothing to put in.</span>
+<span class="a">+                val o = enc.dequeueOutputBuffer(info, if (piece != null || pieces.isNotEmpty()) 0 else 10_000)</span>
+<span class="a">+                if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) outFormat = enc.outputFormat</span>
+<span class="a">+                else if (o &gt;= 0) {</span>
+<span class="a">+                    if (info.size &gt; 0 &amp;&amp; info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {</span>
+<span class="a">+                        val bytes = ByteArray(info.size)</span>
+<span class="a">+                        enc.getOutputBuffer(o)!!.apply { position(info.offset); get(bytes) }</span>
+<span class="a">+                        ready += Sample(bytes, info.presentationTimeUs)</span>
+<span class="a">+                    }</span>
+<span class="a">+                    val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0</span>
+<span class="a">+                    enc.releaseOutputBuffer(o, false)</span>
+<span class="a">+                    if (end) finished = true</span>
+<span class="a">+                    return</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+</span>
+<span class="a">+            if (piece == null &amp;&amp; !pcmEnded) {</span>
+<span class="a">+                val next = pieces.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS) ?: return</span>
+<span class="a">+                if (next === END) {</span>
+<span class="a">+                    pcmEnded = true</span>
+<span class="a">+                    failure?.let { throw it }</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    piece = next</span>
+<span class="a">+                    pieceAt = 0</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+            if (encoderEnded) return</span>
+<span class="a">+</span>
+<span class="a">+            val enc = encoder ?: startEncoder()</span>
+<span class="a">+            val i = enc.dequeueInputBuffer(10_000)</span>
+<span class="a">+            if (i &lt; 0) return</span>
+<span class="a">+            val ptsUs = framesIn * 1_000_000 / rate</span>
+<span class="a">+            val pcm = piece</span>
+<span class="a">+            if (pcm != null) {</span>
+<span class="a">+                val buf = enc.getInputBuffer(i)!!</span>
+<span class="a">+                val frame = 2 * channels</span>
+<span class="a">+                val n = minOf(buf.capacity() / frame * frame, pcm.size - pieceAt)</span>
+<span class="a">+                buf.clear()</span>
+<span class="a">+                buf.put(pcm, pieceAt, n)</span>
+<span class="a">+                enc.queueInputBuffer(i, 0, n, ptsUs, 0)</span>
+<span class="a">+                pieceAt += n</span>
+<span class="a">+                framesIn += n / frame</span>
+<span class="a">+                if (pieceAt &gt;= pcm.size) piece = null</span>
+<span class="a">+            } else {</span>
+<span class="a">+                enc.queueInputBuffer(i, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)</span>
+<span class="a">+                encoderEnded = true</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        override fun close() {</span>
+<span class="a">+            closed = true</span>
+<span class="a">+            pieces.clear()              // so a decoder that waits to put a piece can go on, and stop</span>
+<span class="a">+            decoding.join(2_000)</span>
+<span class="a">+            runCatching { decoder.stop() }; decoder.release()</span>
+<span class="a">+            encoder?.let { runCatching { it.stop() }; it.release() }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        private companion object {</span>
+<span class="a">+            /** About a third of a second of stereo sound. */</span>
+<span class="a">+            const val PIECE = 1 shl 16</span>
+<span class="a">+            val END = ByteArray(0)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---------------------------------------------------------------- picture</span>
+<span class="a">+</span>
+<span class="a">+    /** The cover, letterboxed on a black card; a plain dark card when there is none. */</span>
+<span class="a">+    internal fun picture(cover: ByteArray?, size: VideoSize): Bitmap {</span>
+<span class="a">+        val width = size.width</span>
+<span class="a">+        val height = size.height</span>
+<span class="a">+        val card = createBitmap(width, height)</span>
+<span class="a">+        val canvas = android.graphics.Canvas(card)</span>
+<span class="a">+        canvas.drawColor(Color.rgb(0x16, 0x16, 0x1a))</span>
+<span class="a">+        val image = cover?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size) }.getOrNull() }</span>
+<span class="a">+        if (image != null) {</span>
+<span class="a">+            canvas.drawColor(Color.BLACK)</span>
+<span class="a">+            val scale = minOf(width.toFloat() / image.width, height.toFloat() / image.height)</span>
+<span class="a">+            val w = image.width * scale</span>
+<span class="a">+            val h = image.height * scale</span>
+<span class="a">+            canvas.drawBitmap(image, null, RectF((width - w) / 2, (height - h) / 2, (width + w) / 2, (height + h) / 2),</span>
+<span class="a">+                Paint(Paint.FILTER_BITMAP_FLAG))</span>
+<span class="a">+        }</span>
+<span class="a">+        return card</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The encoder for a picture of this size. The software encoder is first:</span>
+<span class="a">+     * it is the same on each device. A hardware encoder makes the larger sizes.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun encoderFor(size: VideoSize): String? =</span>
+<span class="a">+        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos</span>
+<span class="a">+            .filter { c -&gt; c.isEncoder &amp;&amp; c.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }</span>
+<span class="a">+            .filter { c -&gt;</span>
+<span class="a">+                runCatching {</span>
+<span class="a">+                    c.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities.isSizeSupported(size.width, size.height)</span>
+<span class="a">+                }.getOrDefault(false)</span>
+<span class="a">+            }</span>
+<span class="a">+            .sortedBy { c -&gt; if (c.name.startsWith(&quot;c2.android.&quot;) || c.name.startsWith(&quot;OMX.google.&quot;)) 0 else 1 }</span>
+<span class="a">+            .firstOrNull()?.name</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The first [count] seconds of the picture at one frame a second. The</span>
+<span class="a">+     * frames go in as YUV buffers: that is the input each encoder accepts</span>
+<span class="a">+     * (the MediaTek encoder fails on frames drawn with a Canvas).</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun encodeStill(yuv: Yuv, size: VideoSize, count: Int): Pair&lt;MediaFormat, List&lt;Frame&gt;&gt; {</span>
+<span class="a">+        val width = size.width</span>
+<span class="a">+        val height = size.height</span>
+<span class="a">+        val name = encoderFor(size) ?: throw IllegalStateException(&quot;This device has no H.264 encoder for ${size.label} video.&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {</span>
+<span class="a">+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)</span>
+<span class="a">+            setInteger(MediaFormat.KEY_BIT_RATE, 600_000)</span>
+<span class="a">+            setInteger(MediaFormat.KEY_FRAME_RATE, 1)</span>
+<span class="a">+            setInteger(&quot;video-qp-i-min&quot;, KEY_FRAME_QP)</span>
+<span class="a">+            setInteger(&quot;video-qp-i-max&quot;, KEY_FRAME_QP)</span>
+<span class="a">+            // Far longer than the clip: only the first frame is a key frame.</span>
+<span class="a">+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3600)</span>
+<span class="a">+            // Baseline: each player decodes it, and H264Still can write frames for it.</span>
+<span class="a">+            setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)</span>
+<span class="a">+            // The level for one frame a second. make() writes the true level afterwards.</span>
+<span class="a">+            setInteger(MediaFormat.KEY_LEVEL, AVC_LEVELS.getValue(H264Still.level(width, height, 1)))</span>
+<span class="a">+        }</span>
+<span class="a">+        val codec = MediaCodec.createByCodecName(name)</span>
+<span class="a">+        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)</span>
+<span class="a">+        codec.start()</span>
+<span class="a">+        val info = MediaCodec.BufferInfo()</span>
+<span class="a">+        val frames = ArrayList&lt;Frame&gt;()</span>
+<span class="a">+        var outFormat: MediaFormat? = null</span>
+<span class="a">+        var queued = 0</span>
+<span class="a">+        var ended = false</span>
+<span class="a">+        try {</span>
+<span class="a">+            while (!ended) {</span>
+<span class="a">+                if (queued &lt;= count) {</span>
+<span class="a">+                    val i = codec.dequeueInputBuffer(10_000)</span>
+<span class="a">+                    if (i &gt;= 0) {</span>
+<span class="a">+                        if (queued == count) {</span>
+<span class="a">+                            codec.queueInputBuffer(i, 0, 0, queued * 1_000_000L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)</span>
+<span class="a">+                        } else {</span>
+<span class="a">+                            yuv.fill(codec.getInputImage(i)!!)</span>
+<span class="a">+                            codec.queueInputBuffer(i, 0, width * height * 3 / 2, queued * 1_000_000L, 0)</span>
+<span class="a">+                        }</span>
+<span class="a">+                        queued++</span>
+<span class="a">+                    }</span>
+<span class="a">+                }</span>
+<span class="a">+                val o = codec.dequeueOutputBuffer(info, 10_000)</span>
+<span class="a">+                if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) outFormat = codec.outputFormat</span>
+<span class="a">+                if (o &lt; 0) continue</span>
+<span class="a">+                if (info.size &gt; 0 &amp;&amp; info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {</span>
+<span class="a">+                    val bytes = ByteArray(info.size)</span>
+<span class="a">+                    codec.getOutputBuffer(o)!!.apply { position(info.offset); get(bytes) }</span>
+<span class="a">+                    frames += Frame(bytes, info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)</span>
+<span class="a">+                }</span>
+<span class="a">+                ended = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0</span>
+<span class="a">+                codec.releaseOutputBuffer(o, false)</span>
+<span class="a">+            }</span>
+<span class="a">+        } finally {</span>
+<span class="a">+            runCatching { codec.stop() }</span>
+<span class="a">+            codec.release()</span>
+<span class="a">+        }</span>
+<span class="a">+        check(frames.size == count &amp;&amp; frames[0].key) { &quot;The video encoder made ${frames.size} of $count frames.&quot; }</span>
+<span class="a">+        check(frames.drop(1).none { it.key }) { &quot;The video encoder made more than one key frame.&quot; }</span>
+<span class="a">+        return (outFormat ?: throw IllegalStateException(&quot;The video encoder gave no format.&quot;)) to frames</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The picture as Y, U and V planes (BT.601, video range), made once and copied into each frame. */</span>
+<span class="a">+    internal class Yuv(picture: Bitmap, size: VideoSize) {</span>
+<span class="a">+        private val width = size.width</span>
+<span class="a">+        private val height = size.height</span>
+<span class="a">+        val y = ByteArray(width * height)</span>
+<span class="a">+        private val u = ByteArray(width * height / 4)</span>
+<span class="a">+        private val v = ByteArray(width * height / 4)</span>
+<span class="a">+</span>
+<span class="a">+        init {</span>
+<span class="a">+            val argb = IntArray(width * height)</span>
+<span class="a">+            picture.getPixels(argb, 0, width, 0, 0, width, height)</span>
+<span class="a">+            for (row in 0 until height) for (col in 0 until width) {</span>
+<span class="a">+                val c = argb[row * width + col]</span>
+<span class="a">+                val r = (c shr 16) and 0xff</span>
+<span class="a">+                val g = (c shr 8) and 0xff</span>
+<span class="a">+                val b = c and 0xff</span>
+<span class="a">+                y[row * width + col] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).toByte()</span>
+<span class="a">+                if (row % 2 == 0 &amp;&amp; col % 2 == 0) {</span>
+<span class="a">+                    val k = (row / 2) * (width / 2) + col / 2</span>
+<span class="a">+                    u[k] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).toByte()</span>
+<span class="a">+                    v[k] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).toByte()</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /** Planar or semi-planar, padded or not: the Image says, and this follows. */</span>
+<span class="a">+        fun fill(image: android.media.Image) {</span>
+<span class="a">+            copy(y, width, height, image.planes[0])</span>
+<span class="a">+            copy(u, width / 2, height / 2, image.planes[1])</span>
+<span class="a">+            copy(v, width / 2, height / 2, image.planes[2])</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        private fun copy(src: ByteArray, w: Int, h: Int, plane: android.media.Image.Plane) {</span>
+<span class="a">+            val buffer = plane.buffer</span>
+<span class="a">+            if (plane.pixelStride == 1 &amp;&amp; plane.rowStride == w) {</span>
+<span class="a">+                buffer.position(0)</span>
+<span class="a">+                buffer.put(src, 0, w * h)</span>
+<span class="a">+                return</span>
+<span class="a">+            }</span>
+<span class="a">+            for (row in 0 until h) for (col in 0 until w) {</span>
+<span class="a">+                buffer.put(row * plane.rowStride + col * plane.pixelStride, src[row * w + col])</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span></pre>
+</div></body></html>

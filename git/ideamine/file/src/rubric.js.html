@@ -7,8 +7,8 @@
 <div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
 <h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
 <div id="content">
-<p>src/rubric.js (4442 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // How ideas are judged and which model builds them. Both triage paths (the MCP tool used by
-<a id="l2" href="#l2">2</a> // /idea-triage and the headless `ideamine triage`) read this file.
+<p>src/rubric.js (5140 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // How ideas are judged and which model builds them. Both triage paths (the MCP tool used by
+<a id="l2" href="#l2">2</a> // /ideas-go and /ideas-sort, and the headless `ideamine sort`) read this file.
 <a id="l3" href="#l3">3</a> 
 <a id="l4" href="#l4">4</a> import path from &#x27;node:path&#x27;;
 <a id="l5" href="#l5">5</a> import { lane, listIdeas } from &#x27;./store.js&#x27;;
@@ -58,54 +58,66 @@
 <a id="l49" href="#l49">49</a> - brief: 1-4 sentences an agent can act on without this conversation: goal, scope, and &quot;done when&quot;. Leave empty for skip.
 <a id="l50" href="#l50">50</a> - dup_of: id of an existing idea this one duplicates (use verdict &quot;skip&quot;), if any`;
 <a id="l51" href="#l51">51</a> 
-<a id="l52" href="#l52">52</a> /** JSON Schema for a batch of verdicts; used for `claude -p --json-schema` and the MCP tool. */
-<a id="l53" href="#l53">53</a> export const VERDICT_SCHEMA = {
-<a id="l54" href="#l54">54</a>   type: &#x27;object&#x27;,
-<a id="l55" href="#l55">55</a>   properties: {
-<a id="l56" href="#l56">56</a>     id: { type: &#x27;integer&#x27; },
-<a id="l57" href="#l57">57</a>     verdict: { type: &#x27;string&#x27;, enum: [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;] },
-<a id="l58" href="#l58">58</a>     impact: { type: &#x27;integer&#x27;, minimum: 1, maximum: 5 },
-<a id="l59" href="#l59">59</a>     size: { type: &#x27;string&#x27;, enum: [&#x27;xs&#x27;, &#x27;s&#x27;, &#x27;m&#x27;, &#x27;l&#x27;, &#x27;xl&#x27;] },
-<a id="l60" href="#l60">60</a>     model: { type: &#x27;string&#x27;, enum: MODELS.map((m) =&gt; m.alias) },
-<a id="l61" href="#l61">61</a>     title: { type: &#x27;string&#x27; },
-<a id="l62" href="#l62">62</a>     why: { type: &#x27;string&#x27; },
-<a id="l63" href="#l63">63</a>     brief: { type: &#x27;string&#x27; },
-<a id="l64" href="#l64">64</a>     dup_of: { type: &#x27;integer&#x27; },
-<a id="l65" href="#l65">65</a>   },
-<a id="l66" href="#l66">66</a>   required: [&#x27;id&#x27;, &#x27;verdict&#x27;, &#x27;impact&#x27;, &#x27;size&#x27;, &#x27;model&#x27;, &#x27;title&#x27;, &#x27;why&#x27;, &#x27;brief&#x27;],
-<a id="l67" href="#l67">67</a> };
-<a id="l68" href="#l68">68</a> 
-<a id="l69" href="#l69">69</a> export const BATCH_SCHEMA = {
-<a id="l70" href="#l70">70</a>   type: &#x27;object&#x27;,
-<a id="l71" href="#l71">71</a>   properties: { verdicts: { type: &#x27;array&#x27;, items: VERDICT_SCHEMA } },
-<a id="l72" href="#l72">72</a>   required: [&#x27;verdicts&#x27;],
-<a id="l73" href="#l73">73</a> };
-<a id="l74" href="#l74">74</a> 
-<a id="l75" href="#l75">75</a> /** Ideas waiting for a verdict: the inbox, or the given ids (re-triage). */
-<a id="l76" href="#l76">76</a> export function pendingIdeas(db, { ids = null, limit = 30 } = {}) {
-<a id="l77" href="#l77">77</a>   if (Array.isArray(ids) &amp;&amp; ids.length) {
-<a id="l78" href="#l78">78</a>     const wanted = new Set(ids.map(Number));
-<a id="l79" href="#l79">79</a>     return db.ideas.filter((i) =&gt; wanted.has(i.id));
-<a id="l80" href="#l80">80</a>   }
-<a id="l81" href="#l81">81</a>   return listIdeas(db, { filter: &#x27;inbox&#x27; }).reverse().slice(0, limit); // oldest first
-<a id="l82" href="#l82">82</a> }
-<a id="l83" href="#l83">83</a> 
-<a id="l84" href="#l84">84</a> /** The rubric plus the ideas to judge, as one prompt. */
-<a id="l85" href="#l85">85</a> export function triagePrompt(db, pending) {
-<a id="l86" href="#l86">86</a>   const pendingIds = new Set(pending.map((i) =&gt; i.id));
-<a id="l87" href="#l87">87</a>   const existing = db.ideas
-<a id="l88" href="#l88">88</a>     .filter((i) =&gt; !pendingIds.has(i.id) &amp;&amp; [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;].includes(lane(i)))
-<a id="l89" href="#l89">89</a>     .slice(-60)
-<a id="l90" href="#l90">90</a>     .map((i) =&gt; `#${i.id} ${clip(i.title, 70)} (${lane(i)})`);
-<a id="l91" href="#l91">91</a>   const lines = [RUBRIC, &#x27;&#x27;];
-<a id="l92" href="#l92">92</a>   if (existing.length) lines.push(&#x27;Existing ideas, for duplicate checks:&#x27;, ...existing, &#x27;&#x27;);
-<a id="l93" href="#l93">93</a>   lines.push(`Ideas to triage (${pending.length}):`);
-<a id="l94" href="#l94">94</a>   for (const i of pending) {
-<a id="l95" href="#l95">95</a>     const ctx = [i.project &amp;&amp; `project: ${path.basename(i.project)}`, i.tags?.length &amp;&amp; `tags: ${i.tags.join(&#x27;, &#x27;)}`]
-<a id="l96" href="#l96">96</a>       .filter(Boolean)
-<a id="l97" href="#l97">97</a>       .join(&#x27;; &#x27;);
-<a id="l98" href="#l98">98</a>     lines.push(`#${i.id}${ctx ? ` [${ctx}]` : &#x27;&#x27;}: ${i.text.replace(/\r?\n/g, &#x27; / &#x27;)}`);
-<a id="l99" href="#l99">99</a>   }
-<a id="l100" href="#l100">100</a>   return lines.join(&#x27;\n&#x27;);
-<a id="l101" href="#l101">101</a> }</pre>
+<a id="l52" href="#l52">52</a> // Only when there are projects to choose from.
+<a id="l53" href="#l53">53</a> const PAIRING =
+<a id="l54" href="#l54">54</a>   &#x27;- project: the name (the word before the colon) of the project in &quot;Projects on this machine&quot; that the idea is &#x27; +
+<a id="l55" href="#l55">55</a>   &#x27;about. The user saves ideas from any chat, so the folder where an idea was saved often has nothing to do with it. &#x27; +
+<a id="l56" href="#l56">56</a>   &#x27;&quot;&quot; if no project fits, for example an idea for a new product.&#x27;;
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a> /** JSON Schema for a batch of verdicts; used for `claude -p --json-schema` and the MCP tool. */
+<a id="l59" href="#l59">59</a> export const VERDICT_SCHEMA = {
+<a id="l60" href="#l60">60</a>   type: &#x27;object&#x27;,
+<a id="l61" href="#l61">61</a>   properties: {
+<a id="l62" href="#l62">62</a>     id: { type: &#x27;integer&#x27; },
+<a id="l63" href="#l63">63</a>     verdict: { type: &#x27;string&#x27;, enum: [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;] },
+<a id="l64" href="#l64">64</a>     impact: { type: &#x27;integer&#x27;, minimum: 1, maximum: 5 },
+<a id="l65" href="#l65">65</a>     size: { type: &#x27;string&#x27;, enum: [&#x27;xs&#x27;, &#x27;s&#x27;, &#x27;m&#x27;, &#x27;l&#x27;, &#x27;xl&#x27;] },
+<a id="l66" href="#l66">66</a>     model: { type: &#x27;string&#x27;, enum: MODELS.map((m) =&gt; m.alias) },
+<a id="l67" href="#l67">67</a>     title: { type: &#x27;string&#x27; },
+<a id="l68" href="#l68">68</a>     why: { type: &#x27;string&#x27; },
+<a id="l69" href="#l69">69</a>     brief: { type: &#x27;string&#x27; },
+<a id="l70" href="#l70">70</a>     dup_of: { type: &#x27;integer&#x27; },
+<a id="l71" href="#l71">71</a>     project: { type: &#x27;string&#x27; },
+<a id="l72" href="#l72">72</a>   },
+<a id="l73" href="#l73">73</a>   required: [&#x27;id&#x27;, &#x27;verdict&#x27;, &#x27;impact&#x27;, &#x27;size&#x27;, &#x27;model&#x27;, &#x27;title&#x27;, &#x27;why&#x27;, &#x27;brief&#x27;],
+<a id="l74" href="#l74">74</a> };
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a> export const BATCH_SCHEMA = {
+<a id="l77" href="#l77">77</a>   type: &#x27;object&#x27;,
+<a id="l78" href="#l78">78</a>   properties: { verdicts: { type: &#x27;array&#x27;, items: VERDICT_SCHEMA } },
+<a id="l79" href="#l79">79</a>   required: [&#x27;verdicts&#x27;],
+<a id="l80" href="#l80">80</a> };
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> /** Ideas waiting for a verdict: the inbox, or the given ids (re-triage). */
+<a id="l83" href="#l83">83</a> export function pendingIdeas(db, { ids = null, limit = 30 } = {}) {
+<a id="l84" href="#l84">84</a>   if (Array.isArray(ids) &amp;&amp; ids.length) {
+<a id="l85" href="#l85">85</a>     const wanted = new Set(ids.map(Number));
+<a id="l86" href="#l86">86</a>     return db.ideas.filter((i) =&gt; wanted.has(i.id));
+<a id="l87" href="#l87">87</a>   }
+<a id="l88" href="#l88">88</a>   return listIdeas(db, { filter: &#x27;inbox&#x27; }).reverse().slice(0, limit); // oldest first
+<a id="l89" href="#l89">89</a> }
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a> /** The rubric plus the ideas to judge, as one prompt. `projects` (from knownProjects) turns on pairing. */
+<a id="l92" href="#l92">92</a> export function triagePrompt(db, pending, projects = []) {
+<a id="l93" href="#l93">93</a>   const pendingIds = new Set(pending.map((i) =&gt; i.id));
+<a id="l94" href="#l94">94</a>   const existing = db.ideas
+<a id="l95" href="#l95">95</a>     .filter((i) =&gt; !pendingIds.has(i.id) &amp;&amp; [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;].includes(lane(i)))
+<a id="l96" href="#l96">96</a>     .slice(-60)
+<a id="l97" href="#l97">97</a>     .map((i) =&gt; `#${i.id} ${clip(i.title, 70)} (${lane(i)})`);
+<a id="l98" href="#l98">98</a>   const lines = [RUBRIC];
+<a id="l99" href="#l99">99</a>   if (projects.length) lines.push(PAIRING);
+<a id="l100" href="#l100">100</a>   lines.push(&#x27;&#x27;);
+<a id="l101" href="#l101">101</a>   if (existing.length) lines.push(&#x27;Existing ideas, for duplicate checks:&#x27;, ...existing, &#x27;&#x27;);
+<a id="l102" href="#l102">102</a>   if (projects.length) {
+<a id="l103" href="#l103">103</a>     lines.push(&#x27;Projects on this machine:&#x27;, ...projects.map((p) =&gt; `${p.name}: ${p.dir}${p.about ? ` — ${p.about}` : &#x27;&#x27;}`), &#x27;&#x27;);
+<a id="l104" href="#l104">104</a>   }
+<a id="l105" href="#l105">105</a>   lines.push(`Ideas to triage (${pending.length}):`);
+<a id="l106" href="#l106">106</a>   for (const i of pending) {
+<a id="l107" href="#l107">107</a>     const ctx = [i.project &amp;&amp; `project: ${path.basename(i.project)}`, i.tags?.length &amp;&amp; `tags: ${i.tags.join(&#x27;, &#x27;)}`]
+<a id="l108" href="#l108">108</a>       .filter(Boolean)
+<a id="l109" href="#l109">109</a>       .join(&#x27;; &#x27;);
+<a id="l110" href="#l110">110</a>     lines.push(`#${i.id}${ctx ? ` [${ctx}]` : &#x27;&#x27;}: ${i.text.replace(/\r?\n/g, &#x27; / &#x27;)}`);
+<a id="l111" href="#l111">111</a>   }
+<a id="l112" href="#l112">112</a>   return lines.join(&#x27;\n&#x27;);
+<a id="l113" href="#l113">113</a> }</pre>
 </div></body></html>

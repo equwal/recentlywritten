@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/auth.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/auth.py (2740 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Email sign-in links.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> No passwords: a link is mailed, opening it signs the browser in. The link
+<a id="l4" href="#l4">4</a> carries a random token; only its hash is stored, it works once, and it expires.
+<a id="l5" href="#l5">5</a> &quot;&quot;&quot;
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> from __future__ import annotations
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> import hashlib
+<a id="l10" href="#l10">10</a> import secrets
+<a id="l11" href="#l11">11</a> from datetime import timedelta, timezone
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> from sqlalchemy import func
+<a id="l14" href="#l14">14</a> from sqlalchemy.orm import Session
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> from . import accounts
+<a id="l17" href="#l17">17</a> from .db import Account, LoginToken, utcnow
+<a id="l18" href="#l18">18</a> from .settings import settings
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> # Per address and per device, per hour. Enough for someone fumbling a typo,
+<a id="l21" href="#l21">21</a> # not enough to use us as a mail cannon.
+<a id="l22" href="#l22">22</a> _MAX_LINKS_PER_HOUR = 5
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> class TooManyRequests(RuntimeError):
+<a id="l26" href="#l26">26</a>     pass
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> def _hash(token: str) -&gt; str:
+<a id="l30" href="#l30">30</a>     return hashlib.sha256(token.encode(&quot;utf-8&quot;)).hexdigest()
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> 
+<a id="l33" href="#l33">33</a> def issue(session: Session, account: Account, email: str) -&gt; str:
+<a id="l34" href="#l34">34</a>     &quot;&quot;&quot;Create a sign-in token for `email` and return the link to send.&quot;&quot;&quot;
+<a id="l35" href="#l35">35</a>     since = utcnow() - timedelta(hours=1)
+<a id="l36" href="#l36">36</a>     recent = (
+<a id="l37" href="#l37">37</a>         session.query(func.count(LoginToken.id))
+<a id="l38" href="#l38">38</a>         .filter(
+<a id="l39" href="#l39">39</a>             LoginToken.created_at &gt;= since,
+<a id="l40" href="#l40">40</a>             (LoginToken.email == email) | (LoginToken.account_id == account.id),
+<a id="l41" href="#l41">41</a>         )
+<a id="l42" href="#l42">42</a>         .scalar()
+<a id="l43" href="#l43">43</a>         or 0
+<a id="l44" href="#l44">44</a>     )
+<a id="l45" href="#l45">45</a>     if recent &gt;= _MAX_LINKS_PER_HOUR:
+<a id="l46" href="#l46">46</a>         raise TooManyRequests(
+<a id="l47" href="#l47">47</a>             &quot;Too many sign-in links requested. Wait a little and try again.&quot;
+<a id="l48" href="#l48">48</a>         )
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a>     token = secrets.token_urlsafe(32)
+<a id="l51" href="#l51">51</a>     session.add(
+<a id="l52" href="#l52">52</a>         LoginToken(
+<a id="l53" href="#l53">53</a>             token_hash=_hash(token),
+<a id="l54" href="#l54">54</a>             email=email,
+<a id="l55" href="#l55">55</a>             account_id=account.id,
+<a id="l56" href="#l56">56</a>             expires_at=utcnow() + timedelta(minutes=settings.login_link_minutes),
+<a id="l57" href="#l57">57</a>         )
+<a id="l58" href="#l58">58</a>     )
+<a id="l59" href="#l59">59</a>     session.commit()
+<a id="l60" href="#l60">60</a>     # Lands on the page, which then POSTs the token back. Mail scanners follow
+<a id="l61" href="#l61">61</a>     # links but do not run scripts, so they cannot burn a one-time token.
+<a id="l62" href="#l62">62</a>     return f&quot;{settings.public_base_url.rstrip(&#x27;/&#x27;)}/?login={token}&quot;
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a> def redeem(session: Session, token: str, device: Account) -&gt; Account | None:
+<a id="l66" href="#l66">66</a>     &quot;&quot;&quot;Spend a token. Returns the account to sign this browser into.&quot;&quot;&quot;
+<a id="l67" href="#l67">67</a>     row = (
+<a id="l68" href="#l68">68</a>         session.query(LoginToken)
+<a id="l69" href="#l69">69</a>         .filter(LoginToken.token_hash == _hash(token or &quot;&quot;))
+<a id="l70" href="#l70">70</a>         .first()
+<a id="l71" href="#l71">71</a>     )
+<a id="l72" href="#l72">72</a>     if row is None or row.used_at is not None:
+<a id="l73" href="#l73">73</a>         return None
+<a id="l74" href="#l74">74</a>     expires = row.expires_at
+<a id="l75" href="#l75">75</a>     if expires.tzinfo is None:  # SQLite hands back naive datetimes
+<a id="l76" href="#l76">76</a>         expires = expires.replace(tzinfo=timezone.utc)
+<a id="l77" href="#l77">77</a>     if expires &lt; utcnow():
+<a id="l78" href="#l78">78</a>         return None
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a>     row.used_at = utcnow()
+<a id="l81" href="#l81">81</a>     # Fold in the device that opened the link. Usually that is the one that
+<a id="l82" href="#l82">82</a>     # asked for it; when it is not (link opened on a phone), this still does
+<a id="l83" href="#l83">83</a>     # the right thing - the phone&#x27;s anonymous work joins the account.
+<a id="l84" href="#l84">84</a>     owner = accounts.adopt_email(session, device, row.email)
+<a id="l85" href="#l85">85</a>     session.commit()
+<a id="l86" href="#l86">86</a>     return owner</pre>
+</div></body></html>

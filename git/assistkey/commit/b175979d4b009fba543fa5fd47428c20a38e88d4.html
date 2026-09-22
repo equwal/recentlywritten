@@ -1,0 +1,1837 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey b175979d - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../assistkey/index.html">Log</a> | <a href="../../assistkey/files.html">Files</a> | <a href="../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit b175979d4b009fba543fa5fd47428c20a38e88d4
+truex &lt;truex@equwal.com&gt;
+2026-09-20 21:22:32 -0700
+
+Read the Power button through shell access; merge the Power and Navigation UI
+
+With shell access (Shizuku, started on the device through wireless debugging)
+the app reads KEY_POWER straight from the kernel input node and feeds it to the
+same gesture engine as every other key. Power gains any number of taps, hold,
+and true combinations with other keys. Defaults asked for: tap Back, hold Home
+closing the keyboard first, double tap Recents; triple tap locks, so there is
+still a way to sleep.
+
+While that is active the firmware&#x27;s own reactions are switched to nothing:
+short press, long press, the double-tap camera gesture. That is what stops a
+single tap from grabbing a double tap - the firmware was set to Go Home on
+short press and acted before anything else could. The engine already waits out
+the multi-tap window when a double tap is bound.
+
+The values are saved first and restored the moment shell access, the licence,
+the bindings or the service stop justifying it. Restoring needs no shell: the
+app grants itself WRITE_SECURE_SETTINGS through the shell on first contact. A
+restart that leaves Shizuku stopped leaves a normal Power button. The press
+that wakes the screen is never a gesture. Power + Volume up stays the power
+menu.
+
+Shizuku&#x27;s bound user service cannot be used here: its starter dies inside
+LoadedApk.makeApplication on Android 16 before our class loads. Shell access
+uses Shizuku&#x27;s remote process call instead, and the key watcher is a pipe from
+`getevent -q` on the nodes that declare the key.
+
+UI. The assistant, camera and wallet &quot;channels&quot; were presented as equals of
+the key filter; they are side doors for Power when there is no shell access,
+and now live on the Power screen as that. The Power screen shows the direct
+route or the side doors, never both. Navigation applies the bar and gestures
+itself through the shell and only falls back to printing adb commands. The
+main screen gains a Setup section: key remapping, shell access.
+
+New action: Home, closing the keyboard first.
+
+</pre><pre> app/build.gradle.kts                               |   7 +
+ app/src/main/AndroidManifest.xml                   |  12 +
+ .../equwal/assistkey/engine/KeyFilterService.kt    |  58 +++-
+ .../dev/equwal/assistkey/model/GlobalAction.kt     |   2 +
+ .../java/dev/equwal/assistkey/native/NavNative.kt  |  31 +-
+ .../dev/equwal/assistkey/route/ActionRouter.kt     |  18 ++
+ .../dev/equwal/assistkey/shell/PowerControl.kt     | 136 ++++++++
+ .../main/java/dev/equwal/assistkey/shell/Shell.kt  | 228 +++++++++++++
+ .../java/dev/equwal/assistkey/store/Bindings.kt    |  57 ++--
+ .../main/java/dev/equwal/assistkey/store/Store.kt  |   4 +
+ .../java/dev/equwal/assistkey/ui/MainActivity.kt   |  56 ++--
+ .../dev/equwal/assistkey/ui/NavigationActivity.kt  | 261 ++++++++-------
+ .../java/dev/equwal/assistkey/ui/PowerActivity.kt  | 351 +++++++++------------
+ .../java/dev/equwal/assistkey/ui/ShellActivity.kt  | 122 +++++++
+ .../main/res/xml/accessibility_service_config.xml  |   2 +-
+ 15 files changed, 936 insertions(+), 409 deletions(-)
+</pre><pre>diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 369b278..e5c9e38 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+<span class="h">@@ -121,4 +121,11 @@ dependencies {</span>
+     implementation(&quot;com.android.billingclient:billing:8.3.0&quot;) {
+         exclude(group = &quot;com.google.android.datatransport&quot;)
+     }
+<span class="a">+</span>
+<span class="a">+    // Shell access. Shizuku (MIT) lets the app run a small service of its own</span>
+<span class="a">+    // under the shell uid, which is what reads the Power key and switches the</span>
+<span class="a">+    // settings Android keeps from ordinary apps. The user starts Shizuku through</span>
+<span class="a">+    // wireless debugging; nothing here needs root or a computer.</span>
+<span class="a">+    implementation(&quot;dev.rikka.shizuku:api:13.1.5&quot;)</span>
+<span class="a">+    implementation(&quot;dev.rikka.shizuku:provider:13.1.5&quot;)</span>
+ }
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 90b0b92..e66bed8 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+<span class="h">@@ -29,6 +29,8 @@</span>
+         &lt;package android:name=&quot;com.viwoods.launcher&quot; /&gt;
+         &lt;package android:name=&quot;com.viwoods.viwoodsai&quot; /&gt;
+         &lt;package android:name=&quot;com.viwoods.settings&quot; /&gt;
+<span class="a">+        &lt;!-- Shizuku, for shell access. --&gt;</span>
+<span class="a">+        &lt;package android:name=&quot;moe.shizuku.privileged.api&quot; /&gt;</span>
+     &lt;/queries&gt;
+ 
+     &lt;application
+<span class="h">@@ -58,6 +60,7 @@</span>
+         &lt;activity android:name=&quot;.ui.KeyTesterActivity&quot; android:exported=&quot;false&quot; /&gt;
+         &lt;activity android:name=&quot;.ui.LicenseActivity&quot; android:exported=&quot;false&quot; /&gt;
+         &lt;activity android:name=&quot;.ui.NavigationActivity&quot; android:exported=&quot;false&quot; /&gt;
+<span class="a">+        &lt;activity android:name=&quot;.ui.ShellActivity&quot; android:exported=&quot;false&quot; /&gt;</span>
+ 
+         &lt;!--
+             The three impersonation entry points. Each starts disabled: the app
+<span class="h">@@ -162,6 +165,15 @@</span>
+                 android:resource=&quot;@xml/quick_access_wallet&quot; /&gt;
+         &lt;/service&gt;
+ 
+<span class="a">+        &lt;!-- How Shizuku hands this app its binder. --&gt;</span>
+<span class="a">+        &lt;provider</span>
+<span class="a">+            android:name=&quot;rikka.shizuku.ShizukuProvider&quot;</span>
+<span class="a">+            android:authorities=&quot;${applicationId}.shizuku&quot;</span>
+<span class="a">+            android:enabled=&quot;true&quot;</span>
+<span class="a">+            android:exported=&quot;true&quot;</span>
+<span class="a">+            android:multiprocess=&quot;false&quot;</span>
+<span class="a">+            android:permission=&quot;android.permission.INTERACT_ACROSS_USERS_FULL&quot; /&gt;</span>
+<span class="a">+</span>
+         &lt;!--
+             The accessibility channel. This is the only component that sees the
+             AI key and the volume keys; Power never reaches it.
+diff --git a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+index 2f55726..c3908d1 100644
+--- a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
++++ b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+<span class="h">@@ -19,6 +19,8 @@ import dev.equwal.assistkey.model.Trigger</span>
+ import dev.equwal.assistkey.native.ViwoodsBridge
+ import dev.equwal.assistkey.route.ActionRouter
+ import dev.equwal.assistkey.route.ServiceHolder
+<span class="a">+import dev.equwal.assistkey.shell.PowerControl</span>
+<span class="a">+import dev.equwal.assistkey.shell.Shell</span>
+ import dev.equwal.assistkey.store.Store
+ 
+ /**
+<span class="h">@@ -40,18 +42,58 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         ServiceHolder.service = this
+         // The service starts at boot and may run for weeks without the settings
+         // screen ever opening, so it keeps the licence fresh on its own.
+<span class="d">-        PlayBilling.refresh(this)</span>
+<span class="a">+        PlayBilling.refresh(this) { syncPower() }</span>
+<span class="a">+</span>
+<span class="a">+        Shell.onChange(shellChanged)</span>
+<span class="a">+        Store.onBindingsChanged = { syncPower() }</span>
+<span class="a">+        registerReceiver(screenOn, android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_ON))</span>
+<span class="a">+        Shell.connect(this)</span>
+<span class="a">+        syncPower()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- the Power button, when there is shell access -----------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private val shellChanged: () -&gt; Unit = { syncPower() }</span>
+<span class="a">+    private var powerIgnoredUntilUp = false</span>
+<span class="a">+</span>
+<span class="a">+    /** A press that wakes the reader is not a gesture. */</span>
+<span class="a">+    private val screenOn = object : android.content.BroadcastReceiver() {</span>
+<span class="a">+        override fun onReceive(c: android.content.Context?, i: android.content.Intent?) {</span>
+<span class="a">+            powerIgnoredUntilUp = true</span>
+<span class="a">+            if (::engine.isInitialized) engine.onCancel()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun syncPower() = PowerControl.sync(this, serviceRunning = ServiceHolder.service === this, ::onRawPower)</span>
+<span class="a">+</span>
+<span class="a">+    private fun onRawPower(down: Boolean, at: Long) {</span>
+<span class="a">+        if (!::engine.isInitialized) return</span>
+<span class="a">+        if (down) {</span>
+<span class="a">+            val awake = getSystemService(android.os.PowerManager::class.java)?.isInteractive != false</span>
+<span class="a">+            powerIgnoredUntilUp = !awake</span>
+<span class="a">+            if (awake) engine.onDown(HwKey.POWER, at, 0)</span>
+<span class="a">+        } else {</span>
+<span class="a">+            if (powerIgnoredUntilUp) powerIgnoredUntilUp = false else engine.onUp(HwKey.POWER, at)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun stopPower() {</span>
+<span class="a">+        Shell.removeOnChange(shellChanged)</span>
+<span class="a">+        Store.onBindingsChanged = null</span>
+<span class="a">+        runCatching { unregisterReceiver(screenOn) }</span>
+<span class="a">+        ServiceHolder.service = null</span>
+<span class="a">+        syncPower() // with no service running this hands Power back to the firmware</span>
+     }
+ 
+     override fun onUnbind(intent: android.content.Intent?): Boolean {
+         cancelAll()
+<span class="d">-        ServiceHolder.service = null</span>
+<span class="a">+        stopPower()</span>
+         return super.onUnbind(intent)
+     }
+ 
+     override fun onDestroy() {
+         cancelAll()
+<span class="d">-        ServiceHolder.service = null</span>
+<span class="a">+        stopPower()</span>
+         super.onDestroy()
+     }
+ 
+<span class="h">@@ -156,13 +198,14 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+ 
+     private fun bindings() = Store.bindings(this)
+ 
+<span class="d">-    override fun maxTaps(keys: Set&lt;HwKey&gt;): Int = bindings().maxTaps(keys)</span>
+<span class="a">+    override fun maxTaps(keys: Set&lt;HwKey&gt;): Int = bindings().maxTaps(keys, PowerControl.active)</span>
+ 
+<span class="d">-    override fun hasHold(keys: Set&lt;HwKey&gt;): Boolean = bindings().hasHold(keys)</span>
+<span class="a">+    override fun hasHold(keys: Set&lt;HwKey&gt;): Boolean = bindings().hasHold(keys, PowerControl.active)</span>
+ 
+     override fun isBound(trigger: Trigger): Boolean = bindings().isBound(trigger)
+ 
+<span class="d">-    override fun chordPartners(key: HwKey): Set&lt;HwKey&gt; = bindings().chordPartners(key)</span>
+<span class="a">+    override fun chordPartners(key: HwKey): Set&lt;HwKey&gt; =</span>
+<span class="a">+        bindings().chordPartners(key, PowerControl.active)</span>
+ 
+     companion object {
+         /** How long after a Power hold a key press still counts as a combination. */
+<span class="h">@@ -192,7 +235,8 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+                 this,
+                 ActionSpec(ActionKind.LAUNCH_COMPONENT, ViwoodsBridge.aiTarget(this))
+             )
+<span class="d">-            HwKey.POWER -&gt; Unit</span>
+<span class="a">+            // An unbound Power gesture does what Power always did.</span>
+<span class="a">+            HwKey.POWER -&gt; performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)</span>
+         }
+     }
+ 
+diff --git a/app/src/main/java/dev/equwal/assistkey/model/GlobalAction.kt b/app/src/main/java/dev/equwal/assistkey/model/GlobalAction.kt
+index af542ea..28ac48f 100644
+--- a/app/src/main/java/dev/equwal/assistkey/model/GlobalAction.kt
++++ b/app/src/main/java/dev/equwal/assistkey/model/GlobalAction.kt
+<span class="h">@@ -11,6 +11,8 @@ import android.os.Build</span>
+ enum class GlobalAction(val id: Int, val label: String, val minSdk: Int = 30) {
+     BACK(AS.GLOBAL_ACTION_BACK, &quot;Back&quot;),
+     HOME(AS.GLOBAL_ACTION_HOME, &quot;Home&quot;),
+<span class="a">+    /** Not a framework action: Back first if a keyboard is up, then Home. */</span>
+<span class="a">+    HOME_CLOSE_IME(-1, &quot;Home, closing the keyboard first&quot;),</span>
+     RECENTS(AS.GLOBAL_ACTION_RECENTS, &quot;Recent apps&quot;),
+     NOTIFICATIONS(AS.GLOBAL_ACTION_NOTIFICATIONS, &quot;Notification shade&quot;),
+     QUICK_SETTINGS(AS.GLOBAL_ACTION_QUICK_SETTINGS, &quot;Quick settings&quot;),
+diff --git a/app/src/main/java/dev/equwal/assistkey/native/NavNative.kt b/app/src/main/java/dev/equwal/assistkey/native/NavNative.kt
+index a44fd6a..04ac77e 100644
+--- a/app/src/main/java/dev/equwal/assistkey/native/NavNative.kt
++++ b/app/src/main/java/dev/equwal/assistkey/native/NavNative.kt
+<span class="h">@@ -47,17 +47,30 @@ object NavNative {</span>
+         return v?.trim() != &quot;1&quot;
+     }
+ 
+<span class="d">-    /** The commands that produce the wanted state, in the order they must run. */</span>
+<span class="d">-    fun commands(buttons: Boolean, gestures: Boolean): List&lt;String&gt; {</span>
+<span class="d">-        val out = ArrayList&lt;String&gt;()</span>
+<span class="d">-        out += &quot;adb shell cmd overlay enable-exclusive --category &quot; + OVERLAY +</span>
+<span class="d">-            (if (buttons) &quot;threebutton&quot; else &quot;gestural&quot;)</span>
+<span class="d">-        out += &quot;adb shell settings put system &quot; + GESTURE_BOTTOM + &quot; &quot; + (if (gestures) &quot;0&quot; else &quot;1&quot;)</span>
+<span class="a">+    /**</span>
+<span class="a">+     * What a shell has to run to produce the wanted state, in the order it must</span>
+<span class="a">+     * run. The pause and the double write are not decoration: SystemUI rebuilds</span>
+<span class="a">+     * itself when the overlay changes and only notices the gesture setting if it</span>
+<span class="a">+     * changes afterwards.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun shellCommands(buttons: Boolean, gestures: Boolean): List&lt;String&gt; {</span>
+<span class="a">+        val off = if (gestures) &quot;0&quot; else &quot;1&quot;</span>
+<span class="a">+        val nudge = if (gestures) &quot;1&quot; else &quot;0&quot;</span>
+         // Only meaningful without the bar, but harmless with it, and setting it
+         // every time means a later switch to gestural mode cannot surprise.
+         val scale = if (gestures) &quot;0.6&quot; else &quot;0&quot;
+<span class="d">-        out += &quot;adb shell settings put secure back_gesture_inset_scale_left $scale&quot;</span>
+<span class="d">-        out += &quot;adb shell settings put secure back_gesture_inset_scale_right $scale&quot;</span>
+<span class="d">-        return out</span>
+<span class="a">+        return listOf(</span>
+<span class="a">+            &quot;cmd overlay enable-exclusive --category &quot; + OVERLAY + (if (buttons) &quot;threebutton&quot; else &quot;gestural&quot;),</span>
+<span class="a">+            &quot;sleep 4&quot;,</span>
+<span class="a">+            &quot;settings put system $GESTURE_BOTTOM $nudge&quot;,</span>
+<span class="a">+            &quot;sleep 1&quot;,</span>
+<span class="a">+            &quot;settings put system $GESTURE_BOTTOM $off&quot;,</span>
+<span class="a">+            &quot;settings put secure back_gesture_inset_scale_left $scale&quot;,</span>
+<span class="a">+            &quot;settings put secure back_gesture_inset_scale_right $scale&quot;</span>
+<span class="a">+        )</span>
+     }
+<span class="a">+</span>
+<span class="a">+    /** The same, for someone typing them at a computer. */</span>
+<span class="a">+    fun commands(buttons: Boolean, gestures: Boolean): List&lt;String&gt; =</span>
+<span class="a">+        shellCommands(buttons, gestures).filterNot { it.startsWith(&quot;sleep&quot;) }.distinct().map { &quot;adb shell $it&quot; }</span>
+ }
+diff --git a/app/src/main/java/dev/equwal/assistkey/route/ActionRouter.kt b/app/src/main/java/dev/equwal/assistkey/route/ActionRouter.kt
+index eb5225f..c36618c 100644
+--- a/app/src/main/java/dev/equwal/assistkey/route/ActionRouter.kt
++++ b/app/src/main/java/dev/equwal/assistkey/route/ActionRouter.kt
+<span class="h">@@ -43,9 +43,27 @@ object ActionRouter {</span>
+         val svc = ServiceHolder.service ?: return false
+         val action = GlobalAction.fromName(name) ?: return false
+         if (!action.available) return false
+<span class="a">+        if (action == GlobalAction.HOME_CLOSE_IME) return homeClosingKeyboard(svc)</span>
+         return svc.performGlobalAction(action.id)
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Home alone leaves a keyboard floating over the launcher on some firmware,</span>
+<span class="a">+     * so an open keyboard is dismissed first. Seeing the keyboard&#x27;s window needs</span>
+<span class="a">+     * flagRetrieveInteractiveWindows; if the list is unavailable this is Home.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun homeClosingKeyboard(svc: android.accessibilityservice.AccessibilityService): Boolean {</span>
+<span class="a">+        val keyboardUp = runCatching {</span>
+<span class="a">+            svc.windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }</span>
+<span class="a">+        }.getOrDefault(false)</span>
+<span class="a">+        if (!keyboardUp) return svc.performGlobalAction(GlobalAction.HOME.id)</span>
+<span class="a">+        svc.performGlobalAction(GlobalAction.BACK.id)</span>
+<span class="a">+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(</span>
+<span class="a">+            { svc.performGlobalAction(GlobalAction.HOME.id) }, 180L</span>
+<span class="a">+        )</span>
+<span class="a">+        return true</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     private fun volume(ctx: Context, dir: String): Boolean {
+         val am = ctx.getSystemService(AudioManager::class.java) ?: return false
+         val adjust = when (dir) {
+diff --git a/app/src/main/java/dev/equwal/assistkey/shell/PowerControl.kt b/app/src/main/java/dev/equwal/assistkey/shell/PowerControl.kt
+new file mode 100644
+index 0000000..a9741bc
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/shell/PowerControl.kt
+<span class="h">@@ -0,0 +1,136 @@</span>
+<span class="a">+package dev.equwal.assistkey.shell</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.provider.Settings</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import dev.equwal.assistkey.license.License</span>
+<span class="a">+import dev.equwal.assistkey.store.Store</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Taking the Power button over, and giving it back.</span>
+<span class="a">+ *</span>
+<span class="a">+ * No app is ever shown the Power key: the window manager acts on it before</span>
+<span class="a">+ * input reaches anybody. But the shell user can read the kernel input nodes,</span>
+<span class="a">+ * so with shell access the button can be watched from outside the framework.</span>
+<span class="a">+ * To make that useful the firmware has to stop reacting first - short press,</span>
+<span class="a">+ * long press and the double-tap camera gesture are all switched to &quot;nothing&quot; -</span>
+<span class="a">+ * and from then on every tap, double tap and hold is ours to time and to bind,</span>
+<span class="a">+ * through the same gesture engine that serves the other keys.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The firmware&#x27;s own values are saved before they are touched and restored the</span>
+<span class="a">+ * moment any of this stops being true: shell access lost, the app locked, the</span>
+<span class="a">+ * user switching it off. Restoring does not need shell access; the app grants</span>
+<span class="a">+ * itself WRITE_SECURE_SETTINGS through the shell the first time it connects,</span>
+<span class="a">+ * for exactly this reason. A restart that leaves Shizuku stopped therefore</span>
+<span class="a">+ * leaves a Power button that works normally, not one that does nothing.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Power + Volume up is always left opening the power menu.</span>
+<span class="a">+ */</span>
+<span class="a">+object PowerControl {</span>
+<span class="a">+</span>
+<span class="a">+    private const val TAG = &quot;AssistKey&quot;</span>
+<span class="a">+    private const val PREFS = &quot;assistkey_power&quot;</span>
+<span class="a">+    private const val K_WANTED = &quot;wanted&quot;</span>
+<span class="a">+    private const val K_TAKEN = &quot;taken&quot;</span>
+<span class="a">+    private const val K_SAVED = &quot;saved_&quot;</span>
+<span class="a">+</span>
+<span class="a">+    const val KEY_POWER = 116</span>
+<span class="a">+</span>
+<span class="a">+    private class Knob(val scope: String, val name: String, val managed: String)</span>
+<span class="a">+</span>
+<span class="a">+    private val knobs = listOf(</span>
+<span class="a">+        Knob(&quot;global&quot;, &quot;power_button_short_press&quot;, &quot;0&quot;),</span>
+<span class="a">+        Knob(&quot;global&quot;, &quot;power_button_long_press&quot;, &quot;0&quot;),</span>
+<span class="a">+        Knob(&quot;secure&quot;, &quot;camera_double_tap_power_gesture_disabled&quot;, &quot;1&quot;),</span>
+<span class="a">+        Knob(&quot;secure&quot;, &quot;double_tap_power_button_gesture_enabled&quot;, &quot;0&quot;),</span>
+<span class="a">+        // The way out, whatever else happens.</span>
+<span class="a">+        Knob(&quot;global&quot;, &quot;key_chord_power_volume_up&quot;, &quot;2&quot;)</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+    private val main = android.os.Handler(android.os.Looper.getMainLooper())</span>
+<span class="a">+</span>
+<span class="a">+    /** True while raw Power presses are reaching the gesture engine. */</span>
+<span class="a">+    @Volatile var active = false</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)</span>
+<span class="a">+</span>
+<span class="a">+    /** The user&#x27;s switch. On by default: it only takes effect with shell access. */</span>
+<span class="a">+    fun wanted(c: Context): Boolean = prefs(c).getBoolean(K_WANTED, true)</span>
+<span class="a">+</span>
+<span class="a">+    fun setWanted(c: Context, on: Boolean) {</span>
+<span class="a">+        prefs(c).edit().putBoolean(K_WANTED, on).apply()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun anyPowerBinding(c: Context): Boolean =</span>
+<span class="a">+        Store.bindings(c).all().any { (t, _) -&gt; dev.equwal.assistkey.model.HwKey.POWER in t.keys }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Brings reality into line with what should be true right now. Cheap and</span>
+<span class="a">+     * idempotent; call it whenever shell access, the licence, the bindings or</span>
+<span class="a">+     * the service may have changed. [onKey] is where presses are delivered.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun sync(c: Context, serviceRunning: Boolean, onKey: (down: Boolean, at: Long) -&gt; Unit) {</span>
+<span class="a">+        val should = serviceRunning &amp;&amp; Shell.ready &amp;&amp; wanted(c) &amp;&amp;</span>
+<span class="a">+            License.active(c) &amp;&amp; anyPowerBinding(c)</span>
+<span class="a">+        when {</span>
+<span class="a">+            should &amp;&amp; !active -&gt; take(c, onKey)</span>
+<span class="a">+            !should &amp;&amp; (active || prefs(c).getBoolean(K_TAKEN, false)) -&gt; release(c)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private var taking = false</span>
+<span class="a">+</span>
+<span class="a">+    private fun take(c: Context, onKey: (Boolean, Long) -&gt; Unit) {</span>
+<span class="a">+        if (taking) return</span>
+<span class="a">+        taking = true</span>
+<span class="a">+        main.postDelayed({ taking = false }, 8000L)</span>
+<span class="a">+        val p = prefs(c)</span>
+<span class="a">+        val read = knobs.joinToString(&quot;; &quot;) { &quot;settings get &quot; + it.scope + &quot; &quot; + it.name }</span>
+<span class="a">+        Shell.run(read) { r -&gt;</span>
+<span class="a">+            if (!r.ok) return@run</span>
+<span class="a">+            // Save once. A second take() after a crash must not record our own</span>
+<span class="a">+            // values as if they were the firmware&#x27;s.</span>
+<span class="a">+            if (!p.getBoolean(K_TAKEN, false)) {</span>
+<span class="a">+                val lines = r.output.trim().lines()</span>
+<span class="a">+                val e = p.edit()</span>
+<span class="a">+                knobs.forEachIndexed { i, k -&gt; e.putString(K_SAVED + k.name, lines.getOrNull(i)?.trim() ?: &quot;null&quot;) }</span>
+<span class="a">+                e.putBoolean(K_TAKEN, true).apply()</span>
+<span class="a">+            }</span>
+<span class="a">+            Shell.runAll(knobs.map { &quot;settings put &quot; + it.scope + &quot; &quot; + it.name + &quot; &quot; + it.managed }) {</span>
+<span class="a">+                Shell.watchKeys(setOf(KEY_POWER), { _, down, at -&gt; onKey(down, at) }) { ok -&gt;</span>
+<span class="a">+                    active = ok</span>
+<span class="a">+                    taking = false</span>
+<span class="a">+                    Log.i(TAG, &quot;power button: &quot; + if (ok) &quot;managed&quot; else &quot;watch failed&quot;)</span>
+<span class="a">+                    if (!ok) release(c)</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun release(c: Context) {</span>
+<span class="a">+        active = false</span>
+<span class="a">+        Shell.stopWatching()</span>
+<span class="a">+        val p = prefs(c)</span>
+<span class="a">+        if (!p.getBoolean(K_TAKEN, false)) return</span>
+<span class="a">+</span>
+<span class="a">+        val saved = knobs.associateWith { p.getString(K_SAVED + it.name, &quot;null&quot;) ?: &quot;null&quot; }</span>
+<span class="a">+        if (Shell.ready) {</span>
+<span class="a">+            Shell.runAll(saved.map { (k, v) -&gt;</span>
+<span class="a">+                if (v == &quot;null&quot;) &quot;settings delete &quot; + k.scope + &quot; &quot; + k.name</span>
+<span class="a">+                else &quot;settings put &quot; + k.scope + &quot; &quot; + k.name + &quot; &quot; + v</span>
+<span class="a">+            }) { ok -&gt; if (ok) p.edit().putBoolean(K_TAKEN, false).apply() }</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        // No shell: fall back on the permission the shell granted us earlier.</span>
+<span class="a">+        val ok = saved.all { (k, v) -&gt;</span>
+<span class="a">+            runCatching {</span>
+<span class="a">+                val value = if (v == &quot;null&quot;) null else v</span>
+<span class="a">+                if (k.scope == &quot;global&quot;) Settings.Global.putString(c.contentResolver, k.name, value)</span>
+<span class="a">+                else Settings.Secure.putString(c.contentResolver, k.name, value)</span>
+<span class="a">+            }.getOrDefault(false)</span>
+<span class="a">+        }</span>
+<span class="a">+        if (ok) p.edit().putBoolean(K_TAKEN, false).apply()</span>
+<span class="a">+        Log.i(TAG, &quot;power button: handed back to the firmware&quot; + if (ok) &quot;&quot; else &quot; (incomplete)&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/shell/Shell.kt b/app/src/main/java/dev/equwal/assistkey/shell/Shell.kt
+new file mode 100644
+index 0000000..2f46da6
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/shell/Shell.kt
+<span class="h">@@ -0,0 +1,228 @@</span>
+<span class="a">+package dev.equwal.assistkey.shell</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.content.pm.PackageManager</span>
+<span class="a">+import android.os.Handler</span>
+<span class="a">+import android.os.Looper</span>
+<span class="a">+import android.os.SystemClock</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import rikka.shizuku.Shizuku</span>
+<span class="a">+import java.util.concurrent.Executors</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Shell access, by way of Shizuku.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Shizuku is a separate, free app that a user starts from the device itself</span>
+<span class="a">+ * through Android&#x27;s wireless debugging - no computer, no root. Once it is</span>
+<span class="a">+ * running and has said yes to us, this object can start processes under the</span>
+<span class="a">+ * shell uid, and everything Android keeps from ordinary apps is within reach:</span>
+<span class="a">+ * the kernel input nodes (so the Power key), `settings`, `cmd overlay`.</span>
+<span class="a">+ *</span>
+<span class="a">+ * It uses Shizuku&#x27;s plain remote-process call and nothing grander. Shizuku&#x27;s</span>
+<span class="a">+ * bound &quot;user service&quot; would be the tidier design, but its starter dies inside</span>
+<span class="a">+ * LoadedApk.makeApplication on Android 16 before our code is ever loaded, and a</span>
+<span class="a">+ * pipe from `getevent` needs none of it.</span>
+<span class="a">+ *</span>
+<span class="a">+ * All of this is optional. Without shell access the app falls back on what an</span>
+<span class="a">+ * installed app can do alone, and says what is missing.</span>
+<span class="a">+ */</span>
+<span class="a">+object Shell {</span>
+<span class="a">+</span>
+<span class="a">+    private const val TAG = &quot;AssistKey&quot;</span>
+<span class="a">+    const val SHIZUKU_PACKAGE = &quot;moe.shizuku.privileged.api&quot;</span>
+<span class="a">+    private const val REQUEST_CODE = 7301</span>
+<span class="a">+</span>
+<span class="a">+    enum class State { NOT_INSTALLED, NOT_RUNNING, NO_PERMISSION, READY }</span>
+<span class="a">+</span>
+<span class="a">+    private val main = Handler(Looper.getMainLooper())</span>
+<span class="a">+    private val worker = Executors.newSingleThreadExecutor()</span>
+<span class="a">+    private val listeners = ArrayList&lt;() -&gt; Unit&gt;()</span>
+<span class="a">+    private var hooked = false</span>
+<span class="a">+    private var granted = false</span>
+<span class="a">+</span>
+<span class="a">+    val ready: Boolean get() = alive() &amp;&amp; permitted()</span>
+<span class="a">+</span>
+<span class="a">+    fun state(c: Context): State = when {</span>
+<span class="a">+        ready -&gt; State.READY</span>
+<span class="a">+        !installed(c) -&gt; State.NOT_INSTALLED</span>
+<span class="a">+        !alive() -&gt; State.NOT_RUNNING</span>
+<span class="a">+        else -&gt; State.NO_PERMISSION</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun describe(c: Context): String = when (state(c)) {</span>
+<span class="a">+        State.READY -&gt; &quot;On&quot;</span>
+<span class="a">+        State.NO_PERMISSION -&gt; &quot;Shizuku is running - permission needed&quot;</span>
+<span class="a">+        State.NOT_RUNNING -&gt; &quot;Shizuku is installed but not started&quot;</span>
+<span class="a">+        State.NOT_INSTALLED -&gt; &quot;Off - needs the free Shizuku app&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Called whenever the state may have changed; always on the main thread. */</span>
+<span class="a">+    fun onChange(l: () -&gt; Unit) { if (l !in listeners) listeners.add(l) }</span>
+<span class="a">+    fun removeOnChange(l: () -&gt; Unit) { listeners.remove(l) }</span>
+<span class="a">+    private fun changed() = main.post { ArrayList(listeners).forEach { it() } }</span>
+<span class="a">+</span>
+<span class="a">+    private fun installed(c: Context): Boolean =</span>
+<span class="a">+        runCatching { c.packageManager.getPackageInfo(SHIZUKU_PACKAGE, 0); true }.getOrDefault(false)</span>
+<span class="a">+</span>
+<span class="a">+    private fun alive(): Boolean = runCatching { Shizuku.pingBinder() }.getOrDefault(false)</span>
+<span class="a">+</span>
+<span class="a">+    private fun permitted(): Boolean = runCatching {</span>
+<span class="a">+        !Shizuku.isPreV11() &amp;&amp; Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED</span>
+<span class="a">+    }.getOrDefault(false)</span>
+<span class="a">+</span>
+<span class="a">+    /** Safe to call often. Registers for Shizuku&#x27;s comings and goings, once. */</span>
+<span class="a">+    fun connect(c: Context) {</span>
+<span class="a">+        val app = c.applicationContext</span>
+<span class="a">+        if (!hooked) {</span>
+<span class="a">+            hooked = true</span>
+<span class="a">+            runCatching {</span>
+<span class="a">+                Shizuku.addBinderReceivedListenerSticky { onUp(app) }</span>
+<span class="a">+                Shizuku.addBinderDeadListener {</span>
+<span class="a">+                    stopWatching()</span>
+<span class="a">+                    changed()</span>
+<span class="a">+                }</span>
+<span class="a">+                Shizuku.addRequestPermissionResultListener { _, _ -&gt; onUp(app) }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        onUp(app)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun onUp(app: Context) {</span>
+<span class="a">+        if (ready &amp;&amp; !granted) {</span>
+<span class="a">+            granted = true</span>
+<span class="a">+            // With this the app can put the Power button back to firmware</span>
+<span class="a">+            // defaults by itself, even when Shizuku is gone after a restart.</span>
+<span class="a">+            run(&quot;pm grant &quot; + app.packageName + &quot; android.permission.WRITE_SECURE_SETTINGS&quot;)</span>
+<span class="a">+            Log.i(TAG, &quot;shell access ready&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+        changed()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun requestPermission() {</span>
+<span class="a">+        runCatching { if (alive() &amp;&amp; !permitted()) Shizuku.requestPermission(REQUEST_CODE) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- processes ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Shizuku.newProcess is private in the v13 API but is the supported wire</span>
+<span class="a">+     * call underneath, and the one every shell-style client uses.</span>
+<span class="a">+     */</span>
+<span class="a">+    private val newProcess by lazy {</span>
+<span class="a">+        Shizuku::class.java.getDeclaredMethod(</span>
+<span class="a">+            &quot;newProcess&quot;, Array&lt;String&gt;::class.java, Array&lt;String&gt;::class.java, String::class.java</span>
+<span class="a">+        ).apply { isAccessible = true }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun start(vararg argv: String): Process? = runCatching {</span>
+<span class="a">+        newProcess.invoke(null, argv, null, null) as Process</span>
+<span class="a">+    }.onFailure { Log.w(TAG, &quot;shell process failed: &quot; + argv.joinToString(&quot; &quot;), it) }.getOrNull()</span>
+<span class="a">+</span>
+<span class="a">+    data class Result(val exit: Int, val output: String) {</span>
+<span class="a">+        val ok: Boolean get() = exit == 0</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun execNow(command: String): Result {</span>
+<span class="a">+        val p = start(&quot;sh&quot;, &quot;-c&quot;, &quot;$command 2&gt;&amp;1&quot;) ?: return Result(-1, &quot;no shell access&quot;)</span>
+<span class="a">+        return runCatching {</span>
+<span class="a">+            val out = p.inputStream.bufferedReader().readText()</span>
+<span class="a">+            Result(p.waitFor(), out)</span>
+<span class="a">+        }.getOrElse { Result(-1, it.toString()) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Runs off the main thread; [done] comes back on it. */</span>
+<span class="a">+    fun run(command: String, done: ((Result) -&gt; Unit)? = null) {</span>
+<span class="a">+        worker.execute {</span>
+<span class="a">+            val r = if (ready) execNow(command) else Result(-1, &quot;no shell access&quot;)</span>
+<span class="a">+            if (!r.ok) Log.i(TAG, &quot;shell: &quot; + command + &quot; -&gt; &quot; + r.exit + &quot; &quot; + r.output.take(200))</span>
+<span class="a">+            done?.let { main.post { it(r) } }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Commands in order, stopping at nothing; [done] gets true if every one succeeded. */</span>
+<span class="a">+    fun runAll(commands: List&lt;String&gt;, done: ((Boolean) -&gt; Unit)? = null) {</span>
+<span class="a">+        worker.execute {</span>
+<span class="a">+            var allOk = true</span>
+<span class="a">+            for (c in commands) if (!ready || !execNow(c).ok) allOk = false</span>
+<span class="a">+            done?.let { main.post { it(allOk) } }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- keys ----------------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private val watchers = ArrayList&lt;Process&gt;()</span>
+<span class="a">+    @Volatile private var generation = 0</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Reports presses and releases of the given Linux key codes, read from the</span>
+<span class="a">+     * kernel input nodes by `getevent` running as the shell user. Only the</span>
+<span class="a">+     * nodes that declare one of the keys are opened, which keeps the</span>
+<span class="a">+     * touchscreen&#x27;s firehose out of it.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun watchKeys(scanCodes: Set&lt;Int&gt;, onKey: (code: Int, down: Boolean, at: Long) -&gt; Unit, started: (Boolean) -&gt; Unit) {</span>
+<span class="a">+        stopWatching()</span>
+<span class="a">+        val mine = ++generation</span>
+<span class="a">+        worker.execute {</span>
+<span class="a">+            val nodes = nodesDeclaring(scanCodes)</span>
+<span class="a">+            val procs = nodes.mapNotNull { node -&gt; start(&quot;getevent&quot;, &quot;-q&quot;, node)?.also { pump(it, scanCodes, mine, onKey) } }</span>
+<span class="a">+            synchronized(watchers) {</span>
+<span class="a">+                if (generation == mine) watchers.addAll(procs) else procs.forEach { it.destroy() }</span>
+<span class="a">+            }</span>
+<span class="a">+            Log.i(TAG, &quot;watching &quot; + nodes.joinToString(&quot; &quot;))</span>
+<span class="a">+            main.post { started(procs.isNotEmpty()) }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun stopWatching() {</span>
+<span class="a">+        generation++</span>
+<span class="a">+        synchronized(watchers) {</span>
+<span class="a">+            watchers.forEach { p -&gt; runCatching { p.destroy() } }</span>
+<span class="a">+            watchers.clear()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Lines look like `0001 0074 00000001`: type, code, value, in hex. */</span>
+<span class="a">+    private fun pump(p: Process, wanted: Set&lt;Int&gt;, mine: Int, onKey: (Int, Boolean, Long) -&gt; Unit) {</span>
+<span class="a">+        Thread({</span>
+<span class="a">+            runCatching {</span>
+<span class="a">+                p.inputStream.bufferedReader().forEachLine { line -&gt;</span>
+<span class="a">+                    if (generation != mine) return@forEachLine</span>
+<span class="a">+                    val f = line.trim().split(&#x27; &#x27;).filter { it.isNotEmpty() }</span>
+<span class="a">+                    if (f.size != 3 || f[0] != &quot;0001&quot;) return@forEachLine</span>
+<span class="a">+                    val code = f[1].toIntOrNull(16) ?: return@forEachLine</span>
+<span class="a">+                    val value = f[2].toLongOrNull(16) ?: return@forEachLine</span>
+<span class="a">+                    // value 2 is auto-repeat, which carries no news</span>
+<span class="a">+                    if (code !in wanted || value &gt; 1L) return@forEachLine</span>
+<span class="a">+                    val at = SystemClock.uptimeMillis()</span>
+<span class="a">+                    main.post { if (generation == mine) onKey(code, value == 1L, at) }</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+            // The pipe closed: Shizuku went away, or we were told to stop.</span>
+<span class="a">+            if (generation == mine) main.post { changed() }</span>
+<span class="a">+        }, &quot;keys&quot;).apply { isDaemon = true }.start()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** `getevent -p` prints, per device, the hex key codes it declares. */</span>
+<span class="a">+    private fun nodesDeclaring(codes: Set&lt;Int&gt;): List&lt;String&gt; {</span>
+<span class="a">+        val hex = codes.map { &quot;%04x&quot;.format(it) }.toSet()</span>
+<span class="a">+        val found = LinkedHashSet&lt;String&gt;()</span>
+<span class="a">+        var node: String? = null</span>
+<span class="a">+        var inKeys = false</span>
+<span class="a">+        execNow(&quot;getevent -p&quot;).output.lineSequence().forEach { raw -&gt;</span>
+<span class="a">+            val line = raw.trim()</span>
+<span class="a">+            when {</span>
+<span class="a">+                line.startsWith(&quot;add device&quot;) -&gt; {</span>
+<span class="a">+                    node = line.substringAfter(&quot;: &quot;).trim()</span>
+<span class="a">+                    inKeys = false</span>
+<span class="a">+                }</span>
+<span class="a">+                line.startsWith(&quot;KEY (0001):&quot;) -&gt; {</span>
+<span class="a">+                    inKeys = true</span>
+<span class="a">+                    if (line.substringAfter(&quot;:&quot;).split(&#x27; &#x27;).any { it in hex }) node?.let(found::add)</span>
+<span class="a">+                }</span>
+<span class="a">+                inKeys &amp;&amp; line.contains(&quot;(00&quot;) -&gt; inKeys = false // next event class</span>
+<span class="a">+                inKeys -&gt; if (line.split(&#x27; &#x27;).any { it in hex }) node?.let(found::add)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        return found.toList()</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/store/Bindings.kt b/app/src/main/java/dev/equwal/assistkey/store/Bindings.kt
+index f5ee943..ae689d9 100644
+--- a/app/src/main/java/dev/equwal/assistkey/store/Bindings.kt
++++ b/app/src/main/java/dev/equwal/assistkey/store/Bindings.kt
+<span class="h">@@ -15,51 +15,54 @@ class Bindings(private val map: Map&lt;Trigger, ActionSpec&gt;) {</span>
+     private val active: Map&lt;Trigger, ActionSpec&gt; =
+         map.filterValues { it.kind != ActionKind.PASS_THROUGH }
+ 
+<span class="d">-    /**</span>
+<span class="d">-     * What the gesture engine may know about. Anything involving Power is kept</span>
+<span class="d">-     * from it: Power never reaches the key filter, so an engine that believed</span>
+<span class="d">-     * in a Power chord would hold every volume press back waiting for a</span>
+<span class="d">-     * partner that cannot arrive. Power triggers are served by the channels</span>
+<span class="d">-     * and by [powerCombo] instead.</span>
+<span class="d">-     */</span>
+<span class="d">-    private val engine: Set&lt;Trigger&gt; = active.keys.filter { HwKey.POWER !in it.keys }.toSet()</span>
+<span class="d">-</span>
+<span class="d">-    private val tapsByKeys: Map&lt;Set&lt;HwKey&gt;, Int&gt; =</span>
+<span class="d">-        engine.filter { it.type == GestureType.TAP }</span>
+<span class="d">-            .groupBy { it.keys }</span>
+<span class="d">-            .mapValues { (_, v) -&gt; v.maxOf { it.count } }</span>
+<span class="a">+    /** What the gesture engine is told, for one answer to &quot;can it see Power?&quot;. */</span>
+<span class="a">+    private class View(triggers: Collection&lt;Trigger&gt;) {</span>
+<span class="a">+        val taps: Map&lt;Set&lt;HwKey&gt;, Int&gt; =</span>
+<span class="a">+            triggers.filter { it.type == GestureType.TAP }</span>
+<span class="a">+                .groupBy { it.keys }</span>
+<span class="a">+                .mapValues { (_, v) -&gt; v.maxOf { it.count } }</span>
+ 
+<span class="d">-    private val holdKeys: Set&lt;Set&lt;HwKey&gt;&gt; =</span>
+<span class="d">-        engine.filter { it.type == GestureType.HOLD }.map { it.keys }.toSet()</span>
+<span class="a">+        val holds: Set&lt;Set&lt;HwKey&gt;&gt; =</span>
+<span class="a">+            triggers.filter { it.type == GestureType.HOLD }.map { it.keys }.toSet()</span>
+ 
+<span class="d">-    /** For each key, the other keys it forms a bound chord with. */</span>
+<span class="d">-    private val partners: Map&lt;HwKey, Set&lt;HwKey&gt;&gt; = buildMap {</span>
+<span class="d">-        engine.filter { it.isChord }.forEach { t -&gt;</span>
+<span class="d">-            t.keys.forEach { k -&gt; merge(k, t.keys - k) { a, b -&gt; a + b } }</span>
+<span class="a">+        /** For each key, the other keys it forms a bound chord with. */</span>
+<span class="a">+        val partners: Map&lt;HwKey, Set&lt;HwKey&gt;&gt; = buildMap {</span>
+<span class="a">+            triggers.filter { it.isChord }.forEach { t -&gt;</span>
+<span class="a">+                t.keys.forEach { k -&gt; merge(k, t.keys - k) { a, b -&gt; a + b } }</span>
+<span class="a">+            }</span>
+         }
+     }
+ 
+<span class="d">-    fun maxTaps(keys: Set&lt;HwKey&gt;): Int = tapsByKeys[keys] ?: 0</span>
+<span class="d">-    fun hasHold(keys: Set&lt;HwKey&gt;): Boolean = keys in holdKeys</span>
+<span class="d">-    fun chordPartners(key: HwKey): Set&lt;HwKey&gt; = partners[key] ?: emptySet()</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Two views, because whether the engine may know about Power depends on</span>
+<span class="a">+     * whether Power presses can reach it. Without shell access they cannot, and</span>
+<span class="a">+     * an engine that believed in a Power chord would hold every volume press</span>
+<span class="a">+     * back waiting for a partner that never arrives. With it, Power is a key</span>
+<span class="a">+     * like any other.</span>
+<span class="a">+     */</span>
+<span class="a">+    private val withPower = View(active.keys)</span>
+<span class="a">+    private val withoutPower = View(active.keys.filter { HwKey.POWER !in it.keys })</span>
+<span class="a">+</span>
+<span class="a">+    private fun view(power: Boolean) = if (power) withPower else withoutPower</span>
+<span class="a">+</span>
+<span class="a">+    fun maxTaps(keys: Set&lt;HwKey&gt;, power: Boolean = false): Int = view(power).taps[keys] ?: 0</span>
+<span class="a">+    fun hasHold(keys: Set&lt;HwKey&gt;, power: Boolean = false): Boolean = keys in view(power).holds</span>
+<span class="a">+    fun chordPartners(key: HwKey, power: Boolean = false): Set&lt;HwKey&gt; =</span>
+<span class="a">+        view(power).partners[key] ?: emptySet()</span>
+ 
+     operator fun get(trigger: Trigger): ActionSpec? = active[trigger]
+<span class="a">+    fun isBound(trigger: Trigger): Boolean = trigger in active</span>
+ 
+     /** The action for &quot;hold Power, then press [key]&quot;, if there is one. */
+     fun powerCombo(key: HwKey): ActionSpec? = active[Trigger.powerThen(key)]
+ 
+     val hasPowerCombos: Boolean =
+         HwKey.interceptable.any { active.containsKey(Trigger.powerThen(it)) }
+<span class="d">-    fun isBound(trigger: Trigger): Boolean = trigger in active</span>
+ 
+     /** Including PASS_THROUGH entries, for the UI. */
+     fun raw(trigger: Trigger): ActionSpec = map[trigger] ?: ActionSpec.PASS
+     fun all(): Map&lt;Trigger, ActionSpec&gt; = map
+ 
+<span class="d">-    /** Key sets the engine should watch at all. */</span>
+<span class="d">-    fun watchedKeys(): Set&lt;HwKey&gt; =</span>
+<span class="d">-        (tapsByKeys.keys + holdKeys).flatten().toSet()</span>
+<span class="d">-</span>
+     fun with(trigger: Trigger, spec: ActionSpec): Bindings =
+         Bindings(map.toMutableMap().apply {
+             if (spec.kind == ActionKind.PASS_THROUGH) remove(trigger) else put(trigger, spec)
+diff --git a/app/src/main/java/dev/equwal/assistkey/store/Store.kt b/app/src/main/java/dev/equwal/assistkey/store/Store.kt
+index b0e53e3..63b1fe3 100644
+--- a/app/src/main/java/dev/equwal/assistkey/store/Store.kt
++++ b/app/src/main/java/dev/equwal/assistkey/store/Store.kt
+<span class="h">@@ -45,8 +45,12 @@ object Store {</span>
+         b.all().forEach { (t, spec) -&gt; o.put(t.id, spec.toJson()) }
+         prefs(c).edit().putString(K_BINDINGS, o.toString()).apply()
+         cache = b
+<span class="a">+        onBindingsChanged?.invoke()</span>
+     }
+ 
+<span class="a">+    /** Set by the key service, which has things to re-decide when bindings move. */</span>
+<span class="a">+    @Volatile var onBindingsChanged: (() -&gt; Unit)? = null</span>
+<span class="a">+</span>
+     fun bind(c: Context, trigger: Trigger, spec: ActionSpec) {
+         save(c, bindings(c).with(trigger, spec))
+     }
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+index 12b8132..e3bb6bb 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+<span class="h">@@ -35,6 +35,7 @@ class MainActivity : Activity() {</span>
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         Channels.syncComponents(this)
+<span class="a">+        dev.equwal.assistkey.shell.Shell.connect(this)</span>
+     }
+ 
+     override fun onResume() {
+<span class="h">@@ -51,8 +52,7 @@ class MainActivity : Activity() {</span>
+         val col = Ui.page(this)
+         col.title(&quot;AssistKey&quot;)
+         col.note(
+<span class="d">-            &quot;Remaps the AI key, both volume keys and the power button. &quot; +</span>
+<span class="d">-                &quot;Turn on the capture channels you want, then bind gestures below.&quot;</span>
+<span class="a">+            &quot;Remaps this device&#x27;s hardware keys, the Power button included.&quot;</span>
+         )
+         licence(col)
+         channels(col)
+<span class="h">@@ -80,26 +80,27 @@ class MainActivity : Activity() {</span>
+     // ---- channels ----------------------------------------------------------
+ 
+     private fun channels(col: LinearLayout) {
+<span class="d">-        col.header(&quot;Capture channels&quot;)</span>
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;Each one is a different way of getting a key routed to this app. &quot; +</span>
+<span class="d">-                &quot;They are independent - tick any combination.&quot;</span>
+<span class="d">-        )</span>
+<span class="a">+        col.header(&quot;Setup&quot;)</span>
+ 
+<span class="d">-        Channel.entries.forEach { ch -&gt;</span>
+<span class="d">-            val on = Channels.isEnabled(this, ch)</span>
+<span class="d">-            val ok = Channels.isSatisfied(this, ch)</span>
+<span class="d">-            col.check(ch.title, ch.summary, on) { checked -&gt;</span>
+<span class="d">-                Channels.setEnabled(this, ch, checked)</span>
+<span class="d">-                if (checked &amp;&amp; !Channels.isSatisfied(this, ch)) claim(ch)</span>
+<span class="d">-                build()</span>
+<span class="d">-            }</span>
+<span class="d">-            col.row(&quot;Status: &quot; + Channels.status(this, ch), null, enabled = on)</span>
+<span class="d">-            if (on &amp;&amp; !ok) {</span>
+<span class="d">-                col.button(&quot;Set up &quot; + ch.title.lowercase()) { claim(ch) }</span>
+<span class="d">-                if (ch == Channel.ACCESSIBILITY) restrictedSettingsHint(col)</span>
+<span class="d">-            }</span>
+<span class="a">+        // The key filter is the one switch everything depends on: it sees the</span>
+<span class="a">+        // keys, and it is what carries out Back, Home and the rest.</span>
+<span class="a">+        val ch = Channel.ACCESSIBILITY</span>
+<span class="a">+        val on = Channels.isEnabled(this, ch)</span>
+<span class="a">+        val ok = Channels.isSatisfied(this, ch)</span>
+<span class="a">+        col.check(&quot;Key remapping&quot;, &quot;Uses the accessibility key filter - &quot; + Channels.status(this, ch).lowercase(), on) { checked -&gt;</span>
+<span class="a">+            Channels.setEnabled(this, ch, checked)</span>
+<span class="a">+            if (checked &amp;&amp; !Channels.isSatisfied(this, ch)) claim(ch)</span>
+<span class="a">+            build()</span>
+<span class="a">+        }</span>
+<span class="a">+        if (on &amp;&amp; !ok) {</span>
+<span class="a">+            col.button(&quot;Turn on the key filter&quot;) { claim(ch) }</span>
+<span class="a">+            restrictedSettingsHint(col)</span>
+         }
+<span class="a">+</span>
+<span class="a">+        col.row(</span>
+<span class="a">+            &quot;Shell access: &quot; + dev.equwal.assistkey.shell.Shell.describe(this),</span>
+<span class="a">+            &quot;Optional. Unlocks the Power button, the navigation bar and system gestures&quot;</span>
+<span class="a">+        ) { startActivity(Intent(this, ShellActivity::class.java)) }</span>
+     }
+ 
+     /**
+<span class="h">@@ -185,7 +186,7 @@ class MainActivity : Activity() {</span>
+ 
+         col.row(
+             &quot;Navigation&quot;,
+<span class="d">-            &quot;Button bar, swipe gestures, Power key combinations - in any mix&quot;</span>
+<span class="a">+            &quot;Button bar, swipe gestures, the Power key - in any mix&quot;</span>
+         ) { startActivity(Intent(this, NavigationActivity::class.java)) }
+ 
+         col.row(
+<span class="h">@@ -212,15 +213,12 @@ class MainActivity : Activity() {</span>
+     }
+ 
+     private fun powerSummary(): String {
+<span class="d">-        val b = Store.bindings(this)</span>
+<span class="d">-        val parts = ArrayList&lt;String&gt;()</span>
+<span class="d">-        PowerNative.shortPressValue(this)?.let { v -&gt;</span>
+<span class="d">-            PowerNative.shortPress.firstOrNull { it.value == v }</span>
+<span class="d">-                ?.let { parts.add(&quot;short → &quot; + it.label.lowercase()) }</span>
+<span class="a">+        val bound = Store.bindings(this).all().filterKeys { HwKey.POWER in it.keys }</span>
+<span class="a">+        if (bound.isEmpty()) return &quot;Default behaviour&quot;</span>
+<span class="a">+        return bound.entries.joinToString(&quot;, &quot;) { (t, spec) -&gt;</span>
+<span class="a">+            val what = if (t.keys.size &gt; 1) &quot;+&quot; + (t.keys - HwKey.POWER).first().label.lowercase() else shortGesture(t)</span>
+<span class="a">+            what + &quot; → &quot; + spec.describe()</span>
+         }
+<span class="d">-        b[Channel.POWER_DOUBLE]?.let { parts.add(&quot;double → &quot; + it.describe()) }</span>
+<span class="d">-        b[Channel.POWER_HOLD]?.let { parts.add(&quot;hold → &quot; + it.describe()) }</span>
+<span class="d">-        return if (parts.isEmpty()) &quot;Default behaviour&quot; else parts.joinToString(&quot;, &quot;)</span>
+     }
+ 
+     // ---- everything else ---------------------------------------------------
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/NavigationActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/NavigationActivity.kt
+index 8d59d67..7d91dff 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/NavigationActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/NavigationActivity.kt
+<span class="h">@@ -2,17 +2,22 @@ package dev.equwal.assistkey.ui</span>
+ 
+ import android.app.Activity
+ import android.content.Context
+<span class="a">+import android.content.Intent</span>
+ import android.widget.LinearLayout
+ import android.widget.Toast
+ import dev.equwal.assistkey.channel.Channel
+ import dev.equwal.assistkey.channel.Channels
+<span class="a">+import dev.equwal.assistkey.engine.KeyFilterService</span>
+ import dev.equwal.assistkey.model.ActionKind
+ import dev.equwal.assistkey.model.ActionSpec
+<span class="a">+import dev.equwal.assistkey.model.GestureType</span>
+ import dev.equwal.assistkey.model.GlobalAction
+ import dev.equwal.assistkey.model.HwKey
+ import dev.equwal.assistkey.model.Trigger
+ import dev.equwal.assistkey.native.NavNative
+<span class="d">-import dev.equwal.assistkey.native.ViwoodsBridge</span>
+<span class="a">+import dev.equwal.assistkey.route.ServiceHolder</span>
+<span class="a">+import dev.equwal.assistkey.shell.PowerControl</span>
+<span class="a">+import dev.equwal.assistkey.shell.Shell</span>
+ import dev.equwal.assistkey.store.Store
+ import dev.equwal.assistkey.ui.Ui.button
+ import dev.equwal.assistkey.ui.Ui.check
+<span class="h">@@ -23,40 +28,44 @@ import dev.equwal.assistkey.ui.Ui.row</span>
+ import dev.equwal.assistkey.ui.Ui.title
+ 
+ /**
+<span class="d">- * How you get around the reader: the button bar, swipe gestures, Power key</span>
+<span class="d">- * combinations, in any mix.</span>
+<span class="a">+ * How you get around: the button bar, swipe gestures, the Power key - any mix.</span>
+  *
+<span class="d">- * The three are not equals. Power combinations are this app&#x27;s own and are</span>
+<span class="d">- * switched here. The bar and the gestures belong to the system, and Android</span>
+<span class="d">- * lets no ordinary app switch either - so for those this screen works out what</span>
+<span class="d">- * has to change, shows where things stand now, and hands over the commands.</span>
+<span class="a">+ * One screen, one decision. Tick what you want and it is applied: the Power</span>
+<span class="a">+ * key part always by the app, the bar and the gestures through shell access</span>
+<span class="a">+ * when there is any. Only without shell access does this fall back to handing</span>
+<span class="a">+ * over commands for a computer.</span>
+  */
+ class NavigationActivity : Activity() {
+ 
+<span class="d">-    private data class Setup(</span>
+<span class="d">-        val name: String,</span>
+<span class="d">-        val blurb: String,</span>
+<span class="d">-        val buttons: Boolean,</span>
+<span class="d">-        val gestures: Boolean,</span>
+<span class="d">-        val keys: Boolean</span>
+<span class="d">-    )</span>
+<span class="a">+    private data class Setup(val name: String, val buttons: Boolean, val gestures: Boolean, val keys: Boolean)</span>
+ 
+     private val setups = listOf(
+<span class="d">-        Setup(&quot;Buttons only&quot;, &quot;Three-button bar at the bottom. No gestures at all.&quot;, true, false, false),</span>
+<span class="d">-        Setup(&quot;Gestures only&quot;, &quot;Swipes, no button bar.&quot;, false, true, false),</span>
+<span class="d">-        Setup(&quot;Power key combos only&quot;, &quot;No bar and no gestures - the whole screen is yours.&quot;, false, false, true),</span>
+<span class="d">-        Setup(&quot;Power key combos + buttons&quot;, &quot;Bar and keys, no gestures.&quot;, true, false, true),</span>
+<span class="d">-        Setup(&quot;Power key combos + buttons + gestures&quot;, &quot;Everything at once.&quot;, true, true, true)</span>
+<span class="a">+        Setup(&quot;Buttons only&quot;, true, false, false),</span>
+<span class="a">+        Setup(&quot;Gestures only&quot;, false, true, false),</span>
+<span class="a">+        Setup(&quot;Power key only&quot;, false, false, true),</span>
+<span class="a">+        Setup(&quot;Power key + buttons&quot;, true, false, true),</span>
+<span class="a">+        Setup(&quot;Power key + gestures&quot;, false, true, true),</span>
+<span class="a">+        Setup(&quot;Buttons + gestures&quot;, true, true, false),</span>
+<span class="a">+        Setup(&quot;Power key + buttons + gestures&quot;, true, true, true)</span>
+     )
+ 
+     private var redrawnForInsets = false
+<span class="a">+    private var applying = false</span>
+<span class="a">+    private val redraw: () -&gt; Unit = { if (!isFinishing) build() }</span>
+ 
+     override fun onResume() {
+         super.onResume()
+<span class="a">+        Shell.onChange(redraw)</span>
+<span class="a">+        Shell.connect(this)</span>
+         build()
+     }
+ 
+<span class="d">-    // ---- wanted state, remembered ------------------------------------------------</span>
+<span class="a">+    override fun onPause() {</span>
+<span class="a">+        super.onPause()</span>
+<span class="a">+        Shell.removeOnChange(redraw)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- what is wanted -------------------------------------------------------------------</span>
+ 
+     private fun prefs() = getSharedPreferences(&quot;assistkey_nav&quot;, Context.MODE_PRIVATE)
+ 
+<span class="h">@@ -69,145 +78,133 @@ class NavigationActivity : Activity() {</span>
+             build()
+             return
+         }
+<span class="d">-        prefs().edit()</span>
+<span class="d">-            .putBoolean(&quot;buttons&quot;, buttons)</span>
+<span class="d">-            .putBoolean(&quot;gestures&quot;, gestures)</span>
+<span class="d">-            .putBoolean(&quot;keys&quot;, keys)</span>
+<span class="d">-            .apply()</span>
+<span class="a">+        prefs().edit().putBoolean(&quot;buttons&quot;, buttons).putBoolean(&quot;gestures&quot;, gestures)</span>
+<span class="a">+            .putBoolean(&quot;keys&quot;, keys).apply()</span>
+         applyKeys(keys)
+<span class="d">-        build()</span>
+<span class="a">+        if (Shell.ready) applySystem(buttons, gestures) else build()</span>
+     }
+ 
+<span class="d">-    // ---- the part this app owns -----------------------------------------------------</span>
+<span class="a">+    // ---- the Power key ---------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private val power = setOf(HwKey.POWER)</span>
+ 
+<span class="a">+    /** Tap back, hold home, double tap recents; triple tap keeps a way to lock. */</span>
+     private val defaults = listOf(
+<span class="d">-        HwKey.VOL_UP to GlobalAction.BACK,</span>
+<span class="d">-        HwKey.AI to GlobalAction.HOME,</span>
+<span class="d">-        HwKey.VOL_DOWN to GlobalAction.RECENTS</span>
+<span class="a">+        Trigger(power, GestureType.TAP, 1) to GlobalAction.BACK,</span>
+<span class="a">+        Trigger(power, GestureType.HOLD) to GlobalAction.HOME_CLOSE_IME,</span>
+<span class="a">+        Trigger(power, GestureType.TAP, 2) to GlobalAction.RECENTS,</span>
+<span class="a">+        Trigger(power, GestureType.TAP, 3) to GlobalAction.LOCK_SCREEN</span>
+     )
+ 
+<span class="d">-    private fun keysOn(): Boolean = Store.bindings(this).hasPowerCombos</span>
+<span class="a">+    private fun keysOn(): Boolean =</span>
+<span class="a">+        Store.bindings(this).all().keys.any { it.keys == power }</span>
+ 
+     /**
+<span class="d">-     * On: make sure the two channels that carry a Power combination are ticked,</span>
+<span class="d">-     * and fill any empty slot with a navigation default. Slots the user has</span>
+<span class="d">-     * already bound are theirs and are left alone. Off: clear the three slots.</span>
+<span class="a">+     * On fills empty slots with the defaults and leaves anything already bound</span>
+<span class="a">+     * alone. Off clears exactly the slots that still hold a default, so a</span>
+<span class="a">+     * binding the user made by hand survives being toggled.</span>
+      */
+     private fun applyKeys(on: Boolean) {
+<span class="a">+        val b = Store.bindings(this)</span>
+<span class="a">+        defaults.forEach { (t, action) -&gt;</span>
+<span class="a">+            val spec = ActionSpec(ActionKind.GLOBAL, action.name, action.label)</span>
+<span class="a">+            if (on &amp;&amp; !b.isBound(t)) Store.bind(this, t, spec)</span>
+<span class="a">+            if (!on &amp;&amp; b[t] == spec) Store.bind(this, t, ActionSpec.PASS)</span>
+<span class="a">+        }</span>
+         if (on) {
+             Channels.setEnabled(this, Channel.ACCESSIBILITY, true)
+<span class="a">+            PowerControl.setWanted(this, true)</span>
+<span class="a">+            // The side doors, for whenever shell access is not there.</span>
+             Channels.setEnabled(this, Channel.ASSISTANT, true)
+<span class="d">-            val b = Store.bindings(this)</span>
+<span class="d">-            defaults.forEach { (key, action) -&gt;</span>
+<span class="d">-                val t = Trigger.powerThen(key)</span>
+<span class="d">-                if (!b.isBound(t)) {</span>
+<span class="d">-                    Store.bind(this, t, ActionSpec(ActionKind.GLOBAL, action.name, action.label))</span>
+<span class="d">-                }</span>
+<span class="d">-            }</span>
+<span class="d">-        } else {</span>
+<span class="d">-            HwKey.interceptable.forEach { Store.bind(this, Trigger.powerThen(it), ActionSpec.PASS) }</span>
+         }
+<span class="a">+        (ServiceHolder.service as? KeyFilterService)?.syncPower()</span>
+     }
+ 
+<span class="d">-    // ---- screen ---------------------------------------------------------------------------</span>
+<span class="a">+    // ---- the bar and the gestures ----------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private fun applySystem(buttons: Boolean, gestures: Boolean) {</span>
+<span class="a">+        applying = true</span>
+<span class="a">+        build()</span>
+<span class="a">+        Shell.runAll(NavNative.shellCommands(buttons, gestures)) { ok -&gt;</span>
+<span class="a">+            applying = false</span>
+<span class="a">+            if (!ok) Toast.makeText(this, &quot;The system refused part of that&quot;, Toast.LENGTH_LONG).show()</span>
+<span class="a">+            // The bar comes and goes with a relayout; give the insets a moment.</span>
+<span class="a">+            window.decorView.postDelayed({ if (!isFinishing) build() }, 1200L)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- screen -----------------------------------------------------------------------------</span>
+ 
+     private fun build() {
+         val buttonsNow = NavNative.buttonsShowing(this)
+         if (buttonsNow == null &amp;&amp; !redrawnForInsets) {
+<span class="d">-            // Insets only exist once the window is attached.</span>
+             redrawnForInsets = true
+<span class="d">-            window.decorView.post { if (!isFinishing) build() }</span>
+<span class="a">+            window.decorView.post { if (!isFinishing) build() } // insets need an attached window</span>
+         }
+         val gesturesNow = NavNative.gesturesOn(this)
+<span class="d">-        val keysNow = keysOn()</span>
+ 
+         val wantButtons = wanted(&quot;buttons&quot;, buttonsNow ?: true)
+         val wantGestures = wanted(&quot;gestures&quot;, gesturesNow ?: true)
+<span class="d">-        val wantKeys = wanted(&quot;keys&quot;, keysNow)</span>
+<span class="a">+        val wantKeys = wanted(&quot;keys&quot;, keysOn())</span>
+ 
+         val col = Ui.page(this)
+         col.title(&quot;Navigation&quot;)
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;Three ways to get around, in any mix: the button bar, swipe &quot; +</span>
+<span class="d">-                &quot;gestures, and Power key combinations.&quot;</span>
+<span class="d">-        )</span>
+<span class="d">-</span>
+<span class="d">-        col.header(&quot;Pick a setup&quot;)</span>
+<span class="d">-        setups.forEach { s -&gt;</span>
+<span class="d">-            val current = s.buttons == wantButtons &amp;&amp; s.gestures == wantGestures &amp;&amp; s.keys == wantKeys</span>
+<span class="d">-            col.row((if (current) &quot;* &quot; else &quot;&quot;) + s.name, s.blurb) {</span>
+<span class="d">-                choose(s.buttons, s.gestures, s.keys)</span>
+<span class="d">-            }</span>
+<span class="d">-        }</span>
+<span class="a">+        col.note(&quot;The button bar, swipe gestures and the Power key, in any mix.&quot;)</span>
+ 
+<span class="d">-        col.header(&quot;Or mix your own&quot;)</span>
+         col.check(&quot;Button bar&quot;, &quot;Back, Home and Recents along the bottom edge&quot;, wantButtons) {
+             choose(it, wantGestures, wantKeys)
+         }
+<span class="d">-        col.check(</span>
+<span class="d">-            &quot;Swipe gestures&quot;,</span>
+<span class="d">-            &quot;Swipe up from the bottom edge for Home; without the bar, swipe in &quot; +</span>
+<span class="d">-                &quot;from a side edge for Back&quot;,</span>
+<span class="d">-            wantGestures</span>
+<span class="d">-        ) { choose(wantButtons, it, wantKeys) }</span>
+<span class="d">-        col.check(</span>
+<span class="d">-            &quot;Power key combinations&quot;,</span>
+<span class="d">-            &quot;Hold Power, then press Volume up, the AI key or Volume down&quot;,</span>
+<span class="d">-            wantKeys</span>
+<span class="d">-        ) { choose(wantButtons, wantGestures, it) }</span>
+<span class="a">+        col.check(&quot;Swipe gestures&quot;, &quot;Swipe up for Home; without the bar, swipe in from a side for Back&quot;, wantGestures) {</span>
+<span class="a">+            choose(wantButtons, it, wantKeys)</span>
+<span class="a">+        }</span>
+<span class="a">+        col.check(&quot;Power key&quot;, &quot;Tap for Back, hold for Home, double tap for Recents&quot;, wantKeys) {</span>
+<span class="a">+            choose(wantButtons, wantGestures, it)</span>
+<span class="a">+        }</span>
+ 
+<span class="d">-        if (wantKeys) keys(col)</span>
+<span class="a">+        col.header(&quot;Or pick a setup&quot;)</span>
+<span class="a">+        val labels = setups.map { s -&gt;</span>
+<span class="a">+            (if (s.buttons == wantButtons &amp;&amp; s.gestures == wantGestures &amp;&amp; s.keys == wantKeys) &quot;* &quot; else &quot;   &quot;) + s.name</span>
+<span class="a">+        }</span>
+<span class="a">+        col.button(&quot;Choose...&quot;) {</span>
+<span class="a">+            Ui.pick(this, &quot;Navigation setup&quot;, labels) { i -&gt;</span>
+<span class="a">+                setups[i].let { choose(it.buttons, it.gestures, it.keys) }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        if (wantKeys) powerKey(col)</span>
+         system(col, wantButtons, wantGestures, buttonsNow, gesturesNow)
+     }
+ 
+<span class="d">-    private fun keys(col: LinearLayout) {</span>
+<span class="d">-        col.header(&quot;Power key combinations&quot;)</span>
+<span class="a">+    private fun powerKey(col: LinearLayout) {</span>
+<span class="a">+        col.header(&quot;Power key&quot;)</span>
+         val b = Store.bindings(this)
+<span class="d">-        HwKey.interceptable.forEach { key -&gt;</span>
+<span class="d">-            val t = Trigger.powerThen(key)</span>
+<span class="d">-            col.row(&quot;Power, then &quot; + Ui.inSentence(key), b.raw(t).describe()) {</span>
+<span class="d">-                startActivity(ActionPickerActivity.intent(this, t))</span>
+<span class="a">+        val direct = Shell.ready &amp;&amp; PowerControl.wanted(this)</span>
+<span class="a">+        defaults.forEach { (t, _) -&gt;</span>
+<span class="a">+            val label = when {</span>
+<span class="a">+                t.type == GestureType.HOLD -&gt; &quot;Hold&quot;</span>
+<span class="a">+                t.count == 1 -&gt; &quot;Tap&quot;</span>
+<span class="a">+                t.count == 2 -&gt; &quot;Double tap&quot;</span>
+<span class="a">+                else -&gt; &quot;Triple tap&quot;</span>
+             }
+<span class="d">-        }</span>
+<span class="d">-</span>
+<span class="d">-        val a11y = Channels.isSatisfied(this, Channel.ACCESSIBILITY)</span>
+<span class="d">-        val assistant = Channels.isSatisfied(this, Channel.ASSISTANT)</span>
+<span class="d">-        if (a11y &amp;&amp; assistant) {</span>
+<span class="d">-            col.note(</span>
+<span class="d">-                &quot;Ready. Hold Power for about half a second, then press the &quot; +</span>
+<span class="d">-                    &quot;second key while still holding.&quot;</span>
+<span class="d">-            )</span>
+<span class="d">-        }</span>
+<span class="d">-        if (!assistant) {</span>
+<span class="d">-            col.note(&quot;Holding Power has to reach this app: make AssistKey the digital assistant.&quot;)</span>
+<span class="d">-            col.button(&quot;Set up digital assistant&quot;) {</span>
+<span class="d">-                Channels.safeStart(this, Channels.claimIntent(this, Channel.ASSISTANT))</span>
+<span class="a">+            // Without shell access only hold and double press have a way in.</span>
+<span class="a">+            val reachable = direct || t == Channel.POWER_HOLD || t == Channel.POWER_DOUBLE</span>
+<span class="a">+            col.row(label + &quot;: &quot; + b.raw(t).describe(), if (reachable) null else &quot;Needs shell access&quot;, reachable) {</span>
+<span class="a">+                startActivity(ActionPickerActivity.intent(this, t))</span>
+             }
+         }
+<span class="d">-        if (!a11y) {</span>
+<span class="d">-            col.note(</span>
+<span class="d">-                &quot;The second key is read by the accessibility key filter, which is &quot; +</span>
+<span class="d">-                    &quot;off. Turn it on from the main screen.&quot;</span>
+<span class="d">-            )</span>
+<span class="a">+        col.row(&quot;More Power button gestures&quot;, &quot;More taps, combinations with other keys, and how it works&quot;) {</span>
+<span class="a">+            startActivity(Intent(this, PowerActivity::class.java))</span>
+         }
+<span class="d">-        if (!ViwoodsBridge.aiHookedToUs(this) &amp;&amp; b.powerCombo(HwKey.AI) != null) {</span>
+<span class="d">-            col.note(</span>
+<span class="d">-                &quot;Power, then the AI key will also open the firmware&#x27;s AI screen &quot; +</span>
+<span class="d">-                    &quot;until the AI key hook points at AssistKey. See Advanced &gt; &quot; +</span>
+<span class="d">-                    &quot;Firmware key hooks.&quot;</span>
+<span class="d">-            )</span>
+<span class="a">+        if (!Channels.isSatisfied(this, Channel.ACCESSIBILITY)) {</span>
+<span class="a">+            col.note(&quot;Actions like Back and Home are carried out by the accessibility key filter, which is off. Turn it on from the main screen.&quot;)</span>
+         }
+<span class="d">-        HwKey.interceptable.filter { ViwoodsBridge.hidesFromFilter(this, it) }.forEach { k -&gt;</span>
+<span class="a">+        if (!direct) {</span>
+             col.note(
+<span class="d">-                &quot;A firmware hook is hiding &quot; + k.label.lowercase() + &quot; from this app, so its &quot; +</span>
+<span class="d">-                    &quot;combination cannot fire. See Advanced &gt; Firmware key hooks.&quot;</span>
+<span class="a">+                &quot;Without shell access a tap cannot reach any app. Hold works once &quot; +</span>
+<span class="a">+                    &quot;AssistKey is the digital assistant, and double press once it is &quot; +</span>
+<span class="a">+                    &quot;the default camera app - both are set up on the Power button screen.&quot;</span>
+             )
+         }
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;Back, Home and Recents on these combinations keep working even if &quot; +</span>
+<span class="d">-                &quot;the app is locked, so a reader with no bar and no gestures can &quot; +</span>
+<span class="d">-                &quot;never be left without a way out.&quot;</span>
+<span class="d">-        )</span>
+     }
+ 
+     private fun system(
+<span class="h">@@ -218,32 +215,25 @@ class NavigationActivity : Activity() {</span>
+         gesturesNow: Boolean?
+     ) {
+         col.header(&quot;Button bar and gestures&quot;)
+<span class="d">-        col.row(&quot;Button bar: &quot; + now(buttonsNow, &quot;showing&quot;, &quot;hidden&quot;) + want(buttonsNow, wantButtons), null, enabled = false)</span>
+<span class="d">-        col.row(&quot;Swipe-up gesture: &quot; + now(gesturesNow, &quot;on&quot;, &quot;off&quot;) + want(gesturesNow, wantGestures), null, enabled = false)</span>
+<span class="a">+        col.row(&quot;Button bar: &quot; + now(buttonsNow, &quot;showing&quot;, &quot;hidden&quot;), null, enabled = false)</span>
+<span class="a">+        col.row(&quot;Swipe-up gesture: &quot; + now(gesturesNow, &quot;on&quot;, &quot;off&quot;), null, enabled = false)</span>
+ 
+<span class="d">-        val settled = buttonsNow == wantButtons &amp;&amp; gesturesNow == wantGestures</span>
+<span class="d">-        if (settled) {</span>
+<span class="d">-            col.note(&quot;The system already matches. Nothing more to do.&quot;)</span>
+<span class="a">+        if (applying) {</span>
+<span class="a">+            col.note(&quot;Applying... the screen may redraw once.&quot;)</span>
+             return
+         }
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;Android does not let apps switch these, so they are set once from a &quot; +</span>
+<span class="d">-                &quot;computer with the reader plugged in and USB debugging on. They &quot; +</span>
+<span class="d">-                &quot;survive restarts. Run them in this order:&quot;</span>
+<span class="d">-        )</span>
+<span class="d">-        col.code(NavNative.commands(wantButtons, wantGestures).joinToString(&quot;\n&quot;))</span>
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;The repository has tools/nav-mode, which runs the same commands: &quot; +</span>
+<span class="d">-                &quot;nav-mode &quot; + (if (wantButtons) &quot;buttons&quot; else &quot;nobuttons&quot;) + &quot; &quot; +</span>
+<span class="d">-                (if (wantGestures) &quot;gestures&quot; else &quot;nogestures&quot;)</span>
+<span class="d">-        )</span>
+<span class="d">-        if (!wantButtons &amp;&amp; !wantGestures) {</span>
+<span class="d">-            col.note(</span>
+<span class="d">-                &quot;With no bar and no gestures, set up and try the Power &quot; +</span>
+<span class="d">-                    &quot;combinations before running these. Power + Volume up still &quot; +</span>
+<span class="d">-                    &quot;opens the power menu whatever happens.&quot;</span>
+<span class="d">-            )</span>
+<span class="a">+        if (buttonsNow == wantButtons &amp;&amp; gesturesNow == wantGestures) return</span>
+<span class="a">+</span>
+<span class="a">+        if (Shell.ready) {</span>
+<span class="a">+            col.button(&quot;Apply&quot;) { applySystem(wantButtons, wantGestures) }</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        col.note(&quot;Android does not let apps switch these. Shell access lets AssistKey do it from here:&quot;)</span>
+<span class="a">+        col.row(&quot;Shell access: &quot; + Shell.describe(this), &quot;Set it up once, on the device, with no computer&quot;) {</span>
+<span class="a">+            startActivity(Intent(this, ShellActivity::class.java))</span>
+         }
+<span class="a">+        col.note(&quot;Or, with a computer and USB debugging:&quot;)</span>
+<span class="a">+        col.code(NavNative.commands(wantButtons, wantGestures).joinToString(&quot;\n&quot;))</span>
+     }
+ 
+     private fun now(v: Boolean?, yes: String, no: String): String = when (v) {
+<span class="h">@@ -251,7 +241,4 @@ class NavigationActivity : Activity() {</span>
+         false -&gt; no
+         null -&gt; &quot;unknown&quot;
+     }
+<span class="d">-</span>
+<span class="d">-    private fun want(now: Boolean?, wanted: Boolean): String =</span>
+<span class="d">-        if (now == wanted) &quot;&quot; else &quot;  -  you want it &quot; + (if (wanted) &quot;on&quot; else &quot;off&quot;)</span>
+ }
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt
+index c4b8d6a..c903bce 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/PowerActivity.kt
+<span class="h">@@ -1,14 +1,22 @@</span>
+ package dev.equwal.assistkey.ui
+ 
+ import android.app.Activity
+<span class="a">+import android.content.Intent</span>
+ import android.widget.LinearLayout
+ import android.widget.Toast
+ import dev.equwal.assistkey.channel.Channel
+ import dev.equwal.assistkey.channel.Channels
+<span class="a">+import dev.equwal.assistkey.engine.KeyFilterService</span>
+<span class="a">+import dev.equwal.assistkey.model.GestureType</span>
+ import dev.equwal.assistkey.model.HwKey
+ import dev.equwal.assistkey.model.Trigger
+ import dev.equwal.assistkey.native.PowerNative
+<span class="a">+import dev.equwal.assistkey.route.ServiceHolder</span>
+<span class="a">+import dev.equwal.assistkey.shell.PowerControl</span>
+<span class="a">+import dev.equwal.assistkey.shell.Shell</span>
+ import dev.equwal.assistkey.store.Store
+<span class="a">+import dev.equwal.assistkey.ui.Ui.button</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.check</span>
+ import dev.equwal.assistkey.ui.Ui.code
+ import dev.equwal.assistkey.ui.Ui.header
+ import dev.equwal.assistkey.ui.Ui.note
+<span class="h">@@ -16,262 +24,207 @@ import dev.equwal.assistkey.ui.Ui.row</span>
+ import dev.equwal.assistkey.ui.Ui.title
+ 
+ /**
+<span class="d">- * Power is its own screen because it is not like the other keys.</span>
+<span class="a">+ * The Power button.</span>
+  *
+<span class="d">- * PhoneWindowManager consumes KEYCODE_POWER before the input dispatcher, so no</span>
+<span class="d">- * app - accessibility service or otherwise - ever sees it. That leaves exactly</span>
+<span class="d">- * three slots, each reached a different way: short press is firmware-only,</span>
+<span class="d">- * double press arrives as a camera or wallet launch, and long press arrives as</span>
+<span class="d">- * an assistant request. No multi-tap beyond two, and no chords.</span>
+<span class="a">+ * It has two lives. With shell access the app reads the button straight from</span>
+<span class="a">+ * the kernel and it becomes a key like any other: any number of taps, hold, and</span>
+<span class="a">+ * combinations. Without shell access no app is ever shown the key, and what is</span>
+<span class="a">+ * left is two side doors - a hold arrives as an assistant request, a double</span>
+<span class="a">+ * press as a camera launch - plus whatever the firmware&#x27;s own switches offer.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The bindings are the same in both lives. &quot;Hold&quot; is one binding whichever door</span>
+<span class="a">+ * it comes through, so gaining or losing shell access changes what can fire,</span>
+<span class="a">+ * never what is configured.</span>
+  */
+ class PowerActivity : Activity() {
+ 
+<span class="d">-    private var readable = true</span>
+<span class="a">+    private val redraw: () -&gt; Unit = { if (!isFinishing) build() }</span>
+ 
+     override fun onResume() {
+         super.onResume()
+<span class="a">+        Shell.onChange(redraw)</span>
+<span class="a">+        Shell.connect(this)</span>
+         build()
+     }
+ 
+<span class="a">+    override fun onPause() {</span>
+<span class="a">+        super.onPause()</span>
+<span class="a">+        Shell.removeOnChange(redraw)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     private fun build() {
+<span class="d">-        readable = PowerNative.canRead(this)</span>
+         val col = Ui.page(this)
+         col.title(&quot;Power button&quot;)
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;The system eats the power key before any app can filter it, so &quot; +</span>
+<span class="d">-                &quot;these three slots are everything that is reachable.&quot;</span>
+<span class="d">-        )</span>
+<span class="d">-</span>
+<span class="d">-        if (!PowerNative.canWriteSecure(this)) {</span>
+<span class="d">-            col.note(</span>
+<span class="d">-                &quot;The firmware switches below cannot be changed without a &quot; +</span>
+<span class="d">-                    &quot;permission that only adb can grant. Run this once with the &quot; +</span>
+<span class="d">-                    &quot;device plugged in:&quot;</span>
+<span class="d">-            )</span>
+<span class="d">-            col.code(PowerNative.GRANT_COMMAND)</span>
+<span class="d">-        } else if (!readable) {</span>
+<span class="d">-            col.note(</span>
+<span class="d">-                &quot;Android blocks apps from reading these particular settings, so &quot; +</span>
+<span class="d">-                    &quot;the current values show as unknown. Writing them still &quot; +</span>
+<span class="d">-                    &quot;works - pick a value and it is applied.&quot;</span>
+<span class="d">-            )</span>
+<span class="d">-        }</span>
+<span class="d">-</span>
+<span class="d">-        shortPress(col)</span>
+<span class="d">-        doublePress(col)</span>
+<span class="d">-        longPress(col)</span>
+<span class="d">-        powerThen(col)</span>
+<span class="d">-        escapeHatch(col)</span>
+<span class="a">+        val direct = Shell.ready &amp;&amp; PowerControl.wanted(this)</span>
+<span class="a">+        if (direct) direct(col) else sideDoors(col)</span>
+     }
+ 
+<span class="d">-    // ---- hold Power, then press a key ---------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-    private fun powerThen(col: LinearLayout) {</span>
+<span class="d">-        col.header(&quot;Hold Power, then press a key&quot;)</span>
+<span class="d">-        col.note(</span>
+<span class="d">-            &quot;Keep Power held for a moment, then press another key before letting &quot; +</span>
+<span class="d">-                &quot;go. It needs the digital assistant channel and the accessibility &quot; +</span>
+<span class="d">-                &quot;key filter, both on. While any of these is bound, the plain &quot; +</span>
+<span class="d">-                &quot;press-and-hold action above waits a second to see whether a key &quot; +</span>
+<span class="d">-                &quot;follows.&quot;</span>
+<span class="d">-        )</span>
+<span class="d">-        val b = Store.bindings(this)</span>
+<span class="d">-        HwKey.interceptable.forEach { key -&gt;</span>
+<span class="d">-            val t = Trigger.powerThen(key)</span>
+<span class="d">-            col.row(&quot;Power, then &quot; + Ui.inSentence(key), b.raw(t).describe()) {</span>
+<span class="d">-                startActivity(ActionPickerActivity.intent(this, t))</span>
+<span class="d">-            }</span>
+<span class="a">+    private fun bindRow(col: LinearLayout, label: String, t: Trigger, enabled: Boolean = true) {</span>
+<span class="a">+        val spec = Store.bindings(this).raw(t)</span>
+<span class="a">+        col.row(label, spec.describe(), enabled) {</span>
+<span class="a">+            startActivity(ActionPickerActivity.intent(this, t))</span>
+         }
+     }
+ 
+<span class="d">-    // ---- short press: firmware only ---------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-    private fun shortPress(col: LinearLayout) {</span>
+<span class="d">-        col.header(&quot;Short press&quot;)</span>
+<span class="d">-        val cur = PowerNative.shortPressValue(this)</span>
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Currently: &quot; + PowerNative.describe(PowerNative.shortPress, cur),</span>
+<span class="d">-            &quot;Handled entirely by the firmware - this rewrites its setting&quot;</span>
+<span class="d">-        ) {</span>
+<span class="d">-            pickNative(&quot;Short press&quot;, PowerNative.shortPress, cur) { v -&gt;</span>
+<span class="d">-                apply(</span>
+<span class="d">-                    PowerNative.setShortPress(this, v),</span>
+<span class="d">-                    &quot;global&quot;, PowerNative.SHORT_PRESS, v</span>
+<span class="d">-                )</span>
+<span class="d">-            }</span>
+<span class="d">-        }</span>
+<span class="d">-    }</span>
+<span class="a">+    private val power = setOf(HwKey.POWER)</span>
+ 
+<span class="d">-    // ---- double press: camera / wallet impersonation -----------------------</span>
+<span class="a">+    // ---- with shell access ----------------------------------------------------------------</span>
+ 
+<span class="d">-    private fun doublePress(col: LinearLayout) {</span>
+<span class="d">-        col.header(&quot;Double press&quot;)</span>
+<span class="d">-        val camera = Channels.isSatisfied(this, Channel.CAMERA)</span>
+<span class="d">-        val wallet = Channels.isSatisfied(this, Channel.WALLET)</span>
+<span class="a">+    private fun direct(col: LinearLayout) {</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;AssistKey is reading the Power button directly. While anything is &quot; +</span>
+<span class="a">+                &quot;bound here the system&#x27;s own reactions are switched off, so a &quot; +</span>
+<span class="a">+                &quot;gesture you leave unbound locks the screen, as Power always did.&quot;</span>
+<span class="a">+        )</span>
+ 
+<span class="a">+        col.header(&quot;Taps&quot;)</span>
+<span class="a">+        bindRow(col, &quot;Tap&quot;, Trigger(power, GestureType.TAP, 1))</span>
+<span class="a">+        bindRow(col, &quot;Double tap&quot;, Trigger(power, GestureType.TAP, 2))</span>
+<span class="a">+        bindRow(col, &quot;Triple tap&quot;, Trigger(power, GestureType.TAP, 3))</span>
+<span class="a">+        bindRow(col, &quot;4 taps&quot;, Trigger(power, GestureType.TAP, 4))</span>
+<span class="a">+        bindRow(col, &quot;5 taps&quot;, Trigger(power, GestureType.TAP, 5))</span>
+         col.note(
+<span class="d">-            when {</span>
+<span class="d">-                camera &amp;&amp; wallet -&gt; &quot;Routed here through both the camera and wallet channels.&quot;</span>
+<span class="d">-                camera -&gt; &quot;Routed here through the camera channel.&quot;</span>
+<span class="d">-                wallet -&gt; &quot;Routed here through the wallet channel.&quot;</span>
+<span class="d">-                else -&gt;</span>
+<span class="d">-                    &quot;Nothing is routing double press here yet. Turn on the camera &quot; +</span>
+<span class="d">-                        &quot;or wallet channel on the main screen, then pick this app &quot; +</span>
+<span class="d">-                        &quot;as the double-press target in system settings.&quot;</span>
+<span class="d">-            }</span>
+<span class="a">+            &quot;A tap waits a moment for a second one only if double tap or more is &quot; +</span>
+<span class="a">+                &quot;bound. The wait is set under Gesture timing.&quot;</span>
+         )
+ 
+<span class="d">-        val spec = Store.bindings(this)[Channel.POWER_DOUBLE]</span>
+<span class="d">-        col.row(&quot;Action&quot;, spec?.describe() ?: &quot;Default behaviour&quot;) {</span>
+<span class="d">-            startActivity(ActionPickerActivity.intent(this, Channel.POWER_DOUBLE))</span>
+<span class="a">+        col.header(&quot;Hold&quot;)</span>
+<span class="a">+        bindRow(col, &quot;Press and hold&quot;, Trigger(power, GestureType.HOLD))</span>
+<span class="a">+</span>
+<span class="a">+        col.header(&quot;Power held, plus another key&quot;)</span>
+<span class="a">+        HwKey.interceptable.forEach { key -&gt;</span>
+<span class="a">+            bindRow(col, &quot;Power + &quot; + key.label, Trigger.powerThen(key))</span>
+         }
+ 
+<span class="d">-        onOffRow(</span>
+<span class="d">-            col,</span>
+<span class="d">-            &quot;Firmware double-press gesture&quot;,</span>
+<span class="d">-            PowerNative.doubleTapGestureEnabled(this),</span>
+<span class="d">-            &quot;Must be on for double press to do anything at all&quot;</span>
+<span class="a">+        col.header(&quot;Safety&quot;)</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;Power + Volume up always opens the power menu. The press that wakes &quot; +</span>
+<span class="a">+                &quot;the screen is never treated as a gesture. If shell access is lost - &quot; +</span>
+<span class="a">+                &quot;after a restart, say - the button goes back to the system until it &quot; +</span>
+<span class="a">+                &quot;returns.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        col.check(</span>
+<span class="a">+            &quot;Let AssistKey handle the Power button&quot;,</span>
+<span class="a">+            &quot;Untick to give it back to the system and use the side doors instead&quot;,</span>
+<span class="a">+            true</span>
+         ) { on -&gt;
+<span class="d">-            apply(</span>
+<span class="d">-                PowerNative.setDoubleTapGestureEnabled(this, on),</span>
+<span class="d">-                &quot;secure&quot;, PowerNative.DOUBLE_TAP, if (on) 1 else 0</span>
+<span class="d">-            )</span>
+<span class="a">+            PowerControl.setWanted(this, on)</span>
+<span class="a">+            (ServiceHolder.service as? KeyFilterService)?.syncPower()</span>
+<span class="a">+            build()</span>
+         }
+ 
+<span class="d">-        onOffRow(</span>
+<span class="d">-            col,</span>
+<span class="d">-            &quot;Camera double-press gesture&quot;,</span>
+<span class="d">-            PowerNative.cameraDoubleTapEnabled(this),</span>
+<span class="d">-            &quot;The older camera-specific route, still live on this firmware&quot;</span>
+<span class="d">-        ) { on -&gt;</span>
+<span class="d">-            apply(</span>
+<span class="d">-                PowerNative.setCameraDoubleTapEnabled(this, on),</span>
+<span class="d">-                &quot;secure&quot;, PowerNative.CAMERA_DOUBLE_TAP, if (on) 0 else 1</span>
+<span class="d">-            )</span>
+<span class="a">+        if (ServiceHolder.service == null) {</span>
+<span class="a">+            col.note(&quot;The accessibility key filter is off, so nothing here can fire yet.&quot;)</span>
+         }
+     }
+ 
+<span class="d">-    // ---- long press: assistant impersonation -------------------------------</span>
+<span class="d">-</span>
+<span class="d">-    private fun longPress(col: LinearLayout) {</span>
+<span class="d">-        col.header(&quot;Press and hold&quot;)</span>
+<span class="d">-        val cur = PowerNative.longPressValue(this)</span>
+<span class="d">-        val held = Channels.isSatisfied(this, Channel.ASSISTANT)</span>
+<span class="a">+    // ---- without it --------------------------------------------------------------------------</span>
+ 
+<span class="a">+    private fun sideDoors(col: LinearLayout) {</span>
+         col.note(
+<span class="d">-            when {</span>
+<span class="d">-                cur == 5 &amp;&amp; held -&gt;</span>
+<span class="d">-                    &quot;Routed here: the firmware sends hold to the assistant, and that is us.&quot;</span>
+<span class="d">-                cur == 5 -&gt;</span>
+<span class="d">-                    &quot;The firmware sends hold to the assistant, but this app does not &quot; +</span>
+<span class="d">-                        &quot;hold that role yet.&quot;</span>
+<span class="d">-                cur == null &amp;&amp; held -&gt;</span>
+<span class="d">-                    &quot;This app holds the assistant role. Whether the firmware sends &quot; +</span>
+<span class="d">-                        &quot;hold to the assistant cannot be read, so try it and see.&quot;</span>
+<span class="d">-                cur == null -&gt;</span>
+<span class="d">-                    &quot;Neither the firmware setting nor the role is in place yet.&quot;</span>
+<span class="d">-                else -&gt;</span>
+<span class="d">-                    &quot;The firmware does not send hold to the assistant, so nothing &quot; +</span>
+<span class="d">-                        &quot;reaches this app.&quot;</span>
+<span class="d">-            }</span>
+<span class="a">+            &quot;Android does not show the Power button to apps. With shell access &quot; +</span>
+<span class="a">+                &quot;AssistKey can read it anyway and every gesture becomes available.&quot;</span>
+         )
+<span class="d">-</span>
+<span class="d">-        val spec = Store.bindings(this)[Channel.POWER_HOLD]</span>
+<span class="d">-        col.row(&quot;Action&quot;, spec?.describe() ?: &quot;Default behaviour&quot;) {</span>
+<span class="d">-            startActivity(ActionPickerActivity.intent(this, Channel.POWER_HOLD))</span>
+<span class="a">+        if (Shell.ready) {</span>
+<span class="a">+            col.check(&quot;Let AssistKey handle the Power button&quot;, &quot;Tap, double tap, hold and more&quot;, false) {</span>
+<span class="a">+                PowerControl.setWanted(this, it)</span>
+<span class="a">+                (ServiceHolder.service as? KeyFilterService)?.syncPower()</span>
+<span class="a">+                build()</span>
+<span class="a">+            }</span>
+<span class="a">+        } else {</span>
+<span class="a">+            col.row(&quot;Shell access: &quot; + Shell.describe(this), &quot;Unlocks tap, double tap, more taps and combinations&quot;) {</span>
+<span class="a">+                startActivity(Intent(this, ShellActivity::class.java))</span>
+<span class="a">+            }</span>
+         }
+ 
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Firmware behaviour: &quot; + PowerNative.describe(PowerNative.longPress, cur),</span>
+<span class="d">-            &quot;Set this to Digital assistant&quot;</span>
+<span class="d">-        ) {</span>
+<span class="d">-            pickNative(&quot;Press and hold&quot;, PowerNative.longPress, cur) { v -&gt;</span>
+<span class="d">-                apply(PowerNative.setLongPress(this, v), &quot;global&quot;, PowerNative.LONG_PRESS, v)</span>
+<span class="d">-            }</span>
+<span class="a">+        col.header(&quot;Hold - through the assistant door&quot;)</span>
+<span class="a">+        door(col, Channel.ASSISTANT)</span>
+<span class="a">+        bindRow(col, &quot;Press and hold&quot;, Channel.POWER_HOLD)</span>
+<span class="a">+        HwKey.interceptable.forEach { key -&gt;</span>
+<span class="a">+            bindRow(col, &quot;Power held, then &quot; + Ui.inSentence(key), Trigger.powerThen(key))</span>
+         }
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;While a held-then-key combination is bound, plain hold waits a second &quot; +</span>
+<span class="a">+                &quot;to see whether a key follows.&quot;</span>
+<span class="a">+        )</span>
+ 
+<span class="d">-        val ms = PowerNative.longPressMs(this)</span>
+<span class="d">-        val opts = listOf(250, 350, 500, 650, 800, 1000).map {</span>
+<span class="d">-            PowerNative.Option(it, it.toString() + &quot; ms&quot;)</span>
+<span class="a">+        col.header(&quot;Double press - through the camera door&quot;)</span>
+<span class="a">+        door(col, Channel.CAMERA)</span>
+<span class="a">+        bindRow(col, &quot;Double press&quot;, Channel.POWER_DOUBLE)</span>
+<span class="a">+</span>
+<span class="a">+        col.header(&quot;Tap&quot;)</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;A single tap cannot reach any app this way. The system&#x27;s own choices &quot; +</span>
+<span class="a">+                &quot;are all there is:&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        firmware(col)</span>
+<span class="a">+</span>
+<span class="a">+        col.header(&quot;Wallet door&quot;)</span>
+<span class="a">+        door(col, Channel.WALLET)</span>
+<span class="a">+        col.note(&quot;Runs the double-press action from the wallet tile and lock-screen button.&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** One side door: its switch, what state it is in, and how to open it. */</span>
+<span class="a">+    private fun door(col: LinearLayout, ch: Channel) {</span>
+<span class="a">+        val on = Channels.isEnabled(this, ch)</span>
+<span class="a">+        col.check(ch.title, ch.summary, on) { checked -&gt;</span>
+<span class="a">+            Channels.setEnabled(this, ch, checked)</span>
+<span class="a">+            if (checked &amp;&amp; !Channels.isSatisfied(this, ch)) claim(ch)</span>
+<span class="a">+            build()</span>
+         }
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Hold time: &quot; + PowerNative.describe(opts, ms),</span>
+<span class="d">-            &quot;How long the button must be down before it counts as a hold&quot;</span>
+<span class="d">-        ) {</span>
+<span class="d">-            pickNative(&quot;Hold time&quot;, opts, ms) { v -&gt;</span>
+<span class="d">-                apply(</span>
+<span class="d">-                    PowerNative.setLongPressMs(this, v),</span>
+<span class="d">-                    &quot;global&quot;, PowerNative.LONG_PRESS_MS, v</span>
+<span class="d">-                )</span>
+<span class="d">-            }</span>
+<span class="a">+        if (on) {</span>
+<span class="a">+            col.row(&quot;Status: &quot; + Channels.status(this, ch), null, enabled = false)</span>
+<span class="a">+            if (!Channels.isSatisfied(this, ch)) col.button(&quot;Set up&quot;) { claim(ch) }</span>
+         }
+     }
+ 
+<span class="d">-    private fun escapeHatch(col: LinearLayout) {</span>
+<span class="d">-        col.header(&quot;Escape hatch&quot;)</span>
+<span class="d">-        val cur = PowerNative.chordVolumeUpValue(this)</span>
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Power + Volume up: &quot; + PowerNative.describe(PowerNative.chordVolumeUp, cur),</span>
+<span class="d">-            &quot;Keep this on the power menu so you can always shut down&quot;</span>
+<span class="d">-        ) {</span>
+<span class="d">-            pickNative(&quot;Power + Volume up&quot;, PowerNative.chordVolumeUp, cur) { v -&gt;</span>
+<span class="d">-                apply(</span>
+<span class="d">-                    PowerNative.setChordVolumeUp(this, v),</span>
+<span class="d">-                    &quot;global&quot;, PowerNative.CHORD_VOL_UP, v</span>
+<span class="d">-                )</span>
+<span class="d">-            }</span>
+<span class="a">+    private fun claim(ch: Channel) {</span>
+<span class="a">+        if (ch == Channel.CAMERA) {</span>
+<span class="a">+            Toast.makeText(this, &quot;Choose Camera app, then pick AssistKey&quot;, Toast.LENGTH_LONG).show()</span>
+<span class="a">+        }</span>
+<span class="a">+        if (!Channels.safeStart(this, Channels.claimIntent(this, ch))) {</span>
+<span class="a">+            Toast.makeText(this, &quot;No settings screen for that on this device&quot;, Toast.LENGTH_LONG).show()</span>
+         }
+     }
+ 
+<span class="d">-    // ---- helpers -----------------------------------------------------------</span>
+<span class="a">+    // ---- the firmware&#x27;s own switches -------------------------------------------------------</span>
+ 
+<span class="d">-    /**</span>
+<span class="d">-     * An explicit On/Off choice rather than a toggle, because when the current</span>
+<span class="d">-     * value cannot be read there is nothing to toggle away from.</span>
+<span class="d">-     */</span>
+<span class="d">-    private fun onOffRow(</span>
+<span class="d">-        col: LinearLayout,</span>
+<span class="d">-        title: String,</span>
+<span class="d">-        current: Boolean?,</span>
+<span class="d">-        blurb: String,</span>
+<span class="d">-        onPick: (Boolean) -&gt; Unit</span>
+<span class="d">-    ) {</span>
+<span class="d">-        val shown = when (current) {</span>
+<span class="d">-            true -&gt; &quot;on&quot;</span>
+<span class="d">-            false -&gt; &quot;off&quot;</span>
+<span class="d">-            null -&gt; &quot;unknown&quot;</span>
+<span class="a">+    private fun firmware(col: LinearLayout) {</span>
+<span class="a">+        if (!PowerNative.canWriteSecure(this)) {</span>
+<span class="a">+            col.note(&quot;Changing them needs a permission that shell access grants by itself, or this once from a computer:&quot;)</span>
+<span class="a">+            col.code(PowerNative.GRANT_COMMAND)</span>
+<span class="a">+            return</span>
+         }
+<span class="d">-        col.row(title + &quot;: &quot; + shown, blurb) {</span>
+<span class="d">-            pickNative(title, PowerNative.onOff, current?.let { if (it) 1 else 0 }) { v -&gt;</span>
+<span class="d">-                onPick(v == 1)</span>
+<span class="a">+        val short = PowerNative.shortPressValue(this)</span>
+<span class="a">+        col.row(&quot;Tap: &quot; + PowerNative.describe(PowerNative.shortPress, short), &quot;Handled by the system&quot;) {</span>
+<span class="a">+            pick(&quot;Tap&quot;, PowerNative.shortPress, short) { v -&gt;</span>
+<span class="a">+                applied(PowerNative.setShortPress(this, v))</span>
+             }
+         }
+<span class="a">+        val long = PowerNative.longPressValue(this)</span>
+<span class="a">+        col.row(</span>
+<span class="a">+            &quot;Hold: &quot; + PowerNative.describe(PowerNative.longPress, long),</span>
+<span class="a">+            &quot;Must be Digital assistant for the assistant door to open&quot;</span>
+<span class="a">+        ) {</span>
+<span class="a">+            pick(&quot;Hold&quot;, PowerNative.longPress, long) { v -&gt; applied(PowerNative.setLongPress(this, v)) }</span>
+<span class="a">+        }</span>
+<span class="a">+        val ms = PowerNative.longPressMs(this)</span>
+<span class="a">+        val times = listOf(250, 350, 500, 650, 800, 1000).map { PowerNative.Option(it, it.toString() + &quot; ms&quot;) }</span>
+<span class="a">+        col.row(&quot;Hold time: &quot; + PowerNative.describe(times, ms), null) {</span>
+<span class="a">+            pick(&quot;Hold time&quot;, times, ms) { v -&gt; applied(PowerNative.setLongPressMs(this, v)) }</span>
+<span class="a">+        }</span>
+     }
+ 
+<span class="d">-    private fun pickNative(</span>
+<span class="d">-        title: String,</span>
+<span class="d">-        options: List&lt;PowerNative.Option&gt;,</span>
+<span class="d">-        current: Int?,</span>
+<span class="d">-        onPick: (Int) -&gt; Unit</span>
+<span class="d">-    ) {</span>
+<span class="a">+    private fun pick(title: String, options: List&lt;PowerNative.Option&gt;, current: Int?, onPick: (Int) -&gt; Unit) {</span>
+         val labels = options.map { o -&gt;
+<span class="d">-            val mark = if (current != null &amp;&amp; o.value == current) &quot;* &quot; else &quot;   &quot;</span>
+<span class="d">-            mark + o.label + if (o.note.isBlank()) &quot;&quot; else &quot;  -  &quot; + o.note</span>
+<span class="a">+            (if (current != null &amp;&amp; o.value == current) &quot;* &quot; else &quot;   &quot;) + o.label +</span>
+<span class="a">+                if (o.note.isBlank()) &quot;&quot; else &quot;  -  &quot; + o.note</span>
+         }
+         Ui.pick(this, title, labels) { i -&gt; onPick(options[i].value) }
+     }
+ 
+<span class="d">-    /** A refused write is the normal case without the adb grant; say so. */</span>
+<span class="d">-    private fun apply(ok: Boolean, scope: String, key: String, value: Int) {</span>
+<span class="d">-        if (ok) {</span>
+<span class="d">-            Toast.makeText(this, &quot;Applied&quot;, Toast.LENGTH_SHORT).show()</span>
+<span class="d">-        } else {</span>
+<span class="d">-            Toast.makeText(</span>
+<span class="d">-                this,</span>
+<span class="d">-                &quot;Refused - run: &quot; + PowerNative.adbFallback(scope, key, value),</span>
+<span class="d">-                Toast.LENGTH_LONG</span>
+<span class="d">-            ).show()</span>
+<span class="d">-        }</span>
+<span class="a">+    private fun applied(ok: Boolean) {</span>
+<span class="a">+        Toast.makeText(this, if (ok) &quot;Applied&quot; else &quot;The system refused&quot;, Toast.LENGTH_SHORT).show()</span>
+         build()
+     }
+ }
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/ShellActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/ShellActivity.kt
+new file mode 100644
+index 0000000..4f37f1d
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/ui/ShellActivity.kt
+<span class="h">@@ -0,0 +1,122 @@</span>
+<span class="a">+package dev.equwal.assistkey.ui</span>
+<span class="a">+</span>
+<span class="a">+import android.app.Activity</span>
+<span class="a">+import android.content.Intent</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.provider.Settings</span>
+<span class="a">+import android.widget.LinearLayout</span>
+<span class="a">+import dev.equwal.assistkey.channel.Channels</span>
+<span class="a">+import dev.equwal.assistkey.shell.Shell</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.button</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.header</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.note</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.row</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.title</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Getting shell access, from the device itself.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Shizuku is the piece that makes it possible without a computer: it pairs with</span>
+<span class="a">+ * Android&#x27;s own wireless debugging over the loopback interface and then runs a</span>
+<span class="a">+ * small server as the shell user. This screen walks through that and then asks</span>
+<span class="a">+ * Shizuku for permission.</span>
+<span class="a">+ */</span>
+<span class="a">+class ShellActivity : Activity() {</span>
+<span class="a">+</span>
+<span class="a">+    private val redraw: () -&gt; Unit = { if (!isFinishing) build() }</span>
+<span class="a">+</span>
+<span class="a">+    override fun onResume() {</span>
+<span class="a">+        super.onResume()</span>
+<span class="a">+        Shell.onChange(redraw)</span>
+<span class="a">+        Shell.connect(this)</span>
+<span class="a">+        build()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun onPause() {</span>
+<span class="a">+        super.onPause()</span>
+<span class="a">+        Shell.removeOnChange(redraw)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun build() {</span>
+<span class="a">+        val state = Shell.state(this)</span>
+<span class="a">+        val col = Ui.page(this)</span>
+<span class="a">+        col.title(&quot;Shell access&quot;)</span>
+<span class="a">+        col.row(&quot;Status: &quot; + Shell.describe(this), null, enabled = false)</span>
+<span class="a">+</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;Android keeps a few things from every installed app: the Power &quot; +</span>
+<span class="a">+                &quot;button, the navigation bar, the system gestures, a device maker&#x27;s &quot; +</span>
+<span class="a">+                &quot;own key settings. The shell user - the one a computer gets over &quot; +</span>
+<span class="a">+                &quot;USB debugging - can reach all of them. Shizuku, a free app, gives &quot; +</span>
+<span class="a">+                &quot;AssistKey that same access from the device itself, with no &quot; +</span>
+<span class="a">+                &quot;computer and no root.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+</span>
+<span class="a">+        if (state == Shell.State.READY) {</span>
+<span class="a">+            col.header(&quot;What this unlocks&quot;)</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;Power button: tap, double tap, more taps, hold, and combinations &quot; +</span>
+<span class="a">+                    &quot;with other keys.\n&quot; +</span>
+<span class="a">+                    &quot;Navigation: show or hide the button bar and switch system &quot; +</span>
+<span class="a">+                    &quot;gestures, from inside the app.\n&quot; +</span>
+<span class="a">+                    &quot;Device key settings that would otherwise need a computer.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;Shizuku started over wireless debugging stops when the device &quot; +</span>
+<span class="a">+                    &quot;restarts. Until it is started again AssistKey gives the Power &quot; +</span>
+<span class="a">+                    &quot;button back to the system, so it always works.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        steps(col, state)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun steps(col: LinearLayout, state: Shell.State) {</span>
+<span class="a">+        col.header(&quot;1. Install Shizuku&quot;)</span>
+<span class="a">+        if (state == Shell.State.NOT_INSTALLED) {</span>
+<span class="a">+            col.button(&quot;Get Shizuku&quot;) {</span>
+<span class="a">+                val market = Intent(Intent.ACTION_VIEW, Uri.parse(&quot;market://details?id=&quot; + Shell.SHIZUKU_PACKAGE))</span>
+<span class="a">+                val web = Intent(Intent.ACTION_VIEW, Uri.parse(&quot;https://shizuku.rikka.app/download/&quot;))</span>
+<span class="a">+                if (!tryStart(market)) tryStart(web)</span>
+<span class="a">+            }</span>
+<span class="a">+        } else {</span>
+<span class="a">+            col.note(&quot;Done.&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        col.header(&quot;2. Turn on wireless debugging&quot;)</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;Settings &gt; About &gt; tap Build number seven times to unlock Developer &quot; +</span>
+<span class="a">+                &quot;options. In Developer options, switch on Wireless debugging. It &quot; +</span>
+<span class="a">+                &quot;needs Wi-Fi to be connected, but nothing leaves the device.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        col.button(&quot;Open Developer options&quot;) {</span>
+<span class="a">+            if (!tryStart(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))) {</span>
+<span class="a">+                tryStart(Intent(Settings.ACTION_DEVICE_INFO_SETTINGS))</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        col.header(&quot;3. Start Shizuku&quot;)</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;In Shizuku choose Pairing, then in Wireless debugging choose Pair &quot; +</span>
+<span class="a">+                &quot;device with pairing code and type the code into Shizuku&#x27;s &quot; +</span>
+<span class="a">+                &quot;notification. Back in Shizuku, press Start.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        if (state != Shell.State.NOT_INSTALLED) {</span>
+<span class="a">+            col.button(&quot;Open Shizuku&quot;) {</span>
+<span class="a">+                packageManager.getLaunchIntentForPackage(Shell.SHIZUKU_PACKAGE)?.let { tryStart(it) }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        col.header(&quot;4. Allow AssistKey&quot;)</span>
+<span class="a">+        when (state) {</span>
+<span class="a">+            Shell.State.NO_PERMISSION -&gt; col.button(&quot;Ask Shizuku for permission&quot;) {</span>
+<span class="a">+                Shell.requestPermission()</span>
+<span class="a">+            }</span>
+<span class="a">+            else -&gt; col.note(&quot;Once Shizuku is running, come back here.&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun tryStart(i: Intent): Boolean =</span>
+<span class="a">+        runCatching { startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); true }.getOrDefault(false)</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/res/xml/accessibility_service_config.xml b/app/src/main/res/xml/accessibility_service_config.xml
+index b9a3582..4799de5 100644
+--- a/app/src/main/res/xml/accessibility_service_config.xml
++++ b/app/src/main/res/xml/accessibility_service_config.xml
+<span class="h">@@ -8,7 +8,7 @@</span>
+ &lt;accessibility-service xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;
+     android:accessibilityEventTypes=&quot;typeWindowStateChanged&quot;
+     android:accessibilityFeedbackType=&quot;feedbackGeneric&quot;
+<span class="d">-    android:accessibilityFlags=&quot;flagDefault|flagRequestFilterKeyEvents|flagReportViewIds&quot;</span>
+<span class="a">+    android:accessibilityFlags=&quot;flagDefault|flagRequestFilterKeyEvents|flagReportViewIds|flagRetrieveInteractiveWindows&quot;</span>
+     android:canRequestFilterKeyEvents=&quot;true&quot;
+     android:canPerformGestures=&quot;true&quot;
+     android:canRetrieveWindowContent=&quot;true&quot;</pre>
+</div></body></html>
