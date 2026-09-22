@@ -14,6 +14,7 @@ Spenser Truex
 ### Home
 
 - [git: mirror of my public repos](git/index.html)
+- [youtube: both channels](youtube.html)
 - [ii/lchat setup for IRC (suckless irc client)](iilchat-setup-too-easy.html)
 - [sbm: suckless bookmarks](sbm.html)
 - [sl -- dependency language](SL--Dependency-Language.html)
