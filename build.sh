@@ -40,6 +40,11 @@ cat > "$TEMPLATE" << 'TMPL'
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>$title$ — Recently Written</title>
+  <meta property="og:type" content="article" />
+  <meta property="og:site_name" content="Recently Written" />
+  <meta property="og:title" content="$title$" />
+  <meta property="og:url" content="$url$" />
+  <meta name="twitter:card" content="summary" />
   <link rel="stylesheet" href="style.css" />
   <link rel="alternate" type="application/rss+xml" title="Recently Written" href="rss.xml" />
 </head>
@@ -90,6 +95,7 @@ render() {
         --to html5 \
         --template "$TEMPLATE" \
         --metadata title="$3" \
+        --metadata url="$SITE_URL/$(basename "$2")" \
         --output "$2" \
         "$1"
 }
