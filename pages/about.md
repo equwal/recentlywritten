@@ -1,5 +1,5 @@
 ---
-title: Projects
+title: About
 ---
 
 Spenser Truex. Free tarballs.
