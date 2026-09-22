@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-overlay 986cd86d - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-overlay</h1><span class="desc">Shows the lines of an .srt over any Android media player, in time with it. Tap a word to look it up.</span><p class="url">git clone https://github.com/equwal/subread-overlay</p><p><a href="../../subread-overlay/index.html">Log</a> | <a href="../../subread-overlay/files.html">Files</a> | <a href="../../subread-overlay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 986cd86dfdfc329e514efc4b73f08a52c44c195b
+equwal &lt;truex@equwal.com&gt;
+2026-09-21 22:11:35 -0700
+
+Take live lines from a caption app
+
+A caption app makes captions from live audio, for example speech
+recognition of the sound of a video. It now sends its lines to the panel
+with the method `line` of the content provider, and `end` when it stops.
+The panel shows the newest line in place of the subtitle file. A partial
+line gets an ellipsis, and the next line replaces it. A final line stays
+as the line before, when the user shows three lines.
+
+The panel holds the line while a word is selected, so that the lookup has
+time. The answer in the key `live` tells the caption app why the panel
+cannot show a line: no notification access, no overlay permission, or the
+panel is hidden. A panel that the user closed does not come back for a
+line. Live lines end ten minutes after the last one, for a caption app
+that dies without `end`.
+
+</pre><pre> README.md                                          | 35 ++++++++++
+ .../kotlin/space/subread/overlay/MediaListener.kt  | 74 ++++++++++++++++++++++
+ .../kotlin/space/subread/overlay/OverlayView.kt    |  3 +
+ .../kotlin/space/subread/overlay/PlayerProvider.kt | 24 ++++++-
+ .../kotlin/space/subread/overlay/core/LiveLines.kt | 38 +++++++++++
+ .../space/subread/overlay/core/LiveLinesTest.kt    | 59 +++++++++++++++++
+ 6 files changed, 232 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 8146070..e7b8f46 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -83,6 +83,41 @@ controls the player. The panel does not need to be on the screen.</span>
+ The [SubRead plugin for KOReader](https://github.com/equwal/subread.koplugin)
+ uses this to turn the pages with the audiobook.
+ 
+<span class="a">+## For caption apps</span>
+<span class="a">+</span>
+<span class="a">+An app that makes captions from live audio, for example speech recognition of</span>
+<span class="a">+the sound of a video, can show its lines on the panel. The user then taps the</span>
+<span class="a">+words and looks them up, the same as with a subtitle file. The app calls the</span>
+<span class="a">+same content provider:</span>
+<span class="a">+</span>
+<span class="a">+```kotlin</span>
+<span class="a">+val panel = Uri.parse(&quot;content://space.subread.overlay.player&quot;)</span>
+<span class="a">+contentResolver.call(panel, &quot;line&quot;, &quot;It was a dark&quot;, bundleOf(&quot;partial&quot; to true))</span>
+<span class="a">+contentResolver.call(panel, &quot;line&quot;, &quot;It was a dark night.&quot;, null)</span>
+<span class="a">+contentResolver.call(panel, &quot;end&quot;, null, null)</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+`line` shows the text. The extra `partial` is true while the sentence goes on:</span>
+<span class="a">+the panel adds `…` to the line, and the next line replaces it. A final line</span>
+<span class="a">+(no `partial`) stays as the line before, when the user shows three lines. `end`</span>
+<span class="a">+gives the panel back to the subtitle file. Without `end`, live lines end ten</span>
+<span class="a">+minutes after the last one.</span>
+<span class="a">+</span>
+<span class="a">+The answer is in the bundle key `live`: `ok`, or the reason the panel cannot</span>
+<span class="a">+show the line. `no_notification_access` and `no_overlay_permission`: the user</span>
+<span class="a">+must allow steps 1 and 2. `panel_hidden`: the user must press &quot;Show the</span>
+<span class="a">+subtitles&quot;, or closed the panel with `✕`. The panel does not come back on its</span>
+<span class="a">+own for a line, so that a close stays a close.</span>
+<span class="a">+</span>
+<span class="a">+While a word is selected, the panel holds the line, so that the lookup has</span>
+<span class="a">+time. The newest line comes when the selection goes.</span>
+<span class="a">+</span>
+<span class="a">+From a shell, for a test:</span>
+<span class="a">+</span>
+<span class="a">+```</span>
+<span class="a">+adb shell content call --uri content://space.subread.overlay.player --method line --arg &quot;It was a dark&quot; --extra partial:b:true</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+ ## Build
+ 
+ ```
+diff --git a/app/src/main/kotlin/space/subread/overlay/MediaListener.kt b/app/src/main/kotlin/space/subread/overlay/MediaListener.kt
+index 42914e7..252eb80 100644
+--- a/app/src/main/kotlin/space/subread/overlay/MediaListener.kt
++++ b/app/src/main/kotlin/space/subread/overlay/MediaListener.kt
+<span class="h">@@ -12,6 +12,7 @@ import android.view.Gravity</span>
+ import android.view.WindowManager
+ import android.widget.Toast
+ import space.subread.overlay.core.CueIndex
+<span class="a">+import space.subread.overlay.core.LiveLines</span>
+ import space.subread.overlay.core.Srt
+ import kotlin.concurrent.thread
+ 
+<span class="h">@@ -21,6 +22,9 @@ import kotlin.concurrent.thread</span>
+  * Android gives the media sessions of other apps only to a notification listener. This service
+  * reads no notification: it has no `onNotificationPosted`. The system keeps a listener running,
+  * so the panel needs no foreground service and no notification of its own.
+<span class="a">+ *</span>
+<span class="a">+ * A caption app can send lines through [PlayerProvider]. While it does, the panel shows its</span>
+<span class="a">+ * newest line and not the subtitle file.</span>
+  */
+ class MediaListener : NotificationListenerService(), OverlayView.Events {
+ 
+<span class="h">@@ -28,6 +32,14 @@ class MediaListener : NotificationListenerService(), OverlayView.Events {</span>
+     private lateinit var store: Store
+     private lateinit var follower: Follower
+     private var panel: OverlayView? = null
+<span class="a">+    private val live = LiveLines()</span>
+<span class="a">+</span>
+<span class="a">+    /** True while a caption app sends lines. The follower then does not draw on the panel. */</span>
+<span class="a">+    private var liveOn = false</span>
+<span class="a">+</span>
+<span class="a">+    /** True when a live line came while a word was selected: the panel shows it after the selection. */</span>
+<span class="a">+    private var livePending = false</span>
+<span class="a">+    private val liveTimeout = Runnable { endLive() }</span>
+     private val params = WindowManager.LayoutParams(
+         WindowManager.LayoutParams.MATCH_PARENT,
+         WindowManager.LayoutParams.WRAP_CONTENT,
+<span class="h">@@ -56,6 +68,7 @@ class MediaListener : NotificationListenerService(), OverlayView.Events {</span>
+         instance = null
+         sessions.removeOnActiveSessionsChangedListener(onSessions)
+         follower.stop()
+<span class="a">+        handler.removeCallbacks(liveTimeout)</span>
+         removePanel()
+     }
+ 
+<span class="h">@@ -106,8 +119,62 @@ class MediaListener : NotificationListenerService(), OverlayView.Events {</span>
+         panel = null
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * A line from a caption app, from any thread. Returns [PlayerProvider.LIVE_OK] when the panel</span>
+<span class="a">+     * shows it, else the reason: the panel needs the overlay permission, and the user must have</span>
+<span class="a">+     * it on the screen. A panel that the user closed does not come back for a line.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun liveLine(text: String, partial: Boolean): String {</span>
+<span class="a">+        if (!Settings.canDrawOverlays(this)) return PlayerProvider.ERROR_NO_OVERLAY</span>
+<span class="a">+        if (!store.shown) return PlayerProvider.ERROR_PANEL_HIDDEN</span>
+<span class="a">+        handler.post {</span>
+<span class="a">+            if (!liveOn) {</span>
+<span class="a">+                liveOn = true</span>
+<span class="a">+                live.clear()</span>
+<span class="a">+            }</span>
+<span class="a">+            live.line(text, partial)</span>
+<span class="a">+            // A caption app that dies without `end` must not leave its last line for ever.</span>
+<span class="a">+            handler.removeCallbacks(liveTimeout)</span>
+<span class="a">+            handler.postDelayed(liveTimeout, LIVE_TIMEOUT_MS)</span>
+<span class="a">+            if (panel == null) showPanel() else showLive()</span>
+<span class="a">+        }</span>
+<span class="a">+        return PlayerProvider.LIVE_OK</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The caption app stopped: the panel goes back to the subtitle file. From any thread. */</span>
+<span class="a">+    fun endLive(): String {</span>
+<span class="a">+        handler.post {</span>
+<span class="a">+            if (!liveOn) return@post</span>
+<span class="a">+            liveOn = false</span>
+<span class="a">+            livePending = false</span>
+<span class="a">+            live.clear()</span>
+<span class="a">+            handler.removeCallbacks(liveTimeout)</span>
+<span class="a">+            if (panel != null) reload()</span>
+<span class="a">+        }</span>
+<span class="a">+        return PlayerProvider.LIVE_OK</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Shows the newest live line. While a word is selected, the line waits: a line that changes</span>
+<span class="a">+     * under the finger would take the selection away before the lookup.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun showLive() {</span>
+<span class="a">+        val view = panel ?: return</span>
+<span class="a">+        if (view.selection != null) {</span>
+<span class="a">+            livePending = true</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        livePending = false</span>
+<span class="a">+        val now = if (live.partial) live.now + &quot; …&quot; else live.now</span>
+<span class="a">+        if (store.linesAround) view.showLine(now, live.before, null) else view.showLine(now)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     private fun show(at: Int, hasPlayer: Boolean, playing: Boolean) {
+         val view = panel ?: return
+<span class="a">+        if (liveOn) {</span>
+<span class="a">+            showLive()</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+         view.showPlaying(playing)
+         val cues = follower.index.cues
+         val line = cues.getOrNull(at)?.text
+<span class="h">@@ -134,6 +201,10 @@ class MediaListener : NotificationListenerService(), OverlayView.Events {</span>
+ 
+     override fun onClose() = hidePanel()
+ 
+<span class="a">+    override fun onSelectionCleared() {</span>
+<span class="a">+        if (liveOn &amp;&amp; livePending) showLive()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     /** The player pauses for the lookup. The play button of the panel starts it again. */
+     override fun onLookUp(word: String) {
+         follower.pause()
+<span class="h">@@ -167,6 +238,9 @@ class MediaListener : NotificationListenerService(), OverlayView.Events {</span>
+     }
+ 
+     companion object {
+<span class="a">+        /** Live lines end on their own this long after the last one. */</span>
+<span class="a">+        const val LIVE_TIMEOUT_MS = 10 * 60_000L</span>
+<span class="a">+</span>
+         /** The listener that the system runs now; null when the user did not allow it. */
+         @Volatile
+         var instance: MediaListener? = null
+diff --git a/app/src/main/kotlin/space/subread/overlay/OverlayView.kt b/app/src/main/kotlin/space/subread/overlay/OverlayView.kt
+index 5c8ec7c..540d811 100644
+--- a/app/src/main/kotlin/space/subread/overlay/OverlayView.kt
++++ b/app/src/main/kotlin/space/subread/overlay/OverlayView.kt
+<span class="h">@@ -43,6 +43,8 @@ class OverlayView(context: Context, private val events: Events) : LinearLayout(c</span>
+         fun onTogglePlay()
+         fun onShiftLines(steps: Int)
+         fun onNudge(ms: Long)
+<span class="a">+        /** The selection went away: a tap beside a word, or a new line. */</span>
+<span class="a">+        fun onSelectionCleared() {}</span>
+     }
+ 
+     /**
+<span class="h">@@ -172,6 +174,7 @@ class OverlayView(context: Context, private val events: Events) : LinearLayout(c</span>
+         }
+         text.text = marked
+         lookUpRow.visibility = if (range == null) View.GONE else View.VISIBLE
+<span class="a">+        if (range == null) events.onSelectionCleared()</span>
+     }
+ 
+     /** The index of the character under the point; null when the point is not on a character. */
+diff --git a/app/src/main/kotlin/space/subread/overlay/PlayerProvider.kt b/app/src/main/kotlin/space/subread/overlay/PlayerProvider.kt
+index 5769cfd..bc173d4 100644
+--- a/app/src/main/kotlin/space/subread/overlay/PlayerProvider.kt
++++ b/app/src/main/kotlin/space/subread/overlay/PlayerProvider.kt
+<span class="h">@@ -29,8 +29,14 @@ import space.subread.overlay.core.PlayClock</span>
+  * `call` takes the method `play`, `pause` or `seek` (the argument is the position in
+  * milliseconds), and returns the state line in the bundle key `state`.
+  *
+<span class="a">+ * A caption app, one that makes captions from live audio, sends its lines with the method `line`</span>
+<span class="a">+ * (the argument is the text, the extra `partial` is true while the sentence goes on) and `end`</span>
+<span class="a">+ * when it stops. The panel shows the newest line, in place of the subtitle file, until `end`.</span>
+<span class="a">+ * The bundle key `live` answers `ok`, or the reason the panel cannot show the line:</span>
+<span class="a">+ * `no_notification_access`, `no_overlay_permission` or `panel_hidden`.</span>
+<span class="a">+ *</span>
+  * The provider is open to each app. Each app can already send the media keys to the player, so
+<span class="d">- * this gives no new control over the device.</span>
+<span class="a">+ * this gives no new control over the device. A line is shown, not kept or sent.</span>
+  */
+ class PlayerProvider : ContentProvider() {
+ 
+<span class="h">@@ -48,6 +54,15 @@ class PlayerProvider : ContentProvider() {</span>
+     ): Cursor = MatrixCursor(arrayOf(COLUMN_STATE)).apply { addRow(arrayOf(stateLine())) }
+ 
+     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
+<span class="a">+        if (method == METHOD_LINE || method == METHOD_END) {</span>
+<span class="a">+            val listener = MediaListener.instance</span>
+<span class="a">+            val answer = when {</span>
+<span class="a">+                listener == null -&gt; ERROR_NO_ACCESS</span>
+<span class="a">+                method == METHOD_END -&gt; listener.endLive()</span>
+<span class="a">+                else -&gt; listener.liveLine(arg.orEmpty(), extras?.getBoolean(EXTRA_PARTIAL) == true)</span>
+<span class="a">+            }</span>
+<span class="a">+            return Bundle().apply { putString(KEY_LIVE, answer) }</span>
+<span class="a">+        }</span>
+         val player = runCatching { player() }.getOrNull()
+         val controls = player?.transportControls
+         when (method) {
+<span class="h">@@ -89,8 +104,15 @@ class PlayerProvider : ContentProvider() {</span>
+         const val METHOD_PLAY = &quot;play&quot;
+         const val METHOD_PAUSE = &quot;pause&quot;
+         const val METHOD_SEEK = &quot;seek&quot;
+<span class="a">+        const val METHOD_LINE = &quot;line&quot;</span>
+<span class="a">+        const val METHOD_END = &quot;end&quot;</span>
+<span class="a">+        const val EXTRA_PARTIAL = &quot;partial&quot;</span>
+<span class="a">+        const val KEY_LIVE = &quot;live&quot;</span>
+<span class="a">+        const val LIVE_OK = &quot;ok&quot;</span>
+         const val ERROR_NO_ACCESS = &quot;no_notification_access&quot;
+         const val ERROR_NO_PLAYER = &quot;no_player&quot;
+<span class="a">+        const val ERROR_NO_OVERLAY = &quot;no_overlay_permission&quot;</span>
+<span class="a">+        const val ERROR_PANEL_HIDDEN = &quot;panel_hidden&quot;</span>
+ 
+         /** The state line for a report of the player, at [nowMs] on the clock of the device. */
+         fun stateLine(state: PlaybackState, packageName: String, nowMs: Long): String {
+diff --git a/core/src/main/kotlin/space/subread/overlay/core/LiveLines.kt b/core/src/main/kotlin/space/subread/overlay/core/LiveLines.kt
+new file mode 100644
+index 0000000..669c619
+--- /dev/null
++++ b/core/src/main/kotlin/space/subread/overlay/core/LiveLines.kt
+<span class="h">@@ -0,0 +1,38 @@</span>
+<span class="a">+package space.subread.overlay.core</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The lines that a caption app sends while it makes captions from live audio.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A caption app sends a line many times while the speech goes on: a partial line, which grows.</span>
+<span class="a">+ * When the sentence is finished, it sends the line once more as a final line. The panel shows the</span>
+<span class="a">+ * newest line. Only a final line becomes the line before: a partial line goes away when the next</span>
+<span class="a">+ * line comes, because the final line of the same speech takes its place.</span>
+<span class="a">+ */</span>
+<span class="a">+class LiveLines {</span>
+<span class="a">+</span>
+<span class="a">+    /** The newest line. Empty before the first line. */</span>
+<span class="a">+    var now: String = &quot;&quot;</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    /** True when [now] is a partial line: the speech that it comes from goes on. */</span>
+<span class="a">+    var partial: Boolean = false</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    /** The last final line before [now]; null when there is none. */</span>
+<span class="a">+    var before: String? = null</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    /** A new line from the caption app. */</span>
+<span class="a">+    fun line(text: String, partial: Boolean) {</span>
+<span class="a">+        if (!this.partial &amp;&amp; now.isNotEmpty()) before = now</span>
+<span class="a">+        now = text</span>
+<span class="a">+        this.partial = partial</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Forgets each line: the caption app stopped. */</span>
+<span class="a">+    fun clear() {</span>
+<span class="a">+        now = &quot;&quot;</span>
+<span class="a">+        partial = false</span>
+<span class="a">+        before = null</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/core/src/test/kotlin/space/subread/overlay/core/LiveLinesTest.kt b/core/src/test/kotlin/space/subread/overlay/core/LiveLinesTest.kt
+new file mode 100644
+index 0000000..f503506
+--- /dev/null
++++ b/core/src/test/kotlin/space/subread/overlay/core/LiveLinesTest.kt
+<span class="h">@@ -0,0 +1,59 @@</span>
+<span class="a">+package space.subread.overlay.core</span>
+<span class="a">+</span>
+<span class="a">+import io.kotest.property.Arb</span>
+<span class="a">+import io.kotest.property.arbitrary.boolean</span>
+<span class="a">+import io.kotest.property.arbitrary.list</span>
+<span class="a">+import io.kotest.property.arbitrary.pair</span>
+<span class="a">+import io.kotest.property.arbitrary.stringPattern</span>
+<span class="a">+import io.kotest.property.checkAll</span>
+<span class="a">+import kotlinx.coroutines.runBlocking</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertFalse</span>
+<span class="a">+import org.junit.Assert.assertNull</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+</span>
+<span class="a">+class LiveLinesTest {</span>
+<span class="a">+</span>
+<span class="a">+    /** Lines as a caption app sends them: the text, and true for a partial line. */</span>
+<span class="a">+    private val feeds = Arb.list(Arb.pair(Arb.stringPattern(&quot;[a-zあ-ん ]{1,12}&quot;), Arb.boolean()), 0..40)</span>
+<span class="a">+</span>
+<span class="a">+    /** The line before is the last final line that came before the newest line. */</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun theLineBeforeIsTheLastFinalLineBeforeTheNewestLine(): Unit = runBlocking {</span>
+<span class="a">+        checkAll(feeds) { feed -&gt;</span>
+<span class="a">+            val lines = LiveLines()</span>
+<span class="a">+            feed.forEach { (text, partial) -&gt; lines.line(text, partial) }</span>
+<span class="a">+            val last = feed.lastOrNull()</span>
+<span class="a">+            assertEquals(last?.first.orEmpty(), lines.now)</span>
+<span class="a">+            assertEquals(last?.second == true, lines.partial)</span>
+<span class="a">+            val finalsBefore = feed.dropLast(1).filter { !it.second }</span>
+<span class="a">+            assertEquals(finalsBefore.lastOrNull()?.first, lines.before)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aPartialLineGrowsAndThenItsFinalLineTakesItsPlace() {</span>
+<span class="a">+        val lines = LiveLines()</span>
+<span class="a">+        lines.line(&quot;It was&quot;, partial = true)</span>
+<span class="a">+        lines.line(&quot;It was a dark&quot;, partial = true)</span>
+<span class="a">+        assertEquals(&quot;It was a dark&quot;, lines.now)</span>
+<span class="a">+        assertNull(lines.before)</span>
+<span class="a">+        lines.line(&quot;It was a dark night.&quot;, partial = false)</span>
+<span class="a">+        assertEquals(&quot;It was a dark night.&quot;, lines.now)</span>
+<span class="a">+        assertFalse(lines.partial)</span>
+<span class="a">+        assertNull(&quot;a partial line is not a line before&quot;, lines.before)</span>
+<span class="a">+        lines.line(&quot;The rain&quot;, partial = true)</span>
+<span class="a">+        assertEquals(&quot;It was a dark night.&quot;, lines.before)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun clearForgetsEachLine() {</span>
+<span class="a">+        val lines = LiveLines()</span>
+<span class="a">+        lines.line(&quot;one&quot;, partial = false)</span>
+<span class="a">+        lines.line(&quot;two&quot;, partial = true)</span>
+<span class="a">+        lines.clear()</span>
+<span class="a">+        assertEquals(&quot;&quot;, lines.now)</span>
+<span class="a">+        assertFalse(lines.partial)</span>
+<span class="a">+        assertNull(lines.before)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span></pre>
+</div></body></html>

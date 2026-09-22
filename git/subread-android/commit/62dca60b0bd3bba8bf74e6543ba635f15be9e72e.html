@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android 62dca60b - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../subread-android/index.html">Log</a> | <a href="../../subread-android/files.html">Files</a> | <a href="../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 62dca60b0bd3bba8bf74e6543ba635f15be9e72e
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 22:48:03 -0700
+
+Read epub pages as XHTML; add an on-device job test
+
+A test on a real device found subtitles with text from the wrong passage.
+The speech model heard the correct words. The epub reader lost two thirds
+of the book: the HTML parser takes a self-closing &lt;title/&gt; as an open
+title and reads the start of a large page as its text. BookText now reads
+each page as XML first. The HTML parser stays as the fallback.
+
+OnDeviceJobTest runs the full job on hardware without the screen: decode,
+transcribe, align, write the .srt, then a cached second run. The media is
+local only. ExcerptTest reproduces the device failure on the JVM.
+
+</pre><pre> .gitignore                                         |  3 +
+ app/build.gradle.kts                               |  3 +
+ .../kotlin/space/subread/app/OnDeviceJobTest.kt    | 79 ++++++++++++++++++++++
+ .../src/main/kotlin/space/subread/core/BookText.kt | 13 ++--
+ .../src/test/kotlin/space/subread/core/BookTest.kt | 17 +++++
+ .../test/kotlin/space/subread/core/ExcerptTest.kt  | 41 +++++++++++
+ gradle/libs.versions.toml                          |  4 ++
+ 7 files changed, 156 insertions(+), 4 deletions(-)
+</pre><pre>diff --git a/.gitignore b/.gitignore
+index ee37da8..607f8d1 100644
+--- a/.gitignore
++++ b/.gitignore
+<span class="h">@@ -12,5 +12,8 @@ captures/</span>
+ # that generated them. Tests skip this directory when it is missing.
+ core/src/test/resources/golden-local/
+ 
+<span class="a">+# On-device test media. Bring your own pair; the test skips without it.</span>
+<span class="a">+app/src/androidTest/assets/local/</span>
+<span class="a">+</span>
+ # Downloaded at build time, never committed.
+ app/src/main/assets/models/
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index fb0509e..c3fb81b 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+<span class="h">@@ -22,6 +22,7 @@ android {</span>
+         targetSdk = 36
+         versionCode = (providers.gradleProperty(&quot;versionCode&quot;).orNull ?: &quot;1&quot;).toInt()
+         versionName = providers.gradleProperty(&quot;versionName&quot;).orNull ?: &quot;0.1.0&quot;
+<span class="a">+        testInstrumentationRunner = &quot;androidx.test.runner.AndroidJUnitRunner&quot;</span>
+ 
+         // Every phone worth transcribing on is 64-bit ARM; the speech library
+         // is built for ARMv8.2 specifically (see src/main/cpp/CMakeLists.txt).
+<span class="h">@@ -82,4 +83,6 @@ dependencies {</span>
+     implementation(libs.androidx.lifecycle.runtime.ktx)
+     implementation(libs.androidx.lifecycle.runtime.compose)
+     implementation(libs.kotlinx.coroutines.android)
+<span class="a">+    androidTestImplementation(libs.androidx.test.runner)</span>
+<span class="a">+    androidTestImplementation(libs.androidx.test.junit)</span>
+ }
+diff --git a/app/src/androidTest/kotlin/space/subread/app/OnDeviceJobTest.kt b/app/src/androidTest/kotlin/space/subread/app/OnDeviceJobTest.kt
+new file mode 100644
+index 0000000..23f11bf
+--- /dev/null
++++ b/app/src/androidTest/kotlin/space/subread/app/OnDeviceJobTest.kt
+<span class="h">@@ -0,0 +1,79 @@</span>
+<span class="a">+package space.subread.app</span>
+<span class="a">+</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import androidx.test.ext.junit.runners.AndroidJUnit4</span>
+<span class="a">+import androidx.test.platform.app.InstrumentationRegistry</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertNotNull</span>
+<span class="a">+import org.junit.Assert.assertTrue</span>
+<span class="a">+import org.junit.Assume.assumeTrue</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+import org.junit.runner.RunWith</span>
+<span class="a">+import space.subread.app.job.Job</span>
+<span class="a">+import space.subread.app.job.Phase</span>
+<span class="a">+import space.subread.app.job.TranscriptStore</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The whole job on real hardware: decode, transcribe with the native speech</span>
+<span class="a">+ * model, align, write the subtitles. No screen is needed.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The media is not in the repository. Put an audio file and its book in</span>
+<span class="a">+ * app/src/androidTest/assets/local/ (gitignored); the test skips without them.</span>
+<span class="a">+ */</span>
+<span class="a">+@RunWith(AndroidJUnit4::class)</span>
+<span class="a">+class OnDeviceJobTest {</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun anAudiobookAndItsBookBecomeSubtitles() {</span>
+<span class="a">+        val instrumentation = InstrumentationRegistry.getInstrumentation()</span>
+<span class="a">+        val names = instrumentation.context.assets.list(&quot;local&quot;).orEmpty()</span>
+<span class="a">+        val audioName = names.firstOrNull { it.endsWith(&quot;.mp3&quot;) || it.endsWith(&quot;.m4b&quot;) || it.endsWith(&quot;.m4a&quot;) }</span>
+<span class="a">+        val bookName = names.firstOrNull { it.endsWith(&quot;.epub&quot;) || it.endsWith(&quot;.txt&quot;) }</span>
+<span class="a">+        assumeTrue(&quot;no local test media&quot;, audioName != null &amp;&amp; bookName != null)</span>
+<span class="a">+</span>
+<span class="a">+        val app = instrumentation.targetContext</span>
+<span class="a">+        fun stage(name: String): Uri {</span>
+<span class="a">+            val out = File(app.cacheDir, name)</span>
+<span class="a">+            instrumentation.context.assets.open(&quot;local/$name&quot;).use { src -&gt; out.outputStream().use { src.copyTo(it) } }</span>
+<span class="a">+            return Uri.fromFile(out)</span>
+<span class="a">+        }</span>
+<span class="a">+        val audio = stage(audioName!!)</span>
+<span class="a">+        val book = stage(bookName!!)</span>
+<span class="a">+        TranscriptStore.forAudio(app, audio).reset()   // measure a cold run, not a cached one</span>
+<span class="a">+</span>
+<span class="a">+        val started = System.nanoTime()</span>
+<span class="a">+        Job.run(app, audio, book, &quot;auto&quot;)</span>
+<span class="a">+        val seconds = (System.nanoTime() - started) / 1e9</span>
+<span class="a">+</span>
+<span class="a">+        val status = Job.status.value</span>
+<span class="a">+        Log.i(&quot;SubReadTest&quot;, &quot;phase=${status.phase} detail=${status.detail} cues=${status.cues} &quot; +</span>
+<span class="a">+            &quot;match=${status.matchRate} dropped=${status.paragraphsDropped} seconds=%.1f&quot;.format(seconds))</span>
+<span class="a">+        assertEquals(status.detail, Phase.DONE, status.phase)</span>
+<span class="a">+        assertNotNull(status.srt)</span>
+<span class="a">+        val srt = status.srt!!.readText()</span>
+<span class="a">+        Log.i(&quot;SubReadTest&quot;, &quot;language=${TranscriptStore.forAudio(app, audio).language} srt head:\n&quot; +</span>
+<span class="a">+            srt.lineSequence().take(12).joinToString(&quot;\n&quot;))</span>
+<span class="a">+        // Side by side: what the model heard, and the book text given to that cue.</span>
+<span class="a">+        val heard = TranscriptStore.forAudio(app, audio).segments()</span>
+<span class="a">+        val cues = srt.trim().split(&quot;\n\n&quot;).map { it.lines().getOrElse(2) { &quot;&quot; } }</span>
+<span class="a">+        heard.forEach { s -&gt;</span>
+<span class="a">+            Log.i(&quot;SubReadSeg&quot;, org.json.JSONObject().put(&quot;text&quot;, s.text).put(&quot;start&quot;, s.start).put(&quot;end&quot;, s.end).toString())</span>
+<span class="a">+        }</span>
+<span class="a">+        heard.take(14).forEachIndexed { i, s -&gt;</span>
+<span class="a">+            Log.i(&quot;SubReadTest&quot;, &quot;%6.2f-%6.2f heard: %s | book: %s&quot;.format(s.start, s.end, s.text, cues.getOrElse(i) { &quot;&quot; }))</span>
+<span class="a">+        }</span>
+<span class="a">+        assertTrue(&quot;only ${status.cues} cues&quot;, status.cues &gt;= 5)</span>
+<span class="a">+        assertTrue(&quot;match rate ${status.matchRate}&quot;, (status.matchRate ?: 0.0) &gt; 0.8)</span>
+<span class="a">+        assertTrue(srt.startsWith(&quot;1\n00:00:&quot;))</span>
+<span class="a">+</span>
+<span class="a">+        // A second run reuses the saved transcript: seconds, not minutes.</span>
+<span class="a">+        val again = System.nanoTime()</span>
+<span class="a">+        Job.run(app, audio, book, &quot;auto&quot;)</span>
+<span class="a">+        val cached = (System.nanoTime() - again) / 1e9</span>
+<span class="a">+        Log.i(&quot;SubReadTest&quot;, &quot;cached rerun seconds=%.1f&quot;.format(cached))</span>
+<span class="a">+        assertEquals(Phase.DONE, Job.status.value.phase)</span>
+<span class="a">+        assertTrue(&quot;cached rerun took ${cached}s&quot;, cached &lt; seconds / 2 + 5)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/core/src/main/kotlin/space/subread/core/BookText.kt b/core/src/main/kotlin/space/subread/core/BookText.kt
+index dd6ca4a..f8a89df 100644
+--- a/core/src/main/kotlin/space/subread/core/BookText.kt
++++ b/core/src/main/kotlin/space/subread/core/BookText.kt
+<span class="h">@@ -73,15 +73,20 @@ object BookText {</span>
+     }
+ 
+     private fun page(bytes: ByteArray): List&lt;String&gt; {
+<span class="d">-        val doc = Jsoup.parse(String(bytes, Charsets.UTF_8))</span>
+<span class="a">+        // An epub page is XHTML, so read it as XML first. To an HTML parser a</span>
+<span class="a">+        // self-closing &lt;title/&gt; never closes, and it takes the whole page as the</span>
+<span class="a">+        // title text. The HTML parser stays as the fallback for malformed pages.</span>
+<span class="a">+        val source = String(bytes, Charsets.UTF_8)</span>
+<span class="a">+        val xml = Jsoup.parse(source, &quot;&quot;, Parser.xmlParser())</span>
+<span class="a">+        val doc = if (xml.selectFirst(&quot;body&quot;) != null) xml else Jsoup.parse(source)</span>
+         // Furigana would otherwise be read twice: once as kanji, once as kana.
+         doc.select(&quot;rt, rp&quot;).remove()
+<span class="d">-        val body = doc.body()</span>
+<span class="a">+        val body = doc.selectFirst(&quot;body&quot;) ?: doc</span>
+         val blocks = body.select(BLOCKS)
+             // A quote holding paragraphs would yield its text twice; keep the leaves.
+             .filter { it.select(BLOCKS).size == 1 }
+<span class="d">-        val source = if (blocks.isEmpty()) listOf(body) else blocks</span>
+<span class="d">-        return source.map { it.text().trim() }.filter { it.isNotEmpty() }</span>
+<span class="a">+        val parts = if (blocks.isEmpty()) listOf(body) else blocks</span>
+<span class="a">+        return parts.map { it.text().trim() }.filter { it.isNotEmpty() }</span>
+     }
+ 
+     // ---------------------------------------------------------------- aozora
+diff --git a/core/src/test/kotlin/space/subread/core/BookTest.kt b/core/src/test/kotlin/space/subread/core/BookTest.kt
+index b0a242e..ae75837 100644
+--- a/core/src/test/kotlin/space/subread/core/BookTest.kt
++++ b/core/src/test/kotlin/space/subread/core/BookTest.kt
+<span class="h">@@ -129,6 +129,23 @@ class BookTest {</span>
+         )
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Found on a real device: two thirds of a real epub disappeared, and the</span>
+<span class="a">+     * subtitles got text from the wrong passage. An HTML parser takes a</span>
+<span class="a">+     * self-closing &lt;title/&gt; as an open title, reads the start of the page as</span>
+<span class="a">+     * its text, and the first paragraphs are lost. The page must be large for</span>
+<span class="a">+     * the defect to show: a small page parses correctly.</span>
+<span class="a">+     */</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aSelfClosingTitleDoesNotSwallowTheStartOfALargePage() {</span>
+<span class="a">+        val paragraphs = (1..120).map { n -&gt; &quot;Paragraph $n. &quot; + &quot;word &quot;.repeat(40).trim() }</span>
+<span class="a">+        val bytes = epub(&quot;a.xhtml&quot; to</span>
+<span class="a">+            &quot;&lt;?xml version=&#x27;1.0&#x27; encoding=&#x27;UTF-8&#x27;?&gt;&lt;html xmlns=&#x27;http://www.w3.org/1999/xhtml&#x27;&gt;&lt;head&gt;&lt;title/&gt;&quot; +</span>
+<span class="a">+            &quot;&lt;link rel=&#x27;stylesheet&#x27; href=&#x27;s.css&#x27; type=&#x27;text/css&#x27;/&gt;&lt;/head&gt;&lt;body&gt;&lt;span id=&#x27;x&#x27;&gt;&quot; +</span>
+<span class="a">+            paragraphs.joinToString(&quot;&quot;) { &quot;&lt;p class=&#x27;p1&#x27;&gt;$it&lt;/p&gt;&quot; } + &quot;&lt;/span&gt;&lt;/body&gt;&lt;/html&gt;&quot;)</span>
+<span class="a">+        assertEquals(paragraphs, BookText.read(ByteArrayInputStream(bytes), &quot;x.epub&quot;))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     @Test
+     fun epubWithoutAUsablePackageFileStillYieldsItsText() {
+         val bytes = epub(&quot;b.html&quot; to page(&quot;&lt;p&gt;two&lt;/p&gt;&quot;), &quot;a.html&quot; to page(&quot;&lt;p&gt;one&lt;/p&gt;&quot;))
+diff --git a/core/src/test/kotlin/space/subread/core/ExcerptTest.kt b/core/src/test/kotlin/space/subread/core/ExcerptTest.kt
+new file mode 100644
+index 0000000..6b39e20
+--- /dev/null
++++ b/core/src/test/kotlin/space/subread/core/ExcerptTest.kt
+<span class="h">@@ -0,0 +1,41 @@</span>
+<span class="a">+package space.subread.core</span>
+<span class="a">+</span>
+<span class="a">+import kotlinx.serialization.json.Json</span>
+<span class="a">+import kotlinx.serialization.json.double</span>
+<span class="a">+import kotlinx.serialization.json.jsonArray</span>
+<span class="a">+import kotlinx.serialization.json.jsonObject</span>
+<span class="a">+import kotlinx.serialization.json.jsonPrimitive</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertTrue</span>
+<span class="a">+import org.junit.Assume.assumeTrue</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * A short excerpt from the middle of a novel, against the whole epub. This is</span>
+<span class="a">+ * the case that went wrong on a real device. Local only: the book is in</span>
+<span class="a">+ * copyright. Needs golden-local/excerpt/ with the epub and the device transcript.</span>
+<span class="a">+ */</span>
+<span class="a">+class ExcerptTest {</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun anExcerptFindsItsPlaceInTheWholeBook() {</span>
+<span class="a">+        val dir = javaClass.classLoader.getResource(&quot;golden-local/excerpt&quot;)?.let { File(it.toURI()) }</span>
+<span class="a">+        assumeTrue(&quot;no local excerpt fixture&quot;, dir != null &amp;&amp; File(dir, &quot;moskva.epub&quot;).exists())</span>
+<span class="a">+        val json = Json.parseToJsonElement(File(dir, &quot;moskva_device.json&quot;).readText()).jsonObject</span>
+<span class="a">+        val transcript = json.getValue(&quot;transcript&quot;).jsonArray.map {</span>
+<span class="a">+            val o = it.jsonObject</span>
+<span class="a">+            TranscriptSegment(o.getValue(&quot;text&quot;).jsonPrimitive.content,</span>
+<span class="a">+                o.getValue(&quot;start&quot;).jsonPrimitive.double, o.getValue(&quot;end&quot;).jsonPrimitive.double)</span>
+<span class="a">+        }</span>
+<span class="a">+        val reference = json.getValue(&quot;paragraphs&quot;).jsonArray.map { it.jsonPrimitive.content }</span>
+<span class="a">+</span>
+<span class="a">+        val paragraphs = BookText.read(File(dir, &quot;moskva.epub&quot;))</span>
+<span class="a">+        println(&quot;paragraphs: ours ${paragraphs.size}, reference reader ${reference.size}; longest ours ${paragraphs.maxOf { it.length }}&quot;)</span>
+<span class="a">+        assertEquals(reference.size, paragraphs.size)</span>
+<span class="a">+</span>
+<span class="a">+        val result = BookAligner.align(transcript, paragraphs, Language.of(&quot;ru&quot;))</span>
+<span class="a">+        result.cues.take(4).forEach { println(it.text) }</span>
+<span class="a">+        assertTrue(result.cues[0].text, result.cues[0].text.startsWith(&quot;Чемоданчик я все-таки взял с собой&quot;))</span>
+<span class="a">+        assertEquals(&quot;в ожидании заказа.&quot;, result.cues[1].text)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index 3c0f364..3019534 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+<span class="h">@@ -9,6 +9,8 @@ kotlinxCoroutines = &quot;1.10.2&quot;</span>
+ kotlinxSerializationJson = &quot;1.9.0&quot;
+ jsoup = &quot;1.21.2&quot;
+ junit = &quot;4.13.2&quot;
+<span class="a">+androidxTestRunner = &quot;1.7.0&quot;</span>
+<span class="a">+androidxTestJunit = &quot;1.3.0&quot;</span>
+ 
+ [libraries]
+ androidx-core-ktx = { group = &quot;androidx.core&quot;, name = &quot;core-ktx&quot;, version.ref = &quot;coreKtx&quot; }
+<span class="h">@@ -25,6 +27,8 @@ kotlinx-coroutines-android = { group = &quot;org.jetbrains.kotlinx&quot;, name = &quot;kotlinx-</span>
+ kotlinx-serialization-json = { group = &quot;org.jetbrains.kotlinx&quot;, name = &quot;kotlinx-serialization-json&quot;, version.ref = &quot;kotlinxSerializationJson&quot; }
+ jsoup = { group = &quot;org.jsoup&quot;, name = &quot;jsoup&quot;, version.ref = &quot;jsoup&quot; }
+ junit = { group = &quot;junit&quot;, name = &quot;junit&quot;, version.ref = &quot;junit&quot; }
+<span class="a">+androidx-test-runner = { group = &quot;androidx.test&quot;, name = &quot;runner&quot;, version.ref = &quot;androidxTestRunner&quot; }</span>
+<span class="a">+androidx-test-junit = { group = &quot;androidx.test.ext&quot;, name = &quot;junit&quot;, version.ref = &quot;androidxTestJunit&quot; }</span>
+ 
+ [plugins]
+ android-application = { id = &quot;com.android.application&quot;, version.ref = &quot;agp&quot; }</pre>
+</div></body></html>

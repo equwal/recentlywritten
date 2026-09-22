@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android/tools/make_golden.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../../subread-android/index.html">Log</a> | <a href="../../../subread-android/files.html">Files</a> | <a href="../../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tools/make_golden.py (8521 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Generate golden fixtures for the Kotlin aligner from the reference Python one.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> The Android app ports subplz&#x27;s alignment (ats.align + subplz.align.shift_align)
+<a id="l4" href="#l4">4</a> to Kotlin. This runs the *original* on real Whisper-tiny transcripts and records
+<a id="l5" href="#l5">5</a> every intermediate stage, so each ported function can be checked against the
+<a id="l6" href="#l6">6</a> real thing with identical inputs - not just the end result.
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> Needs the subplz environment (ats, Bio, rapidfuzz):
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a>     SubPlz/venv311/Scripts/python tools/make_golden.py --cache &lt;dir&gt; --book &lt;name&gt; ...
+<a id="l11" href="#l11">11</a> 
+<a id="l12" href="#l12">12</a> Fixtures committed to the repo use public-domain text only (Aozora Bunko).
+<a id="l13" href="#l13">13</a> Anything else goes to golden-local/, which is gitignored; tests skip it when
+<a id="l14" href="#l14">14</a> it is absent.
+<a id="l15" href="#l15">15</a> &quot;&quot;&quot;
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> from __future__ import annotations
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> import argparse
+<a id="l20" href="#l20">20</a> import ast
+<a id="l21" href="#l21">21</a> import json
+<a id="l22" href="#l22">22</a> import re
+<a id="l23" href="#l23">23</a> import sys
+<a id="l24" href="#l24">24</a> import zipfile
+<a id="l25" href="#l25">25</a> from pathlib import Path
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> from ats import align as ats_align
+<a id="l28" href="#l28">28</a> from ats.lang import get_lang
+<a id="l29" href="#l29">29</a> from ats.main import to_subs
+<a id="l30" href="#l30">30</a> from Bio import Align
+<a id="l31" href="#l31">31</a> from subplz.align import shift_align
+<a id="l32" href="#l32">32</a> from subplz.cli import END_PUNC, START_PUNC
+<a id="l33" href="#l33">33</a> 
+<a id="l34" href="#l34">34</a> OTHER_PUNC = &quot;＊　,，、…&quot;
+<a id="l35" href="#l35">35</a> PREPEND = START_PUNC
+<a id="l36" href="#l36">36</a> APPEND = END_PUNC + OTHER_PUNC
+<a id="l37" href="#l37">37</a> NOPEND = (
+<a id="l38" href="#l38">38</a>     &quot;うぁぃぅぇぉっゃゅょゎゕゖァィゥェォヵㇰヶㇱㇲッㇳㇴㇵㇶㇷㇷ゚ㇸㇹㇺャュョㇻㇼㇽㇾㇿヮ…　\x20&quot;
+<a id="l39" href="#l39">39</a> )
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> def plain(x):
+<a id="l43" href="#l43">43</a>     &quot;&quot;&quot;Deep copy as plain JSON types. align_sub leaves numpy ints in its lists.&quot;&quot;&quot;
+<a id="l44" href="#l44">44</a>     return json.loads(json.dumps(x, default=int))
+<a id="l45" href="#l45">45</a> 
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a> class Para:
+<a id="l48" href="#l48">48</a>     &quot;&quot;&quot;Duck-types ats.main.Paragraph: to_subs only ever calls .text().&quot;&quot;&quot;
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a>     def __init__(self, s: str):
+<a id="l51" href="#l51">51</a>         self._s = s
+<a id="l52" href="#l52">52</a> 
+<a id="l53" href="#l53">53</a>     def text(self) -&gt; str:
+<a id="l54" href="#l54">54</a>         return self._s
+<a id="l55" href="#l55">55</a> 
+<a id="l56" href="#l56">56</a> 
+<a id="l57" href="#l57">57</a> def load_transcript(path: Path) -&gt; dict:
+<a id="l58" href="#l58">58</a>     return ast.literal_eval(path.read_text(encoding=&quot;utf-8&quot;))
+<a id="l59" href="#l59">59</a> 
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> def aozora_paragraphs(zip_path: Path) -&gt; list[str]:
+<a id="l62" href="#l62">62</a>     &quot;&quot;&quot;Body paragraphs of an Aozora Bunko ruby text, markup removed.&quot;&quot;&quot;
+<a id="l63" href="#l63">63</a>     with zipfile.ZipFile(zip_path) as z:
+<a id="l64" href="#l64">64</a>         name = next(n for n in z.namelist() if n.lower().endswith(&quot;.txt&quot;))
+<a id="l65" href="#l65">65</a>         raw = z.read(name).decode(&quot;shift_jis&quot;, errors=&quot;replace&quot;)
+<a id="l66" href="#l66">66</a>     lines = raw.replace(&quot;\r\n&quot;, &quot;\n&quot;).split(&quot;\n&quot;)
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a>     # Header: title block, then a legend fenced by two dashed rules.
+<a id="l69" href="#l69">69</a>     rules = [i for i, l in enumerate(lines) if l.startswith(&quot;-----&quot;)]
+<a id="l70" href="#l70">70</a>     body = lines[rules[1] + 1 :] if len(rules) &gt;= 2 else lines
+<a id="l71" href="#l71">71</a>     # Footer: colophon.
+<a id="l72" href="#l72">72</a>     for i, l in enumerate(body):
+<a id="l73" href="#l73">73</a>         if l.startswith(&quot;底本：&quot;):
+<a id="l74" href="#l74">74</a>             body = body[:i]
+<a id="l75" href="#l75">75</a>             break
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a>     out = []
+<a id="l78" href="#l78">78</a>     for l in body:
+<a id="l79" href="#l79">79</a>         l = re.sub(r&quot;［＃[^］]*］&quot;, &quot;&quot;, l)      # editorial annotations
+<a id="l80" href="#l80">80</a>         l = re.sub(r&quot;《[^》]*》&quot;, &quot;&quot;, l)        # ruby readings
+<a id="l81" href="#l81">81</a>         l = l.replace(&quot;｜&quot;, &quot;&quot;).strip()         # ruby base marker
+<a id="l82" href="#l82">82</a>         if l:
+<a id="l83" href="#l83">83</a>             out.append(l)
+<a id="l84" href="#l84">84</a>     return out
+<a id="l85" href="#l85">85</a> 
+<a id="l86" href="#l86">86</a> 
+<a id="l87" href="#l87">87</a> def clean_len(lang, s: str) -&gt; int:
+<a id="l88" href="#l88">88</a>     return len(lang.clean(s))
+<a id="l89" href="#l89">89</a> 
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a> def run_case(name: str, language: str, segments: list[dict], paragraphs: list[str]) -&gt; dict:
+<a id="l92" href="#l92">92</a>     lang = get_lang(language)  # same call do_batch makes: no punctuation args
+<a id="l93" href="#l93">93</a>     transcript = [s[&quot;text&quot;] for s in segments]
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a>     # Re-run the aligner by hand as well as through ats.align.align, to capture
+<a id="l96" href="#l96">96</a>     # the raw coordinates and the pre-heuristic segments.
+<a id="l97" href="#l97">97</a>     aligner = Align.PairwiseAligner(
+<a id="l98" href="#l98">98</a>         mode=&quot;global&quot;, match_score=1, open_gap_score=-0.8,
+<a id="l99" href="#l99">99</a>         mismatch_score=-0.6, extend_gap_score=-0.5,
+<a id="l100" href="#l100">100</a>     )
+<a id="l101" href="#l101">101</a>     t_clean = [lang.clean(i) for i in transcript]
+<a id="l102" href="#l102">102</a>     p_clean = [lang.clean(i) for i in paragraphs]
+<a id="l103" href="#l103">103</a>     best = aligner.align(&quot;&quot;.join(p_clean), &quot;&quot;.join(t_clean))[0]
+<a id="l104" href="#l104">104</a>     coords = best.coordinates
+<a id="l105" href="#l105">105</a>     # align_sub writes into this array (it keeps a numpy view of a column and
+<a id="l106" href="#l106">106</a>     # assigns through it), so take the copy that gets recorded first.
+<a id="l107" href="#l107">107</a>     coords_in = [[int(v) for v in row] for row in coords]
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a>     raw_segments = ats_align.align_sub(coords, p_clean, t_clean)
+<a id="l110" href="#l110">110</a>     after_sub = plain(raw_segments)
+<a id="l111" href="#l111">111</a>     ats_align.fix(lang, paragraphs, p_clean, raw_segments)
+<a id="l112" href="#l112">112</a>     after_fix = plain(raw_segments)
+<a id="l113" href="#l113">113</a>     ats_align.fix_punc(paragraphs, raw_segments, set(PREPEND), set(APPEND), set(NOPEND))
+<a id="l114" href="#l114">114</a>     after_punc = plain(raw_segments)
+<a id="l115" href="#l115">115</a> 
+<a id="l116" href="#l116">116</a>     # The public entry point must agree with the hand-run stages.
+<a id="l117" href="#l117">117</a>     alignment, _ = ats_align.align(
+<a id="l118" href="#l118">118</a>         None, lang, transcript, paragraphs, [], set(PREPEND), set(APPEND), set(NOPEND)
+<a id="l119" href="#l119">119</a>     )
+<a id="l120" href="#l120">120</a>     assert plain(alignment) == after_punc, &quot;stage capture drifted&quot;
+<a id="l121" href="#l121">121</a> 
+<a id="l122" href="#l122">122</a>     subs = to_subs([Para(p) for p in paragraphs], segments, alignment, 0, None)
+<a id="l123" href="#l123">123</a>     cues_raw = [{&quot;text&quot;: s.text, &quot;start&quot;: s.start, &quot;end&quot;: s.end} for s in subs]
+<a id="l124" href="#l124">124</a>     shifted = shift_align(subs)
+<a id="l125" href="#l125">125</a>     cues = [{&quot;text&quot;: s.text, &quot;start&quot;: s.start, &quot;end&quot;: s.end} for s in shifted]
+<a id="l126" href="#l126">126</a> 
+<a id="l127" href="#l127">127</a>     matched = sum(1 for c in cues_raw if not c[&quot;text&quot;].startswith(&quot;＊&quot;))
+<a id="l128" href="#l128">128</a>     print(f&quot;{name}: {len(segments)} segs, {len(paragraphs)} paras, &quot;
+<a id="l129" href="#l129">129</a>           f&quot;{sum(map(len, t_clean))}x{sum(map(len, p_clean))} chars, &quot;
+<a id="l130" href="#l130">130</a>           f&quot;score {best.score:.1f}, {matched}/{len(cues_raw)} cues matched&quot;)
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a>     return {
+<a id="l133" href="#l133">133</a>         &quot;name&quot;: name,
+<a id="l134" href="#l134">134</a>         &quot;language&quot;: language,
+<a id="l135" href="#l135">135</a>         &quot;prepend&quot;: PREPEND, &quot;append&quot;: APPEND, &quot;nopend&quot;: NOPEND,
+<a id="l136" href="#l136">136</a>         &quot;transcript&quot;: [{&quot;text&quot;: s[&quot;text&quot;], &quot;start&quot;: s[&quot;start&quot;], &quot;end&quot;: s[&quot;end&quot;]}
+<a id="l137" href="#l137">137</a>                        for s in segments],
+<a id="l138" href="#l138">138</a>         &quot;paragraphs&quot;: paragraphs,
+<a id="l139" href="#l139">139</a>         &quot;transcript_clean&quot;: t_clean,
+<a id="l140" href="#l140">140</a>         &quot;paragraphs_clean&quot;: p_clean,
+<a id="l141" href="#l141">141</a>         &quot;score&quot;: float(best.score),
+<a id="l142" href="#l142">142</a>         &quot;coords&quot;: coords_in,
+<a id="l143" href="#l143">143</a>         &quot;after_align_sub&quot;: after_sub,
+<a id="l144" href="#l144">144</a>         &quot;after_fix&quot;: after_fix,
+<a id="l145" href="#l145">145</a>         &quot;after_fix_punc&quot;: after_punc,
+<a id="l146" href="#l146">146</a>         &quot;cues_raw&quot;: cues_raw,
+<a id="l147" href="#l147">147</a>         &quot;cues&quot;: cues,
+<a id="l148" href="#l148">148</a>     }
+<a id="l149" href="#l149">149</a> 
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a> def chapter_files(cache: Path, book: str) -&gt; list[Path]:
+<a id="l152" href="#l152">152</a>     rx = re.compile(re.escape(book) + r&quot;\.(\d+)\.tiny\.subs$&quot;)
+<a id="l153" href="#l153">153</a>     found = [(int(m.group(1)), p) for p in cache.iterdir() if (m := rx.search(p.name))]
+<a id="l154" href="#l154">154</a>     return [p for _, p in sorted(found)]
+<a id="l155" href="#l155">155</a> 
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a> def main() -&gt; None:
+<a id="l158" href="#l158">158</a>     sys.stdout.reconfigure(encoding=&quot;utf-8&quot;)
+<a id="l159" href="#l159">159</a>     ap = argparse.ArgumentParser()
+<a id="l160" href="#l160">160</a>     ap.add_argument(&quot;--cache&quot;, type=Path, required=True, help=&quot;subplz transcript cache dir&quot;)
+<a id="l161" href="#l161">161</a>     ap.add_argument(&quot;--book&quot;, required=True, help=&quot;audio file name the cache entries start with&quot;)
+<a id="l162" href="#l162">162</a>     ap.add_argument(&quot;--aozora&quot;, type=Path, help=&quot;Aozora Bunko ruby zip with the matching text&quot;)
+<a id="l163" href="#l163">163</a>     ap.add_argument(&quot;--epub&quot;, type=Path, help=&quot;epub with the matching text&quot;)
+<a id="l164" href="#l164">164</a>     ap.add_argument(&quot;--out&quot;, type=Path, required=True)
+<a id="l165" href="#l165">165</a>     ap.add_argument(&quot;--prefix&quot;, required=True)
+<a id="l166" href="#l166">166</a>     ap.add_argument(&quot;--spans&quot;, default=&quot;0:3,3:6,20:24&quot;,
+<a id="l167" href="#l167">167</a>                     help=&quot;audio chapter ranges to turn into cases, e.g. 0:3,10:14&quot;)
+<a id="l168" href="#l168">168</a>     args = ap.parse_args()
+<a id="l169" href="#l169">169</a> 
+<a id="l170" href="#l170">170</a>     files = chapter_files(args.cache, args.book)
+<a id="l171" href="#l171">171</a>     if not files:
+<a id="l172" href="#l172">172</a>         sys.exit(f&quot;no cache entries for {args.book!r} in {args.cache}&quot;)
+<a id="l173" href="#l173">173</a>     transcripts = [load_transcript(p) for p in files]
+<a id="l174" href="#l174">174</a>     language = transcripts[0][&quot;language&quot;]
+<a id="l175" href="#l175">175</a>     lang = get_lang(language)
+<a id="l176" href="#l176">176</a> 
+<a id="l177" href="#l177">177</a>     if args.aozora:
+<a id="l178" href="#l178">178</a>         paragraphs = aozora_paragraphs(args.aozora)
+<a id="l179" href="#l179">179</a>     else:
+<a id="l180" href="#l180">180</a>         from ats.main import Epub
+<a id="l181" href="#l181">181</a>         paragraphs = [p.text() for ch in Epub.from_file(str(args.epub)) for p in ch.text()]
+<a id="l182" href="#l182">182</a>         paragraphs = [p for p in paragraphs if p.strip()]
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a>     # Where each audio chapter starts in the text, by cumulative cleaned length.
+<a id="l185" href="#l185">185</a>     # Approximate on purpose: a fixture whose text runs a little long or short
+<a id="l186" href="#l186">186</a>     # at either end is a more honest test than a perfectly trimmed one.
+<a id="l187" href="#l187">187</a>     para_cum = [0]
+<a id="l188" href="#l188">188</a>     for p in paragraphs:
+<a id="l189" href="#l189">189</a>         para_cum.append(para_cum[-1] + clean_len(lang, p))
+<a id="l190" href="#l190">190</a>     chap_cum = [0]
+<a id="l191" href="#l191">191</a>     for t in transcripts:
+<a id="l192" href="#l192">192</a>         chap_cum.append(chap_cum[-1] + sum(clean_len(lang, s[&quot;text&quot;]) for s in t[&quot;segments&quot;]))
+<a id="l193" href="#l193">193</a>     scale = para_cum[-1] / max(1, chap_cum[-1])
+<a id="l194" href="#l194">194</a> 
+<a id="l195" href="#l195">195</a>     def para_at(chars: float) -&gt; int:
+<a id="l196" href="#l196">196</a>         target = chars * scale
+<a id="l197" href="#l197">197</a>         return next((i for i, c in enumerate(para_cum) if c &gt;= target), len(paragraphs))
+<a id="l198" href="#l198">198</a> 
+<a id="l199" href="#l199">199</a>     args.out.mkdir(parents=True, exist_ok=True)
+<a id="l200" href="#l200">200</a>     for span in args.spans.split(&quot;,&quot;):
+<a id="l201" href="#l201">201</a>         a, b = (int(x) for x in span.split(&quot;:&quot;))
+<a id="l202" href="#l202">202</a>         b = min(b, len(transcripts))
+<a id="l203" href="#l203">203</a>         segments, offset = [], 0.0
+<a id="l204" href="#l204">204</a>         for t in transcripts[a:b]:
+<a id="l205" href="#l205">205</a>             for s in t[&quot;segments&quot;]:
+<a id="l206" href="#l206">206</a>                 segments.append({&quot;text&quot;: s[&quot;text&quot;], &quot;start&quot;: s[&quot;start&quot;] + offset,
+<a id="l207" href="#l207">207</a>                                  &quot;end&quot;: s[&quot;end&quot;] + offset})
+<a id="l208" href="#l208">208</a>             offset = segments[-1][&quot;end&quot;] if segments else offset
+<a id="l209" href="#l209">209</a>         lo = max(0, para_at(chap_cum[a]) - 2)
+<a id="l210" href="#l210">210</a>         hi = min(len(paragraphs), para_at(chap_cum[b]) + 2)
+<a id="l211" href="#l211">211</a>         name = f&quot;{args.prefix}_{a:03d}_{b:03d}&quot;
+<a id="l212" href="#l212">212</a>         case = run_case(name, language, segments, paragraphs[lo:hi])
+<a id="l213" href="#l213">213</a>         (args.out / f&quot;{name}.json&quot;).write_text(
+<a id="l214" href="#l214">214</a>             json.dumps(case, ensure_ascii=False, indent=0), encoding=&quot;utf-8&quot;)
+<a id="l215" href="#l215">215</a> 
+<a id="l216" href="#l216">216</a> 
+<a id="l217" href="#l217">217</a> if __name__ == &quot;__main__&quot;:
+<a id="l218" href="#l218">218</a>     main()</pre>
+</div></body></html>

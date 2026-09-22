@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-overlay/app/src/main/kotlin/space/subread/overlay/MediaListener.kt - Recently Written</title>
+<link rel="stylesheet" href="../../../../../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../../../../../index.html">git</a></div>
+<h1>subread-overlay</h1><span class="desc">Shows the lines of an .srt over any Android media player, in time with it. Tap a word to look it up.</span><p class="url">git clone https://github.com/equwal/subread-overlay</p><p><a href="../../../../../../../../../subread-overlay/index.html">Log</a> | <a href="../../../../../../../../../subread-overlay/files.html">Files</a> | <a href="../../../../../../../../../subread-overlay/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>app/src/main/kotlin/space/subread/overlay/MediaListener.kt (9385 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package space.subread.overlay
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import android.content.ComponentName
+<a id="l4" href="#l4">4</a> import android.content.Context
+<a id="l5" href="#l5">5</a> import android.graphics.PixelFormat
+<a id="l6" href="#l6">6</a> import android.media.session.MediaSessionManager
+<a id="l7" href="#l7">7</a> import android.os.Handler
+<a id="l8" href="#l8">8</a> import android.os.Looper
+<a id="l9" href="#l9">9</a> import android.provider.Settings
+<a id="l10" href="#l10">10</a> import android.service.notification.NotificationListenerService
+<a id="l11" href="#l11">11</a> import android.view.Gravity
+<a id="l12" href="#l12">12</a> import android.view.WindowManager
+<a id="l13" href="#l13">13</a> import android.widget.Toast
+<a id="l14" href="#l14">14</a> import space.subread.overlay.core.CueIndex
+<a id="l15" href="#l15">15</a> import space.subread.overlay.core.LiveLines
+<a id="l16" href="#l16">16</a> import space.subread.overlay.core.Srt
+<a id="l17" href="#l17">17</a> import kotlin.concurrent.thread
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> /**
+<a id="l20" href="#l20">20</a>  * Holds the panel, and follows the media sessions of the device.
+<a id="l21" href="#l21">21</a>  *
+<a id="l22" href="#l22">22</a>  * Android gives the media sessions of other apps only to a notification listener. This service
+<a id="l23" href="#l23">23</a>  * reads no notification: it has no `onNotificationPosted`. The system keeps a listener running,
+<a id="l24" href="#l24">24</a>  * so the panel needs no foreground service and no notification of its own.
+<a id="l25" href="#l25">25</a>  *
+<a id="l26" href="#l26">26</a>  * A caption app can send lines through [PlayerProvider]. While it does, the panel shows its
+<a id="l27" href="#l27">27</a>  * newest line and not the subtitle file.
+<a id="l28" href="#l28">28</a>  */
+<a id="l29" href="#l29">29</a> class MediaListener : NotificationListenerService(), OverlayView.Events {
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a>     private val handler = Handler(Looper.getMainLooper())
+<a id="l32" href="#l32">32</a>     private lateinit var store: Store
+<a id="l33" href="#l33">33</a>     private lateinit var follower: Follower
+<a id="l34" href="#l34">34</a>     private var panel: OverlayView? = null
+<a id="l35" href="#l35">35</a>     private val live = LiveLines()
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a>     /** True while a caption app sends lines. The follower then does not draw on the panel. */
+<a id="l38" href="#l38">38</a>     private var liveOn = false
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a>     /** True when a live line came while a word was selected: the panel shows it after the selection. */
+<a id="l41" href="#l41">41</a>     private var livePending = false
+<a id="l42" href="#l42">42</a>     private val liveTimeout = Runnable { endLive() }
+<a id="l43" href="#l43">43</a>     private val params = WindowManager.LayoutParams(
+<a id="l44" href="#l44">44</a>         WindowManager.LayoutParams.MATCH_PARENT,
+<a id="l45" href="#l45">45</a>         WindowManager.LayoutParams.WRAP_CONTENT,
+<a id="l46" href="#l46">46</a>         WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+<a id="l47" href="#l47">47</a>         // The player below keeps the keys and each touch that is not on the panel.
+<a id="l48" href="#l48">48</a>         WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+<a id="l49" href="#l49">49</a>         PixelFormat.TRANSLUCENT,
+<a id="l50" href="#l50">50</a>     ).apply { gravity = Gravity.TOP or Gravity.START }
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a>     private val sessions by lazy { getSystemService(MediaSessionManager::class.java) }
+<a id="l53" href="#l53">53</a>     private val me by lazy { ComponentName(this, MediaListener::class.java) }
+<a id="l54" href="#l54">54</a>     private val onSessions = MediaSessionManager.OnActiveSessionsChangedListener {
+<a id="l55" href="#l55">55</a>         // A hidden panel follows nothing: no work while the user does not read along.
+<a id="l56" href="#l56">56</a>         if (panel != null) follower.follow(it.orEmpty())
+<a id="l57" href="#l57">57</a>     }
+<a id="l58" href="#l58">58</a> 
+<a id="l59" href="#l59">59</a>     override fun onListenerConnected() {
+<a id="l60" href="#l60">60</a>         store = Store(this)
+<a id="l61" href="#l61">61</a>         follower = Follower(handler) { at, hasPlayer, playing -&gt; show(at, hasPlayer, playing) }
+<a id="l62" href="#l62">62</a>         sessions.addOnActiveSessionsChangedListener(onSessions, me, handler)
+<a id="l63" href="#l63">63</a>         instance = this
+<a id="l64" href="#l64">64</a>         if (store.shown) showPanel()
+<a id="l65" href="#l65">65</a>     }
+<a id="l66" href="#l66">66</a> 
+<a id="l67" href="#l67">67</a>     override fun onListenerDisconnected() {
+<a id="l68" href="#l68">68</a>         instance = null
+<a id="l69" href="#l69">69</a>         sessions.removeOnActiveSessionsChangedListener(onSessions)
+<a id="l70" href="#l70">70</a>         follower.stop()
+<a id="l71" href="#l71">71</a>         handler.removeCallbacks(liveTimeout)
+<a id="l72" href="#l72">72</a>         removePanel()
+<a id="l73" href="#l73">73</a>     }
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a>     /** Puts the panel on the screen. False when the user did not allow the panel yet. */
+<a id="l76" href="#l76">76</a>     fun showPanel(): Boolean {
+<a id="l77" href="#l77">77</a>         if (!Settings.canDrawOverlays(this)) return false
+<a id="l78" href="#l78">78</a>         store.shown = true
+<a id="l79" href="#l79">79</a>         if (panel == null) {
+<a id="l80" href="#l80">80</a>             params.x = store.x
+<a id="l81" href="#l81">81</a>             params.y = store.y
+<a id="l82" href="#l82">82</a>             panel = OverlayView(this, this).also { getSystemService(WindowManager::class.java).addView(it, params) }
+<a id="l83" href="#l83">83</a>         }
+<a id="l84" href="#l84">84</a>         reload()
+<a id="l85" href="#l85">85</a>         return true
+<a id="l86" href="#l86">86</a>     }
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a>     fun hidePanel() {
+<a id="l89" href="#l89">89</a>         store.shown = false
+<a id="l90" href="#l90">90</a>         follower.stop()
+<a id="l91" href="#l91">91</a>         removePanel()
+<a id="l92" href="#l92">92</a>     }
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a>     /** Reads the settings and the subtitle file again. */
+<a id="l95" href="#l95">95</a>     fun reload() {
+<a id="l96" href="#l96">96</a>         val view = panel ?: return
+<a id="l97" href="#l97">97</a>         view.setTextSize(store.textSizeSp)
+<a id="l98" href="#l98">98</a>         view.setTransparency(store.transparencyPercent)
+<a id="l99" href="#l99">99</a>         view.showOffset(store.offsetMs)
+<a id="l100" href="#l100">100</a>         follower.offsetMs = store.offsetMs
+<a id="l101" href="#l101">101</a>         val file = store.subtitles
+<a id="l102" href="#l102">102</a>         if (file == null) {
+<a id="l103" href="#l103">103</a>             follower.index = CueIndex(emptyList())
+<a id="l104" href="#l104">104</a>             return
+<a id="l105" href="#l105">105</a>         }
+<a id="l106" href="#l106">106</a>         thread(name = &quot;subtitles&quot;) {
+<a id="l107" href="#l107">107</a>             val cues = runCatching {
+<a id="l108" href="#l108">108</a>                 contentResolver.openInputStream(file)!!.use { Srt.parse(it.readBytes().decodeToString()) }
+<a id="l109" href="#l109">109</a>             }.getOrDefault(emptyList())
+<a id="l110" href="#l110">110</a>             handler.post {
+<a id="l111" href="#l111">111</a>                 follower.index = CueIndex(cues)
+<a id="l112" href="#l112">112</a>                 follower.follow(sessions.getActiveSessions(me))
+<a id="l113" href="#l113">113</a>             }
+<a id="l114" href="#l114">114</a>         }
+<a id="l115" href="#l115">115</a>     }
+<a id="l116" href="#l116">116</a> 
+<a id="l117" href="#l117">117</a>     private fun removePanel() {
+<a id="l118" href="#l118">118</a>         panel?.let { getSystemService(WindowManager::class.java).removeView(it) }
+<a id="l119" href="#l119">119</a>         panel = null
+<a id="l120" href="#l120">120</a>     }
+<a id="l121" href="#l121">121</a> 
+<a id="l122" href="#l122">122</a>     /**
+<a id="l123" href="#l123">123</a>      * A line from a caption app, from any thread. Returns [PlayerProvider.LIVE_OK] when the panel
+<a id="l124" href="#l124">124</a>      * shows it, else the reason: the panel needs the overlay permission, and the user must have
+<a id="l125" href="#l125">125</a>      * it on the screen. A panel that the user closed does not come back for a line.
+<a id="l126" href="#l126">126</a>      */
+<a id="l127" href="#l127">127</a>     fun liveLine(text: String, partial: Boolean): String {
+<a id="l128" href="#l128">128</a>         if (!Settings.canDrawOverlays(this)) return PlayerProvider.ERROR_NO_OVERLAY
+<a id="l129" href="#l129">129</a>         if (!store.shown) return PlayerProvider.ERROR_PANEL_HIDDEN
+<a id="l130" href="#l130">130</a>         handler.post {
+<a id="l131" href="#l131">131</a>             if (!liveOn) {
+<a id="l132" href="#l132">132</a>                 liveOn = true
+<a id="l133" href="#l133">133</a>                 live.clear()
+<a id="l134" href="#l134">134</a>             }
+<a id="l135" href="#l135">135</a>             live.line(text, partial)
+<a id="l136" href="#l136">136</a>             // A caption app that dies without `end` must not leave its last line for ever.
+<a id="l137" href="#l137">137</a>             handler.removeCallbacks(liveTimeout)
+<a id="l138" href="#l138">138</a>             handler.postDelayed(liveTimeout, LIVE_TIMEOUT_MS)
+<a id="l139" href="#l139">139</a>             if (panel == null) showPanel() else showLive()
+<a id="l140" href="#l140">140</a>         }
+<a id="l141" href="#l141">141</a>         return PlayerProvider.LIVE_OK
+<a id="l142" href="#l142">142</a>     }
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a>     /** The caption app stopped: the panel goes back to the subtitle file. From any thread. */
+<a id="l145" href="#l145">145</a>     fun endLive(): String {
+<a id="l146" href="#l146">146</a>         handler.post {
+<a id="l147" href="#l147">147</a>             if (!liveOn) return@post
+<a id="l148" href="#l148">148</a>             liveOn = false
+<a id="l149" href="#l149">149</a>             livePending = false
+<a id="l150" href="#l150">150</a>             live.clear()
+<a id="l151" href="#l151">151</a>             handler.removeCallbacks(liveTimeout)
+<a id="l152" href="#l152">152</a>             if (panel != null) reload()
+<a id="l153" href="#l153">153</a>         }
+<a id="l154" href="#l154">154</a>         return PlayerProvider.LIVE_OK
+<a id="l155" href="#l155">155</a>     }
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a>     /**
+<a id="l158" href="#l158">158</a>      * Shows the newest live line. While a word is selected, the line waits: a line that changes
+<a id="l159" href="#l159">159</a>      * under the finger would take the selection away before the lookup.
+<a id="l160" href="#l160">160</a>      */
+<a id="l161" href="#l161">161</a>     private fun showLive() {
+<a id="l162" href="#l162">162</a>         val view = panel ?: return
+<a id="l163" href="#l163">163</a>         if (view.selection != null) {
+<a id="l164" href="#l164">164</a>             livePending = true
+<a id="l165" href="#l165">165</a>             return
+<a id="l166" href="#l166">166</a>         }
+<a id="l167" href="#l167">167</a>         livePending = false
+<a id="l168" href="#l168">168</a>         val now = if (live.partial) live.now + &quot; …&quot; else live.now
+<a id="l169" href="#l169">169</a>         if (store.linesAround) view.showLine(now, live.before, null) else view.showLine(now)
+<a id="l170" href="#l170">170</a>     }
+<a id="l171" href="#l171">171</a> 
+<a id="l172" href="#l172">172</a>     private fun show(at: Int, hasPlayer: Boolean, playing: Boolean) {
+<a id="l173" href="#l173">173</a>         val view = panel ?: return
+<a id="l174" href="#l174">174</a>         if (liveOn) {
+<a id="l175" href="#l175">175</a>             showLive()
+<a id="l176" href="#l176">176</a>             return
+<a id="l177" href="#l177">177</a>         }
+<a id="l178" href="#l178">178</a>         view.showPlaying(playing)
+<a id="l179" href="#l179">179</a>         val cues = follower.index.cues
+<a id="l180" href="#l180">180</a>         val line = cues.getOrNull(at)?.text
+<a id="l181" href="#l181">181</a>         when {
+<a id="l182" href="#l182">182</a>             store.subtitles == null -&gt; view.showStatus(getString(R.string.status_no_file))
+<a id="l183" href="#l183">183</a>             cues.isEmpty() -&gt; view.showStatus(getString(R.string.status_empty_file))
+<a id="l184" href="#l184">184</a>             !hasPlayer -&gt; view.showStatus(getString(R.string.status_no_player))
+<a id="l185" href="#l185">185</a>             line == null -&gt; view.showStatus(getString(R.string.status_before_first_line))
+<a id="l186" href="#l186">186</a>             store.linesAround -&gt; view.showLine(line, cues.getOrNull(at - 1)?.text, cues.getOrNull(at + 1)?.text)
+<a id="l187" href="#l187">187</a>             else -&gt; view.showLine(line)
+<a id="l188" href="#l188">188</a>         }
+<a id="l189" href="#l189">189</a>     }
+<a id="l190" href="#l190">190</a> 
+<a id="l191" href="#l191">191</a>     override fun onDrag(dx: Float, dy: Float) {
+<a id="l192" href="#l192">192</a>         params.x += dx.toInt()
+<a id="l193" href="#l193">193</a>         params.y += dy.toInt()
+<a id="l194" href="#l194">194</a>         panel?.let { getSystemService(WindowManager::class.java).updateViewLayout(it, params) }
+<a id="l195" href="#l195">195</a>     }
+<a id="l196" href="#l196">196</a> 
+<a id="l197" href="#l197">197</a>     override fun onDragEnd() {
+<a id="l198" href="#l198">198</a>         store.x = params.x
+<a id="l199" href="#l199">199</a>         store.y = params.y
+<a id="l200" href="#l200">200</a>     }
+<a id="l201" href="#l201">201</a> 
+<a id="l202" href="#l202">202</a>     override fun onClose() = hidePanel()
+<a id="l203" href="#l203">203</a> 
+<a id="l204" href="#l204">204</a>     override fun onSelectionCleared() {
+<a id="l205" href="#l205">205</a>         if (liveOn &amp;&amp; livePending) showLive()
+<a id="l206" href="#l206">206</a>     }
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a>     /** The player pauses for the lookup. The play button of the panel starts it again. */
+<a id="l209" href="#l209">209</a>     override fun onLookUp(word: String) {
+<a id="l210" href="#l210">210</a>         follower.pause()
+<a id="l211" href="#l211">211</a>         runCatching { startActivity(Lookup.intent(word, store.dictionary)) }.onFailure {
+<a id="l212" href="#l212">212</a>             Toast.makeText(this, R.string.no_dictionary, Toast.LENGTH_LONG).show()
+<a id="l213" href="#l213">213</a>         }
+<a id="l214" href="#l214">214</a>     }
+<a id="l215" href="#l215">215</a> 
+<a id="l216" href="#l216">216</a>     override fun onShare(word: String) {
+<a id="l217" href="#l217">217</a>         follower.pause()
+<a id="l218" href="#l218">218</a>         runCatching { startActivity(Lookup.share(word)) }
+<a id="l219" href="#l219">219</a>     }
+<a id="l220" href="#l220">220</a> 
+<a id="l221" href="#l221">221</a>     override fun onTogglePlay() {
+<a id="l222" href="#l222">222</a>         if (!follower.pause()) follower.play()
+<a id="l223" href="#l223">223</a>     }
+<a id="l224" href="#l224">224</a> 
+<a id="l225" href="#l225">225</a>     override fun onShiftLines(steps: Int) {
+<a id="l226" href="#l226">226</a>         follower.shiftLines(steps)
+<a id="l227" href="#l227">227</a>         keepOffset()
+<a id="l228" href="#l228">228</a>     }
+<a id="l229" href="#l229">229</a> 
+<a id="l230" href="#l230">230</a>     override fun onNudge(ms: Long) {
+<a id="l231" href="#l231">231</a>         follower.offsetMs += ms
+<a id="l232" href="#l232">232</a>         keepOffset()
+<a id="l233" href="#l233">233</a>     }
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a>     private fun keepOffset() {
+<a id="l236" href="#l236">236</a>         store.offsetMs = follower.offsetMs
+<a id="l237" href="#l237">237</a>         panel?.showOffset(follower.offsetMs)
+<a id="l238" href="#l238">238</a>     }
+<a id="l239" href="#l239">239</a> 
+<a id="l240" href="#l240">240</a>     companion object {
+<a id="l241" href="#l241">241</a>         /** Live lines end on their own this long after the last one. */
+<a id="l242" href="#l242">242</a>         const val LIVE_TIMEOUT_MS = 10 * 60_000L
+<a id="l243" href="#l243">243</a> 
+<a id="l244" href="#l244">244</a>         /** The listener that the system runs now; null when the user did not allow it. */
+<a id="l245" href="#l245">245</a>         @Volatile
+<a id="l246" href="#l246">246</a>         var instance: MediaListener? = null
+<a id="l247" href="#l247">247</a>             private set
+<a id="l248" href="#l248">248</a> 
+<a id="l249" href="#l249">249</a>         fun isAllowed(context: Context): Boolean =
+<a id="l250" href="#l250">250</a>             Settings.Secure.getString(context.contentResolver, &quot;enabled_notification_listeners&quot;)
+<a id="l251" href="#l251">251</a>                 ?.split(&#x27;:&#x27;)?.mapNotNull(ComponentName::unflattenFromString)
+<a id="l252" href="#l252">252</a>                 ?.any { it.packageName == context.packageName } == true
+<a id="l253" href="#l253">253</a>     }
+<a id="l254" href="#l254">254</a> }</pre>
+</div></body></html>

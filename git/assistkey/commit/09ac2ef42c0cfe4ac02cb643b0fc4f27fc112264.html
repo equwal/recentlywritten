@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey 09ac2ef4 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../assistkey/index.html">Log</a> | <a href="../../assistkey/files.html">Files</a> | <a href="../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 09ac2ef42c0cfe4ac02cb643b0fc4f27fc112264
+truex &lt;truex@equwal.com&gt;
+2026-09-20 22:27:51 -0700
+
+Fix: a Power press on a sleeping or locked device always wakes and unlocks it
+
+While the app manages the Power button, the firmware reaction to a short press
+is off. A press on a sleeping or locked device then had only the firmware&#x27;s own
+wake to rely on, and the press could also run the tap action (Back).
+
+KeyFilterService now treats such a press as a wake and never as a gesture. It
+tracks SCREEN_OFF and SCREEN_ON, because the firmware can set isInteractive
+before the press reaches this process. It also sends KEYCODE_WAKEUP and
+`wm dismiss-keyguard` through the shell, so the wake does not depend on the
+firmware. A press within one second after the screen comes on is the press that
+woke it, and is ignored.
+
+Regression test on a device: tools/e2e/power-wake.sh.
+
+</pre><pre> .../equwal/assistkey/engine/KeyFilterService.kt    | 57 ++++++++++++++++++----
+ tools/e2e/power-wake.sh                            | 49 +++++++++++++++++++
+ 2 files changed, 96 insertions(+), 10 deletions(-)
+</pre><pre>diff --git a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+index 9d0b5fd..bd87f80 100644
+--- a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
++++ b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+<span class="h">@@ -46,7 +46,12 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+ 
+         Shell.onChange(shellChanged)
+         Store.onBindingsChanged = { syncPower() }
+<span class="d">-        registerReceiver(screenOn, android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_ON))</span>
+<span class="a">+        registerReceiver(</span>
+<span class="a">+            screenState,</span>
+<span class="a">+            android.content.IntentFilter(android.content.Intent.ACTION_SCREEN_ON).apply {</span>
+<span class="a">+                addAction(android.content.Intent.ACTION_SCREEN_OFF)</span>
+<span class="a">+            }</span>
+<span class="a">+        )</span>
+         Shell.connect(this)
+         syncPower()
+     }
+<span class="h">@@ -56,32 +61,61 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+     private val shellChanged: () -&gt; Unit = { syncPower() }
+     private var powerIgnoredUntilUp = false
+ 
+<span class="d">-    /** A press that wakes the reader is not a gesture. */</span>
+<span class="d">-    private val screenOn = object : android.content.BroadcastReceiver() {</span>
+<span class="a">+    /**</span>
+<span class="a">+     * True from the moment the screen goes off until it is on again. The</span>
+<span class="a">+     * broadcast for &quot;off&quot; arrives before the device sleeps, so this is a better</span>
+<span class="a">+     * witness than PowerManager.isInteractive, which the firmware may already</span>
+<span class="a">+     * have flipped by the time a Power press reaches this process.</span>
+<span class="a">+     */</span>
+<span class="a">+    private var screenOff = false</span>
+<span class="a">+    private var wokeAt = 0L</span>
+<span class="a">+</span>
+<span class="a">+    private val screenState = object : android.content.BroadcastReceiver() {</span>
+         override fun onReceive(c: android.content.Context?, i: android.content.Intent?) {
+<span class="a">+            if (i?.action == android.content.Intent.ACTION_SCREEN_OFF) {</span>
+<span class="a">+                screenOff = true</span>
+<span class="a">+            } else {</span>
+<span class="a">+                screenOff = false</span>
+<span class="a">+                wokeAt = SystemClock.uptimeMillis()</span>
+<span class="a">+                dev.equwal.assistkey.display.ExtraDim.reapply(this@KeyFilterService)</span>
+<span class="a">+            }</span>
+             powerIgnoredUntilUp = true
+             if (::engine.isInitialized) engine.onCancel()
+<span class="d">-            dev.equwal.assistkey.display.ExtraDim.reapply(this@KeyFilterService)</span>
+         }
+     }
+ 
+     fun syncPower() = PowerControl.sync(this, serviceRunning = ServiceHolder.service === this, ::onRawPower)
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * A Power press on a sleeping or locked device has one job: wake it and</span>
+<span class="a">+     * unlock it. It is never a gesture. The firmware normally wakes the device</span>
+<span class="a">+     * by itself, but the button is ours now, so this does not rely on that: the</span>
+<span class="a">+     * wake and the keyguard dismissal are sent through the shell as well.</span>
+<span class="a">+     */</span>
+     private fun onRawPower(down: Boolean, at: Long) {
+         if (!::engine.isInitialized) return
+<span class="d">-        if (down) {</span>
+<span class="d">-            val awake = getSystemService(android.os.PowerManager::class.java)?.isInteractive != false</span>
+<span class="d">-            powerIgnoredUntilUp = !awake</span>
+<span class="d">-            if (awake) engine.onDown(HwKey.POWER, at, 0)</span>
+<span class="d">-        } else {</span>
+<span class="a">+        if (!down) {</span>
+             if (powerIgnoredUntilUp) powerIgnoredUntilUp = false else engine.onUp(HwKey.POWER, at)
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        val asleep = screenOff ||</span>
+<span class="a">+            getSystemService(android.os.PowerManager::class.java)?.isInteractive == false</span>
+<span class="a">+        val locked = getSystemService(android.app.KeyguardManager::class.java)?.isKeyguardLocked == true</span>
+<span class="a">+        val justWoke = SystemClock.uptimeMillis() - wokeAt &lt; WAKE_GRACE_MS</span>
+<span class="a">+        if (asleep || locked || justWoke) {</span>
+<span class="a">+            powerIgnoredUntilUp = true</span>
+<span class="a">+            engine.onCancel()</span>
+<span class="a">+            if (asleep || locked) Shell.run(&quot;input keyevent KEYCODE_WAKEUP; wm dismiss-keyguard&quot;)</span>
+<span class="a">+            return</span>
+         }
+<span class="a">+        powerIgnoredUntilUp = false</span>
+<span class="a">+        engine.onDown(HwKey.POWER, at, 0)</span>
+     }
+ 
+     private fun stopPower() {
+         Shell.removeOnChange(shellChanged)
+         Store.onBindingsChanged = null
+<span class="d">-        runCatching { unregisterReceiver(screenOn) }</span>
+<span class="a">+        runCatching { unregisterReceiver(screenState) }</span>
+         ServiceHolder.service = null
+         syncPower() // with no service running this hands Power back to the firmware
+     }
+<span class="h">@@ -220,6 +254,9 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         /** How long after a Power hold a key press still counts as a combination. */
+         const val POWER_COMBO_WINDOW_MS = 1000L
+ 
+<span class="a">+        /** A press this soon after the screen came on is the press that woke it. */</span>
+<span class="a">+        private const val WAKE_GRACE_MS = 1000L</span>
+<span class="a">+</span>
+         private val LIFELINE = setOf(
+             GlobalAction.BACK.name, GlobalAction.HOME.name, GlobalAction.RECENTS.name
+         )
+diff --git a/tools/e2e/power-wake.sh b/tools/e2e/power-wake.sh
+new file mode 100644
+index 0000000..8508ea1
+--- /dev/null
++++ b/tools/e2e/power-wake.sh
+<span class="h">@@ -0,0 +1,49 @@</span>
+<span class="a">+#!/usr/bin/env bash</span>
+<span class="a">+# Regression test, on a device: in managed Power mode a Power press on a sleeping</span>
+<span class="a">+# device wakes it, and is NOT read as a gesture.</span>
+<span class="a">+#</span>
+<span class="a">+# Bug it guards: with tap bound to Back, the press that woke the reader could</span>
+<span class="a">+# also run Back, and a locked or charging reader had no sure way to wake.</span>
+<span class="a">+#</span>
+<span class="a">+# Needs: adb root, release build installed, key remapping on, shell access on,</span>
+<span class="a">+# Power tap bound to Back and triple tap to Lock screen (Navigation &gt; Power key). Presses go through the kernel input</span>
+<span class="a">+# node, because `adb shell input keyevent` skips the input filter stage.</span>
+<span class="a">+set -u</span>
+<span class="a">+export MSYS_NO_PATHCONV=1</span>
+<span class="a">+NODE=${POWER_NODE:-/dev/input/event1}</span>
+<span class="a">+E=&quot;sendevent $NODE&quot;; TAP=&quot;$E 1 116 1; $E 0 0 0; sleep 0.06; $E 1 116 0; $E 0 0 0&quot;</span>
+<span class="a">+wake()  { adb shell dumpsys power | grep -oE &#x27;mWakefulness=[A-Za-z]+&#x27; | head -1 | cut -d= -f2; }</span>
+<span class="a">+top()   { # dumpsys now and then answers before the activity has settled; ask again.</span>
+<span class="a">+  local t=&quot;&quot; i</span>
+<span class="a">+  for i in 1 2 3 4 5; do</span>
+<span class="a">+    t=$(adb shell &quot;dumpsys activity activities&quot; | grep -m1 topResumedActivity | grep -oE &#x27;[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+&#x27; | head -1)</span>
+<span class="a">+    [ -n &quot;$t&quot; ] &amp;&amp; break; sleep 1</span>
+<span class="a">+  done; echo &quot;$t&quot;; }</span>
+<span class="a">+fail=0</span>
+<span class="a">+check() { if [ &quot;$2&quot; = &quot;$3&quot; ]; then echo &quot;PASS  $1: $2&quot;; else echo &quot;FAIL  $1: got &#x27;$2&#x27;, want &#x27;$3&#x27;&quot;; fail=1; fi; }</span>
+<span class="a">+</span>
+<span class="a">+[ &quot;$(adb shell settings get global power_button_short_press | tr -d &#x27;\r&#x27;)&quot; = &quot;0&quot; ] || { echo &quot;SKIP  Power is not managed (power_button_short_press is not 0)&quot;; exit 2; }</span>
+<span class="a">+</span>
+<span class="a">+adb shell input keyevent KEYCODE_WAKEUP; sleep 2   # let any earlier tap window run out</span>
+<span class="a">+# Two AssistKey screens deep, so that Back would visibly change the top activity.</span>
+<span class="a">+# (Not the Settings app: on the Viwoods reader an injected SLEEP key is ignored</span>
+<span class="a">+# while Settings &gt; Display is in front.)</span>
+<span class="a">+P=dev.equwal.assistkey</span>
+<span class="a">+adb shell &quot;am start -n $P/.ui.MainActivity&quot; &gt;/dev/null 2&gt;&amp;1; sleep 2</span>
+<span class="a">+adb shell &quot;su 0 am start -n $P/.ui.TimingActivity&quot; &gt;/dev/null 2&gt;&amp;1; sleep 2.5</span>
+<span class="a">+before=$(top)</span>
+<span class="a">+</span>
+<span class="a">+# Sleep with the triple tap the app binds to Lock screen. An injected SLEEP key</span>
+<span class="a">+# is not reliable on this firmware.</span>
+<span class="a">+QUICK=&quot;$E 1 116 1; $E 0 0 0; $E 1 116 0; $E 0 0 0;&quot;</span>
+<span class="a">+adb shell &quot;su 0 sh -c &#x27;$QUICK sleep 0.05; $QUICK sleep 0.05; $QUICK&#x27;&quot;; sleep 4</span>
+<span class="a">+check &quot;device sleeps&quot; &quot;$(wake | sed &#x27;s/Dozing/Asleep/&#x27;)&quot; &quot;Asleep&quot;</span>
+<span class="a">+</span>
+<span class="a">+adb shell &quot;su 0 sh -c &#x27;$TAP&#x27;&quot;; sleep 3</span>
+<span class="a">+check &quot;one Power press wakes it&quot; &quot;$(wake)&quot; &quot;Awake&quot;</span>
+<span class="a">+check &quot;the waking press is not a Back gesture&quot; &quot;$(top)&quot; &quot;$before&quot;</span>
+<span class="a">+</span>
+<span class="a">+adb shell &quot;su 0 sh -c &#x27;$TAP&#x27;&quot;; sleep 2.5</span>
+<span class="a">+[ &quot;$(top)&quot; != &quot;$before&quot; ] &amp;&amp; echo &quot;PASS  the next press is a gesture again&quot; || { echo &quot;FAIL  a press while awake did nothing&quot;; fail=1; }</span>
+<span class="a">+adb shell input keyevent KEYCODE_HOME</span>
+<span class="a">+exit $fail</span></pre>
+</div></body></html>

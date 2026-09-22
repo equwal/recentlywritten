@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/src/sync.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/sync.js (14986 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Sync with an ideamine server, so that every Claude on every machine sees one archive. The server
+<a id="l2" href="#l2">2</a> // (`ideamine serve`, for example behind nginx on a WireGuard address) holds the archive, and
+<a id="l3" href="#l3">3</a> // ideas.json on this machine is a copy of it. A change goes into the outbox first and then to the
+<a id="l4" href="#l4">4</a> // server. When the server does not answer, the change waits in the outbox, so no idea is lost. The
+<a id="l5" href="#l5">5</a> // prompt log takes the same way. No process stays alive: the hook calls kick() for each prompt, and
+<a id="l6" href="#l6">6</a> // kick() starts a background sync when work waits or the copy is old.
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> import { spawn } from &#x27;node:child_process&#x27;;
+<a id="l9" href="#l9">9</a> import crypto from &#x27;node:crypto&#x27;;
+<a id="l10" href="#l10">10</a> import fs from &#x27;node:fs&#x27;;
+<a id="l11" href="#l11">11</a> import os from &#x27;node:os&#x27;;
+<a id="l12" href="#l12">12</a> import path from &#x27;node:path&#x27;;
+<a id="l13" href="#l13">13</a> import { fileURLToPath } from &#x27;node:url&#x27;;
+<a id="l14" href="#l14">14</a> import * as config from &#x27;./config.js&#x27;;
+<a id="l15" href="#l15">15</a> import { stamp } from &#x27;./render.js&#x27;;
+<a id="l16" href="#l16">16</a> import { dbPath, home, withLock, writeAtomic } from &#x27;./store.js&#x27;;
+<a id="l17" href="#l17">17</a> import { clip } from &#x27;./text.js&#x27;;
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> const PULL_EVERY_MS = 60 * 1000; // a copy older than this is pulled again in the background
+<a id="l20" href="#l20">20</a> const PROMPTS_EVERY_MS = 20 * 1000; // prompts wait at least this long, so that a prompt starts no process each time
+<a id="l21" href="#l21">21</a> const WAIT_AFTER_ERROR_MS = 2 * 60 * 1000; // after a failed sync, before kick() tries again
+<a id="l22" href="#l22">22</a> const LOCK_STALE_MS = 10 * 60 * 1000;
+<a id="l23" href="#l23">23</a> const OPS_PER_REQUEST = 100;
+<a id="l24" href="#l24">24</a> const PROMPT_BYTES_PER_REQUEST = 256 * 1024;
+<a id="l25" href="#l25">25</a> const MAX_PROMPT_CHARS = 100 * 1000; // a longer paste is cut, so that each prompt fits in a request
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> const outboxPath = () =&gt; path.join(home(), &#x27;outbox.jsonl&#x27;);
+<a id="l28" href="#l28">28</a> const promptsPath = () =&gt; path.join(home(), &#x27;prompts-outbox.jsonl&#x27;);
+<a id="l29" href="#l29">29</a> const statePath = () =&gt; path.join(home(), &#x27;sync.json&#x27;);
+<a id="l30" href="#l30">30</a> const lockPath = () =&gt; path.join(home(), &#x27;.sync&#x27;);
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> /** The server does not answer, or it refuses the request. The change stays in the outbox. */
+<a id="l33" href="#l33">33</a> export class SyncError extends Error {}
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> /** The address of the server, with a slash at the end, or &#x27;&#x27; when sync is off. */
+<a id="l36" href="#l36">36</a> export function serverUrl() {
+<a id="l37" href="#l37">37</a>   const url = config.get(&#x27;sync_url&#x27;);
+<a id="l38" href="#l38">38</a>   return url ? (url.endsWith(&#x27;/&#x27;) ? url : `${url}/`) : &#x27;&#x27;;
+<a id="l39" href="#l39">39</a> }
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> export const enabled = () =&gt; serverUrl() !== &#x27;&#x27;;
+<a id="l42" href="#l42">42</a> export const logsPrompts = () =&gt; enabled() &amp;&amp; /^(on|true|yes|1)$/i.test(config.get(&#x27;prompt_log&#x27;));
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> function readLines(file) {
+<a id="l45" href="#l45">45</a>   let raw;
+<a id="l46" href="#l46">46</a>   try {
+<a id="l47" href="#l47">47</a>     raw = fs.readFileSync(file, &#x27;utf8&#x27;);
+<a id="l48" href="#l48">48</a>   } catch {
+<a id="l49" href="#l49">49</a>     return [];
+<a id="l50" href="#l50">50</a>   }
+<a id="l51" href="#l51">51</a>   const out = [];
+<a id="l52" href="#l52">52</a>   for (const line of raw.split(&#x27;\n&#x27;)) {
+<a id="l53" href="#l53">53</a>     if (!line.trim()) continue;
+<a id="l54" href="#l54">54</a>     try {
+<a id="l55" href="#l55">55</a>       out.push(JSON.parse(line));
+<a id="l56" href="#l56">56</a>     } catch {
+<a id="l57" href="#l57">57</a>       // A line that a crash cut in half. The rest of the file is still good.
+<a id="l58" href="#l58">58</a>     }
+<a id="l59" href="#l59">59</a>   }
+<a id="l60" href="#l60">60</a>   return out;
+<a id="l61" href="#l61">61</a> }
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> const writeLines = (file, items) =&gt; writeAtomic(file, items.map((i) =&gt; `${JSON.stringify(i)}\n`).join(&#x27;&#x27;));
+<a id="l64" href="#l64">64</a> const append = (file, items) =&gt; withLock(() =&gt; fs.appendFileSync(file, items.map((i) =&gt; `${JSON.stringify(i)}\n`).join(&#x27;&#x27;)));
+<a id="l65" href="#l65">65</a> const size = (file) =&gt; fs.statSync(file, { throwIfNoEntry: false })?.size || 0;
+<a id="l66" href="#l66">66</a> 
+<a id="l67" href="#l67">67</a> export function readState() {
+<a id="l68" href="#l68">68</a>   try {
+<a id="l69" href="#l69">69</a>     return JSON.parse(fs.readFileSync(statePath(), &#x27;utf8&#x27;));
+<a id="l70" href="#l70">70</a>   } catch {
+<a id="l71" href="#l71">71</a>     return {};
+<a id="l72" href="#l72">72</a>   }
+<a id="l73" href="#l73">73</a> }
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a> // Call it while you hold the lock.
+<a id="l76" href="#l76">76</a> const saveState = (patch) =&gt; writeAtomic(statePath(), `${JSON.stringify({ ...readState(), ...patch }, null, 2)}\n`);
+<a id="l77" href="#l77">77</a> const writeState = (patch) =&gt; withLock(() =&gt; saveState(patch));
+<a id="l78" href="#l78">78</a> const failed = (e) =&gt; writeState({ error: e.message, errorAt: new Date().toISOString() });
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> async function request(route, { body, timeoutMs }) {
+<a id="l81" href="#l81">81</a>   const target = new URL(route, serverUrl());
+<a id="l82" href="#l82">82</a>   const init = { signal: AbortSignal.timeout(timeoutMs) };
+<a id="l83" href="#l83">83</a>   if (body !== undefined) Object.assign(init, { method: &#x27;POST&#x27;, headers: { &#x27;content-type&#x27;: &#x27;application/json&#x27; }, body: JSON.stringify(body) });
+<a id="l84" href="#l84">84</a>   let res;
+<a id="l85" href="#l85">85</a>   try {
+<a id="l86" href="#l86">86</a>     res = await fetch(target, init);
+<a id="l87" href="#l87">87</a>   } catch (e) {
+<a id="l88" href="#l88">88</a>     const why = e.name === &#x27;TimeoutError&#x27; ? `no answer in ${timeoutMs / 1000} s` : e.cause?.code || e.cause?.message || e.message;
+<a id="l89" href="#l89">89</a>     throw new SyncError(`cannot reach ${target.origin} (${why})`);
+<a id="l90" href="#l90">90</a>   }
+<a id="l91" href="#l91">91</a>   const text = await res.text();
+<a id="l92" href="#l92">92</a>   let json = null;
+<a id="l93" href="#l93">93</a>   try {
+<a id="l94" href="#l94">94</a>     json = JSON.parse(text);
+<a id="l95" href="#l95">95</a>   } catch {
+<a id="l96" href="#l96">96</a>     // Not JSON: the error below shows the text.
+<a id="l97" href="#l97">97</a>   }
+<a id="l98" href="#l98">98</a>   if (!res.ok || !json?.ok) throw new SyncError(`${target.origin} answered ${res.status}: ${json?.error || clip(text, 160)}`);
+<a id="l99" href="#l99">99</a>   return json;
+<a id="l100" href="#l100">100</a> }
+<a id="l101" href="#l101">101</a> 
+<a id="l102" href="#l102">102</a> /** Keep the archive of the server as the copy here, unless the copy is newer: a slow answer must not undo a later one. */
+<a id="l103" href="#l103">103</a> function keep(db) {
+<a id="l104" href="#l104">104</a>   if (!db || !Array.isArray(db.ideas)) throw new SyncError(&#x27;the server sent no archive&#x27;);
+<a id="l105" href="#l105">105</a>   withLock(() =&gt; {
+<a id="l106" href="#l106">106</a>     const state = readState();
+<a id="l107" href="#l107">107</a>     if (db.uid === state.uid &amp;&amp; (Number(db.rev) || 0) &lt; (Number(state.rev) || 0)) return;
+<a id="l108" href="#l108">108</a>     writeAtomic(dbPath(), `${JSON.stringify(db, null, 2)}\n`, { backup: true });
+<a id="l109" href="#l109">109</a>     saveState({ uid: db.uid, rev: db.rev, pulled: new Date().toISOString(), error: null, errorAt: null });
+<a id="l110" href="#l110">110</a>   });
+<a id="l111" href="#l111">111</a> }
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a> /**
+<a id="l114" href="#l114">114</a>  * Send the changes of the outbox, oldest first. `extra` must go even when another process took it
+<a id="l115" href="#l115">115</a>  * from the outbox already: the server applies a change only once, and it answers with the result.
+<a id="l116" href="#l116">116</a>  * Resolves to the results by oid, and to the archive of the server after the last change.
+<a id="l117" href="#l117">117</a>  */
+<a id="l118" href="#l118">118</a> async function sendOps({ extra = null, timeoutMs }) {
+<a id="l119" href="#l119">119</a>   const ops = withLock(() =&gt; readLines(outboxPath()));
+<a id="l120" href="#l120">120</a>   if (extra &amp;&amp; !ops.some((op) =&gt; op.oid === extra.oid)) ops.push(extra);
+<a id="l121" href="#l121">121</a>   const results = new Map();
+<a id="l122" href="#l122">122</a>   let db = null;
+<a id="l123" href="#l123">123</a>   for (let i = 0; i &lt; ops.length; i += OPS_PER_REQUEST) {
+<a id="l124" href="#l124">124</a>     const part = ops.slice(i, i + OPS_PER_REQUEST);
+<a id="l125" href="#l125">125</a>     const out = await request(&#x27;api/ops&#x27;, { body: { ops: part }, timeoutMs });
+<a id="l126" href="#l126">126</a>     part.forEach((op, k) =&gt; results.set(op.oid, out.results[k]));
+<a id="l127" href="#l127">127</a>     withLock(() =&gt; writeLines(outboxPath(), readLines(outboxPath()).filter((op) =&gt; !results.has(op.oid))));
+<a id="l128" href="#l128">128</a>     db = out.db;
+<a id="l129" href="#l129">129</a>   }
+<a id="l130" href="#l130">130</a>   return { results, db };
+<a id="l131" href="#l131">131</a> }
+<a id="l132" href="#l132">132</a> 
+<a id="l133" href="#l133">133</a> async function sendPrompts({ timeoutMs }) {
+<a id="l134" href="#l134">134</a>   const prompts = withLock(() =&gt; readLines(promptsPath()));
+<a id="l135" href="#l135">135</a>   let part = [];
+<a id="l136" href="#l136">136</a>   let bytes = 0;
+<a id="l137" href="#l137">137</a>   const sendPart = async () =&gt; {
+<a id="l138" href="#l138">138</a>     if (!part.length) return;
+<a id="l139" href="#l139">139</a>     await request(&#x27;api/prompts&#x27;, { body: { prompts: part }, timeoutMs });
+<a id="l140" href="#l140">140</a>     const sent = new Set(part.map((p) =&gt; p.id));
+<a id="l141" href="#l141">141</a>     withLock(() =&gt; writeLines(promptsPath(), readLines(promptsPath()).filter((p) =&gt; !sent.has(p.id))));
+<a id="l142" href="#l142">142</a>     part = [];
+<a id="l143" href="#l143">143</a>     bytes = 0;
+<a id="l144" href="#l144">144</a>   };
+<a id="l145" href="#l145">145</a>   for (const p of prompts) {
+<a id="l146" href="#l146">146</a>     const n = Buffer.byteLength(JSON.stringify(p));
+<a id="l147" href="#l147">147</a>     if (bytes + n &gt; PROMPT_BYTES_PER_REQUEST) await sendPart();
+<a id="l148" href="#l148">148</a>     part.push(p);
+<a id="l149" href="#l149">149</a>     bytes += n;
+<a id="l150" href="#l150">150</a>   }
+<a id="l151" href="#l151">151</a>   await sendPart();
+<a id="l152" href="#l152">152</a> }
+<a id="l153" href="#l153">153</a> 
+<a id="l154" href="#l154">154</a> /**
+<a id="l155" href="#l155">155</a>  * Bring the copy here up to date: send the changes that wait, then take the archive of the server.
+<a id="l156" href="#l156">156</a>  * With `prompts`, send the prompts that wait too. Throws SyncError when the server does not answer.
+<a id="l157" href="#l157">157</a>  */
+<a id="l158" href="#l158">158</a> export async function pull({ timeoutMs = 10000, prompts = false } = {}) {
+<a id="l159" href="#l159">159</a>   let { db } = await sendOps({ timeoutMs });
+<a id="l160" href="#l160">160</a>   if (prompts) await sendPrompts({ timeoutMs });
+<a id="l161" href="#l161">161</a>   db ||= (await request(&#x27;api/db&#x27;, { timeoutMs })).db;
+<a id="l162" href="#l162">162</a>   keep(db);
+<a id="l163" href="#l163">163</a> }
+<a id="l164" href="#l164">164</a> 
+<a id="l165" href="#l165">165</a> /**
+<a id="l166" href="#l166">166</a>  * Change the archive on the server. The change goes into the outbox, then to the server. Resolves
+<a id="l167" href="#l167">167</a>  * to { value }, the result of the change, or to { queued, reason } when the server does not answer:
+<a id="l168" href="#l168">168</a>  * the change then waits in the outbox. A change that the server refuses throws.
+<a id="l169" href="#l169">169</a>  */
+<a id="l170" href="#l170">170</a> export async function change(op, { timeoutMs = 3000 } = {}) {
+<a id="l171" href="#l171">171</a>   const item = { ...op, oid: crypto.randomUUID(), at: new Date().toISOString() };
+<a id="l172" href="#l172">172</a>   append(outboxPath(), [item]);
+<a id="l173" href="#l173">173</a>   let sent;
+<a id="l174" href="#l174">174</a>   try {
+<a id="l175" href="#l175">175</a>     sent = await sendOps({ extra: item, timeoutMs });
+<a id="l176" href="#l176">176</a>   } catch (e) {
+<a id="l177" href="#l177">177</a>     if (!(e instanceof SyncError)) throw e;
+<a id="l178" href="#l178">178</a>     failed(e);
+<a id="l179" href="#l179">179</a>     return { queued: true, reason: e.message };
+<a id="l180" href="#l180">180</a>   }
+<a id="l181" href="#l181">181</a>   keep(sent.db);
+<a id="l182" href="#l182">182</a>   const r = sent.results.get(item.oid);
+<a id="l183" href="#l183">183</a>   if (!r?.ok) throw new Error(r?.error || &#x27;the server sent no result&#x27;);
+<a id="l184" href="#l184">184</a>   return { value: r.value };
+<a id="l185" href="#l185">185</a> }
+<a id="l186" href="#l186">186</a> 
+<a id="l187" href="#l187">187</a> /** How many changes wait in the outbox. */
+<a id="l188" href="#l188">188</a> export const waiting = () =&gt; readLines(outboxPath()).length;
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a> /**
+<a id="l191" href="#l191">191</a>  * The text of a prompt for the log, or null when nothing is left. The notes that Claude Code and the
+<a id="l192" href="#l192">192</a>  * desktop app put into a prompt (&lt;system-reminder&gt; blocks) go, and a huge paste is cut.
+<a id="l193" href="#l193">193</a>  */
+<a id="l194" href="#l194">194</a> function promptText(raw) {
+<a id="l195" href="#l195">195</a>   const text = String(raw ?? &#x27;&#x27;).replace(/&lt;system-reminder&gt;[\s\S]*?&lt;\/system-reminder&gt;/g, &#x27;&#x27;).trim();
+<a id="l196" href="#l196">196</a>   if (!text) return null;
+<a id="l197" href="#l197">197</a>   return text.length &gt; MAX_PROMPT_CHARS ? `${text.slice(0, MAX_PROMPT_CHARS)}\n… (cut: ${text.length - MAX_PROMPT_CHARS} more characters)` : text;
+<a id="l198" href="#l198">198</a> }
+<a id="l199" href="#l199">199</a> 
+<a id="l200" href="#l200">200</a> /** Put a prompt into the prompt outbox. The next background sync sends it. */
+<a id="l201" href="#l201">201</a> export function logPrompt({ prompt, session = null, cwd = null, at = new Date().toISOString() }) {
+<a id="l202" href="#l202">202</a>   const text = promptText(prompt);
+<a id="l203" href="#l203">203</a>   if (!text) return;
+<a id="l204" href="#l204">204</a>   append(promptsPath(), [{ id: crypto.randomUUID(), at, host: os.hostname(), session, cwd, prompt: text }]);
+<a id="l205" href="#l205">205</a>   if (!readState().promptsSince) writeState({ promptsSince: at });
+<a id="l206" href="#l206">206</a> }
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a> // The text that the user typed, from one line of a Claude Code transcript. Null for everything
+<a id="l209" href="#l209">209</a> // else: tool results, subagent prompts, command output, and notes that Claude Code adds itself.
+<a id="l210" href="#l210">210</a> function typedText(entry) {
+<a id="l211" href="#l211">211</a>   if (entry?.type !== &#x27;user&#x27; || entry.isMeta || entry.isSidechain || entry.toolUseResult) return null;
+<a id="l212" href="#l212">212</a>   const content = entry.message?.content;
+<a id="l213" href="#l213">213</a>   let text = null;
+<a id="l214" href="#l214">214</a>   if (typeof content === &#x27;string&#x27;) text = content;
+<a id="l215" href="#l215">215</a>   else if (Array.isArray(content) &amp;&amp; content.every((b) =&gt; b?.type === &#x27;text&#x27; || b?.type === &#x27;image&#x27;)) {
+<a id="l216" href="#l216">216</a>     text = content.filter((b) =&gt; b.type === &#x27;text&#x27;).map((b) =&gt; b.text).join(&#x27;\n&#x27;);
+<a id="l217" href="#l217">217</a>   }
+<a id="l218" href="#l218">218</a>   if (!text?.trim()) return null;
+<a id="l219" href="#l219">219</a>   const name = text.match(/&lt;command-name&gt;([^&lt;]*)&lt;\/command-name&gt;/);
+<a id="l220" href="#l220">220</a>   if (name) {
+<a id="l221" href="#l221">221</a>     const args = text.match(/&lt;command-args&gt;([\s\S]*?)&lt;\/command-args&gt;/);
+<a id="l222" href="#l222">222</a>     return `${name[1]} ${args ? args[1] : &#x27;&#x27;}`.trim();
+<a id="l223" href="#l223">223</a>   }
+<a id="l224" href="#l224">224</a>   if (/^(&lt;(local-command-stdout|local-command-stderr|command-message|bash-input|bash-stdout|bash-stderr)&gt;|\[Request interrupted)/.test(text.trim())) return null;
+<a id="l225" href="#l225">225</a>   return text;
+<a id="l226" href="#l226">226</a> }
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a> /** The transcripts folder of Claude Code on this machine. */
+<a id="l229" href="#l229">229</a> export function transcriptsDir() {
+<a id="l230" href="#l230">230</a>   return path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), &#x27;.claude&#x27;), &#x27;projects&#x27;);
+<a id="l231" href="#l231">231</a> }
+<a id="l232" href="#l232">232</a> 
+<a id="l233" href="#l233">233</a> /**
+<a id="l234" href="#l234">234</a>  * Prompts from the Claude Code transcripts of this machine, for the prompt log. Only prompts from
+<a id="l235" href="#l235">235</a>  * before the live prompt log started are taken, so that no prompt comes twice. An id made from the
+<a id="l236" href="#l236">236</a>  * session, the time, and the text lets the server skip a prompt that an earlier import sent.
+<a id="l237" href="#l237">237</a>  */
+<a id="l238" href="#l238">238</a> export function importPrompts({ dir = transcriptsDir() } = {}) {
+<a id="l239" href="#l239">239</a>   const before = readState().promptsSince || null;
+<a id="l240" href="#l240">240</a>   const found = [];
+<a id="l241" href="#l241">241</a>   let files = [];
+<a id="l242" href="#l242">242</a>   try {
+<a id="l243" href="#l243">243</a>     files = fs.readdirSync(dir, { recursive: true }).filter((f) =&gt; String(f).endsWith(&#x27;.jsonl&#x27;));
+<a id="l244" href="#l244">244</a>   } catch {
+<a id="l245" href="#l245">245</a>     return 0;
+<a id="l246" href="#l246">246</a>   }
+<a id="l247" href="#l247">247</a>   for (const file of files) {
+<a id="l248" href="#l248">248</a>     let raw;
+<a id="l249" href="#l249">249</a>     try {
+<a id="l250" href="#l250">250</a>       raw = fs.readFileSync(path.join(dir, String(file)), &#x27;utf8&#x27;);
+<a id="l251" href="#l251">251</a>     } catch {
+<a id="l252" href="#l252">252</a>       continue;
+<a id="l253" href="#l253">253</a>     }
+<a id="l254" href="#l254">254</a>     for (const line of raw.split(&#x27;\n&#x27;)) {
+<a id="l255" href="#l255">255</a>       if (!line.includes(&#x27;&quot;user&quot;&#x27;)) continue;
+<a id="l256" href="#l256">256</a>       let entry;
+<a id="l257" href="#l257">257</a>       try {
+<a id="l258" href="#l258">258</a>         entry = JSON.parse(line);
+<a id="l259" href="#l259">259</a>       } catch {
+<a id="l260" href="#l260">260</a>         continue;
+<a id="l261" href="#l261">261</a>       }
+<a id="l262" href="#l262">262</a>       const prompt = promptText(typedText(entry));
+<a id="l263" href="#l263">263</a>       if (!prompt || !entry.timestamp || (before &amp;&amp; entry.timestamp &gt;= before)) continue;
+<a id="l264" href="#l264">264</a>       const id = crypto.createHash(&#x27;sha256&#x27;).update(`${entry.sessionId}\n${entry.timestamp}\n${prompt}`).digest(&#x27;hex&#x27;).slice(0, 32);
+<a id="l265" href="#l265">265</a>       found.push({ id, at: entry.timestamp, host: os.hostname(), session: entry.sessionId || null, cwd: entry.cwd || null, prompt });
+<a id="l266" href="#l266">266</a>     }
+<a id="l267" href="#l267">267</a>   }
+<a id="l268" href="#l268">268</a>   if (found.length) append(promptsPath(), found);
+<a id="l269" href="#l269">269</a>   return found.length;
+<a id="l270" href="#l270">270</a> }
+<a id="l271" href="#l271">271</a> 
+<a id="l272" href="#l272">272</a> function isRunning(now) {
+<a id="l273" href="#l273">273</a>   try {
+<a id="l274" href="#l274">274</a>     return now - fs.statSync(lockPath()).mtimeMs &lt; LOCK_STALE_MS;
+<a id="l275" href="#l275">275</a>   } catch {
+<a id="l276" href="#l276">276</a>     return false;
+<a id="l277" href="#l277">277</a>   }
+<a id="l278" href="#l278">278</a> }
+<a id="l279" href="#l279">279</a> 
+<a id="l280" href="#l280">280</a> function startProcess() {
+<a id="l281" href="#l281">281</a>   const bin = fileURLToPath(new URL(&#x27;../bin/ideamine.js&#x27;, import.meta.url));
+<a id="l282" href="#l282">282</a>   const child = spawn(process.execPath, [bin, &#x27;sync&#x27;, &#x27;--background&#x27;], { cwd: home(), detached: true, stdio: &#x27;ignore&#x27;, windowsHide: true });
+<a id="l283" href="#l283">283</a>   // A sync that cannot start must not stop the caller.
+<a id="l284" href="#l284">284</a>   child.on(&#x27;error&#x27;, (e) =&gt; failed(new Error(`cannot start a sync: ${e.message}`)));
+<a id="l285" href="#l285">285</a>   child.unref();
+<a id="l286" href="#l286">286</a> }
+<a id="l287" href="#l287">287</a> 
+<a id="l288" href="#l288">288</a> /**
+<a id="l289" href="#l289">289</a>  * Start a background sync when sync is on, no sync runs, no sync failed a short time ago, and
+<a id="l290" href="#l290">290</a>  * changes wait, prompts wait since the last sync 20 seconds ago, or the copy is older than a minute.
+<a id="l291" href="#l291">291</a>  */
+<a id="l292" href="#l292">292</a> export function kick({ start = startProcess, now = Date.now() } = {}) {
+<a id="l293" href="#l293">293</a>   if (!enabled()) return false;
+<a id="l294" href="#l294">294</a>   const state = readState();
+<a id="l295" href="#l295">295</a>   if (state.errorAt &amp;&amp; now - Date.parse(state.errorAt) &lt; WAIT_AFTER_ERROR_MS) return false;
+<a id="l296" href="#l296">296</a>   if (isRunning(now)) return false;
+<a id="l297" href="#l297">297</a>   const age = state.pulled ? now - Date.parse(state.pulled) : Infinity;
+<a id="l298" href="#l298">298</a>   const due = age &gt; PULL_EVERY_MS || size(outboxPath()) &gt; 0 || (size(promptsPath()) &gt; 0 &amp;&amp; age &gt; PROMPTS_EVERY_MS);
+<a id="l299" href="#l299">299</a>   if (!due) return false;
+<a id="l300" href="#l300">300</a>   start();
+<a id="l301" href="#l301">301</a>   return true;
+<a id="l302" href="#l302">302</a> }
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a> /** One background sync, from kick(). Only one runs at a time. */
+<a id="l305" href="#l305">305</a> export async function backgroundSync() {
+<a id="l306" href="#l306">306</a>   fs.mkdirSync(home(), { recursive: true });
+<a id="l307" href="#l307">307</a>   try {
+<a id="l308" href="#l308">308</a>     fs.mkdirSync(lockPath());
+<a id="l309" href="#l309">309</a>   } catch (e) {
+<a id="l310" href="#l310">310</a>     if (e.code !== &#x27;EEXIST&#x27; || isRunning(Date.now())) return &#x27;busy&#x27;;
+<a id="l311" href="#l311">311</a>     fs.utimesSync(lockPath(), new Date(), new Date()); // take over the lock of a crashed sync
+<a id="l312" href="#l312">312</a>   }
+<a id="l313" href="#l313">313</a>   try {
+<a id="l314" href="#l314">314</a>     await pull({ timeoutMs: 30000, prompts: true });
+<a id="l315" href="#l315">315</a>     return &#x27;done&#x27;;
+<a id="l316" href="#l316">316</a>   } catch (e) {
+<a id="l317" href="#l317">317</a>     failed(e);
+<a id="l318" href="#l318">318</a>     return &#x27;error&#x27;;
+<a id="l319" href="#l319">319</a>   } finally {
+<a id="l320" href="#l320">320</a>     fs.rmSync(lockPath(), { recursive: true, force: true });
+<a id="l321" href="#l321">321</a>   }
+<a id="l322" href="#l322">322</a> }
+<a id="l323" href="#l323">323</a> 
+<a id="l324" href="#l324">324</a> /**
+<a id="l325" href="#l325">325</a>  * Turn sync on with the server at `url`, or off with &#x27;&#x27;. Before the first sync with a server, the
+<a id="l326" href="#l326">326</a>  * archive here goes to a backup file, because the archive of the server takes its place.
+<a id="l327" href="#l327">327</a>  */
+<a id="l328" href="#l328">328</a> export function setServer(url) {
+<a id="l329" href="#l329">329</a>   const clean = String(url || &#x27;&#x27;).trim();
+<a id="l330" href="#l330">330</a>   if (clean &amp;&amp; !/^https?:\/\//i.test(clean)) throw new Error(`&quot;${clean}&quot; is not an http:// or https:// address`);
+<a id="l331" href="#l331">331</a>   let backup = null;
+<a id="l332" href="#l332">332</a>   if (clean &amp;&amp; fs.existsSync(dbPath()) &amp;&amp; !readState().uid) {
+<a id="l333" href="#l333">333</a>     backup = path.join(home(), `ideas.before-sync-${new Date().toISOString().slice(0, 10)}.json`);
+<a id="l334" href="#l334">334</a>     fs.copyFileSync(dbPath(), backup);
+<a id="l335" href="#l335">335</a>   }
+<a id="l336" href="#l336">336</a>   config.set(&#x27;sync_url&#x27;, clean);
+<a id="l337" href="#l337">337</a>   if (clean) config.set(&#x27;publish_url&#x27;, &#x27;&#x27;); // the server shows the live archive: no uploads
+<a id="l338" href="#l338">338</a>   else writeState({ uid: null, rev: null, pulled: null, error: null, errorAt: null });
+<a id="l339" href="#l339">339</a>   return backup;
+<a id="l340" href="#l340">340</a> }
+<a id="l341" href="#l341">341</a> 
+<a id="l342" href="#l342">342</a> /** On or off, the last sync, and what waits. */
+<a id="l343" href="#l343">343</a> export function status() {
+<a id="l344" href="#l344">344</a>   const url = serverUrl();
+<a id="l345" href="#l345">345</a>   if (!url) return &#x27;ideamine sync: off. The archive is on this machine. /ideas-sync &lt;url&gt; shares it through an ideamine server.&#x27;;
+<a id="l346" href="#l346">346</a>   const s = readState();
+<a id="l347" href="#l347">347</a>   const lines = [`ideamine sync: ${url}`];
+<a id="l348" href="#l348">348</a>   lines.push(s.pulled ? `last sync ${stamp(s.pulled)}${s.rev ? `, revision ${s.rev}` : &#x27;&#x27;}.` : &#x27;Not synced yet.&#x27;);
+<a id="l349" href="#l349">349</a>   const changes = waiting();
+<a id="l350" href="#l350">350</a>   if (changes) lines.push(`${changes} change${changes === 1 ? &#x27; waits&#x27; : &#x27;s wait&#x27;} for the server.`);
+<a id="l351" href="#l351">351</a>   const prompts = readLines(promptsPath()).length;
+<a id="l352" href="#l352">352</a>   if (prompts) lines.push(`${prompts} prompt${prompts === 1 ? &#x27; waits&#x27; : &#x27;s wait&#x27;} for the server.`);
+<a id="l353" href="#l353">353</a>   lines.push(logsPrompts() ? &#x27;The prompt log is on.&#x27; : &#x27;The prompt log is off. `ideamine config prompt_log on` turns it on.&#x27;);
+<a id="l354" href="#l354">354</a>   if (s.error) lines.push(`The last sync failed at ${stamp(s.errorAt)}: ${s.error}`);
+<a id="l355" href="#l355">355</a>   return lines.join(&#x27;\n&#x27;);
+<a id="l356" href="#l356">356</a> }</pre>
+</div></body></html>

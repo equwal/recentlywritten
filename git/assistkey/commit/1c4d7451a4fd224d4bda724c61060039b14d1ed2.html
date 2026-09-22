@@ -1,0 +1,1666 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>assistkey 1c4d7451 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>assistkey</h1><span class="desc">Hardware key remapper for the Viwoods AiPaper Reader: AI key, volume keys and power, with multi-tap, hold and chords</span><p class="url">git clone https://github.com/equwal/assistkey</p><p><a href="../../assistkey/index.html">Log</a> | <a href="../../assistkey/files.html">Files</a> | <a href="../../assistkey/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 1c4d7451a4fd224d4bda724c61060039b14d1ed2
+truex &lt;truex@equwal.com&gt;
+2026-09-20 16:19:31 -0700
+
+Add Play Billing licensing, and make the firmware hooks screen read-only
+
+Licensing. Four tiers, tried in order: LICENSED (Play says the account owns
+assistkey_pro or assistkey_pro_tester), BETA (free while the beta is open),
+TRIAL (seven days from first launch), LOCKED (the key filter and the three
+impersonation entry points go inert; bindings are kept).
+
+Whether the beta is open is answered by Google Play rather than a server of
+ours: a third product, assistkey_beta_open, is never sold and exists only as a
+flag. Deactivating it in Play Console closes the beta for every install at
+once. Only &quot;paid product visible, flag missing&quot; in the same response reads as
+closed, so an empty or failed answer can never lock anyone out; installs that
+cannot reach Play fall back to the date compiled into the build. Anyone who
+ran the app during the beta is marked as a tester and offered the cheaper
+product, with a code as the fallback for a new device.
+
+The billing library&#x27;s telemetry runtime (datatransport) is excluded. It was
+merging INTERNET and ACCESS_NETWORK_STATE into the manifest, which an
+accessibility service that sees key presses has no business holding. The
+library initialises that runtime inside a catch-all and carries on without it;
+confirmed in bytecode and on the device. The library&#x27;s auto-reconnection is
+off too: with the Play Store disabled, which is how this reader ships, it held
+every answer back for seconds.
+
+The accessibility switch now sits behind an in-app disclosure and an explicit
+Agree, as Play requires of any non-assistive use of the API.
+
+Firmware hooks. Measured with sendevent on the kernel input nodes, which
+unlike `adb shell input` travels the path a real press does:
+
+- The AI key reaches the accessibility filter whatever CustomAiKey says.
+- A volume key reaches it only while its Custom*Key setting is unset. Any
+  value, even the default token, makes the firmware keep the key to itself.
+- An ordinary app cannot write those settings at all. SettingsProvider throws
+  &quot;You cannot keep your settings in the secure settings&quot;, with or without
+  WRITE_SECURE_SETTINGS.
+
+So the Viwoods channel could never have worked, and its &quot;restore&quot; button was
+writing the very tokens that hide a key. It is now a read-only screen that
+shows each hook, says when one is hiding a key, and gives the adb command.
+WRITE_SETTINGS is dropped from the manifest. Pass-through of the AI key opens
+whatever the firmware has configured instead of a hard-coded guess.
+
+Also: the key log records only while the tester screen is open, so nothing a
+keyboard types is ever held, even in memory.
+
+Version is now 0.0.1-alpha, read from gradle.properties.
+
+</pre><pre> app/build.gradle.kts                               |  59 +++-
+ app/src/main/AndroidManifest.xml                   |   5 +-
+ .../java/dev/equwal/assistkey/channel/Channel.kt   |  21 +-
+ .../dev/equwal/assistkey/channel/ChannelEntry.kt   |  11 +
+ .../java/dev/equwal/assistkey/channel/Channels.kt  |   7 -
+ .../equwal/assistkey/engine/KeyFilterService.kt    |  13 +-
+ .../java/dev/equwal/assistkey/engine/KeyLog.kt     |  10 +
+ .../java/dev/equwal/assistkey/license/License.kt   | 168 ++++++++++++
+ .../dev/equwal/assistkey/license/PlayBilling.kt    | 304 +++++++++++++++++++++
+ .../main/java/dev/equwal/assistkey/license/Sku.kt  |  20 ++
+ .../dev/equwal/assistkey/native/ViwoodsBridge.kt   | 126 ++++-----
+ .../dev/equwal/assistkey/ui/KeyTesterActivity.kt   |  13 +-
+ .../dev/equwal/assistkey/ui/LicenseActivity.kt     | 198 ++++++++++++++
+ .../java/dev/equwal/assistkey/ui/MainActivity.kt   |  76 +++++-
+ .../dev/equwal/assistkey/ui/TriggerListActivity.kt |   9 +
+ .../dev/equwal/assistkey/ui/ViwoodsActivity.kt     | 118 ++------
+ gradle.properties                                  |  11 +-
+ 17 files changed, 960 insertions(+), 209 deletions(-)
+</pre><pre>diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 093d352..369b278 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+<span class="h">@@ -1,3 +1,6 @@</span>
+<span class="a">+import java.security.MessageDigest</span>
+<span class="a">+import java.time.LocalDate</span>
+<span class="a">+import java.time.ZoneOffset</span>
+ import java.util.Properties
+ 
+ plugins {
+<span class="h">@@ -16,6 +19,25 @@ val keystoreProps = Properties().apply {</span>
+ }
+ val hasSigning = keystoreProps.getProperty(&quot;storeFile&quot;) != null
+ 
+<span class="a">+fun prop(name: String): String =</span>
+<span class="a">+    (project.findProperty(name) as String?) ?: error(&quot;missing gradle property $name&quot;)</span>
+<span class="a">+</span>
+<span class="a">+/** Midnight UTC at the start of the given ISO date, as epoch millis. */</span>
+<span class="a">+fun epochMillis(isoDate: String): Long =</span>
+<span class="a">+    LocalDate.parse(isoDate)</span>
+<span class="a">+        .atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()</span>
+<span class="a">+</span>
+<span class="a">+fun sha256Hex(text: String): String =</span>
+<span class="a">+    MessageDigest.getInstance(&quot;SHA-256&quot;)</span>
+<span class="a">+        .digest(text.toByteArray(Charsets.UTF_8))</span>
+<span class="a">+        .joinToString(&quot;&quot;) { b -&gt; &quot;%02x&quot;.format(b) }</span>
+<span class="a">+</span>
+<span class="a">+// Only the digest of the tester code is compiled in. With no code configured</span>
+<span class="a">+// the digest is of the empty string, which no entered code can match.</span>
+<span class="a">+val testerCodeHash = sha256Hex(</span>
+<span class="a">+    (keystoreProps.getProperty(&quot;testerCode&quot;) ?: &quot;&quot;).trim().uppercase()</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+ android {
+     namespace = &quot;dev.equwal.assistkey&quot;
+     compileSdk = 36
+<span class="h">@@ -25,8 +47,15 @@ android {</span>
+         // QuickAccessWalletService, which the wallet channel needs, is API 31.
+         minSdk = 31
+         targetSdk = 36
+<span class="d">-        versionCode = 1</span>
+<span class="d">-        versionName = &quot;1.0&quot;</span>
+<span class="a">+        versionCode = prop(&quot;assistkey.versionCode&quot;).toInt()</span>
+<span class="a">+        versionName = prop(&quot;assistkey.versionName&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        buildConfigField(</span>
+<span class="a">+            &quot;long&quot;, &quot;BETA_EXPIRES_MS&quot;,</span>
+<span class="a">+            epochMillis(prop(&quot;assistkey.betaExpires&quot;)).toString() + &quot;L&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        buildConfigField(&quot;String&quot;, &quot;BETA_EXPIRES_DATE&quot;, &quot;\&quot;&quot; + prop(&quot;assistkey.betaExpires&quot;) + &quot;\&quot;&quot;)</span>
+<span class="a">+        buildConfigField(&quot;String&quot;, &quot;TESTER_CODE_SHA256&quot;, &quot;\&quot;&quot; + testerCodeHash + &quot;\&quot;&quot;)</span>
+     }
+ 
+     signingConfigs {
+<span class="h">@@ -54,6 +83,10 @@ android {</span>
+         }
+     }
+ 
+<span class="a">+    buildFeatures {</span>
+<span class="a">+        buildConfig = true</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     compileOptions {
+         sourceCompatibility = JavaVersion.VERSION_17
+         targetCompatibility = JavaVersion.VERSION_17
+<span class="h">@@ -70,6 +103,22 @@ android {</span>
+     }
+ }
+ 
+<span class="d">-// Framework APIs only, so the APK stays a couple of hundred KB and there is</span>
+<span class="d">-// nothing to audit but our own code.</span>
+<span class="d">-dependencies { }</span>
+<span class="a">+// One dependency, and only because there is no other way to sell on Play.</span>
+<span class="a">+// Everything else is framework API.</span>
+<span class="a">+//</span>
+<span class="a">+// The billing library talks to the Play Store app over IPC and needs no network</span>
+<span class="a">+// access of its own. What does want the network is its usage telemetry, which</span>
+<span class="a">+// rides on Google&#x27;s datatransport runtime and would merge INTERNET and</span>
+<span class="a">+// ACCESS_NETWORK_STATE into the manifest. An accessibility service that sees</span>
+<span class="a">+// key presses should not also hold INTERNET, so that runtime is left out.</span>
+<span class="a">+//</span>
+<span class="a">+// This is safe by construction, not by luck: the only class in the library that</span>
+<span class="a">+// touches datatransport (zzdn in 8.3.0) initialises it inside a catch-all and</span>
+<span class="a">+// falls back to &quot;Skipping logging since initialization failed&quot;. Re-check that</span>
+<span class="a">+// with javap before bumping the billing version, and re-check the merged</span>
+<span class="a">+// permissions with `aapt2 dump badging` after.</span>
+<span class="a">+dependencies {</span>
+<span class="a">+    implementation(&quot;com.android.billingclient:billing:8.3.0&quot;) {</span>
+<span class="a">+        exclude(group = &quot;com.google.android.datatransport&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index dd1cb4f..c189e06 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+<span class="h">@@ -2,10 +2,6 @@</span>
+ &lt;manifest xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;
+     xmlns:tools=&quot;http://schemas.android.com/tools&quot;&gt;
+ 
+<span class="d">-    &lt;!-- User-grantable from a settings screen; drives the Viwoods channel. --&gt;</span>
+<span class="d">-    &lt;uses-permission android:name=&quot;android.permission.WRITE_SETTINGS&quot;</span>
+<span class="d">-        tools:ignore=&quot;ProtectedPermissions&quot; /&gt;</span>
+<span class="d">-</span>
+     &lt;!--
+         Not grantable at install. Declared so that `adb shell pm grant` can turn
+         it on for the power-gesture switches; without it those rows report the
+<span class="h">@@ -60,6 +56,7 @@</span>
+         &lt;activity android:name=&quot;.ui.ViwoodsActivity&quot; android:exported=&quot;false&quot; /&gt;
+         &lt;activity android:name=&quot;.ui.TimingActivity&quot; android:exported=&quot;false&quot; /&gt;
+         &lt;activity android:name=&quot;.ui.KeyTesterActivity&quot; android:exported=&quot;false&quot; /&gt;
+<span class="a">+        &lt;activity android:name=&quot;.ui.LicenseActivity&quot; android:exported=&quot;false&quot; /&gt;</span>
+ 
+         &lt;!--
+             The three impersonation entry points. Each starts disabled: the app
+diff --git a/app/src/main/java/dev/equwal/assistkey/channel/Channel.kt b/app/src/main/java/dev/equwal/assistkey/channel/Channel.kt
+index 63ff709..545f449 100644
+--- a/app/src/main/java/dev/equwal/assistkey/channel/Channel.kt
++++ b/app/src/main/java/dev/equwal/assistkey/channel/Channel.kt
+<span class="h">@@ -27,7 +27,7 @@ enum class Channel(</span>
+         &quot;accessibility&quot;,
+         &quot;Accessibility key filter&quot;,
+         &quot;Captures the AI key and both volume keys. Required for multi-tap, &quot; +
+<span class="d">-            &quot;holds, chords, and for Back / Recents / swipe actions.&quot;,</span>
+<span class="a">+            &quot;holds, combinations, and for Back / Recents / swipe actions.&quot;,</span>
+         listOf()
+     ),
+ 
+<span class="h">@@ -41,28 +41,21 @@ enum class Channel(</span>
+     CAMERA(
+         &quot;camera&quot;,
+         &quot;Camera app&quot;,
+<span class="d">-        &quot;Captures double-press Power when the gesture target is Camera. &quot; +</span>
+<span class="d">-            &quot;Needs this app set as the default camera app.&quot;,</span>
+<span class="a">+        &quot;Captures double-press Power. The firmware opens the camera on a &quot; +</span>
+<span class="a">+            &quot;double press, so this app has to be the default camera app.&quot;,</span>
+         listOf(&quot;dev.equwal.assistkey.channel.CameraShimActivity&quot;)
+     ),
+ 
+     WALLET(
+         &quot;wallet&quot;,
+         &quot;Wallet app&quot;,
+<span class="d">-        &quot;Captures double-press Power when the gesture target is Wallet, plus &quot; +</span>
+<span class="d">-            &quot;the lock-screen wallet button and the quick-settings wallet tile.&quot;,</span>
+<span class="a">+        &quot;Captures the quick-settings wallet tile and the lock-screen wallet &quot; +</span>
+<span class="a">+            &quot;button, and double-press Power on firmware that sends it to the &quot; +</span>
+<span class="a">+            &quot;wallet. This reader sends it to the camera instead.&quot;,</span>
+         listOf(
+             &quot;dev.equwal.assistkey.channel.WalletActivity&quot;,
+             &quot;dev.equwal.assistkey.channel.WalletService&quot;
+         )
+<span class="d">-    ),</span>
+<span class="d">-</span>
+<span class="d">-    VIWOODS(</span>
+<span class="d">-        &quot;viwoods&quot;,</span>
+<span class="d">-        &quot;Viwoods native key hooks&quot;,</span>
+<span class="d">-        &quot;Rebinds the firmware key settings directly. Works without the &quot; +</span>
+<span class="d">-            &quot;accessibility service, but single-action only - no multi-tap.&quot;,</span>
+<span class="d">-        listOf()</span>
+     );
+ 
+     /**
+<span class="h">@@ -74,7 +67,7 @@ enum class Channel(</span>
+         get() = when (this) {
+             ASSISTANT -&gt; POWER_HOLD
+             CAMERA, WALLET -&gt; POWER_DOUBLE
+<span class="d">-            ACCESSIBILITY, VIWOODS -&gt; null</span>
+<span class="a">+            ACCESSIBILITY -&gt; null</span>
+         }
+ 
+     companion object {
+diff --git a/app/src/main/java/dev/equwal/assistkey/channel/ChannelEntry.kt b/app/src/main/java/dev/equwal/assistkey/channel/ChannelEntry.kt
+index 37e9101..1a66b65 100644
+--- a/app/src/main/java/dev/equwal/assistkey/channel/ChannelEntry.kt
++++ b/app/src/main/java/dev/equwal/assistkey/channel/ChannelEntry.kt
+<span class="h">@@ -5,6 +5,7 @@ import android.os.Handler</span>
+ import android.os.Looper
+ import android.util.Log
+ import android.widget.Toast
+<span class="a">+import dev.equwal.assistkey.license.License</span>
+ import dev.equwal.assistkey.route.ActionRouter
+ import dev.equwal.assistkey.route.ServiceHolder
+ import dev.equwal.assistkey.store.Store
+<span class="h">@@ -24,6 +25,16 @@ object ChannelEntry {</span>
+      * activity launch restrictions would drop it.
+      */
+     fun handle(activity: Activity, channel: Channel) {
+<span class="a">+        if (!License.active(activity)) {</span>
+<span class="a">+            Toast.makeText(</span>
+<span class="a">+                activity,</span>
+<span class="a">+                &quot;AssistKey is locked - open the app to unlock it&quot;,</span>
+<span class="a">+                Toast.LENGTH_SHORT</span>
+<span class="a">+            ).show()</span>
+<span class="a">+            activity.finishAndVanish()</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+         val trigger = channel.trigger
+         val spec = trigger?.let { Store.bindings(activity)[it] }
+ 
+diff --git a/app/src/main/java/dev/equwal/assistkey/channel/Channels.kt b/app/src/main/java/dev/equwal/assistkey/channel/Channels.kt
+index 1ca57e2..310eec4 100644
+--- a/app/src/main/java/dev/equwal/assistkey/channel/Channels.kt
++++ b/app/src/main/java/dev/equwal/assistkey/channel/Channels.kt
+<span class="h">@@ -75,7 +75,6 @@ object Channels {</span>
+         Channel.ASSISTANT -&gt; isRoleHeld(c, RoleManager.ROLE_ASSISTANT)
+         Channel.WALLET -&gt; isRoleHeld(c, ROLE_WALLET)
+         Channel.CAMERA -&gt; isDefaultCamera(c)
+<span class="d">-        Channel.VIWOODS -&gt; Settings.System.canWrite(c)</span>
+     }
+ 
+     /** One line for the UI, describing exactly what is missing. */
+<span class="h">@@ -89,7 +88,6 @@ object Channels {</span>
+                 if (isRoleAvailable(c, ROLE_WALLET)) &quot;Not the default wallet app&quot;
+                 else &quot;No wallet role on this firmware&quot;
+             Channel.CAMERA -&gt; &quot;Not the default camera app&quot;
+<span class="d">-            Channel.VIWOODS -&gt; &quot;Needs permission to modify system settings&quot;</span>
+         }
+     }
+ 
+<span class="h">@@ -154,11 +152,6 @@ object Channels {</span>
+             ?: defaultApps()
+ 
+         Channel.CAMERA -&gt; defaultApps()
+<span class="d">-</span>
+<span class="d">-        Channel.VIWOODS -&gt; Intent(</span>
+<span class="d">-            Settings.ACTION_MANAGE_WRITE_SETTINGS,</span>
+<span class="d">-            Uri.parse(&quot;package:&quot; + c.packageName)</span>
+<span class="d">-        )</span>
+     }.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+ 
+     private fun roleRequest(c: Context, role: String): Intent? {
+diff --git a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+index b305ed6..ea7316e 100644
+--- a/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
++++ b/app/src/main/java/dev/equwal/assistkey/engine/KeyFilterService.kt
+<span class="h">@@ -8,11 +8,13 @@ import android.view.KeyEvent</span>
+ import android.view.accessibility.AccessibilityEvent
+ import dev.equwal.assistkey.channel.Channel
+ import dev.equwal.assistkey.channel.Channels
+<span class="a">+import dev.equwal.assistkey.license.License</span>
+<span class="a">+import dev.equwal.assistkey.license.PlayBilling</span>
+ import dev.equwal.assistkey.model.ActionKind
+ import dev.equwal.assistkey.model.ActionSpec
+ import dev.equwal.assistkey.model.HwKey
+<span class="d">-import dev.equwal.assistkey.model.Presets</span>
+ import dev.equwal.assistkey.model.Trigger
+<span class="a">+import dev.equwal.assistkey.native.ViwoodsBridge</span>
+ import dev.equwal.assistkey.route.ActionRouter
+ import dev.equwal.assistkey.route.ServiceHolder
+ import dev.equwal.assistkey.store.Store
+<span class="h">@@ -34,6 +36,9 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         super.onServiceConnected()
+         engine = GestureEngine(this, Store.timing(this))
+         ServiceHolder.service = this
+<span class="a">+        // The service starts at boot and may run for weeks without the settings</span>
+<span class="a">+        // screen ever opening, so it keeps the licence fresh on its own.</span>
+<span class="a">+        PlayBilling.refresh(this)</span>
+     }
+ 
+     override fun onUnbind(intent: android.content.Intent?): Boolean {
+<span class="h">@@ -52,6 +57,8 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         val key = HwKey.fromCode(event.keyCode)
+         val consumed = when {
+             !Channels.isEnabled(this, Channel.ACCESSIBILITY) -&gt; false
+<span class="a">+            // Locked means inert, not broken: every key goes to the firmware.</span>
+<span class="a">+            !License.active(this) -&gt; false</span>
+             key == null || !key.interceptable -&gt; false
+             event.action == KeyEvent.ACTION_DOWN -&gt;
+                 engine.onDown(key, event.eventTime, event.repeatCount)
+<span class="h">@@ -60,6 +67,7 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         }
+         // Every event, not just the ones we act on: the tester screen is the
+         // only way to find out whether a key reaches a filter on this firmware.
+<span class="a">+        // KeyLog drops it on the floor unless that screen is open.</span>
+         KeyLog.record(event, key?.label ?: (&quot;Key &quot; + event.keyCode), consumed)
+         return consumed
+     }
+<span class="h">@@ -105,9 +113,10 @@ class KeyFilterService : AccessibilityService(), GestureEngine.Host {</span>
+         when (keys.first()) {
+             HwKey.VOL_UP -&gt; adjust(AudioManager.ADJUST_RAISE)
+             HwKey.VOL_DOWN -&gt; adjust(AudioManager.ADJUST_LOWER)
+<span class="a">+            // Whatever the firmware would have opened, not a guess at it.</span>
+             HwKey.AI -&gt; ActionRouter.run(
+                 this,
+<span class="d">-                ActionSpec(ActionKind.LAUNCH_COMPONENT, Presets.STOCK_AI_KEY)</span>
+<span class="a">+                ActionSpec(ActionKind.LAUNCH_COMPONENT, ViwoodsBridge.aiTarget(this))</span>
+             )
+             HwKey.POWER -&gt; Unit
+         }
+diff --git a/app/src/main/java/dev/equwal/assistkey/engine/KeyLog.kt b/app/src/main/java/dev/equwal/assistkey/engine/KeyLog.kt
+index 1014a58..bd8bf57 100644
+--- a/app/src/main/java/dev/equwal/assistkey/engine/KeyLog.kt
++++ b/app/src/main/java/dev/equwal/assistkey/engine/KeyLog.kt
+<span class="h">@@ -38,8 +38,18 @@ object KeyLog {</span>
+ 
+     private val entries = ArrayDeque&lt;Entry&gt;(CAPACITY)
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Only the tester screen turns this on, and only while it is in front. A</span>
+<span class="a">+     * key filter is handed every key on the device, a Bluetooth keyboard&#x27;s</span>
+<span class="a">+     * included, and the app&#x27;s promise is that it keeps none of them - so</span>
+<span class="a">+     * outside that screen nothing is remembered, even in memory.</span>
+<span class="a">+     */</span>
+<span class="a">+    @Volatile</span>
+<span class="a">+    var recording = false</span>
+<span class="a">+</span>
+     @Synchronized
+     fun record(event: KeyEvent, label: String, consumed: Boolean) {
+<span class="a">+        if (!recording) return</span>
+         if (entries.size &gt;= CAPACITY) entries.removeFirst()
+         entries.addLast(
+             Entry(
+diff --git a/app/src/main/java/dev/equwal/assistkey/license/License.kt b/app/src/main/java/dev/equwal/assistkey/license/License.kt
+new file mode 100644
+index 0000000..0cee602
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/license/License.kt
+<span class="h">@@ -0,0 +1,168 @@</span>
+<span class="a">+package dev.equwal.assistkey.license</span>
+<span class="a">+</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.content.SharedPreferences</span>
+<span class="a">+import dev.equwal.assistkey.BuildConfig</span>
+<span class="a">+import java.security.MessageDigest</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Whether the app is allowed to do its job, and why.</span>
+<span class="a">+ *</span>
+<span class="a">+ * There are four tiers, tried in order:</span>
+<span class="a">+ *</span>
+<span class="a">+ *  1. LICENSED - Google Play says this account owns one of the two paid</span>
+<span class="a">+ *     products. Cached, so it survives being offline.</span>
+<span class="a">+ *  2. BETA     - the free beta is still open. Everything works.</span>
+<span class="a">+ *  3. TRIAL    - the beta is over; seven days from first launch to decide.</span>
+<span class="a">+ *  4. LOCKED   - nothing is remapped until a licence is bought.</span>
+<span class="a">+ *</span>
+<span class="a">+ * &quot;Is the beta open&quot; is answered by Google Play, not by a server of ours. The</span>
+<span class="a">+ * catalogue holds a third product, [Sku.BETA_OPEN], that is never sold; it is</span>
+<span class="a">+ * only a flag. While it is active the beta is open. Deactivating it in Play</span>
+<span class="a">+ * Console ends the beta for every install at once, sideloaded or not. The</span>
+<span class="a">+ * state &quot;the paid product is visible but the flag is gone&quot; is the only one read</span>
+<span class="a">+ * as closed, so an install that cannot reach Play - or a build that predates</span>
+<span class="a">+ * the Play listing entirely - stays open, up to the date compiled into it.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Anyone who ran the app while the beta was open is remembered as a tester and</span>
+<span class="a">+ * is offered [Sku.PRO_TESTER], the same licence at a lower price.</span>
+<span class="a">+ */</span>
+<span class="a">+object License {</span>
+<span class="a">+</span>
+<span class="a">+    enum class Tier { LICENSED, BETA, TRIAL, LOCKED }</span>
+<span class="a">+</span>
+<span class="a">+    data class State(</span>
+<span class="a">+        val tier: Tier,</span>
+<span class="a">+        /** Whole days of trial left, rounded up; zero outside TRIAL. */</span>
+<span class="a">+        val trialDaysLeft: Int = 0,</span>
+<span class="a">+        /** True when Play has positively confirmed the beta flag, not just a date. */</span>
+<span class="a">+        val betaConfirmedByPlay: Boolean = false</span>
+<span class="a">+    ) {</span>
+<span class="a">+        val active: Boolean get() = tier != Tier.LOCKED</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** What a catalogue lookup said about one product. */</span>
+<span class="a">+    object Seen {</span>
+<span class="a">+        const val UNKNOWN = 0</span>
+<span class="a">+        const val FOUND = 1</span>
+<span class="a">+        const val NOT_FOUND = 2</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private const val PREFS = &quot;assistkey_license&quot;</span>
+<span class="a">+    private const val K_FIRST_RUN = &quot;first_run_at&quot;</span>
+<span class="a">+    private const val K_TESTER = &quot;beta_tester&quot;</span>
+<span class="a">+    private const val K_CODE_OK = &quot;tester_code_ok&quot;</span>
+<span class="a">+    private const val K_OWNED = &quot;owned&quot;</span>
+<span class="a">+    private const val K_CAT_PRO = &quot;catalog_pro&quot;</span>
+<span class="a">+    private const val K_CAT_BETA = &quot;catalog_beta&quot;</span>
+<span class="a">+    private const val K_CAT_AT = &quot;catalog_at&quot;</span>
+<span class="a">+</span>
+<span class="a">+    private const val DAY_MS = 24L * 60 * 60 * 1000</span>
+<span class="a">+    const val TRIAL_DAYS = 7</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * A catalogue answer older than this is not trusted to say the beta is</span>
+<span class="a">+     * still open; the compiled-in date takes over again.</span>
+<span class="a">+     */</span>
+<span class="a">+    private const val CATALOG_FRESH_MS = 14 * DAY_MS</span>
+<span class="a">+</span>
+<span class="a">+    /** The key filter asks on every key event, so the answer is held briefly. */</span>
+<span class="a">+    private const val STATE_TTL_MS = 30_000L</span>
+<span class="a">+</span>
+<span class="a">+    @Volatile private var cached: State? = null</span>
+<span class="a">+    @Volatile private var cachedAt = 0L</span>
+<span class="a">+</span>
+<span class="a">+    private fun prefs(c: Context): SharedPreferences =</span>
+<span class="a">+        c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)</span>
+<span class="a">+</span>
+<span class="a">+    // ---- reading ------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    fun state(c: Context): State {</span>
+<span class="a">+        val now = System.currentTimeMillis()</span>
+<span class="a">+        cached?.let { if (now - cachedAt &lt; STATE_TTL_MS) return it }</span>
+<span class="a">+        return compute(c, now).also {</span>
+<span class="a">+            cached = it</span>
+<span class="a">+            cachedAt = now</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun active(c: Context): Boolean = state(c).active</span>
+<span class="a">+</span>
+<span class="a">+    fun invalidate() {</span>
+<span class="a">+        cached = null</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun compute(c: Context, now: Long): State {</span>
+<span class="a">+        val p = prefs(c)</span>
+<span class="a">+        val firstRun = firstRunAt(p, now)</span>
+<span class="a">+</span>
+<span class="a">+        val owned = p.getStringSet(K_OWNED, emptySet()) ?: emptySet()</span>
+<span class="a">+        if (owned.any { it in Sku.LICENCES }) return State(Tier.LICENSED)</span>
+<span class="a">+</span>
+<span class="a">+        val fresh = now - p.getLong(K_CAT_AT, 0L) &lt; CATALOG_FRESH_MS</span>
+<span class="a">+        val pro = if (fresh) p.getInt(K_CAT_PRO, Seen.UNKNOWN) else Seen.UNKNOWN</span>
+<span class="a">+        val beta = if (fresh) p.getInt(K_CAT_BETA, Seen.UNKNOWN) else Seen.UNKNOWN</span>
+<span class="a">+</span>
+<span class="a">+        val open = when {</span>
+<span class="a">+            beta == Seen.FOUND -&gt; true</span>
+<span class="a">+            pro == Seen.FOUND &amp;&amp; beta == Seen.NOT_FOUND -&gt; false</span>
+<span class="a">+            else -&gt; now &lt; BuildConfig.BETA_EXPIRES_MS</span>
+<span class="a">+        }</span>
+<span class="a">+        if (open) {</span>
+<span class="a">+            if (!p.getBoolean(K_TESTER, false)) p.edit().putBoolean(K_TESTER, true).apply()</span>
+<span class="a">+            return State(Tier.BETA, betaConfirmedByPlay = beta == Seen.FOUND)</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        val left = firstRun + TRIAL_DAYS * DAY_MS - now</span>
+<span class="a">+        if (left &gt; 0) {</span>
+<span class="a">+            return State(Tier.TRIAL, trialDaysLeft = ((left + DAY_MS - 1) / DAY_MS).toInt())</span>
+<span class="a">+        }</span>
+<span class="a">+        return State(Tier.LOCKED)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun firstRunAt(p: SharedPreferences, now: Long): Long {</span>
+<span class="a">+        val at = p.getLong(K_FIRST_RUN, 0L)</span>
+<span class="a">+        if (at in 1..now) return at</span>
+<span class="a">+        p.edit().putLong(K_FIRST_RUN, now).apply()</span>
+<span class="a">+        return now</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Ran the app during the beta, or typed the code a tester was given. */</span>
+<span class="a">+    fun testerEligible(c: Context): Boolean {</span>
+<span class="a">+        val p = prefs(c)</span>
+<span class="a">+        return p.getBoolean(K_TESTER, false) || p.getBoolean(K_CODE_OK, false)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- writing, from PlayBilling ------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    fun recordOwned(c: Context, productIds: Set&lt;String&gt;) {</span>
+<span class="a">+        prefs(c).edit().putStringSet(K_OWNED, HashSet(productIds)).apply()</span>
+<span class="a">+        invalidate()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    fun recordCatalog(c: Context, pro: Int, beta: Int) {</span>
+<span class="a">+        prefs(c).edit()</span>
+<span class="a">+            .putInt(K_CAT_PRO, pro)</span>
+<span class="a">+            .putInt(K_CAT_BETA, beta)</span>
+<span class="a">+            .putLong(K_CAT_AT, System.currentTimeMillis())</span>
+<span class="a">+            .apply()</span>
+<span class="a">+        invalidate()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- tester code ---------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * For testers who cannot carry the marker over - a new device, or a Play</span>
+<span class="a">+     * install that refused to upgrade in place over the sideloaded beta.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun redeemTesterCode(c: Context, code: String): Boolean {</span>
+<span class="a">+        val digest = MessageDigest.getInstance(&quot;SHA-256&quot;)</span>
+<span class="a">+            .digest(code.trim().uppercase().toByteArray(Charsets.UTF_8))</span>
+<span class="a">+            .joinToString(&quot;&quot;) { &quot;%02x&quot;.format(it) }</span>
+<span class="a">+        val ok = MessageDigest.isEqual(</span>
+<span class="a">+            digest.toByteArray(), BuildConfig.TESTER_CODE_SHA256.toByteArray()</span>
+<span class="a">+        )</span>
+<span class="a">+        if (ok) prefs(c).edit().putBoolean(K_CODE_OK, true).apply()</span>
+<span class="a">+        return ok</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/license/PlayBilling.kt b/app/src/main/java/dev/equwal/assistkey/license/PlayBilling.kt
+new file mode 100644
+index 0000000..bafa120
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/license/PlayBilling.kt
+<span class="h">@@ -0,0 +1,304 @@</span>
+<span class="a">+package dev.equwal.assistkey.license</span>
+<span class="a">+</span>
+<span class="a">+import android.app.Activity</span>
+<span class="a">+import android.content.Context</span>
+<span class="a">+import android.os.Handler</span>
+<span class="a">+import android.os.Looper</span>
+<span class="a">+import android.util.Log</span>
+<span class="a">+import com.android.billingclient.api.AcknowledgePurchaseParams</span>
+<span class="a">+import com.android.billingclient.api.BillingClient</span>
+<span class="a">+import com.android.billingclient.api.BillingClient.BillingResponseCode</span>
+<span class="a">+import com.android.billingclient.api.BillingClient.ProductType</span>
+<span class="a">+import com.android.billingclient.api.BillingClientStateListener</span>
+<span class="a">+import com.android.billingclient.api.BillingFlowParams</span>
+<span class="a">+import com.android.billingclient.api.BillingResult</span>
+<span class="a">+import com.android.billingclient.api.PendingPurchasesParams</span>
+<span class="a">+import com.android.billingclient.api.ProductDetails</span>
+<span class="a">+import com.android.billingclient.api.Purchase</span>
+<span class="a">+import com.android.billingclient.api.PurchasesUpdatedListener</span>
+<span class="a">+import com.android.billingclient.api.QueryProductDetailsParams</span>
+<span class="a">+import com.android.billingclient.api.QueryPurchasesParams</span>
+<span class="a">+import com.android.billingclient.api.UnfetchedProduct</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Everything that touches Google Play Billing.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The rest of the app never sees a billing type: this object turns what Play</span>
+<span class="a">+ * says into [License.recordOwned] and [License.recordCatalog], and the licence</span>
+<span class="a">+ * is computed from those. That keeps the key-event hot path free of IPC, and</span>
+<span class="a">+ * means a device with no Play Store at all simply never writes anything.</span>
+<span class="a">+ *</span>
+<span class="a">+ * All state here is confined to the main thread. Billing callbacks are</span>
+<span class="a">+ * re-posted onto it rather than trusted to arrive there.</span>
+<span class="a">+ */</span>
+<span class="a">+object PlayBilling {</span>
+<span class="a">+</span>
+<span class="a">+    private const val TAG = &quot;AssistKey&quot;</span>
+<span class="a">+</span>
+<span class="a">+    enum class Availability { UNKNOWN, READY, UNAVAILABLE }</span>
+<span class="a">+</span>
+<span class="a">+    /** Whether Play could be reached the last time anyone tried. */</span>
+<span class="a">+    var availability = Availability.UNKNOWN</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    /** The last problem worth showing a person, or null if there is none. */</span>
+<span class="a">+    var lastProblem: String? = null</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    /** True while a purchase is waiting on a slow payment method. */</span>
+<span class="a">+    var purchasePending = false</span>
+<span class="a">+        private set</span>
+<span class="a">+</span>
+<span class="a">+    /** Set by whichever screen is in front, so it can redraw. */</span>
+<span class="a">+    var onChange: (() -&gt; Unit)? = null</span>
+<span class="a">+</span>
+<span class="a">+    private val main = Handler(Looper.getMainLooper())</span>
+<span class="a">+    private val details = HashMap&lt;String, ProductDetails&gt;()</span>
+<span class="a">+    private val waiters = ArrayList&lt;() -&gt; Unit&gt;()</span>
+<span class="a">+    private var client: BillingClient? = null</span>
+<span class="a">+    private var inFlight = false</span>
+<span class="a">+</span>
+<span class="a">+    // ---- what the screens read ----------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    fun price(productId: String): String? = details[productId]?.let(::offerOf)?.formattedPrice</span>
+<span class="a">+</span>
+<span class="a">+    fun canBuy(productId: String): Boolean = details.containsKey(productId)</span>
+<span class="a">+</span>
+<span class="a">+    // ---- refresh --------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Connects if need be, then re-reads the catalogue and the purchases.</span>
+<span class="a">+     * Callers that arrive while one is running share its result.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun refresh(c: Context, done: (() -&gt; Unit)? = null) {</span>
+<span class="a">+        val app = c.applicationContext</span>
+<span class="a">+        main.post {</span>
+<span class="a">+            done?.let { waiters.add(it) }</span>
+<span class="a">+            if (inFlight) return@post</span>
+<span class="a">+            inFlight = true</span>
+<span class="a">+            connect(app) { ok -&gt;</span>
+<span class="a">+                if (!ok) finish() else queryCatalog(app) { queryOwned(app) { finish() } }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun finish() {</span>
+<span class="a">+        inFlight = false</span>
+<span class="a">+        val run = ArrayList(waiters)</span>
+<span class="a">+        waiters.clear()</span>
+<span class="a">+        run.forEach { it() }</span>
+<span class="a">+        onChange?.invoke()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun connect(app: Context, then: (Boolean) -&gt; Unit) {</span>
+<span class="a">+        val existing = client</span>
+<span class="a">+        if (existing != null &amp;&amp; existing.isReady) {</span>
+<span class="a">+            then(true)</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        val fresh = existing ?: try {</span>
+<span class="a">+            BillingClient.newBuilder(app)</span>
+<span class="a">+                .setListener(purchaseListener(app))</span>
+<span class="a">+                .enablePendingPurchases(</span>
+<span class="a">+                    PendingPurchasesParams.newBuilder().enableOneTimeProducts().build()</span>
+<span class="a">+                )</span>
+<span class="a">+                .build()</span>
+<span class="a">+                .also { client = it }</span>
+<span class="a">+        } catch (e: Exception) {</span>
+<span class="a">+            // No Play Store, or one too old to speak this protocol.</span>
+<span class="a">+            Log.w(TAG, &quot;billing client could not be built&quot;, e)</span>
+<span class="a">+            unavailable(&quot;Google Play billing is not available on this device.&quot;)</span>
+<span class="a">+            then(false)</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        var answered = false</span>
+<span class="a">+        fresh.startConnection(object : BillingClientStateListener {</span>
+<span class="a">+            override fun onBillingSetupFinished(result: BillingResult) {</span>
+<span class="a">+                main.post {</span>
+<span class="a">+                    if (answered) return@post</span>
+<span class="a">+                    answered = true</span>
+<span class="a">+                    Log.i(TAG, &quot;billing setup: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)</span>
+<span class="a">+                    if (result.responseCode == BillingResponseCode.OK) {</span>
+<span class="a">+                        availability = Availability.READY</span>
+<span class="a">+                        then(true)</span>
+<span class="a">+                    } else {</span>
+<span class="a">+                        unavailable(explain(result))</span>
+<span class="a">+                        then(false)</span>
+<span class="a">+                    }</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+</span>
+<span class="a">+            override fun onBillingServiceDisconnected() {</span>
+<span class="a">+                // Nothing to do here. Every refresh checks isReady and connects</span>
+<span class="a">+                // again if need be, which is one attempt with a prompt answer.</span>
+<span class="a">+                // The library&#x27;s own auto-reconnection was tried and dropped: on</span>
+<span class="a">+                // a device with the Play Store disabled - how this reader ships</span>
+<span class="a">+                // - it retries three times per call and holds each answer back</span>
+<span class="a">+                // for seconds.</span>
+<span class="a">+            }</span>
+<span class="a">+        })</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun unavailable(why: String) {</span>
+<span class="a">+        availability = Availability.UNAVAILABLE</span>
+<span class="a">+        lastProblem = why</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun queryCatalog(app: Context, then: () -&gt; Unit) {</span>
+<span class="a">+        val c = client ?: return then()</span>
+<span class="a">+        val params = QueryProductDetailsParams.newBuilder()</span>
+<span class="a">+            .setProductList(</span>
+<span class="a">+                Sku.ALL.map {</span>
+<span class="a">+                    QueryProductDetailsParams.Product.newBuilder()</span>
+<span class="a">+                        .setProductId(it)</span>
+<span class="a">+                        .setProductType(ProductType.INAPP)</span>
+<span class="a">+                        .build()</span>
+<span class="a">+                }</span>
+<span class="a">+            )</span>
+<span class="a">+            .build()</span>
+<span class="a">+</span>
+<span class="a">+        c.queryProductDetailsAsync(params) { result, response -&gt;</span>
+<span class="a">+            main.post {</span>
+<span class="a">+                if (result.responseCode == BillingResponseCode.OK) {</span>
+<span class="a">+                    details.clear()</span>
+<span class="a">+                    response.productDetailsList.forEach { details[it.productId] = it }</span>
+<span class="a">+                    val missing = response.unfetchedProductList</span>
+<span class="a">+                        .associate { it.productId to it.statusCode }</span>
+<span class="a">+                    License.recordCatalog(</span>
+<span class="a">+                        app,</span>
+<span class="a">+                        pro = seen(Sku.PRO, missing),</span>
+<span class="a">+                        beta = seen(Sku.BETA_OPEN, missing)</span>
+<span class="a">+                    )</span>
+<span class="a">+                    lastProblem = null</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    // Keep whatever was cached; one bad answer proves nothing.</span>
+<span class="a">+                    lastProblem = explain(result)</span>
+<span class="a">+                    Log.i(TAG, &quot;catalogue query: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)</span>
+<span class="a">+                }</span>
+<span class="a">+                then()</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Present means found. Absent means not found - unless Play said it could</span>
+<span class="a">+     * not tell, in which case neither can we. A product whose only purchase</span>
+<span class="a">+     * option has been switched off comes back as NO_ELIGIBLE_OFFER rather than</span>
+<span class="a">+     * PRODUCT_NOT_FOUND; for a flag that means the same thing.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun seen(productId: String, missing: Map&lt;String, Int&gt;): Int = when {</span>
+<span class="a">+        details.containsKey(productId) -&gt; License.Seen.FOUND</span>
+<span class="a">+        missing[productId] == UnfetchedProduct.StatusCode.UNKNOWN -&gt; License.Seen.UNKNOWN</span>
+<span class="a">+        else -&gt; License.Seen.NOT_FOUND</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun queryOwned(app: Context, then: () -&gt; Unit) {</span>
+<span class="a">+        val c = client ?: return then()</span>
+<span class="a">+        val params = QueryPurchasesParams.newBuilder().setProductType(ProductType.INAPP).build()</span>
+<span class="a">+        c.queryPurchasesAsync(params) { result, purchases -&gt;</span>
+<span class="a">+            main.post {</span>
+<span class="a">+                if (result.responseCode == BillingResponseCode.OK) {</span>
+<span class="a">+                    absorb(app, purchases, replace = true)</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    Log.i(TAG, &quot;purchase query: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)</span>
+<span class="a">+                }</span>
+<span class="a">+                then()</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- buying ---------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    /** Returns false, with [lastProblem] set, if the purchase sheet could not open. */</span>
+<span class="a">+    fun buy(activity: Activity, productId: String): Boolean {</span>
+<span class="a">+        val product = details[productId]</span>
+<span class="a">+        val c = client</span>
+<span class="a">+        if (product == null || c == null || !c.isReady) {</span>
+<span class="a">+            lastProblem = &quot;Google Play has not answered yet. Try again in a moment.&quot;</span>
+<span class="a">+            return false</span>
+<span class="a">+        }</span>
+<span class="a">+        val item = BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(product)</span>
+<span class="a">+        offerOf(product)?.offerToken?.takeIf { it.isNotEmpty() }?.let { item.setOfferToken(it) }</span>
+<span class="a">+</span>
+<span class="a">+        val result = c.launchBillingFlow(</span>
+<span class="a">+            activity,</span>
+<span class="a">+            BillingFlowParams.newBuilder().setProductDetailsParamsList(listOf(item.build())).build()</span>
+<span class="a">+        )</span>
+<span class="a">+        if (result.responseCode == BillingResponseCode.OK) return true</span>
+<span class="a">+        if (result.responseCode == BillingResponseCode.ITEM_ALREADY_OWNED) {</span>
+<span class="a">+            refresh(activity)</span>
+<span class="a">+            return true</span>
+<span class="a">+        }</span>
+<span class="a">+        lastProblem = explain(result)</span>
+<span class="a">+        return false</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun purchaseListener(app: Context) = PurchasesUpdatedListener { result, purchases -&gt;</span>
+<span class="a">+        main.post {</span>
+<span class="a">+            when (result.responseCode) {</span>
+<span class="a">+                BillingResponseCode.OK -&gt; {</span>
+<span class="a">+                    absorb(app, purchases ?: emptyList(), replace = false)</span>
+<span class="a">+                    lastProblem = null</span>
+<span class="a">+                }</span>
+<span class="a">+                BillingResponseCode.USER_CANCELED -&gt; Unit</span>
+<span class="a">+                BillingResponseCode.ITEM_ALREADY_OWNED -&gt; refresh(app)</span>
+<span class="a">+                else -&gt; lastProblem = explain(result)</span>
+<span class="a">+            }</span>
+<span class="a">+            onChange?.invoke()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Records what is owned and acknowledges anything new. Acknowledging is not</span>
+<span class="a">+     * optional: Play refunds a purchase that goes three days without it.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun absorb(app: Context, purchases: List&lt;Purchase&gt;, replace: Boolean) {</span>
+<span class="a">+        val owned = HashSet&lt;String&gt;()</span>
+<span class="a">+        var pending = false</span>
+<span class="a">+        purchases.forEach { p -&gt;</span>
+<span class="a">+            when (p.purchaseState) {</span>
+<span class="a">+                Purchase.PurchaseState.PURCHASED -&gt; {</span>
+<span class="a">+                    owned.addAll(p.products)</span>
+<span class="a">+                    if (!p.isAcknowledged) acknowledge(p)</span>
+<span class="a">+                }</span>
+<span class="a">+                Purchase.PurchaseState.PENDING -&gt; pending = true</span>
+<span class="a">+                else -&gt; Unit</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        purchasePending = pending</span>
+<span class="a">+        if (replace || owned.isNotEmpty()) License.recordOwned(app, owned)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun acknowledge(p: Purchase) {</span>
+<span class="a">+        val params = AcknowledgePurchaseParams.newBuilder().setPurchaseToken(p.purchaseToken).build()</span>
+<span class="a">+        client?.acknowledgePurchase(params) { result -&gt;</span>
+<span class="a">+            if (result.responseCode != BillingResponseCode.OK) {</span>
+<span class="a">+                // Not fatal: the next refresh sees it unacknowledged and retries.</span>
+<span class="a">+                Log.w(TAG, &quot;acknowledge failed: &quot; + result.responseCode + &quot; &quot; + result.debugMessage)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- helpers ----------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    /** The cheapest way to buy a product, should it ever carry more than one offer. */</span>
+<span class="a">+    private fun offerOf(p: ProductDetails): ProductDetails.OneTimePurchaseOfferDetails? =</span>
+<span class="a">+        p.oneTimePurchaseOfferDetailsList?.minByOrNull { it.priceAmountMicros }</span>
+<span class="a">+            ?: p.oneTimePurchaseOfferDetails</span>
+<span class="a">+</span>
+<span class="a">+    private fun explain(r: BillingResult): String = when (r.responseCode) {</span>
+<span class="a">+        BillingResponseCode.BILLING_UNAVAILABLE -&gt;</span>
+<span class="a">+            &quot;Google Play billing is not available for this device or account.&quot;</span>
+<span class="a">+        BillingResponseCode.SERVICE_UNAVAILABLE,</span>
+<span class="a">+        BillingResponseCode.SERVICE_DISCONNECTED,</span>
+<span class="a">+        BillingResponseCode.NETWORK_ERROR -&gt;</span>
+<span class="a">+            &quot;Could not reach Google Play. Check the connection and try again.&quot;</span>
+<span class="a">+        BillingResponseCode.ITEM_UNAVAILABLE -&gt;</span>
+<span class="a">+            &quot;That product is not available for this account.&quot;</span>
+<span class="a">+        BillingResponseCode.FEATURE_NOT_SUPPORTED -&gt;</span>
+<span class="a">+            &quot;The Play Store app on this device is too old. Update it and try again.&quot;</span>
+<span class="a">+        else -&gt; &quot;Google Play error &quot; + r.responseCode +</span>
+<span class="a">+            (if (r.debugMessage.isNullOrBlank()) &quot;&quot; else &quot;: &quot; + r.debugMessage)</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/license/Sku.kt b/app/src/main/java/dev/equwal/assistkey/license/Sku.kt
+new file mode 100644
+index 0000000..db42760
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/license/Sku.kt
+<span class="h">@@ -0,0 +1,20 @@</span>
+<span class="a">+package dev.equwal.assistkey.license</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The three product ids, exactly as they must be typed into Play Console.</span>
+<span class="a">+ * Product ids can never be changed or reused once created, so neither can</span>
+<span class="a">+ * these.</span>
+<span class="a">+ */</span>
+<span class="a">+object Sku {</span>
+<span class="a">+    /** The licence. One-time, non-consumable. */</span>
+<span class="a">+    const val PRO = &quot;assistkey_pro&quot;</span>
+<span class="a">+</span>
+<span class="a">+    /** The same licence at the tester price. Only offered to [License.testerEligible]. */</span>
+<span class="a">+    const val PRO_TESTER = &quot;assistkey_pro_tester&quot;</span>
+<span class="a">+</span>
+<span class="a">+    /** Never sold. Active means the beta is open; deactivate it to end the beta. */</span>
+<span class="a">+    const val BETA_OPEN = &quot;assistkey_beta_open&quot;</span>
+<span class="a">+</span>
+<span class="a">+    val LICENCES = setOf(PRO, PRO_TESTER)</span>
+<span class="a">+    val ALL = listOf(PRO, PRO_TESTER, BETA_OPEN)</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/native/ViwoodsBridge.kt b/app/src/main/java/dev/equwal/assistkey/native/ViwoodsBridge.kt
+index 40dae98..ac8232d 100644
+--- a/app/src/main/java/dev/equwal/assistkey/native/ViwoodsBridge.kt
++++ b/app/src/main/java/dev/equwal/assistkey/native/ViwoodsBridge.kt
+<span class="h">@@ -7,19 +7,31 @@ import dev.equwal.assistkey.model.HwKey</span>
+ import dev.equwal.assistkey.model.Presets
+ 
+ /**
+<span class="d">- * The firmware&#x27;s own key remapper, which turns out to be nothing more than a</span>
+<span class="d">- * handful of Settings.System strings that the Viwoods launcher reads. The names</span>
+<span class="d">- * and the token vocabulary below were read out of setting_se08 1.3.7 on</span>
+<span class="a">+ * The firmware&#x27;s own key remapper: a handful of Settings.System strings. The</span>
+<span class="a">+ * names and the token vocabulary were read out of setting_se08 1.3.7 on</span>
+  * firmware 1.5.6.
+  *
+<span class="d">- * Writing them needs WRITE_SETTINGS, which the user can grant from an ordinary</span>
+<span class="d">- * settings screen - no adb - so this is the one channel that works on a</span>
+<span class="d">- * completely untouched device. The cost is one action per key: no multi-tap,</span>
+<span class="d">- * no holds, no chords.</span>
+<span class="a">+ * This is read-only, and not by choice. An ordinary app cannot write these</span>
+<span class="a">+ * keys. SettingsProvider refuses any Settings.System name outside its public</span>
+<span class="a">+ * list unless the caller is a privileged system app - WRITE_SETTINGS does not</span>
+<span class="a">+ * help and neither does an adb-granted WRITE_SECURE_SETTINGS; the call dies</span>
+<span class="a">+ * with &quot;You cannot keep your settings in the secure settings&quot;. Only the shell</span>
+<span class="a">+ * can change them, so the most this app can do is show them and hand over the</span>
+<span class="a">+ * command.</span>
+  *
+<span class="d">- * The two key families are not symmetric. The volume keys hold a token, with</span>
+<span class="d">- * the component kept alongside in *AppShortcut; the AI key holds the flat</span>
+<span class="d">- * component itself and has no shortcut slot.</span>
+<span class="a">+ * They still matter, because of one interaction measured on the device:</span>
+<span class="a">+ *</span>
+<span class="a">+ *   While a volume key&#x27;s hook holds ANY value - even its &quot;default&quot; token,</span>
+<span class="a">+ *   volume_up or volume_down - the firmware handles that key before the input</span>
+<span class="a">+ *   filter stage, and no app ever sees the press. Unset, the key reaches the</span>
+<span class="a">+ *   accessibility filter normally.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The AI key is not like that: it reaches the filter whatever its hook says,</span>
+<span class="a">+ * and the hook only decides what happens when nothing consumes the press.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The two families are not symmetric. A volume key holds a token, with a</span>
+<span class="a">+ * component kept alongside in *AppShortcut; the AI key holds the flat component</span>
+<span class="a">+ * itself.</span>
+  */
+ object ViwoodsBridge {
+ 
+<span class="h">@@ -32,10 +44,10 @@ object ViwoodsBridge {</span>
+ 
+     data class Slot(val key: String, val shortcut: String)
+ 
+<span class="d">-    const val TOKEN_APP = &quot;shortcut_app&quot;</span>
+<span class="a">+    private const val TOKEN_APP = &quot;shortcut_app&quot;</span>
+ 
+<span class="d">-    /** Every value the stock launcher understands for a volume key. */</span>
+<span class="d">-    val volumeTokens = listOf(</span>
+<span class="a">+    /** Every value the stock settings screen writes for a volume key. */</span>
+<span class="a">+    private val volumeTokens = mapOf(</span>
+         &quot;volume_up&quot; to &quot;Volume up&quot;,
+         &quot;volume_down&quot; to &quot;Volume down&quot;,
+         &quot;screenshot&quot; to &quot;Screenshot&quot;,
+<span class="h">@@ -44,78 +56,42 @@ object ViwoodsBridge {</span>
+ 
+     fun keys(): List&lt;HwKey&gt; = listOf(HwKey.AI, HwKey.VOL_UP, HwKey.VOL_DOWN)
+ 
+<span class="d">-    fun canWrite(c: Context): Boolean = Settings.System.canWrite(c)</span>
+<span class="d">-</span>
+<span class="d">-    // ---- reads -------------------------------------------------------------</span>
+<span class="a">+    /** Defensive: an OEM key that a later firmware hides must not take the app down. */</span>
+<span class="a">+    private fun get(c: Context, name: String): String? =</span>
+<span class="a">+        runCatching { Settings.System.getString(c.contentResolver, name) }</span>
+<span class="a">+            .getOrNull()?.takeIf { it.isNotBlank() &amp;&amp; it != &quot;null&quot; }</span>
+ 
+     fun read(c: Context, key: HwKey): String? = when (key) {
+<span class="d">-        HwKey.AI -&gt; Settings.System.getString(c.contentResolver, AI_KEY)</span>
+<span class="d">-        else -&gt; VOLUME_SLOT[key]?.let {</span>
+<span class="d">-            Settings.System.getString(c.contentResolver, it.key)</span>
+<span class="d">-        }</span>
+<span class="a">+        HwKey.AI -&gt; get(c, AI_KEY)</span>
+<span class="a">+        else -&gt; VOLUME_SLOT[key]?.let { get(c, it.key) }</span>
+     }
+ 
+<span class="d">-    fun readShortcut(c: Context, key: HwKey): String? =</span>
+<span class="d">-        VOLUME_SLOT[key]?.let { Settings.System.getString(c.contentResolver, it.shortcut) }</span>
+<span class="d">-</span>
+<span class="d">-    /** Human description of whatever the firmware currently has bound. */</span>
+<span class="d">-    fun describe(c: Context, key: HwKey): String {</span>
+<span class="d">-        val v = read(c, key)</span>
+<span class="d">-        if (v.isNullOrBlank()) return &quot;Not set (firmware default)&quot;</span>
+<span class="d">-        if (key == HwKey.AI) return shortName(c, v)</span>
+<span class="d">-</span>
+<span class="d">-        val named = volumeTokens.firstOrNull { it.first == v } ?: return shortName(c, v)</span>
+<span class="d">-        if (v != TOKEN_APP) return named.second</span>
+<span class="d">-        val target = readShortcut(c, key)</span>
+<span class="d">-        return if (target.isNullOrBlank()) &quot;Open an app (none chosen)&quot;</span>
+<span class="d">-        else &quot;Open &quot; + shortName(c, target)</span>
+<span class="d">-    }</span>
+<span class="d">-</span>
+<span class="d">-    // ---- writes ------------------------------------------------------------</span>
+<span class="a">+    private fun readShortcut(c: Context, key: HwKey): String? =</span>
+<span class="a">+        VOLUME_SLOT[key]?.let { get(c, it.shortcut) }</span>
+ 
+     /**
+<span class="d">-     * Returns false when WRITE_SETTINGS has not been granted, so the caller can</span>
+<span class="d">-     * send the user to the grant screen rather than silently doing nothing.</span>
+<span class="a">+     * True when the firmware is keeping this key to itself, so that bindings</span>
+<span class="a">+     * made for it in this app can never fire.</span>
+      */
+<span class="d">-    fun bindComponent(c: Context, key: HwKey, flatComponent: String): Boolean {</span>
+<span class="d">-        if (!canWrite(c)) return false</span>
+<span class="d">-        return runCatching {</span>
+<span class="d">-            if (key == HwKey.AI) {</span>
+<span class="d">-                Settings.System.putString(c.contentResolver, AI_KEY, flatComponent)</span>
+<span class="d">-            } else {</span>
+<span class="d">-                val slot = VOLUME_SLOT[key] ?: return false</span>
+<span class="d">-                Settings.System.putString(c.contentResolver, slot.shortcut, flatComponent)</span>
+<span class="d">-                Settings.System.putString(c.contentResolver, slot.key, TOKEN_APP)</span>
+<span class="d">-            }</span>
+<span class="d">-            true</span>
+<span class="d">-        }.getOrDefault(false)</span>
+<span class="d">-    }</span>
+<span class="a">+    fun hidesFromFilter(c: Context, key: HwKey): Boolean =</span>
+<span class="a">+        VOLUME_SLOT.containsKey(key) &amp;&amp; read(c, key) != null</span>
+ 
+<span class="d">-    fun bindToken(c: Context, key: HwKey, token: String): Boolean {</span>
+<span class="d">-        val slot = VOLUME_SLOT[key] ?: return false</span>
+<span class="d">-        if (!canWrite(c)) return false</span>
+<span class="d">-        return runCatching {</span>
+<span class="d">-            Settings.System.putString(c.contentResolver, slot.key, token); true</span>
+<span class="d">-        }.getOrDefault(false)</span>
+<span class="d">-    }</span>
+<span class="a">+    /** What the firmware does with the AI key when nothing consumes the press. */</span>
+<span class="a">+    fun aiTarget(c: Context): String = read(c, HwKey.AI) ?: Presets.STOCK_AI_KEY</span>
+ 
+<span class="d">-    /**</span>
+<span class="d">-     * Points a firmware key at our own assist entry, which is how the Viwoods</span>
+<span class="d">-     * channel gets the full gesture engine on a device where the accessibility</span>
+<span class="d">-     * service is unavailable or unwanted.</span>
+<span class="d">-     */</span>
+<span class="d">-    fun bindToUs(c: Context, key: HwKey): Boolean =</span>
+<span class="d">-        bindComponent(c, key, c.packageName + &quot;/dev.equwal.assistkey.channel.AssistActivity&quot;)</span>
+<span class="a">+    /** The command that hands a volume key back to the input pipeline. */</span>
+<span class="a">+    fun unsetCommand(key: HwKey): String? =</span>
+<span class="a">+        VOLUME_SLOT[key]?.let { &quot;adb shell settings delete system &quot; + it.key }</span>
+ 
+<span class="d">-    /**</span>
+<span class="d">-     * Hands a key back to the firmware: the AI key to its factory target, the</span>
+<span class="d">-     * volume keys to plain volume.</span>
+<span class="d">-     */</span>
+<span class="d">-    fun restore(c: Context, key: HwKey): Boolean = when (key) {</span>
+<span class="d">-        HwKey.AI -&gt; bindComponent(c, key, Presets.STOCK_AI_KEY)</span>
+<span class="d">-        HwKey.VOL_UP -&gt; bindToken(c, key, &quot;volume_up&quot;)</span>
+<span class="d">-        HwKey.VOL_DOWN -&gt; bindToken(c, key, &quot;volume_down&quot;)</span>
+<span class="d">-        HwKey.POWER -&gt; false</span>
+<span class="a">+    /** Human description of whatever the firmware currently has bound. */</span>
+<span class="a">+    fun describe(c: Context, key: HwKey): String {</span>
+<span class="a">+        val v = read(c, key) ?: return &quot;Not set&quot;</span>
+<span class="a">+        if (key == HwKey.AI) return shortName(c, v)</span>
+<span class="a">+</span>
+<span class="a">+        val label = volumeTokens[v] ?: return shortName(c, v)</span>
+<span class="a">+        if (v != TOKEN_APP) return label</span>
+<span class="a">+        val target = readShortcut(c, key)</span>
+<span class="a">+        return if (target == null) &quot;Open an app (none chosen)&quot; else &quot;Open &quot; + shortName(c, target)</span>
+     }
+ 
+     private fun shortName(c: Context, flat: String): String {
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/KeyTesterActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/KeyTesterActivity.kt
+index ba41d25..fb5155a 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/KeyTesterActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/KeyTesterActivity.kt
+<span class="h">@@ -41,12 +41,14 @@ class KeyTesterActivity : Activity() {</span>
+ 
+     override fun onResume() {
+         super.onResume()
+<span class="a">+        KeyLog.recording = true</span>
+         build()
+         handler.postDelayed(tick, 400L)
+     }
+ 
+     override fun onPause() {
+         super.onPause()
+<span class="a">+        KeyLog.recording = false</span>
+         handler.removeCallbacks(tick)
+     }
+ 
+<span class="h">@@ -69,8 +71,9 @@ class KeyTesterActivity : Activity() {</span>
+                 &quot;window manager consumes it before any app can see it.&quot;
+         )
+         col.note(
+<span class="d">-            &quot;Only real presses count. Events injected over adb bypass &quot; +</span>
+<span class="d">-                &quot;accessibility input filters and will not show up.&quot;</span>
+<span class="a">+            &quot;Only real presses count. Events injected with adb shell input &quot; +</span>
+<span class="a">+                &quot;bypass accessibility filters and will not show up. Keys are &quot; +</span>
+<span class="a">+                &quot;listed only while this screen is open, and never stored.&quot;</span>
+         )
+ 
+         col.button(&quot;Clear&quot;) { KeyLog.clear(); build() }
+<span class="h">@@ -79,9 +82,9 @@ class KeyTesterActivity : Activity() {</span>
+         col.header(if (recent.isEmpty()) &quot;Nothing yet&quot; else &quot;Most recent first&quot;)
+         if (recent.isEmpty()) {
+             col.note(
+<span class="d">-                &quot;If a key never appears after pressing it, that key cannot be &quot; +</span>
+<span class="d">-                    &quot;remapped through the accessibility channel on this &quot; +</span>
+<span class="d">-                    &quot;firmware. Try the Viwoods native hooks instead.&quot;</span>
+<span class="a">+                &quot;If a key never appears after pressing it, the firmware is &quot; +</span>
+<span class="a">+                    &quot;keeping it to itself. For a volume key that usually means &quot; +</span>
+<span class="a">+                    &quot;a firmware hook is set - see Firmware key hooks.&quot;</span>
+             )
+             return
+         }
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/LicenseActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/LicenseActivity.kt
+new file mode 100644
+index 0000000..31c1da0
+--- /dev/null
++++ b/app/src/main/java/dev/equwal/assistkey/ui/LicenseActivity.kt
+<span class="h">@@ -0,0 +1,198 @@</span>
+<span class="a">+package dev.equwal.assistkey.ui</span>
+<span class="a">+</span>
+<span class="a">+import android.app.Activity</span>
+<span class="a">+import android.widget.LinearLayout</span>
+<span class="a">+import android.widget.Toast</span>
+<span class="a">+import dev.equwal.assistkey.BuildConfig</span>
+<span class="a">+import dev.equwal.assistkey.license.License</span>
+<span class="a">+import dev.equwal.assistkey.license.PlayBilling</span>
+<span class="a">+import dev.equwal.assistkey.license.Sku</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.button</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.header</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.note</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.row</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.title</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Where the licence is shown, bought and restored.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Prices are never written into the app. They come from Google Play at the</span>
+<span class="a">+ * moment the screen opens, already converted and formatted for the buyer&#x27;s</span>
+<span class="a">+ * country, so changing a price is a Play Console edit and not a release.</span>
+<span class="a">+ */</span>
+<span class="a">+class LicenseActivity : Activity() {</span>
+<span class="a">+</span>
+<span class="a">+    override fun onResume() {</span>
+<span class="a">+        super.onResume()</span>
+<span class="a">+        PlayBilling.onChange = { build() }</span>
+<span class="a">+        build()</span>
+<span class="a">+        PlayBilling.refresh(this)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun onPause() {</span>
+<span class="a">+        super.onPause()</span>
+<span class="a">+        PlayBilling.onChange = null</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun build() {</span>
+<span class="a">+        val state = License.state(this)</span>
+<span class="a">+        val col = Ui.page(this)</span>
+<span class="a">+        col.title(&quot;Licence&quot;)</span>
+<span class="a">+        status(col, state)</span>
+<span class="a">+        if (state.tier != License.Tier.LICENSED) buy(col, state)</span>
+<span class="a">+        restore(col)</span>
+<span class="a">+        col.note(&quot;Version &quot; + BuildConfig.VERSION_NAME)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- status ---------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private fun status(col: LinearLayout, state: License.State) {</span>
+<span class="a">+        when (state.tier) {</span>
+<span class="a">+            License.Tier.LICENSED -&gt; {</span>
+<span class="a">+                col.header(&quot;Unlocked&quot;)</span>
+<span class="a">+                col.note(</span>
+<span class="a">+                    &quot;This Google account owns AssistKey. It stays unlocked on every &quot; +</span>
+<span class="a">+                        &quot;device signed in to the same account. Thank you.&quot;</span>
+<span class="a">+                )</span>
+<span class="a">+            }</span>
+<span class="a">+            License.Tier.BETA -&gt; {</span>
+<span class="a">+                col.header(&quot;Beta - free for now&quot;)</span>
+<span class="a">+                col.note(</span>
+<span class="a">+                    &quot;Everything works, at no charge, for as long as the beta is open. &quot; +</span>
+<span class="a">+                        &quot;When it closes, remapping stops until a licence is bought. &quot; +</span>
+<span class="a">+                        &quot;Because you were here for the beta, yours will be at the &quot; +</span>
+<span class="a">+                        &quot;tester price.&quot;</span>
+<span class="a">+                )</span>
+<span class="a">+                col.note(</span>
+<span class="a">+                    if (state.betaConfirmedByPlay) {</span>
+<span class="a">+                        &quot;Google Play confirms the beta is open.&quot;</span>
+<span class="a">+                    } else {</span>
+<span class="a">+                        &quot;This build&#x27;s free access ends on &quot; + BuildConfig.BETA_EXPIRES_DATE +</span>
+<span class="a">+                            &quot; at the latest, and sooner if the beta is closed before then.&quot;</span>
+<span class="a">+                    }</span>
+<span class="a">+                )</span>
+<span class="a">+            }</span>
+<span class="a">+            License.Tier.TRIAL -&gt; {</span>
+<span class="a">+                col.header(&quot;Trial - &quot; + days(state.trialDaysLeft) + &quot; left&quot;)</span>
+<span class="a">+                col.note(</span>
+<span class="a">+                    &quot;Everything works during the trial. After it, remapping stops &quot; +</span>
+<span class="a">+                        &quot;until a licence is bought. Your bindings are kept either way.&quot;</span>
+<span class="a">+                )</span>
+<span class="a">+            }</span>
+<span class="a">+            License.Tier.LOCKED -&gt; {</span>
+<span class="a">+                col.header(&quot;Locked&quot;)</span>
+<span class="a">+                col.note(</span>
+<span class="a">+                    &quot;Remapping is switched off and every key behaves as the firmware &quot; +</span>
+<span class="a">+                        &quot;intends. Your bindings are kept and come back the moment the &quot; +</span>
+<span class="a">+                        &quot;app is unlocked.&quot;</span>
+<span class="a">+                )</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun days(n: Int): String = if (n == 1) &quot;1 day&quot; else n.toString() + &quot; days&quot;</span>
+<span class="a">+</span>
+<span class="a">+    // ---- buying ---------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private fun buy(col: LinearLayout, state: License.State) {</span>
+<span class="a">+        col.header(&quot;Buy&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        if (PlayBilling.purchasePending) {</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;A payment is still being processed by Google Play. The app unlocks &quot; +</span>
+<span class="a">+                    &quot;by itself when it clears; nothing more is needed.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        val tester = License.testerEligible(this)</span>
+<span class="a">+        val fullPrice = PlayBilling.price(Sku.PRO)</span>
+<span class="a">+        val testerPrice = PlayBilling.price(Sku.PRO_TESTER)</span>
+<span class="a">+</span>
+<span class="a">+        when {</span>
+<span class="a">+            fullPrice == null &amp;&amp; testerPrice == null -&gt; notOnSale(col, state)</span>
+<span class="a">+            else -&gt; {</span>
+<span class="a">+                if (tester &amp;&amp; testerPrice != null) {</span>
+<span class="a">+                    col.note(</span>
+<span class="a">+                        &quot;You took part in the beta, so the licence is &quot; + testerPrice +</span>
+<span class="a">+                            (if (fullPrice != null) &quot; instead of &quot; + fullPrice else &quot;&quot;) + &quot;.&quot;</span>
+<span class="a">+                    )</span>
+<span class="a">+                    col.button(&quot;Buy at the tester price - &quot; + testerPrice) {</span>
+<span class="a">+                        purchase(Sku.PRO_TESTER)</span>
+<span class="a">+                    }</span>
+<span class="a">+                } else if (fullPrice != null) {</span>
+<span class="a">+                    col.button(&quot;Buy AssistKey - &quot; + fullPrice) { purchase(Sku.PRO) }</span>
+<span class="a">+                }</span>
+<span class="a">+                col.note(&quot;One payment through Google Play. No subscription, no account.&quot;)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        if (!tester) {</span>
+<span class="a">+            col.row(</span>
+<span class="a">+                &quot;I was a beta tester&quot;,</span>
+<span class="a">+                &quot;Enter the code you were given to get the tester price&quot;</span>
+<span class="a">+            ) { askForCode() }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** No prices means Play gave us nothing to sell - say which kind of nothing. */</span>
+<span class="a">+    private fun notOnSale(col: LinearLayout, state: License.State) {</span>
+<span class="a">+        val problem = PlayBilling.lastProblem</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            when {</span>
+<span class="a">+                PlayBilling.availability == PlayBilling.Availability.UNKNOWN -&gt;</span>
+<span class="a">+                    &quot;Asking Google Play...&quot;</span>
+<span class="a">+                problem != null -&gt; problem</span>
+<span class="a">+                state.tier == License.Tier.BETA -&gt;</span>
+<span class="a">+                    &quot;The licence is not on sale yet. There is nothing to buy during &quot; +</span>
+<span class="a">+                        &quot;this stage of the beta.&quot;</span>
+<span class="a">+                else -&gt;</span>
+<span class="a">+                    &quot;Google Play is not offering the licence to this account. If the &quot; +</span>
+<span class="a">+                        &quot;app was installed from a file, install it from Google Play &quot; +</span>
+<span class="a">+                        &quot;instead and try again.&quot;</span>
+<span class="a">+            }</span>
+<span class="a">+        )</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun purchase(productId: String) {</span>
+<span class="a">+        if (!PlayBilling.buy(this, productId)) {</span>
+<span class="a">+            Toast.makeText(</span>
+<span class="a">+                this,</span>
+<span class="a">+                PlayBilling.lastProblem ?: &quot;Could not start the purchase&quot;,</span>
+<span class="a">+                Toast.LENGTH_LONG</span>
+<span class="a">+            ).show()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun askForCode() {</span>
+<span class="a">+        Ui.textInput(this, &quot;Tester code&quot;, &quot;TESTER-XXXX-XXXX&quot;) { code -&gt;</span>
+<span class="a">+            val ok = License.redeemTesterCode(this, code)</span>
+<span class="a">+            Toast.makeText(</span>
+<span class="a">+                this,</span>
+<span class="a">+                if (ok) &quot;Tester price unlocked&quot; else &quot;That code was not recognised&quot;,</span>
+<span class="a">+                Toast.LENGTH_LONG</span>
+<span class="a">+            ).show()</span>
+<span class="a">+            if (ok) build()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // ---- restoring -------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private fun restore(col: LinearLayout) {</span>
+<span class="a">+        col.header(&quot;Already bought it?&quot;)</span>
+<span class="a">+        col.note(</span>
+<span class="a">+            &quot;Purchases belong to the Google account that made them. Sign in to that &quot; +</span>
+<span class="a">+                &quot;account in the Play Store, then check again.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        col.button(&quot;Check Google Play again&quot;) {</span>
+<span class="a">+            Toast.makeText(this, &quot;Checking...&quot;, Toast.LENGTH_SHORT).show()</span>
+<span class="a">+            PlayBilling.refresh(this) {</span>
+<span class="a">+                val tier = License.state(this).tier</span>
+<span class="a">+                Toast.makeText(</span>
+<span class="a">+                    this,</span>
+<span class="a">+                    if (tier == License.Tier.LICENSED) &quot;Unlocked&quot; else &quot;No purchase found on this account&quot;,</span>
+<span class="a">+                    Toast.LENGTH_LONG</span>
+<span class="a">+                ).show()</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+index a38a7ba..4ef74bb 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/MainActivity.kt
+<span class="h">@@ -1,16 +1,20 @@</span>
+ package dev.equwal.assistkey.ui
+ 
+ import android.app.Activity
+<span class="a">+import android.app.AlertDialog</span>
+ import android.content.Intent
+ import android.os.Bundle
+ import android.widget.LinearLayout
+ import android.widget.Toast
+ import dev.equwal.assistkey.channel.Channel
+ import dev.equwal.assistkey.channel.Channels
+<span class="a">+import dev.equwal.assistkey.license.License</span>
+<span class="a">+import dev.equwal.assistkey.license.PlayBilling</span>
+ import dev.equwal.assistkey.model.GestureType
+ import dev.equwal.assistkey.model.HwKey
+ import dev.equwal.assistkey.model.Trigger
+ import dev.equwal.assistkey.native.PowerNative
+<span class="a">+import dev.equwal.assistkey.native.ViwoodsBridge</span>
+ import dev.equwal.assistkey.store.Store
+ import dev.equwal.assistkey.ui.Ui.button
+ import dev.equwal.assistkey.ui.Ui.check
+<span class="h">@@ -36,6 +40,11 @@ class MainActivity : Activity() {</span>
+     override fun onResume() {
+         super.onResume()
+         build()
+<span class="a">+        // Play answers asynchronously; redraw only if the answer changed the tier.</span>
+<span class="a">+        val before = License.state(this).tier</span>
+<span class="a">+        PlayBilling.refresh(this) {</span>
+<span class="a">+            if (License.state(this).tier != before &amp;&amp; !isFinishing) build()</span>
+<span class="a">+        }</span>
+     }
+ 
+     private fun build() {
+<span class="h">@@ -45,11 +54,29 @@ class MainActivity : Activity() {</span>
+             &quot;Remaps the AI key, both volume keys and the power button. &quot; +
+                 &quot;Turn on the capture channels you want, then bind gestures below.&quot;
+         )
+<span class="a">+        licence(col)</span>
+         channels(col)
+         buttons(col)
+         extras(col)
+     }
+ 
+<span class="a">+    // ---- licence -----------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+    private fun licence(col: LinearLayout) {</span>
+<span class="a">+        val s = License.state(this)</span>
+<span class="a">+        val (title, subtitle) = when (s.tier) {</span>
+<span class="a">+            License.Tier.LICENSED -&gt; &quot;Unlocked&quot; to &quot;Thank you for buying AssistKey&quot;</span>
+<span class="a">+            License.Tier.BETA -&gt;</span>
+<span class="a">+                &quot;Beta - free for now&quot; to &quot;Everything works while the beta is open&quot;</span>
+<span class="a">+            License.Tier.TRIAL -&gt;</span>
+<span class="a">+                (&quot;Trial - &quot; + s.trialDaysLeft + (if (s.trialDaysLeft == 1) &quot; day&quot; else &quot; days&quot;) +</span>
+<span class="a">+                    &quot; left&quot;) to &quot;Tap to buy a licence&quot;</span>
+<span class="a">+            License.Tier.LOCKED -&gt;</span>
+<span class="a">+                &quot;Locked - remapping is off&quot; to &quot;Tap to unlock. Your bindings are kept.&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+        col.row(title, subtitle) { startActivity(Intent(this, LicenseActivity::class.java)) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     // ---- channels ----------------------------------------------------------
+ 
+     private fun channels(col: LinearLayout) {
+<span class="h">@@ -93,7 +120,37 @@ class MainActivity : Activity() {</span>
+         }
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Google Play requires that an app using the accessibility API for anything</span>
+<span class="a">+     * other than assistive technology says so, in the app, in plain words, and</span>
+<span class="a">+     * gets a yes before sending anyone to the switch. It is also simply the</span>
+<span class="a">+     * right thing to do with a permission this broad.</span>
+<span class="a">+     */</span>
+     private fun claim(ch: Channel) {
+<span class="a">+        if (ch != Channel.ACCESSIBILITY) return claimNow(ch)</span>
+<span class="a">+        AlertDialog.Builder(this)</span>
+<span class="a">+            .setTitle(&quot;Accessibility service&quot;)</span>
+<span class="a">+            .setMessage(</span>
+<span class="a">+                &quot;AssistKey uses Android&#x27;s AccessibilityService API for one purpose: &quot; +</span>
+<span class="a">+                    &quot;remapping this device&#x27;s hardware keys.\n\n&quot; +</span>
+<span class="a">+                    &quot;With the service switched on, AssistKey:\n\n&quot; +</span>
+<span class="a">+                    &quot;- receives presses of the AI key and the volume keys, so that it &quot; +</span>
+<span class="a">+                    &quot;can recognise taps, holds and combinations;\n\n&quot; +</span>
+<span class="a">+                    &quot;- performs the action you chose - Back, Home, Recents, a swipe, &quot; +</span>
+<span class="a">+                    &quot;a scroll - on your behalf;\n\n&quot; +</span>
+<span class="a">+                    &quot;- looks at the window in front only to find its scrollable area, &quot; +</span>
+<span class="a">+                    &quot;and only when you use the Scroll action.\n\n&quot; +</span>
+<span class="a">+                    &quot;It does not record what you type or what is on your screen. It &quot; +</span>
+<span class="a">+                    &quot;collects nothing, stores nothing and sends nothing: the app has no &quot; +</span>
+<span class="a">+                    &quot;internet permission.\n\n&quot; +</span>
+<span class="a">+                    &quot;Agree to continue to Android&#x27;s accessibility settings.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+            .setPositiveButton(&quot;Agree&quot;) { _, _ -&gt; claimNow(ch) }</span>
+<span class="a">+            .setNegativeButton(&quot;Not now&quot;, null)</span>
+<span class="a">+            .show()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun claimNow(ch: Channel) {</span>
+         if (ch == Channel.CAMERA) {
+             Toast.makeText(
+                 this,
+<span class="h">@@ -113,7 +170,13 @@ class MainActivity : Activity() {</span>
+         col.header(&quot;Buttons&quot;)
+ 
+         listOf(HwKey.AI, HwKey.VOL_UP, HwKey.VOL_DOWN).forEach { key -&gt;
+<span class="d">-            col.row(key.label, boundSummary(setOf(key))) {</span>
+<span class="a">+            val summary =</span>
+<span class="a">+                if (ViwoodsBridge.hidesFromFilter(this, key)) {</span>
+<span class="a">+                    &quot;Hidden by a firmware hook - see Firmware key hooks below&quot;</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    boundSummary(setOf(key))</span>
+<span class="a">+                }</span>
+<span class="a">+            col.row(key.label, summary) {</span>
+                 startActivity(TriggerListActivity.intent(this, setOf(key)))
+             }
+         }
+<span class="h">@@ -160,10 +223,12 @@ class MainActivity : Activity() {</span>
+     private fun extras(col: LinearLayout) {
+         col.header(&quot;Advanced&quot;)
+ 
+<span class="a">+        val hidden = ViwoodsBridge.keys().filter { ViwoodsBridge.hidesFromFilter(this, it) }</span>
+         col.row(
+             &quot;Firmware key hooks&quot;,
+<span class="d">-            if (Channels.isEnabled(this, Channel.VIWOODS)) &quot;Viwoods channel settings&quot;</span>
+<span class="d">-            else &quot;Enable the Viwoods channel to use these&quot;</span>
+<span class="a">+            if (hidden.isEmpty()) &quot;What the firmware itself does with each key&quot;</span>
+<span class="a">+            else &quot;Hiding &quot; + hidden.joinToString(&quot; and &quot;) { it.label.lowercase() } +</span>
+<span class="a">+                &quot; from this app - tap for the fix&quot;</span>
+         ) { startActivity(Intent(this, ViwoodsActivity::class.java)) }
+ 
+         col.row(
+<span class="h">@@ -181,9 +246,8 @@ class MainActivity : Activity() {</span>
+         col.header(&quot;If you get stuck&quot;)
+         col.note(
+             &quot;Power + Volume up opens the power menu, whatever else is bound. &quot; +
+<span class="d">-                &quot;Uninstalling the app restores every key to firmware defaults, &quot; +</span>
+<span class="d">-                &quot;except the ones written through the Viwoods channel - reset &quot; +</span>
+<span class="d">-                &quot;those from Firmware key hooks first.&quot;</span>
+<span class="a">+                &quot;Uninstalling the app restores every key to its firmware &quot; +</span>
+<span class="a">+                &quot;behaviour; nothing it does outlives it.&quot;</span>
+         )
+     }
+ }
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/TriggerListActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/TriggerListActivity.kt
+index a95e504..265ebaf 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/TriggerListActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/TriggerListActivity.kt
+<span class="h">@@ -9,6 +9,7 @@ import dev.equwal.assistkey.channel.Channels</span>
+ import dev.equwal.assistkey.model.GestureType
+ import dev.equwal.assistkey.model.HwKey
+ import dev.equwal.assistkey.model.Trigger
+<span class="a">+import dev.equwal.assistkey.native.ViwoodsBridge</span>
+ import dev.equwal.assistkey.store.Store
+ import dev.equwal.assistkey.ui.Ui.header
+ import dev.equwal.assistkey.ui.Ui.note
+<span class="h">@@ -45,6 +46,14 @@ class TriggerListActivity : Activity() {</span>
+             )
+         }
+ 
+<span class="a">+        keys.filter { ViwoodsBridge.hidesFromFilter(this, it) }.forEach { k -&gt;</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;A firmware hook is set for &quot; + k.label.lowercase() + &quot;, so the &quot; +</span>
+<span class="a">+                    &quot;firmware keeps that key to itself and nothing bound here &quot; +</span>
+<span class="a">+                    &quot;can fire. Advanced &gt; Firmware key hooks has the fix.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+         val b = Store.bindings(this)
+         col.header(&quot;Taps&quot;)
+         (1..Trigger.MAX_TAPS).forEach { n -&gt;
+diff --git a/app/src/main/java/dev/equwal/assistkey/ui/ViwoodsActivity.kt b/app/src/main/java/dev/equwal/assistkey/ui/ViwoodsActivity.kt
+index b42c58e..ab15c51 100644
+--- a/app/src/main/java/dev/equwal/assistkey/ui/ViwoodsActivity.kt
++++ b/app/src/main/java/dev/equwal/assistkey/ui/ViwoodsActivity.kt
+<span class="h">@@ -1,26 +1,22 @@</span>
+ package dev.equwal.assistkey.ui
+ 
+ import android.app.Activity
+<span class="d">-import android.content.Intent</span>
+ import android.widget.LinearLayout
+<span class="d">-import android.widget.Toast</span>
+<span class="d">-import dev.equwal.assistkey.channel.Channel</span>
+<span class="d">-import dev.equwal.assistkey.channel.Channels</span>
+ import dev.equwal.assistkey.model.HwKey
+<span class="d">-import dev.equwal.assistkey.model.Presets</span>
+ import dev.equwal.assistkey.native.ViwoodsBridge
+<span class="d">-import dev.equwal.assistkey.ui.Ui.button</span>
+<span class="a">+import dev.equwal.assistkey.ui.Ui.code</span>
+ import dev.equwal.assistkey.ui.Ui.header
+ import dev.equwal.assistkey.ui.Ui.note
+ import dev.equwal.assistkey.ui.Ui.row
+ import dev.equwal.assistkey.ui.Ui.title
+ 
+ /**
+<span class="d">- * The firmware&#x27;s own key settings, edited directly.</span>
+<span class="a">+ * Shows what the firmware itself has bound to each key.</span>
+  *
+<span class="d">- * Worth having even though the accessibility channel is more capable: this one</span>
+<span class="d">- * survives the accessibility service being killed, works on the lock screen,</span>
+<span class="d">- * and costs nothing in latency. It just cannot do more than one action per key.</span>
+<span class="a">+ * Read-only: Android does not let an ordinary app write these settings, however</span>
+<span class="a">+ * many permissions it holds. The screen earns its place anyway, because a set</span>
+<span class="a">+ * volume hook is the one thing that makes a key silently unmappable, and</span>
+<span class="a">+ * nothing else on the device will tell you that is what happened.</span>
+  */
+ class ViwoodsActivity : Activity() {
+ 
+<span class="h">@@ -33,95 +29,37 @@ class ViwoodsActivity : Activity() {</span>
+         val col = Ui.page(this)
+         col.title(&quot;Firmware key hooks&quot;)
+         col.note(
+<span class="d">-            &quot;These are the same settings the stock key screen writes. Changing &quot; +</span>
+<span class="d">-                &quot;them here affects the whole system, not just this app, and they &quot; +</span>
+<span class="d">-                &quot;survive uninstalling it - reset them before you remove the app.&quot;</span>
+<span class="a">+            &quot;The firmware has its own setting for each key. Android does not allow &quot; +</span>
+<span class="a">+                &quot;apps to change these, so they are shown here for information, &quot; +</span>
+<span class="a">+                &quot;with the adb command where one is needed.&quot;</span>
+         )
+<span class="d">-</span>
+<span class="d">-        if (!ViwoodsBridge.canWrite(this)) {</span>
+<span class="d">-            col.note(&quot;This needs permission to modify system settings.&quot;)</span>
+<span class="d">-            col.button(&quot;Grant permission&quot;) {</span>
+<span class="d">-                Channels.safeStart(this, Channels.claimIntent(this, Channel.VIWOODS))</span>
+<span class="d">-            }</span>
+<span class="d">-            return</span>
+<span class="d">-        }</span>
+<span class="d">-</span>
+<span class="d">-        ViwoodsBridge.keys().forEach { key -&gt; keyBlock(col, key) }</span>
+<span class="d">-</span>
+<span class="d">-        col.header(&quot;Reset&quot;)</span>
+<span class="d">-        col.button(&quot;Restore all three keys to factory&quot;) {</span>
+<span class="d">-            var ok = true</span>
+<span class="d">-            ViwoodsBridge.keys().forEach { if (!ViwoodsBridge.restore(this, it)) ok = false }</span>
+<span class="d">-            toast(if (ok) &quot;Restored&quot; else &quot;Some keys could not be written&quot;)</span>
+<span class="d">-            build()</span>
+<span class="d">-        }</span>
+<span class="a">+        ViwoodsBridge.keys().forEach { keyBlock(col, it) }</span>
+     }
+ 
+     private fun keyBlock(col: LinearLayout, key: HwKey) {
+         col.header(key.label)
+<span class="d">-        col.row(&quot;Currently: &quot; + ViwoodsBridge.describe(this, key), null, enabled = false)</span>
+<span class="d">-</span>
+<span class="d">-        col.row(</span>
+<span class="d">-            &quot;Send to AssistKey&quot;,</span>
+<span class="d">-            &quot;Routes this key into the gesture engine without the accessibility service&quot;</span>
+<span class="d">-        ) {</span>
+<span class="d">-            toast(if (ViwoodsBridge.bindToUs(this, key)) &quot;Bound&quot; else &quot;Write refused&quot;)</span>
+<span class="d">-            build()</span>
+<span class="d">-        }</span>
+<span class="d">-</span>
+<span class="d">-        col.row(&quot;Viwoods AI target&quot;, &quot;Pick one of the built-in AI screens&quot;) {</span>
+<span class="d">-            Ui.pick(this, key.label, Presets.viwoods.map { it.label }) { i -&gt;</span>
+<span class="d">-                val p = Presets.viwoods[i]</span>
+<span class="d">-                toast(</span>
+<span class="d">-                    if (ViwoodsBridge.bindComponent(this, key, p.component)) &quot;Bound&quot;</span>
+<span class="d">-                    else &quot;Write refused&quot;</span>
+<span class="d">-                )</span>
+<span class="d">-                build()</span>
+<span class="d">-            }</span>
+<span class="d">-        }</span>
+<span class="a">+        col.row(&quot;Firmware setting: &quot; + ViwoodsBridge.describe(this, key), null, enabled = false)</span>
+ 
+<span class="d">-        if (key != HwKey.AI) {</span>
+<span class="d">-            col.row(&quot;Built-in behaviour&quot;, &quot;Volume, screenshot, or open an app&quot;) {</span>
+<span class="d">-                Ui.pick(this, key.label, ViwoodsBridge.volumeTokens.map { it.second }) { i -&gt;</span>
+<span class="d">-                    val token = ViwoodsBridge.volumeTokens[i].first</span>
+<span class="d">-                    if (token == ViwoodsBridge.TOKEN_APP) pickApp(key) else {</span>
+<span class="d">-                        toast(</span>
+<span class="d">-                            if (ViwoodsBridge.bindToken(this, key, token)) &quot;Bound&quot;</span>
+<span class="d">-                            else &quot;Write refused&quot;</span>
+<span class="d">-                        )</span>
+<span class="d">-                        build()</span>
+<span class="d">-                    }</span>
+<span class="d">-                }</span>
+<span class="d">-            }</span>
+<span class="d">-        }</span>
+<span class="d">-</span>
+<span class="d">-        col.row(&quot;Open an app&quot;, null) { pickApp(key) }</span>
+<span class="d">-        col.row(&quot;Restore factory value&quot;, null) {</span>
+<span class="d">-            toast(if (ViwoodsBridge.restore(this, key)) &quot;Restored&quot; else &quot;Write refused&quot;)</span>
+<span class="d">-            build()</span>
+<span class="a">+        if (key == HwKey.AI) {</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;AssistKey sees the AI key whatever this says. The setting only &quot; +</span>
+<span class="a">+                    &quot;decides what opens when a press is not bound to anything.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+            return</span>
+         }
+<span class="d">-    }</span>
+ 
+<span class="d">-    private fun pickApp(key: HwKey) {</span>
+<span class="d">-        val pm = packageManager</span>
+<span class="d">-        val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)</span>
+<span class="d">-        val apps = pm.queryIntentActivities(main, 0)</span>
+<span class="d">-            .map {</span>
+<span class="d">-                it.loadLabel(pm).toString() to</span>
+<span class="d">-                    (it.activityInfo.packageName + &quot;/&quot; + it.activityInfo.name)</span>
+<span class="d">-            }</span>
+<span class="d">-            .sortedBy { it.first.lowercase() }</span>
+<span class="d">-</span>
+<span class="d">-        if (apps.isEmpty()) { toast(&quot;No launchable apps visible&quot;); return }</span>
+<span class="d">-</span>
+<span class="d">-        Ui.pick(this, &quot;Open an app&quot;, apps.map { it.first }) { i -&gt;</span>
+<span class="d">-            toast(</span>
+<span class="d">-                if (ViwoodsBridge.bindComponent(this, key, apps[i].second)) &quot;Bound&quot;</span>
+<span class="d">-                else &quot;Write refused&quot;</span>
+<span class="a">+        if (ViwoodsBridge.hidesFromFilter(this, key)) {</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;While this is set, the firmware keeps &quot; + key.label.lowercase() +</span>
+<span class="a">+                    &quot; to itself and no app can see it - bindings made for it in &quot; +</span>
+<span class="a">+                    &quot;AssistKey will not fire. Clear it once from a computer:&quot;</span>
+             )
+<span class="d">-            build()</span>
+<span class="a">+            ViwoodsBridge.unsetCommand(key)?.let { col.code(it) }</span>
+<span class="a">+            col.note(</span>
+<span class="a">+                &quot;Changing this key in the device&#x27;s own key settings sets it again.&quot;</span>
+<span class="a">+            )</span>
+<span class="a">+        } else {</span>
+<span class="a">+            col.note(&quot;Not set, so AssistKey can see this key.&quot;)</span>
+         }
+     }
+<span class="d">-</span>
+<span class="d">-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()</span>
+ }
+diff --git a/gradle.properties b/gradle.properties
+index 9d9fecd..dfb31f2 100644
+--- a/gradle.properties
++++ b/gradle.properties
+<span class="h">@@ -1,6 +1,15 @@</span>
+ org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+ org.gradle.parallel=true
+ org.gradle.caching=true
+<span class="d">-android.useAndroidX=false</span>
+<span class="a">+android.useAndroidX=true</span>
+ android.nonTransitiveRClass=true
+ kotlin.code.style=official
+<span class="a">+</span>
+<span class="a">+# Release identity. versionCode must rise with every upload to Play.</span>
+<span class="a">+assistkey.versionName=0.0.1-alpha</span>
+<span class="a">+assistkey.versionCode=1</span>
+<span class="a">+</span>
+<span class="a">+# The free beta ends on this date (UTC) at the latest. It is the backstop for</span>
+<span class="a">+# installs that cannot reach Google Play; the real switch is the</span>
+<span class="a">+# assistkey_beta_open product in Play Console - see play/CHECKLIST.md.</span>
+<span class="a">+assistkey.betaExpires=2027-03-31</span></pre>
+</div></body></html>

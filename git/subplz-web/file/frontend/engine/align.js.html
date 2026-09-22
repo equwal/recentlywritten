@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/frontend/engine/align.js - Recently Written</title>
+<link rel="stylesheet" href="../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../../subplz-web/index.html">Log</a> | <a href="../../../../subplz-web/files.html">Files</a> | <a href="../../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>frontend/engine/align.js (24688 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> /* The alignment engine, in the browser.
+<a id="l2" href="#l2">2</a>  *
+<a id="l3" href="#l3">3</a>  * A transcript with times and a book without them go in; subtitles worded by
+<a id="l4" href="#l4">4</a>  * the book and timed by the transcript come out.
+<a id="l5" href="#l5">5</a>  *
+<a id="l6" href="#l6">6</a>  * This is a port of SubPlz&#x27;s aligner (ats.align, subplz.align.shift_align),
+<a id="l7" href="#l7">7</a>  * kept statement-for-statement where it is a port, quirks included: the tests
+<a id="l8" href="#l8">8</a>  * in tests/engine run it against the reference implementation&#x27;s real output,
+<a id="l9" href="#l9">9</a>  * stage by stage, and it is only trustworthy while it reproduces that exactly.
+<a id="l10" href="#l10">10</a>  *
+<a id="l11" href="#l11">11</a>  * What is not a port is anchoredAlign. The reference aligns one chapter at a
+<a id="l12" href="#l12">12</a>  * time in a full dynamic-programming table and needs gigabytes to do it. This
+<a id="l13" href="#l13">13</a>  * aligns the whole book at once by anchoring on stretches unique to both texts
+<a id="l14" href="#l14">14</a>  * and solving exactly only between anchors - seconds and megabytes, which is
+<a id="l15" href="#l15">15</a>  * what makes doing it in a browser tab possible at all.
+<a id="l16" href="#l16">16</a>  *
+<a id="l17" href="#l17">17</a>  * Offsets are code points throughout, never UTF-16 units, so a slice cannot
+<a id="l18" href="#l18">18</a>  * split a surrogate pair however the text was cut.
+<a id="l19" href="#l19">19</a>  */
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> export const toCodePoints = (s) =&gt; Int32Array.from(s, (ch) =&gt; ch.codePointAt(0));
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> export function fromCodePoints(cps, from = 0, to = cps.length) {
+<a id="l24" href="#l24">24</a>   if (to &lt;= from) return &#x27;&#x27;;
+<a id="l25" href="#l25">25</a>   let out = &#x27;&#x27;;
+<a id="l26" href="#l26">26</a>   for (let i = from; i &lt; to; i += 8192) {
+<a id="l27" href="#l27">27</a>     out += String.fromCodePoint(...cps.subarray(i, Math.min(to, i + 8192)));
+<a id="l28" href="#l28">28</a>   }
+<a id="l29" href="#l29">29</a>   return out;
+<a id="l30" href="#l30">30</a> }
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> /* ------------------------------------------------------------------ language */
+<a id="l33" href="#l33">33</a> 
+<a id="l34" href="#l34">34</a> const JA = (() =&gt; {
+<a id="l35" href="#l35">35</a>   const map = new Map();
+<a id="l36" href="#l36">36</a>   // Katakana to hiragana: the recogniser picks between them at random.
+<a id="l37" href="#l37">37</a>   for (let i = 0; i &lt; 0x56; i++) map.set(0x30a1 + i, 0x3041 + i);
+<a id="l38" href="#l38">38</a>   // Kanji numerals to digits. The digit string is shorter and wraps, which is
+<a id="l39" href="#l39">39</a>   // how both 十 and 拾 come out as １.
+<a id="l40" href="#l40">40</a>   const kansuu = toCodePoints(&#x27;一二三四五六七八九十〇零壱弐参肆伍陸漆捌玖拾&#x27;);
+<a id="l41" href="#l41">41</a>   const arabic = toCodePoints(&#x27;１２３４５６７８９１００&#x27;);
+<a id="l42" href="#l42">42</a>   kansuu.forEach((cp, i) =&gt; map.set(cp, arabic[i % arabic.length]));
+<a id="l43" href="#l43">43</a>   // ASCII to full width, so &quot;A&quot; in one text meets &quot;Ａ&quot; in the other.
+<a id="l44" href="#l44">44</a>   for (let cp = 0x21; cp &lt; 0x7f; cp++) map.set(cp, cp + 0xfee0);
+<a id="l45" href="#l45">45</a>   // Particles written one way and pronounced another.
+<a id="l46" href="#l46">46</a>   for (const [a, b] of [[&#x27;は&#x27;, &#x27;わ&#x27;], [&#x27;あ&#x27;, &#x27;わ&#x27;], [&#x27;お&#x27;, &#x27;を&#x27;], [&#x27;へ&#x27;, &#x27;え&#x27;]]) {
+<a id="l47" href="#l47">47</a>     map.set(a.codePointAt(0), b.codePointAt(0));
+<a id="l48" href="#l48">48</a>   }
+<a id="l49" href="#l49">49</a>   return map;
+<a id="l50" href="#l50">50</a> })();
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> // Everything that is not a letter or digit goes, except 。 when it leads a run.
+<a id="l53" href="#l53">53</a> const JA_NOISE = /(?![。])[\p{C}\p{M}\p{P}\p{S}\p{Z}\sー々ゝ]+/gu;
+<a id="l54" href="#l54">54</a> // Collapse repeats: long vowels and stutters are where the two texts disagree.
+<a id="l55" href="#l55">55</a> const JA_REPEATS = /(.)(?=\1+)/gu;
+<a id="l56" href="#l56">56</a> 
+<a id="l57" href="#l57">57</a> /** Only Japanese has rules of its own; everything else is case-folded. */
+<a id="l58" href="#l58">58</a> export function language(code) {
+<a id="l59" href="#l59">59</a>   const japanese = code === &#x27;ja&#x27;;
+<a id="l60" href="#l60">60</a>   const translate = (s) =&gt; {
+<a id="l61" href="#l61">61</a>     if (!japanese) return s.toLowerCase();
+<a id="l62" href="#l62">62</a>     let out = &#x27;&#x27;;
+<a id="l63" href="#l63">63</a>     for (const ch of s) {
+<a id="l64" href="#l64">64</a>       const cp = ch.codePointAt(0);
+<a id="l65" href="#l65">65</a>       out += JA.has(cp) ? String.fromCodePoint(JA.get(cp)) : ch;
+<a id="l66" href="#l66">66</a>     }
+<a id="l67" href="#l67">67</a>     return out.toLowerCase();
+<a id="l68" href="#l68">68</a>   };
+<a id="l69" href="#l69">69</a>   const clean = japanese
+<a id="l70" href="#l70">70</a>     ? (s) =&gt; translate(s).replace(JA_NOISE, &#x27;&#x27;).replace(JA_REPEATS, &#x27;&#x27;)
+<a id="l71" href="#l71">71</a>     : translate;
+<a id="l72" href="#l72">72</a>   return { code, translate, clean };
+<a id="l73" href="#l73">73</a> }
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a> /* --------------------------------------------------------------------- gotoh */
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a> // The reference&#x27;s scores, times ten so ties are exact.
+<a id="l78" href="#l78">78</a> const MATCH = 10, MISMATCH = -6, OPEN = -8, EXTEND = -5;
+<a id="l79" href="#l79">79</a> const NEG = -(2 ** 29);
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a> export const cells = (n, m) =&gt; (n + 1) * (m + 1);
+<a id="l82" href="#l82">82</a> 
+<a id="l83" href="#l83">83</a> /** Exact global alignment with affine gaps. Returns {score, t, q}: a path of breakpoints. */
+<a id="l84" href="#l84">84</a> export function gotoh(target, query) {
+<a id="l85" href="#l85">85</a>   const n = target.length, m = query.length, width = m + 1;
+<a id="l86" href="#l86">86</a>   const trace = new Uint8Array(cells(n, m));
+<a id="l87" href="#l87">87</a>   let pm = new Int32Array(width).fill(NEG), px = new Int32Array(width).fill(NEG),
+<a id="l88" href="#l88">88</a>       py = new Int32Array(width).fill(NEG);
+<a id="l89" href="#l89">89</a>   let cm = new Int32Array(width), cx = new Int32Array(width), cy = new Int32Array(width);
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a>   pm[0] = 0;
+<a id="l92" href="#l92">92</a>   for (let j = 1; j &lt;= m; j++) { py[j] = OPEN + (j - 1) * EXTEND; trace[j] = j === 1 ? 0 : 32; }
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a>   for (let i = 1; i &lt;= n; i++) {
+<a id="l95" href="#l95">95</a>     const row = i * width, t = target[i - 1];
+<a id="l96" href="#l96">96</a>     cm[0] = NEG; cy[0] = NEG; cx[0] = OPEN + (i - 1) * EXTEND;
+<a id="l97" href="#l97">97</a>     trace[row] = i === 1 ? 0 : 4;
+<a id="l98" href="#l98">98</a>     for (let j = 1; j &lt;= m; j++) {
+<a id="l99" href="#l99">99</a>       let bits = 0, best = pm[j - 1];
+<a id="l100" href="#l100">100</a>       if (px[j - 1] &gt; best) { best = px[j - 1]; bits = 1; }
+<a id="l101" href="#l101">101</a>       if (py[j - 1] &gt; best) { best = py[j - 1]; bits = 2; }
+<a id="l102" href="#l102">102</a>       cm[j] = best + (t === query[j - 1] ? MATCH : MISMATCH);
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a>       let bx = pm[j] + OPEN, xb = 0;
+<a id="l105" href="#l105">105</a>       if (px[j] + EXTEND &gt; bx) { bx = px[j] + EXTEND; xb = 4; }
+<a id="l106" href="#l106">106</a>       if (py[j] + OPEN &gt; bx) { bx = py[j] + OPEN; xb = 8; }
+<a id="l107" href="#l107">107</a>       cx[j] = bx;
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a>       let by = cm[j - 1] + OPEN, yb = 0;
+<a id="l110" href="#l110">110</a>       if (cx[j - 1] + OPEN &gt; by) { by = cx[j - 1] + OPEN; yb = 16; }
+<a id="l111" href="#l111">111</a>       if (cy[j - 1] + EXTEND &gt; by) { by = cy[j - 1] + EXTEND; yb = 32; }
+<a id="l112" href="#l112">112</a>       cy[j] = by;
+<a id="l113" href="#l113">113</a> 
+<a id="l114" href="#l114">114</a>       trace[row + j] = bits | xb | yb;
+<a id="l115" href="#l115">115</a>     }
+<a id="l116" href="#l116">116</a>     [pm, cm] = [cm, pm]; [px, cx] = [cx, px]; [py, cy] = [cy, py];
+<a id="l117" href="#l117">117</a>   }
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a>   let state = 0, score = pm[m];
+<a id="l120" href="#l120">120</a>   if (px[m] &gt; score) { score = px[m]; state = 1; }
+<a id="l121" href="#l121">121</a>   if (py[m] &gt; score) { score = py[m]; state = 2; }
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a>   const ts = [n], qs = [m];
+<a id="l124" href="#l124">124</a>   let i = n, j = m, last = -1;
+<a id="l125" href="#l125">125</a>   while (i &gt; 0 || j &gt; 0) {
+<a id="l126" href="#l126">126</a>     if (last !== -1 &amp;&amp; last !== state) { ts.push(i); qs.push(j); }
+<a id="l127" href="#l127">127</a>     last = state;
+<a id="l128" href="#l128">128</a>     const bits = trace[i * width + j];
+<a id="l129" href="#l129">129</a>     if (state === 0) { state = bits &amp; 3; i--; j--; }
+<a id="l130" href="#l130">130</a>     else if (state === 1) { state = (bits &gt;&gt; 2) &amp; 3; i--; }
+<a id="l131" href="#l131">131</a>     else { state = (bits &gt;&gt; 4) &amp; 3; j--; }
+<a id="l132" href="#l132">132</a>   }
+<a id="l133" href="#l133">133</a>   if (ts[ts.length - 1] !== 0 || qs[qs.length - 1] !== 0) { ts.push(0); qs.push(0); }
+<a id="l134" href="#l134">134</a>   return { score, t: ts.reverse(), q: qs.reverse() };
+<a id="l135" href="#l135">135</a> }
+<a id="l136" href="#l136">136</a> 
+<a id="l137" href="#l137">137</a> export function pathScore(target, query, path) {
+<a id="l138" href="#l138">138</a>   let total = 0;
+<a id="l139" href="#l139">139</a>   for (let k = 1; k &lt; path.t.length; k++) {
+<a id="l140" href="#l140">140</a>     const dt = path.t[k] - path.t[k - 1], dq = path.q[k] - path.q[k - 1];
+<a id="l141" href="#l141">141</a>     if (dt &gt; 0 &amp;&amp; dq &gt; 0) {
+<a id="l142" href="#l142">142</a>       for (let d = 0; d &lt; dt; d++) {
+<a id="l143" href="#l143">143</a>         total += target[path.t[k - 1] + d] === query[path.q[k - 1] + d] ? MATCH : MISMATCH;
+<a id="l144" href="#l144">144</a>       }
+<a id="l145" href="#l145">145</a>     } else if (dt &gt; 0 || dq &gt; 0) total += OPEN + (Math.max(dt, dq) - 1) * EXTEND;
+<a id="l146" href="#l146">146</a>   }
+<a id="l147" href="#l147">147</a>   return total;
+<a id="l148" href="#l148">148</a> }
+<a id="l149" href="#l149">149</a> 
+<a id="l150" href="#l150">150</a> /* ------------------------------------------------------------------ anchored */
+<a id="l151" href="#l151">151</a> 
+<a id="l152" href="#l152">152</a> // FNV-1a over code points, folded to 53 bits so it is an exact JS number.
+<a id="l153" href="#l153">153</a> function gramHash(seq, at, k) {
+<a id="l154" href="#l154">154</a>   let lo = 0x811c9dc5, hi = 0x1000193;
+<a id="l155" href="#l155">155</a>   for (let d = 0; d &lt; k; d++) {
+<a id="l156" href="#l156">156</a>     const c = seq[at + d];
+<a id="l157" href="#l157">157</a>     lo = Math.imul(lo ^ c, 0x01000193) &gt;&gt;&gt; 0;
+<a id="l158" href="#l158">158</a>     hi = Math.imul(hi ^ (c &gt;&gt;&gt; 3), 0x27d4eb2f) &gt;&gt;&gt; 0;
+<a id="l159" href="#l159">159</a>   }
+<a id="l160" href="#l160">160</a>   return (hi &amp; 0x1fffff) * 4294967296 + lo;
+<a id="l161" href="#l161">161</a> }
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a> /** k-gram -&gt; its position, or -2 when it occurs more than once. */
+<a id="l164" href="#l164">164</a> function uniqueGrams(seq, from, to, k) {
+<a id="l165" href="#l165">165</a>   const map = new Map();
+<a id="l166" href="#l166">166</a>   for (let i = from; i &lt;= to - k; i++) {
+<a id="l167" href="#l167">167</a>     const h = gramHash(seq, i, k);
+<a id="l168" href="#l168">168</a>     map.set(h, map.has(h) ? -2 : i);
+<a id="l169" href="#l169">169</a>   }
+<a id="l170" href="#l170">170</a>   return map;
+<a id="l171" href="#l171">171</a> }
+<a id="l172" href="#l172">172</a> 
+<a id="l173" href="#l173">173</a> function anchors(target, query, t0, t1, q0, q1, k) {
+<a id="l174" href="#l174">174</a>   if (t1 - t0 &lt; k || q1 - q0 &lt; k) return [];
+<a id="l175" href="#l175">175</a>   const inTarget = uniqueGrams(target, t0, t1, k);
+<a id="l176" href="#l176">176</a>   const inQuery = uniqueGrams(query, q0, q1, k);
+<a id="l177" href="#l177">177</a>   const runs = [];
+<a id="l178" href="#l178">178</a>   let current = null;
+<a id="l179" href="#l179">179</a>   for (let qi = q0; qi &lt;= q1 - k; qi++) {
+<a id="l180" href="#l180">180</a>     const h = gramHash(query, qi, k);
+<a id="l181" href="#l181">181</a>     const ti = inQuery.get(h) === qi ? inTarget.get(h) : undefined;
+<a id="l182" href="#l182">182</a>     let same = ti !== undefined &amp;&amp; ti &gt;= 0;
+<a id="l183" href="#l183">183</a>     for (let d = 0; same &amp;&amp; d &lt; k; d++) same = target[ti + d] === query[qi + d];
+<a id="l184" href="#l184">184</a>     if (!same) { current = null; continue; }
+<a id="l185" href="#l185">185</a>     if (current &amp;&amp; ti === current.t + (qi - current.q)) current.len = qi - current.q + k;
+<a id="l186" href="#l186">186</a>     else runs.push(current = { t: ti, q: qi, len: k });
+<a id="l187" href="#l187">187</a>   }
+<a id="l188" href="#l188">188</a>   return runs;
+<a id="l189" href="#l189">189</a> }
+<a id="l190" href="#l190">190</a> 
+<a id="l191" href="#l191">191</a> /** Longest chain of runs in order on both sides (patience sort), overlaps trimmed. */
+<a id="l192" href="#l192">192</a> function chainOf(runs) {
+<a id="l193" href="#l193">193</a>   if (!runs.length) return runs;
+<a id="l194" href="#l194">194</a>   const byT = runs.slice().sort((a, b) =&gt; a.t - b.t);
+<a id="l195" href="#l195">195</a>   const tails = [], prev = new Int32Array(byT.length).fill(-1);
+<a id="l196" href="#l196">196</a>   byT.forEach((r, i) =&gt; {
+<a id="l197" href="#l197">197</a>     let lo = 0, hi = tails.length;
+<a id="l198" href="#l198">198</a>     while (lo &lt; hi) { const mid = (lo + hi) &gt;&gt;&gt; 1; if (byT[tails[mid]].q &lt; r.q) lo = mid + 1; else hi = mid; }
+<a id="l199" href="#l199">199</a>     if (lo &gt; 0) prev[i] = tails[lo - 1];
+<a id="l200" href="#l200">200</a>     tails[lo] = i;
+<a id="l201" href="#l201">201</a>   });
+<a id="l202" href="#l202">202</a>   const picked = [];
+<a id="l203" href="#l203">203</a>   for (let at = tails[tails.length - 1]; at &gt;= 0; at = prev[at]) picked.push(byT[at]);
+<a id="l204" href="#l204">204</a>   picked.reverse();
+<a id="l205" href="#l205">205</a> 
+<a id="l206" href="#l206">206</a>   const out = [];
+<a id="l207" href="#l207">207</a>   let endT = 0, endQ = 0;
+<a id="l208" href="#l208">208</a>   for (const r of picked) {
+<a id="l209" href="#l209">209</a>     const cut = Math.max(endT - r.t, endQ - r.q, 0);
+<a id="l210" href="#l210">210</a>     if (cut &gt;= r.len) continue;
+<a id="l211" href="#l211">211</a>     r.t += cut; r.q += cut; r.len -= cut;
+<a id="l212" href="#l212">212</a>     out.push(r);
+<a id="l213" href="#l213">213</a>     endT = r.t + r.len; endQ = r.q + r.len;
+<a id="l214" href="#l214">214</a>   }
+<a id="l215" href="#l215">215</a>   return out;
+<a id="l216" href="#l216">216</a> }
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a> /** Global alignment of inputs too big for one table. Same shape of result as gotoh. */
+<a id="l219" href="#l219">219</a> export function anchoredAlign(target, query, { exactCells = 4_000_000, firstK = 14, lastK = 5 } = {}) {
+<a id="l220" href="#l220">220</a>   const ts = [0], qs = [0];
+<a id="l221" href="#l221">221</a>   let lastKind = 0;
+<a id="l222" href="#l222">222</a>   const moveTo = (t, q) =&gt; {
+<a id="l223" href="#l223">223</a>     const pt = ts[ts.length - 1], pq = qs[qs.length - 1];
+<a id="l224" href="#l224">224</a>     if (t === pt &amp;&amp; q === pq) return;
+<a id="l225" href="#l225">225</a>     const dt = t - pt, dq = q - pq;
+<a id="l226" href="#l226">226</a>     if (dt &gt; 0 &amp;&amp; dq &gt; 0 &amp;&amp; dt !== dq) {   // a diagonal and a gap in one step
+<a id="l227" href="#l227">227</a>       const d = Math.min(dt, dq);
+<a id="l228" href="#l228">228</a>       moveTo(pt + d, pq + d); moveTo(t, q);
+<a id="l229" href="#l229">229</a>       return;
+<a id="l230" href="#l230">230</a>     }
+<a id="l231" href="#l231">231</a>     const kind = dt &gt; 0 &amp;&amp; dq &gt; 0 ? 1 : dt &gt; 0 ? 2 : 3;
+<a id="l232" href="#l232">232</a>     if (kind === lastKind &amp;&amp; ts.length &gt; 1) { ts[ts.length - 1] = t; qs[qs.length - 1] = q; }
+<a id="l233" href="#l233">233</a>     else { ts.push(t); qs.push(q); }
+<a id="l234" href="#l234">234</a>     lastKind = kind;
+<a id="l235" href="#l235">235</a>   };
+<a id="l236" href="#l236">236</a> 
+<a id="l237" href="#l237">237</a>   // An explicit stack: a book is thousands of ranges deep in places.
+<a id="l238" href="#l238">238</a>   const work = [[0, target.length, 0, query.length, firstK]];
+<a id="l239" href="#l239">239</a>   while (work.length) {
+<a id="l240" href="#l240">240</a>     const job = work.pop();
+<a id="l241" href="#l241">241</a>     if (job.length === 2) { moveTo(job[0], job[1]); continue; }
+<a id="l242" href="#l242">242</a>     const [t0, t1, q0, q1, k] = job;
+<a id="l243" href="#l243">243</a>     const n = t1 - t0, m = q1 - q0;
+<a id="l244" href="#l244">244</a>     if (n === 0 || m === 0) { moveTo(t1, q1); continue; }
+<a id="l245" href="#l245">245</a>     if (cells(n, m) &lt;= exactCells) {
+<a id="l246" href="#l246">246</a>       const sub = gotoh(target.subarray(t0, t1), query.subarray(q0, q1));
+<a id="l247" href="#l247">247</a>       for (let i = 0; i &lt; sub.t.length; i++) moveTo(t0 + sub.t[i], q0 + sub.q[i]);
+<a id="l248" href="#l248">248</a>       continue;
+<a id="l249" href="#l249">249</a>     }
+<a id="l250" href="#l250">250</a> 
+<a id="l251" href="#l251">251</a>     let kk = k, chain = [];
+<a id="l252" href="#l252">252</a>     for (; kk &gt;= lastK; kk -= 3) {
+<a id="l253" href="#l253">253</a>       chain = chainOf(anchors(target, query, t0, t1, q0, q1, kk));
+<a id="l254" href="#l254">254</a>       if (chain.length) break;
+<a id="l255" href="#l255">255</a>     }
+<a id="l256" href="#l256">256</a>     const next = [];
+<a id="l257" href="#l257">257</a>     if (!chain.length) {
+<a id="l258" href="#l258">258</a>       // Two long stretches with nothing in common: halve both and carry on.
+<a id="l259" href="#l259">259</a>       const tm = t0 + (n &gt;&gt; 1), qm = q0 + (m &gt;&gt; 1);
+<a id="l260" href="#l260">260</a>       next.push([t0, tm, q0, qm, lastK], [tm, t1, qm, q1, lastK]);
+<a id="l261" href="#l261">261</a>     } else {
+<a id="l262" href="#l262">262</a>       let ct = t0, cq = q0;
+<a id="l263" href="#l263">263</a>       for (const r of chain) {
+<a id="l264" href="#l264">264</a>         next.push([ct, r.t, cq, r.q, kk], [r.t + r.len, r.q + r.len]);
+<a id="l265" href="#l265">265</a>         ct = r.t + r.len; cq = r.q + r.len;
+<a id="l266" href="#l266">266</a>       }
+<a id="l267" href="#l267">267</a>       next.push([ct, t1, cq, q1, kk]);
+<a id="l268" href="#l268">268</a>     }
+<a id="l269" href="#l269">269</a>     for (let i = next.length - 1; i &gt;= 0; i--) work.push(next[i]);
+<a id="l270" href="#l270">270</a>   }
+<a id="l271" href="#l271">271</a>   moveTo(target.length, query.length);
+<a id="l272" href="#l272">272</a>   const path = { t: ts, q: qs };
+<a id="l273" href="#l273">273</a>   path.score = pathScore(target, query, path);
+<a id="l274" href="#l274">274</a>   return path;
+<a id="l275" href="#l275">275</a> }
+<a id="l276" href="#l276">276</a> 
+<a id="l277" href="#l277">277</a> /* ----------------------------------------------------------------- align_sub */
+<a id="l278" href="#l278">278</a> 
+<a id="l279" href="#l279">279</a> const FULL_STOP = &#x27;。&#x27;.codePointAt(0);
+<a id="l280" href="#l280">280</a> 
+<a id="l281" href="#l281">281</a> function distinctExceptFullStop(cps, start, end) {
+<a id="l282" href="#l282">282</a>   const seen = new Set();
+<a id="l283" href="#l283">283</a>   for (let k = start; k &lt; Math.min(end, cps.length); k++) if (cps[k] !== FULL_STOP) seen.add(cps[k]);
+<a id="l284" href="#l284">284</a>   return seen.size;
+<a id="l285" href="#l285">285</a> }
+<a id="l286" href="#l286">286</a> 
+<a id="l287" href="#l287">287</a> /** Which piece of which paragraph each transcript segment covers. Spans are [start, end, sub]. */
+<a id="l288" href="#l288">288</a> export function alignSub(path, text, subs, thing = 2) {
+<a id="l289" href="#l289">289</a>   let line = 0, sub = 0, toff = 0, off = 0;
+<a id="l290" href="#l290">290</a>   const pos = [0, 0], p = [0, 0], gaps = [0, 0];
+<a id="l291" href="#l291">291</a>   const segments = [[]];
+<a id="l292" href="#l292">292</a>   const last = () =&gt; segments[segments.length - 1];
+<a id="l293" href="#l293">293</a> 
+<a id="l294" href="#l294">294</a>   for (let i = 0; i &lt; path.t.length; i++) {
+<a id="l295" href="#l295">295</a>     const c0 = path.t[i], c1 = path.q[i];
+<a id="l296" href="#l296">296</a>     const isGap = c0 - p[0] === 0 || c1 - p[1] === 0;
+<a id="l297" href="#l297">297</a> 
+<a id="l298" href="#l298">298</a>     while (sub &lt; subs.length &amp;&amp; pos[1] + subs[sub].length &lt;= c1) {
+<a id="l299" href="#l299">299</a>       if (line &gt;= text.length) return segments.slice(0, text.length);
+<a id="l300" href="#l300">300</a>       const subLen = subs[sub].length;
+<a id="l301" href="#l301">301</a>       pos[1] += subLen;
+<a id="l302" href="#l302">302</a>       if (isGap) { gaps[0] += Math.max(pos[1] - p[1], 0); gaps[1] += Math.max(pos[0] - p[0], 0); }
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a>       const diff = subLen + gaps[1] - gaps[0];
+<a id="l305" href="#l305">305</a>       if (diff &gt; Math.floor(subLen / 4)) {
+<a id="l306" href="#l306">306</a>         let target = toff + diff + off;
+<a id="l307" href="#l307">307</a>         off = 0;
+<a id="l308" href="#l308">308</a>         while (line &lt; text.length &amp;&amp; target &gt;= text[line].length) {
+<a id="l309" href="#l309">309</a>           const start = toff, end = text[line].length;
+<a id="l310" href="#l310">310</a>           if (end - start !== 0) {
+<a id="l311" href="#l311">311</a>             const prev = last();
+<a id="l312" href="#l312">312</a>             if (end - start &lt; thing || distinctExceptFullStop(text[line], start, end) &lt; thing) {
+<a id="l313" href="#l313">313</a>               if (prev.length) prev[prev.length - 1][1] = end;
+<a id="l314" href="#l314">314</a>               else prev.push([start, end, sub]);
+<a id="l315" href="#l315">315</a>             } else prev.push([start, end, sub]);
+<a id="l316" href="#l316">316</a>           }
+<a id="l317" href="#l317">317</a>           segments.push([]);
+<a id="l318" href="#l318">318</a>           pos[0] += end - start;
+<a id="l319" href="#l319">319</a>           target -= text[line].length;
+<a id="l320" href="#l320">320</a>           line++;
+<a id="l321" href="#l321">321</a>           toff = 0;
+<a id="l322" href="#l322">322</a>         }
+<a id="l323" href="#l323">323</a>         pos[0] += target - toff;
+<a id="l324" href="#l324">324</a>         last().push([toff, target, sub]);
+<a id="l325" href="#l325">325</a>         toff = target;
+<a id="l326" href="#l326">326</a>       } else {
+<a id="l327" href="#l327">327</a>         const prev = last();
+<a id="l328" href="#l328">328</a>         if (toff &gt;= Math.floor(text[line].length / 2) &amp;&amp; prev.length) {
+<a id="l329" href="#l329">329</a>           prev[prev.length - 1][1] += diff;
+<a id="l330" href="#l330">330</a>           toff += diff;
+<a id="l331" href="#l331">331</a>         } else off += diff;
+<a id="l332" href="#l332">332</a>       }
+<a id="l333" href="#l333">333</a> 
+<a id="l334" href="#l334">334</a>       sub++;
+<a id="l335" href="#l335">335</a>       gaps[0] = 0; gaps[1] = 0;
+<a id="l336" href="#l336">336</a>       p[0] = Math.max(pos[0], p[0]); p[1] = Math.max(pos[1], p[1]);
+<a id="l337" href="#l337">337</a>     }
+<a id="l338" href="#l338">338</a> 
+<a id="l339" href="#l339">339</a>     if (isGap) { gaps[0] += c1 - p[1]; gaps[1] += c0 - p[0]; }
+<a id="l340" href="#l340">340</a>     p[0] = c0; p[1] = c1;
+<a id="l341" href="#l341">341</a>   }
+<a id="l342" href="#l342">342</a>   return segments.slice(0, text.length);
+<a id="l343" href="#l343">343</a> }
+<a id="l344" href="#l344">344</a> 
+<a id="l345" href="#l345">345</a> /** Spans were computed on cleaned text; map them back onto the original. */
+<a id="l346" href="#l346">346</a> export function fix(lang, original, edited, segments) {
+<a id="l347" href="#l347">347</a>   segments.forEach((spans, l) =&gt; {
+<a id="l348" href="#l348">348</a>     const o = toCodePoints(lang.translate(original[l])), e = edited[l];
+<a id="l349" href="#l349">349</a>     const m = new Int32Array(e.length + 1).fill(-1);
+<a id="l350" href="#l350">350</a>     let ei = 0;
+<a id="l351" href="#l351">351</a>     for (let oi = 0; oi &lt; o.length; oi++) {
+<a id="l352" href="#l352">352</a>       if (ei &lt; e.length &amp;&amp; o[oi] === e[ei]) { m[ei] = oi; ei++; }
+<a id="l353" href="#l353">353</a>     }
+<a id="l354" href="#l354">354</a>     m[ei] = o.length;
+<a id="l355" href="#l355">355</a>     m[0] = 0;
+<a id="l356" href="#l356">356</a>     let lastSet = 0;
+<a id="l357" href="#l357">357</a>     for (let i = 0; i &lt; e.length; i++) { if (m[i] !== -1) lastSet = i; else m[i] = m[lastSet]; }
+<a id="l358" href="#l358">358</a>     if (m[e.length] === -1) m[e.length] = o.length;
+<a id="l359" href="#l359">359</a>     const clamp = (v) =&gt; Math.min(Math.max(v, 0), e.length);
+<a id="l360" href="#l360">360</a>     for (const f of spans) { f[0] = m[clamp(f[0])]; f[1] = m[clamp(f[1])]; }
+<a id="l361" href="#l361">361</a>   });
+<a id="l362" href="#l362">362</a> }
+<a id="l363" href="#l363">363</a> 
+<a id="l364" href="#l364">364</a> /** Python indexing: negatives count from the end; out of range is &quot;no character&quot;. */
+<a id="l365" href="#l365">365</a> const at = (t, i) =&gt; { const k = i &lt; 0 ? i + t.length : i; return k &gt;= 0 &amp;&amp; k &lt; t.length ? t[k] : -1; };
+<a id="l366" href="#l366">366</a> 
+<a id="l367" href="#l367">367</a> /** Nudge span ends so punctuation stays with the words it belongs to. */
+<a id="l368" href="#l368">368</a> export function fixPunc(text, segments, prepend, append, nopend) {
+<a id="l369" href="#l369">369</a>   segments.forEach((s, l) =&gt; {
+<a id="l370" href="#l370">370</a>     if (!s.length) return;
+<a id="l371" href="#l371">371</a>     const t = toCodePoints(text[l]);
+<a id="l372" href="#l372">372</a>     for (let k = 0; k &lt; s.length; k++) {
+<a id="l373" href="#l373">373</a>       const p = s[k], f = k + 1 &lt; s.length ? s[k + 1] : s[k];
+<a id="l374" href="#l374">374</a>       const connected = f[0] === p[1];
+<a id="l375" href="#l375">375</a>       for (let loop = 0; loop &lt;= 20; loop++) {
+<a id="l376" href="#l376">376</a>         if (p[1] &lt; t.length &amp;&amp; append.has(at(t, p[1]))) p[1] += 1;
+<a id="l377" href="#l377">377</a>         else if (prepend.has(at(t, p[1] - 1))) p[1] -= 1;
+<a id="l378" href="#l378">378</a>         else if ((p[1] &gt; 0 &amp;&amp; nopend.has(at(t, p[1] - 1))) ||
+<a id="l379" href="#l379">379</a>                  (p[1] &lt; t.length &amp;&amp; nopend.has(at(t, p[1]))) ||
+<a id="l380" href="#l380">380</a>                  (p[1] &lt; t.length - 1 &amp;&amp; nopend.has(at(t, p[1] + 1)))) {
+<a id="l381" href="#l381">381</a>           let start = p[1] - 1, end = p[1];
+<a id="l382" href="#l382">382</a>           if (p[1] &lt; t.length - 1) {
+<a id="l383" href="#l383">383</a>             const here = at(t, p[1]);
+<a id="l384" href="#l384">384</a>             if ((nopend.has(at(t, p[1] + 1)) &amp;&amp; 0x4e00 &gt; here) || here &gt; 0x9faf) end += 1;
+<a id="l385" href="#l385">385</a>           }
+<a id="l386" href="#l386">386</a>           while (start &gt; 0 &amp;&amp; nopend.has(at(t, start))) start -= 1;
+<a id="l387" href="#l387">387</a>           while (end &lt; t.length - 1 &amp;&amp; nopend.has(at(t, end))) end += 1;
+<a id="l388" href="#l388">388</a> 
+<a id="l389" href="#l389">389</a>           if (prepend.has(at(t, start))) { if (p[1] === start) break; p[1] = start; }
+<a id="l390" href="#l390">390</a>           else if (append.has(at(t, start))) { if (p[1] === start + 1) break; p[1] = start + 1; }
+<a id="l391" href="#l391">391</a>           else if (end &lt; t.length &amp;&amp; prepend.has(at(t, end))) { if (p[1] === end) break; p[1] = end; }
+<a id="l392" href="#l392">392</a>           else if (end &lt; t.length &amp;&amp; append.has(at(t, end))) { if (p[1] === end + 1) break; p[1] = end + 1; }
+<a id="l393" href="#l393">393</a>           else break;
+<a id="l394" href="#l394">394</a>         } else break;
+<a id="l395" href="#l395">395</a>       }
+<a id="l396" href="#l396">396</a>       if (connected) f[0] = p[1];
+<a id="l397" href="#l397">397</a>     }
+<a id="l398" href="#l398">398</a>   });
+<a id="l399" href="#l399">399</a> }
+<a id="l400" href="#l400">400</a> 
+<a id="l401" href="#l401">401</a> /* ---------------------------------------------------------------------- subs */
+<a id="l402" href="#l402">402</a> 
+<a id="l403" href="#l403">403</a> export const START_PUNC = &#x27;『「(（《｟[{&quot;\&#x27;“¿&#x27; + &#x27;\&#x27;“&quot;¿([{-『「（〈《〔【｛［｟＜&lt;‘“〝※&#x27;;
+<a id="l404" href="#l404">404</a> export const END_PUNC = &#x27;\&#x27;&quot;・.。!！?？:：”&gt;＞⦆)]}』」）〉》〕】｝］’〟／＼～〜~;；─―–-➡&#x27;;
+<a id="l405" href="#l405">405</a> export const OTHER_PUNC = &#x27;＊　,，、…&#x27;;
+<a id="l406" href="#l406">406</a> export const NOPEND = &#x27;うぁぃぅぇぉっゃゅょゎゕゖァィゥェォヵㇰヶㇱㇲッㇳㇴㇵㇶㇷㇷ゚ㇸㇹㇺャュョㇻㇼㇽㇾㇿヮ…　 &#x27;;
+<a id="l407" href="#l407">407</a> export const UNMATCHED = &#x27;＊&#x27;;
+<a id="l408" href="#l408">408</a> 
+<a id="l409" href="#l409">409</a> const cpSet = (s) =&gt; new Set(toCodePoints(s));
+<a id="l410" href="#l410">410</a> export const PREPEND_SET = cpSet(START_PUNC);
+<a id="l411" href="#l411">411</a> export const APPEND_SET = cpSet(END_PUNC + OTHER_PUNC);
+<a id="l412" href="#l412">412</a> export const NOPEND_SET = cpSet(NOPEND);
+<a id="l413" href="#l413">413</a> 
+<a id="l414" href="#l414">414</a> const PUNCT = new Set(START_PUNC + END_PUNC + OTHER_PUNC);
+<a id="l415" href="#l415">415</a> const START = new Set(START_PUNC), END = new Set(END_PUNC);
+<a id="l416" href="#l416">416</a> 
+<a id="l417" href="#l417">417</a> function pySlice(cps, a, b) {
+<a id="l418" href="#l418">418</a>   const n = cps.length, fixIndex = (v) =&gt; Math.min(Math.max(v &lt; 0 ? v + n : v, 0), n);
+<a id="l419" href="#l419">419</a>   return fromCodePoints(cps, fixIndex(a), fixIndex(b));
+<a id="l420" href="#l420">420</a> }
+<a id="l421" href="#l421">421</a> 
+<a id="l422" href="#l422">422</a> /** One cue per transcript segment: timed by the recogniser, worded by the book. */
+<a id="l423" href="#l423">423</a> export function toSubs(text, subs, alignment, offset = 0) {
+<a id="l424" href="#l424">424</a>   const flat = [];
+<a id="l425" href="#l425">425</a>   alignment.forEach((spans, line) =&gt; spans.forEach((span) =&gt; flat.push({ span, line })));
+<a id="l426" href="#l426">426</a>   const lines = text.map(toCodePoints);
+<a id="l427" href="#l427">427</a>   const out = [];
+<a id="l428" href="#l428">428</a>   let start = 0, end = 0;
+<a id="l429" href="#l429">429</a>   subs.forEach((s, si) =&gt; {
+<a id="l430" href="#l430">430</a>     while (end &lt; flat.length &amp;&amp; flat[end].span[2] === si) end++;
+<a id="l431" href="#l431">431</a>     let body = &#x27;&#x27;;
+<a id="l432" href="#l432">432</a>     for (let k = start; k &lt; end; k++) body += pySlice(lines[flat[k].line], flat[k].span[0], flat[k].span[1]);
+<a id="l433" href="#l433">433</a>     out.push({ text: body.trim() ? body : UNMATCHED + s.text, start: s.start + offset, end: s.end + offset });
+<a id="l434" href="#l434">434</a>     start = end;
+<a id="l435" href="#l435">435</a>   });
+<a id="l436" href="#l436">436</a>   return out;
+<a id="l437" href="#l437">437</a> }
+<a id="l438" href="#l438">438</a> 
+<a id="l439" href="#l439">439</a> const punctIndices = (s) =&gt; { const r = []; for (let i = 0; i &lt; s.length; i++) if (PUNCT.has(s[i])) r.push(i); return r; };
+<a id="l440" href="#l440">440</a> const countNonPunct = (s) =&gt; { let n = 0; for (let i = 0; i &lt; s.length; i++) if (!PUNCT.has(s[i])) n++; return n; };
+<a id="l441" href="#l441">441</a> const doubleComma = (a, b) =&gt; a[a.length - 1] === &#x27;、&#x27; &amp;&amp; b[b.length - 1] === &#x27;、&#x27;;
+<a id="l442" href="#l442">442</a> 
+<a id="l443" href="#l443">443</a> /** Move a stranded character or two across a cue boundary. Cues are mutated, as in the original. */
+<a id="l444" href="#l444">444</a> export function shiftAlign(segments) {
+<a id="l445" href="#l445">445</a>   const fresh = [];
+<a id="l446" href="#l446">446</a>   let startIndex = 0;   // read by the second pass too, as in the original
+<a id="l447" href="#l447">447</a>   segments.forEach((segment, i) =&gt; {
+<a id="l448" href="#l448">448</a>     let text = segment.text;
+<a id="l449" href="#l449">449</a>     const idx = punctIndices(text);
+<a id="l450" href="#l450">450</a>     if (!idx.length) { fresh.push(segment); return; }
+<a id="l451" href="#l451">451</a>     startIndex = idx[0];
+<a id="l452" href="#l452">452</a>     const nonPunc = countNonPunct(text.slice(0, startIndex));
+<a id="l453" href="#l453">453</a>     if (nonPunc === 0 || countNonPunct(text.slice(startIndex + 1)) === 0) { fresh.push(segment); return; }
+<a id="l454" href="#l454">454</a>     const prev = fresh[fresh.length - 1];
+<a id="l455" href="#l455">455</a>     if (nonPunc &lt;= 2 &amp;&amp; i &gt; 0 &amp;&amp; fresh.length &amp;&amp; !END.has(prev.text[prev.text.length - 1]) &amp;&amp;
+<a id="l456" href="#l456">456</a>         !doubleComma(prev.text, text.slice(0, startIndex + 1))) {
+<a id="l457" href="#l457">457</a>       prev.text += text.slice(0, startIndex + 1);
+<a id="l458" href="#l458">458</a>       text = text.slice(startIndex + 1);
+<a id="l459" href="#l459">459</a>     }
+<a id="l460" href="#l460">460</a>     fresh.push({ text, start: segment.start, end: segment.end });
+<a id="l461" href="#l461">461</a>   });
+<a id="l462" href="#l462">462</a> 
+<a id="l463" href="#l463">463</a>   const final = [];
+<a id="l464" href="#l464">464</a>   for (let i = 0; i &lt; fresh.length; i++) {
+<a id="l465" href="#l465">465</a>     const segment = fresh[i];
+<a id="l466" href="#l466">466</a>     let text = segment.text;
+<a id="l467" href="#l467">467</a>     const idx = punctIndices(text);
+<a id="l468" href="#l468">468</a>     if (idx.length) {
+<a id="l469" href="#l469">469</a>       const lastIndex = idx[idx.length - 1], tail = text.slice(lastIndex);
+<a id="l470" href="#l470">470</a>       if (countNonPunct(tail) === 0 || tail.length === text.length) { final.push(segment); continue; }
+<a id="l471" href="#l471">471</a>       if (countNonPunct(tail) &lt;= 2 &amp;&amp; i + 1 &lt; fresh.length &amp;&amp; !END.has(fresh[i + 1].text[0]) &amp;&amp;
+<a id="l472" href="#l472">472</a>           !doubleComma(fresh[i + 1].text.slice(0, 1), text.slice(0, startIndex + 1))) {
+<a id="l473" href="#l473">473</a>         // The original reaches into the *input* list here. Kept: the fixtures depend on it.
+<a id="l474" href="#l474">474</a>         const next = segments[i + 1];
+<a id="l475" href="#l475">475</a>         next.text = text.slice(lastIndex + 1) + next.text;
+<a id="l476" href="#l476">476</a>         text = text.slice(0, lastIndex + 1);
+<a id="l477" href="#l477">477</a>         final.push({ text, start: segment.start, end: segment.end });
+<a id="l478" href="#l478">478</a>         fresh[i + 1] = next;
+<a id="l479" href="#l479">479</a>         continue;
+<a id="l480" href="#l480">480</a>       }
+<a id="l481" href="#l481">481</a>     }
+<a id="l482" href="#l482">482</a>     final.push({ text, start: segment.start, end: segment.end });
+<a id="l483" href="#l483">483</a>   }
+<a id="l484" href="#l484">484</a> 
+<a id="l485" href="#l485">485</a>   if (final.length &gt;= 2) {
+<a id="l486" href="#l486">486</a>     const stray = /(」「(.{1,2})、$|」「(.{1})、$)/u;
+<a id="l487" href="#l487">487</a>     const adjusted = [];
+<a id="l488" href="#l488">488</a>     final.forEach((segment, i) =&gt; {
+<a id="l489" href="#l489">489</a>       const m = stray.exec(segment.text);
+<a id="l490" href="#l490">490</a>       if (m &amp;&amp; i &lt; final.length - 1) {
+<a id="l491" href="#l491">491</a>         final[i + 1].text = m[0] + final[i + 1].text;
+<a id="l492" href="#l492">492</a>         segment.text = segment.text.slice(0, m.index);
+<a id="l493" href="#l493">493</a>       }
+<a id="l494" href="#l494">494</a>       if (segment.text &amp;&amp; END.has(segment.text[0]) &amp;&amp; i &gt; 0) {
+<a id="l495" href="#l495">495</a>         adjusted[adjusted.length - 1].text += segment.text[0];
+<a id="l496" href="#l496">496</a>         segment.text = segment.text.slice(1);
+<a id="l497" href="#l497">497</a>       }
+<a id="l498" href="#l498">498</a>       if (segment.text &amp;&amp; START.has(segment.text[segment.text.length - 1]) &amp;&amp; i &lt; final.length - 1) {
+<a id="l499" href="#l499">499</a>         final[i + 1].text = segment.text[segment.text.length - 1] + final[i + 1].text;
+<a id="l500" href="#l500">500</a>         segment.text = segment.text.slice(0, -1);
+<a id="l501" href="#l501">501</a>       }
+<a id="l502" href="#l502">502</a>       adjusted.push(segment);
+<a id="l503" href="#l503">503</a>     });
+<a id="l504" href="#l504">504</a>   }
+<a id="l505" href="#l505">505</a>   return final.map((c) =&gt; ({ text: c.text.trim(), start: c.start, end: c.end }));
+<a id="l506" href="#l506">506</a> }
+<a id="l507" href="#l507">507</a> 
+<a id="l508" href="#l508">508</a> /* ------------------------------------------------------------------ pipeline */
+<a id="l509" href="#l509">509</a> 
+<a id="l510" href="#l510">510</a> const EXACT_CELL_LIMIT = 64_000_000;
+<a id="l511" href="#l511">511</a> 
+<a id="l512" href="#l512">512</a> function concat(parts) {
+<a id="l513" href="#l513">513</a>   const out = new Int32Array(parts.reduce((n, p) =&gt; n + p.length, 0));
+<a id="l514" href="#l514">514</a>   let o = 0;
+<a id="l515" href="#l515">515</a>   for (const p of parts) { out.set(p, o); o += p.length; }
+<a id="l516" href="#l516">516</a>   return out;
+<a id="l517" href="#l517">517</a> }
+<a id="l518" href="#l518">518</a> 
+<a id="l519" href="#l519">519</a> export function align(transcript, paragraphs, lang, { anchoredOnly = false, exactCells } = {}) {
+<a id="l520" href="#l520">520</a>   if (!transcript.length) return [];
+<a id="l521" href="#l521">521</a>   const subsClean = transcript.map((s) =&gt; toCodePoints(lang.clean(s.text)));
+<a id="l522" href="#l522">522</a>   const textClean = paragraphs.map((p) =&gt; toCodePoints(lang.clean(p)));
+<a id="l523" href="#l523">523</a>   const query = concat(subsClean), target = concat(textClean);
+<a id="l524" href="#l524">524</a>   if (!target.length || !query.length) {
+<a id="l525" href="#l525">525</a>     return transcript.map((s) =&gt; ({ text: UNMATCHED + s.text, start: s.start, end: s.end }));
+<a id="l526" href="#l526">526</a>   }
+<a id="l527" href="#l527">527</a>   const path = !anchoredOnly &amp;&amp; cells(target.length, query.length) &lt;= EXACT_CELL_LIMIT
+<a id="l528" href="#l528">528</a>     ? gotoh(target, query) : anchoredAlign(target, query, exactCells ? { exactCells } : {});
+<a id="l529" href="#l529">529</a>   const spans = alignSub(path, textClean, subsClean);
+<a id="l530" href="#l530">530</a>   fix(lang, paragraphs, textClean, spans);
+<a id="l531" href="#l531">531</a>   fixPunc(paragraphs, spans, PREPEND_SET, APPEND_SET, NOPEND_SET);
+<a id="l532" href="#l532">532</a>   return shiftAlign(toSubs(paragraphs, transcript, spans));
+<a id="l533" href="#l533">533</a> }
+<a id="l534" href="#l534">534</a> 
+<a id="l535" href="#l535">535</a> // A paragraph counts as heard when this share of it agrees with the transcript...
+<a id="l536" href="#l536">536</a> const HEARD = 0.20;
+<a id="l537" href="#l537">537</a> // ...and unheard ones are dropped only in runs this long: one mangled heading
+<a id="l538" href="#l538">538</a> // was still read aloud; a page of nothing was not.
+<a id="l539" href="#l539">539</a> const MIN_UNREAD_RUN = 240;
+<a id="l540" href="#l540">540</a> 
+<a id="l541" href="#l541">541</a> /** The paragraphs that were actually narrated: front matter, notes and the like removed. */
+<a id="l542" href="#l542">542</a> export function narratedOnly(transcript, paragraphs, lang) {
+<a id="l543" href="#l543">543</a>   const textClean = paragraphs.map((p) =&gt; toCodePoints(lang.clean(p)));
+<a id="l544" href="#l544">544</a>   const target = concat(textClean);
+<a id="l545" href="#l545">545</a>   const query = concat(transcript.map((s) =&gt; toCodePoints(lang.clean(s.text))));
+<a id="l546" href="#l546">546</a>   if (!target.length || !query.length) return paragraphs;
+<a id="l547" href="#l547">547</a> 
+<a id="l548" href="#l548">548</a>   const path = anchoredAlign(target, query);
+<a id="l549" href="#l549">549</a>   const agreed = new Uint8Array(target.length);
+<a id="l550" href="#l550">550</a>   for (let k = 1; k &lt; path.t.length; k++) {
+<a id="l551" href="#l551">551</a>     const t0 = path.t[k - 1], q0 = path.q[k - 1], dt = path.t[k] - t0;
+<a id="l552" href="#l552">552</a>     if (dt &gt; 0 &amp;&amp; path.q[k] - q0 &gt; 0) {
+<a id="l553" href="#l553">553</a>       for (let d = 0; d &lt; dt; d++) agreed[t0 + d] = target[t0 + d] === query[q0 + d] ? 1 : 0;
+<a id="l554" href="#l554">554</a>     }
+<a id="l555" href="#l555">555</a>   }
+<a id="l556" href="#l556">556</a> 
+<a id="l557" href="#l557">557</a>   let o = 0;
+<a id="l558" href="#l558">558</a>   const heard = textClean.map((cps) =&gt; {
+<a id="l559" href="#l559">559</a>     let hits = 0;
+<a id="l560" href="#l560">560</a>     for (let i = o; i &lt; o + cps.length; i++) hits += agreed[i];
+<a id="l561" href="#l561">561</a>     o += cps.length;
+<a id="l562" href="#l562">562</a>     return cps.length === 0 || hits &gt;= HEARD * cps.length;
+<a id="l563" href="#l563">563</a>   });
+<a id="l564" href="#l564">564</a> 
+<a id="l565" href="#l565">565</a>   const keep = paragraphs.map(() =&gt; true);
+<a id="l566" href="#l566">566</a>   for (let i = 0; i &lt; paragraphs.length;) {
+<a id="l567" href="#l567">567</a>     if (heard[i]) { i++; continue; }
+<a id="l568" href="#l568">568</a>     let j = i, chars = 0;
+<a id="l569" href="#l569">569</a>     while (j &lt; paragraphs.length &amp;&amp; (!heard[j] || textClean[j].length === 0)) { chars += textClean[j].length; j++; }
+<a id="l570" href="#l570">570</a>     if (chars &gt;= MIN_UNREAD_RUN) for (let k = i; k &lt; j; k++) keep[k] = false;
+<a id="l571" href="#l571">571</a>     i = j;
+<a id="l572" href="#l572">572</a>   }
+<a id="l573" href="#l573">573</a>   const out = paragraphs.filter((_, k) =&gt; keep[k]);
+<a id="l574" href="#l574">574</a>   return out.length ? out : paragraphs;
+<a id="l575" href="#l575">575</a> }
+<a id="l576" href="#l576">576</a> 
+<a id="l577" href="#l577">577</a> /** A whole book at once. No chapter matching: the alignment itself says what was read. */
+<a id="l578" href="#l578">578</a> export function alignBook(transcript, paragraphs, lang) {
+<a id="l579" href="#l579">579</a>   const narrated = narratedOnly(transcript, paragraphs, lang);
+<a id="l580" href="#l580">580</a>   const cues = align(transcript, narrated, lang);
+<a id="l581" href="#l581">581</a>   const matched = cues.filter((c) =&gt; !c.text.startsWith(UNMATCHED)).length;
+<a id="l582" href="#l582">582</a>   return {
+<a id="l583" href="#l583">583</a>     cues,
+<a id="l584" href="#l584">584</a>     paragraphsUsed: narrated.length,
+<a id="l585" href="#l585">585</a>     paragraphsDropped: paragraphs.length - narrated.length,
+<a id="l586" href="#l586">586</a>     matchRate: cues.length ? matched / cues.length : 0,
+<a id="l587" href="#l587">587</a>   };
+<a id="l588" href="#l588">588</a> }
+<a id="l589" href="#l589">589</a> 
+<a id="l590" href="#l590">590</a> /* ----------------------------------------------------------------------- srt */
+<a id="l591" href="#l591">591</a> 
+<a id="l592" href="#l592">592</a> export function stamp(seconds) {
+<a id="l593" href="#l593">593</a>   const ms = Math.round(Math.max(seconds, 0) * 1000);
+<a id="l594" href="#l594">594</a>   const pad = (v, n = 2) =&gt; String(v).padStart(n, &#x27;0&#x27;);
+<a id="l595" href="#l595">595</a>   return `${pad(Math.floor(ms / 3600000))}:${pad(Math.floor(ms / 60000) % 60)}:${pad(Math.floor(ms / 1000) % 60)},${pad(ms % 1000, 3)}`;
+<a id="l596" href="#l596">596</a> }
+<a id="l597" href="#l597">597</a> 
+<a id="l598" href="#l598">598</a> /** One line of text per cue, always: Hoshi Reader reads exactly the third line of each block. */
+<a id="l599" href="#l599">599</a> export function writeSrt(cues) {
+<a id="l600" href="#l600">600</a>   let out = &#x27;&#x27;, n = 0;
+<a id="l601" href="#l601">601</a>   for (const cue of cues) {
+<a id="l602" href="#l602">602</a>     const text = cue.text.replace(/\s*[\r\n]+\s*/g, &#x27; &#x27;).trim();
+<a id="l603" href="#l603">603</a>     if (!text) continue;
+<a id="l604" href="#l604">604</a>     out += `${++n}\n${stamp(cue.start)} --&gt; ${stamp(cue.end)}\n${text}\n\n`;
+<a id="l605" href="#l605">605</a>   }
+<a id="l606" href="#l606">606</a>   return out;
+<a id="l607" href="#l607">607</a> }</pre>
+</div></body></html>

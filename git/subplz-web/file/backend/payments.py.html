@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/payments.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/payments.py (10366 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Stripe: start a checkout, credit the account when it completes.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> Everything Stripe-specific is in this file. billing.py decides what an account
+<a id="l4" href="#l4">4</a> may do; this only moves money into `Account.purchased_credits` and keeps the
+<a id="l5" href="#l5">5</a> subscription fields honest.
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> Two rules the rest follows from:
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> * The browser coming back from Stripe is not proof of payment. Fulfilment
+<a id="l10" href="#l10">10</a>   always re-reads the checkout session from Stripe, and only acts on &quot;paid&quot;.
+<a id="l11" href="#l11">11</a> * Stripe tells us about one payment more than once - the webhook, the
+<a id="l12" href="#l12">12</a>   browser&#x27;s return trip, and any number of webhook retries - so fulfilment is
+<a id="l13" href="#l13">13</a>   idempotent on the checkout session id (see db.Purchase).
+<a id="l14" href="#l14">14</a> 
+<a id="l15" href="#l15">15</a> Prices are sent inline from pricing.py rather than configured in the Stripe
+<a id="l16" href="#l16">16</a> dashboard, so the catalogue has one source of truth and a new deployment needs
+<a id="l17" href="#l17">17</a> nothing but an API key.
+<a id="l18" href="#l18">18</a> &quot;&quot;&quot;
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> from __future__ import annotations
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> import json
+<a id="l23" href="#l23">23</a> import logging
+<a id="l24" href="#l24">24</a> from datetime import datetime, timezone
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> from sqlalchemy.exc import IntegrityError
+<a id="l27" href="#l27">27</a> from sqlalchemy.orm import Session
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> from . import accounts, billing, pricing
+<a id="l30" href="#l30">30</a> from .db import Account, Purchase
+<a id="l31" href="#l31">31</a> from .settings import settings
+<a id="l32" href="#l32">32</a> 
+<a id="l33" href="#l33">33</a> log = logging.getLogger(__name__)
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> class PaymentsUnavailable(RuntimeError):
+<a id="l37" href="#l37">37</a>     pass
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a> class PaymentError(RuntimeError):
+<a id="l41" href="#l41">41</a>     pass
+<a id="l42" href="#l42">42</a> 
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> def _stripe():
+<a id="l45" href="#l45">45</a>     if not settings.payments_configured:
+<a id="l46" href="#l46">46</a>         raise PaymentsUnavailable(
+<a id="l47" href="#l47">47</a>             &quot;Payments are not set up on this server yet.&quot;
+<a id="l48" href="#l48">48</a>         )
+<a id="l49" href="#l49">49</a>     import stripe  # lazy: localhost never needs the package
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a>     stripe.api_key = settings.stripe_secret_key
+<a id="l52" href="#l52">52</a>     return stripe
+<a id="l53" href="#l53">53</a> 
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> def _plain(obj) -&gt; dict:
+<a id="l56" href="#l56">56</a>     &quot;&quot;&quot;A Stripe object as plain data. They stopped being dicts in v13.&quot;&quot;&quot;
+<a id="l57" href="#l57">57</a>     if isinstance(obj, dict):
+<a id="l58" href="#l58">58</a>         return obj
+<a id="l59" href="#l59">59</a>     return obj.to_dict()
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> def _base() -&gt; str:
+<a id="l63" href="#l63">63</a>     return settings.public_base_url.rstrip(&quot;/&quot;)
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a> 
+<a id="l66" href="#l66">66</a> # ---------------------------------------------------------------------------
+<a id="l67" href="#l67">67</a> # checkout
+<a id="l68" href="#l68">68</a> # ---------------------------------------------------------------------------
+<a id="l69" href="#l69">69</a> 
+<a id="l70" href="#l70">70</a> def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; str:
+<a id="l71" href="#l71">71</a>     &quot;&quot;&quot;Return the Stripe-hosted payment page for `plan`.&quot;&quot;&quot;
+<a id="l72" href="#l72">72</a>     stripe = _stripe()
+<a id="l73" href="#l73">73</a> 
+<a id="l74" href="#l74">74</a>     if plan.recurring and billing.is_subscribed(account):
+<a id="l75" href="#l75">75</a>         raise PaymentError(&quot;You are already on this plan.&quot;)
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a>     price = {
+<a id="l78" href="#l78">78</a>         &quot;currency&quot;: plan.currency,
+<a id="l79" href="#l79">79</a>         &quot;unit_amount&quot;: plan.price_cents,
+<a id="l80" href="#l80">80</a>         &quot;product_data&quot;: {&quot;name&quot;: f&quot;{settings.site_name} - {plan.name}&quot;},
+<a id="l81" href="#l81">81</a>     }
+<a id="l82" href="#l82">82</a>     if plan.recurring:
+<a id="l83" href="#l83">83</a>         price[&quot;recurring&quot;] = {&quot;interval&quot;: &quot;month&quot;}
+<a id="l84" href="#l84">84</a> 
+<a id="l85" href="#l85">85</a>     meta = {&quot;account_id&quot;: account.id, &quot;plan_id&quot;: plan.id}
+<a id="l86" href="#l86">86</a>     params: dict = {
+<a id="l87" href="#l87">87</a>         &quot;mode&quot;: &quot;subscription&quot; if plan.recurring else &quot;payment&quot;,
+<a id="l88" href="#l88">88</a>         &quot;line_items&quot;: [{&quot;quantity&quot;: 1, &quot;price_data&quot;: price}],
+<a id="l89" href="#l89">89</a>         &quot;client_reference_id&quot;: account.id,
+<a id="l90" href="#l90">90</a>         &quot;metadata&quot;: meta,
+<a id="l91" href="#l91">91</a>         # Stripe substitutes the real id; the return handler re-reads the
+<a id="l92" href="#l92">92</a>         # session from it rather than trusting anything in the URL.
+<a id="l93" href="#l93">93</a>         &quot;success_url&quot;: f&quot;{_base()}/api/billing/return&quot;
+<a id="l94" href="#l94">94</a>                        &quot;?session_id={CHECKOUT_SESSION_ID}&quot;,
+<a id="l95" href="#l95">95</a>         &quot;cancel_url&quot;: f&quot;{_base()}/?checkout=cancelled&quot;,
+<a id="l96" href="#l96">96</a>         &quot;allow_promotion_codes&quot;: True,
+<a id="l97" href="#l97">97</a>     }
+<a id="l98" href="#l98">98</a>     if account.stripe_customer_id:
+<a id="l99" href="#l99">99</a>         params[&quot;customer&quot;] = account.stripe_customer_id
+<a id="l100" href="#l100">100</a>     else:
+<a id="l101" href="#l101">101</a>         if account.email:
+<a id="l102" href="#l102">102</a>             params[&quot;customer_email&quot;] = account.email
+<a id="l103" href="#l103">103</a>         if not plan.recurring:
+<a id="l104" href="#l104">104</a>             # One-off payments do not create a customer unless asked, and
+<a id="l105" href="#l105">105</a>             # without one there is nothing to hang a later purchase on.
+<a id="l106" href="#l106">106</a>             params[&quot;customer_creation&quot;] = &quot;always&quot;
+<a id="l107" href="#l107">107</a>     if plan.recurring:
+<a id="l108" href="#l108">108</a>         params[&quot;subscription_data&quot;] = {&quot;metadata&quot;: meta}
+<a id="l109" href="#l109">109</a> 
+<a id="l110" href="#l110">110</a>     try:
+<a id="l111" href="#l111">111</a>         checkout = _plain(stripe.checkout.Session.create(**params))
+<a id="l112" href="#l112">112</a>     except stripe.StripeError as exc:
+<a id="l113" href="#l113">113</a>         log.warning(&quot;checkout create failed for %s: %s&quot;, account.id, exc)
+<a id="l114" href="#l114">114</a>         raise PaymentError(&quot;Could not start the checkout. Try again shortly.&quot;) from exc
+<a id="l115" href="#l115">115</a>     return checkout[&quot;url&quot;]
+<a id="l116" href="#l116">116</a> 
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a> def portal_url(account: Account) -&gt; str:
+<a id="l119" href="#l119">119</a>     &quot;&quot;&quot;Stripe&#x27;s own page for cancelling or updating the unlimited plan.&quot;&quot;&quot;
+<a id="l120" href="#l120">120</a>     stripe = _stripe()
+<a id="l121" href="#l121">121</a>     if not account.stripe_customer_id:
+<a id="l122" href="#l122">122</a>         raise PaymentError(&quot;There is no payment history on this account yet.&quot;)
+<a id="l123" href="#l123">123</a>     try:
+<a id="l124" href="#l124">124</a>         portal = _plain(
+<a id="l125" href="#l125">125</a>             stripe.billing_portal.Session.create(
+<a id="l126" href="#l126">126</a>                 customer=account.stripe_customer_id, return_url=f&quot;{_base()}/&quot;
+<a id="l127" href="#l127">127</a>             )
+<a id="l128" href="#l128">128</a>         )
+<a id="l129" href="#l129">129</a>     except stripe.StripeError as exc:
+<a id="l130" href="#l130">130</a>         log.warning(&quot;portal create failed for %s: %s&quot;, account.id, exc)
+<a id="l131" href="#l131">131</a>         raise PaymentError(&quot;Could not open the billing page. Try again shortly.&quot;) from exc
+<a id="l132" href="#l132">132</a>     return portal[&quot;url&quot;]
+<a id="l133" href="#l133">133</a> 
+<a id="l134" href="#l134">134</a> 
+<a id="l135" href="#l135">135</a> # ---------------------------------------------------------------------------
+<a id="l136" href="#l136">136</a> # fulfilment
+<a id="l137" href="#l137">137</a> # ---------------------------------------------------------------------------
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a> def _period_end(sub: dict) -&gt; datetime | None:
+<a id="l140" href="#l140">140</a>     # Moved from the subscription onto its items in the 2025 API versions;
+<a id="l141" href="#l141">141</a>     # which one arrives depends on the account&#x27;s webhook API version.
+<a id="l142" href="#l142">142</a>     stamp = sub.get(&quot;current_period_end&quot;)
+<a id="l143" href="#l143">143</a>     if stamp is None:
+<a id="l144" href="#l144">144</a>         items = (sub.get(&quot;items&quot;) or {}).get(&quot;data&quot;) or []
+<a id="l145" href="#l145">145</a>         stamp = items[0].get(&quot;current_period_end&quot;) if items else None
+<a id="l146" href="#l146">146</a>     return datetime.fromtimestamp(stamp, tz=timezone.utc) if stamp else None
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a> 
+<a id="l149" href="#l149">149</a> def _account_for(session: Session, account_id: str | None, customer: str | None):
+<a id="l150" href="#l150">150</a>     account = session.get(Account, account_id) if account_id else None
+<a id="l151" href="#l151">151</a>     if account is None and customer:
+<a id="l152" href="#l152">152</a>         account = (
+<a id="l153" href="#l153">153</a>             session.query(Account)
+<a id="l154" href="#l154">154</a>             .filter(Account.stripe_customer_id == customer)
+<a id="l155" href="#l155">155</a>             .first()
+<a id="l156" href="#l156">156</a>         )
+<a id="l157" href="#l157">157</a>     return accounts.resolve(session, account) if account else None
+<a id="l158" href="#l158">158</a> 
+<a id="l159" href="#l159">159</a> 
+<a id="l160" href="#l160">160</a> def apply_subscription(session: Session, sub: dict) -&gt; None:
+<a id="l161" href="#l161">161</a>     &quot;&quot;&quot;Mirror a Stripe subscription onto its account.&quot;&quot;&quot;
+<a id="l162" href="#l162">162</a>     meta = sub.get(&quot;metadata&quot;) or {}
+<a id="l163" href="#l163">163</a>     account = _account_for(session, meta.get(&quot;account_id&quot;), sub.get(&quot;customer&quot;))
+<a id="l164" href="#l164">164</a>     if account is None:
+<a id="l165" href="#l165">165</a>         log.warning(&quot;subscription %s matches no account&quot;, sub.get(&quot;id&quot;))
+<a id="l166" href="#l166">166</a>         return
+<a id="l167" href="#l167">167</a>     # An old subscription being deleted must not wipe out its replacement.
+<a id="l168" href="#l168">168</a>     if account.subscription_id and account.subscription_id != sub.get(&quot;id&quot;) \
+<a id="l169" href="#l169">169</a>             and sub.get(&quot;status&quot;) in (&quot;canceled&quot;, &quot;incomplete_expired&quot;):
+<a id="l170" href="#l170">170</a>         return
+<a id="l171" href="#l171">171</a>     account.subscription_id = sub.get(&quot;id&quot;)
+<a id="l172" href="#l172">172</a>     account.subscription_status = sub.get(&quot;status&quot;)
+<a id="l173" href="#l173">173</a>     account.subscription_period_end = _period_end(sub)
+<a id="l174" href="#l174">174</a>     if sub.get(&quot;customer&quot;) and not account.stripe_customer_id:
+<a id="l175" href="#l175">175</a>         account.stripe_customer_id = sub[&quot;customer&quot;]
+<a id="l176" href="#l176">176</a>     session.commit()
+<a id="l177" href="#l177">177</a> 
+<a id="l178" href="#l178">178</a> 
+<a id="l179" href="#l179">179</a> def fulfil(session: Session, checkout: dict) -&gt; Account | None:
+<a id="l180" href="#l180">180</a>     &quot;&quot;&quot;Credit a completed checkout. Safe to call any number of times.&quot;&quot;&quot;
+<a id="l181" href="#l181">181</a>     if checkout.get(&quot;payment_status&quot;) not in (&quot;paid&quot;, &quot;no_payment_required&quot;):
+<a id="l182" href="#l182">182</a>         return None  # e.g. a bank debit still clearing; a later event follows
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a>     meta = checkout.get(&quot;metadata&quot;) or {}
+<a id="l185" href="#l185">185</a>     account = _account_for(
+<a id="l186" href="#l186">186</a>         session,
+<a id="l187" href="#l187">187</a>         checkout.get(&quot;client_reference_id&quot;) or meta.get(&quot;account_id&quot;),
+<a id="l188" href="#l188">188</a>         checkout.get(&quot;customer&quot;),
+<a id="l189" href="#l189">189</a>     )
+<a id="l190" href="#l190">190</a>     plan = pricing.get(meta.get(&quot;plan_id&quot;) or &quot;&quot;)
+<a id="l191" href="#l191">191</a>     if account is None or plan is None:
+<a id="l192" href="#l192">192</a>         log.error(&quot;checkout %s: unknown account or plan %r&quot;, checkout.get(&quot;id&quot;), meta)
+<a id="l193" href="#l193">193</a>         return None
+<a id="l194" href="#l194">194</a> 
+<a id="l195" href="#l195">195</a>     # Paying is also how most people sign in: Stripe has verified nothing about
+<a id="l196" href="#l196">196</a>     # the address, but it is where the receipt went, which is good enough to
+<a id="l197" href="#l197">197</a>     # be the account&#x27;s identity.
+<a id="l198" href="#l198">198</a>     email = ((checkout.get(&quot;customer_details&quot;) or {}).get(&quot;email&quot;) or &quot;&quot;).strip().lower()
+<a id="l199" href="#l199">199</a>     if email and account.email is None:
+<a id="l200" href="#l200">200</a>         account = accounts.adopt_email(session, account, email)
+<a id="l201" href="#l201">201</a> 
+<a id="l202" href="#l202">202</a>     session.add(
+<a id="l203" href="#l203">203</a>         Purchase(
+<a id="l204" href="#l204">204</a>             account_id=account.id,
+<a id="l205" href="#l205">205</a>             plan_id=plan.id,
+<a id="l206" href="#l206">206</a>             credits=plan.credits or 0,
+<a id="l207" href="#l207">207</a>             amount_cents=checkout.get(&quot;amount_total&quot;) or plan.price_cents,
+<a id="l208" href="#l208">208</a>             currency=checkout.get(&quot;currency&quot;) or plan.currency,
+<a id="l209" href="#l209">209</a>             stripe_session_id=checkout[&quot;id&quot;],
+<a id="l210" href="#l210">210</a>         )
+<a id="l211" href="#l211">211</a>     )
+<a id="l212" href="#l212">212</a>     try:
+<a id="l213" href="#l213">213</a>         session.flush()
+<a id="l214" href="#l214">214</a>     except IntegrityError:
+<a id="l215" href="#l215">215</a>         session.rollback()  # already fulfilled by the other delivery path
+<a id="l216" href="#l216">216</a>         return _account_for(session, account.id, None)
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a>     if checkout.get(&quot;customer&quot;) and not account.stripe_customer_id:
+<a id="l219" href="#l219">219</a>         account.stripe_customer_id = checkout[&quot;customer&quot;]
+<a id="l220" href="#l220">220</a>     if plan.credits:
+<a id="l221" href="#l221">221</a>         account.purchased_credits += plan.credits
+<a id="l222" href="#l222">222</a>     session.commit()
+<a id="l223" href="#l223">223</a> 
+<a id="l224" href="#l224">224</a>     if checkout.get(&quot;subscription&quot;):
+<a id="l225" href="#l225">225</a>         try:
+<a id="l226" href="#l226">226</a>             sub = _plain(_stripe().Subscription.retrieve(checkout[&quot;subscription&quot;]))
+<a id="l227" href="#l227">227</a>             apply_subscription(session, sub)
+<a id="l228" href="#l228">228</a>         except Exception as exc:  # noqa: BLE001 - the subscription webhook will land too
+<a id="l229" href="#l229">229</a>             log.warning(&quot;could not read subscription %s: %s&quot;,
+<a id="l230" href="#l230">230</a>                         checkout[&quot;subscription&quot;], exc)
+<a id="l231" href="#l231">231</a> 
+<a id="l232" href="#l232">232</a>     log.info(&quot;fulfilled %s: plan=%s account=%s&quot;, checkout[&quot;id&quot;], plan.id, account.id)
+<a id="l233" href="#l233">233</a>     return account
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> 
+<a id="l236" href="#l236">236</a> def fulfil_by_id(session: Session, session_id: str) -&gt; Account | None:
+<a id="l237" href="#l237">237</a>     &quot;&quot;&quot;The browser&#x27;s return trip: re-read the session from Stripe, then fulfil.&quot;&quot;&quot;
+<a id="l238" href="#l238">238</a>     stripe = _stripe()
+<a id="l239" href="#l239">239</a>     try:
+<a id="l240" href="#l240">240</a>         checkout = _plain(stripe.checkout.Session.retrieve(session_id))
+<a id="l241" href="#l241">241</a>     except stripe.StripeError as exc:
+<a id="l242" href="#l242">242</a>         log.warning(&quot;could not retrieve checkout %s: %s&quot;, session_id, exc)
+<a id="l243" href="#l243">243</a>         return None
+<a id="l244" href="#l244">244</a>     return fulfil(session, checkout)
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a> 
+<a id="l247" href="#l247">247</a> # ---------------------------------------------------------------------------
+<a id="l248" href="#l248">248</a> # webhooks
+<a id="l249" href="#l249">249</a> # ---------------------------------------------------------------------------
+<a id="l250" href="#l250">250</a> 
+<a id="l251" href="#l251">251</a> def verify_webhook(payload: bytes, signature: str | None) -&gt; dict:
+<a id="l252" href="#l252">252</a>     &quot;&quot;&quot;Check Stripe&#x27;s signature and return the event as plain data.&quot;&quot;&quot;
+<a id="l253" href="#l253">253</a>     stripe = _stripe()
+<a id="l254" href="#l254">254</a>     if not settings.stripe_webhook_secret:
+<a id="l255" href="#l255">255</a>         raise PaymentsUnavailable(&quot;No webhook signing secret is configured.&quot;)
+<a id="l256" href="#l256">256</a>     try:
+<a id="l257" href="#l257">257</a>         stripe.Webhook.construct_event(
+<a id="l258" href="#l258">258</a>             payload, signature or &quot;&quot;, settings.stripe_webhook_secret
+<a id="l259" href="#l259">259</a>         )
+<a id="l260" href="#l260">260</a>     except (ValueError, stripe.SignatureVerificationError) as exc:
+<a id="l261" href="#l261">261</a>         raise PaymentError(&quot;Bad webhook signature.&quot;) from exc
+<a id="l262" href="#l262">262</a>     return json.loads(payload)
+<a id="l263" href="#l263">263</a> 
+<a id="l264" href="#l264">264</a> 
+<a id="l265" href="#l265">265</a> def handle_event(session: Session, event: dict) -&gt; None:
+<a id="l266" href="#l266">266</a>     kind = event.get(&quot;type&quot;, &quot;&quot;)
+<a id="l267" href="#l267">267</a>     obj = (event.get(&quot;data&quot;) or {}).get(&quot;object&quot;) or {}
+<a id="l268" href="#l268">268</a> 
+<a id="l269" href="#l269">269</a>     if kind in (&quot;checkout.session.completed&quot;,
+<a id="l270" href="#l270">270</a>                 &quot;checkout.session.async_payment_succeeded&quot;):
+<a id="l271" href="#l271">271</a>         fulfil(session, obj)
+<a id="l272" href="#l272">272</a>     elif kind.startswith(&quot;customer.subscription.&quot;):
+<a id="l273" href="#l273">273</a>         apply_subscription(session, obj)</pre>
+</div></body></html>

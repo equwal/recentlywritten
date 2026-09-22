@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web c545960e - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c545960ed4b45d42095e0157b5b57e252f19f7e0
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 11:32:53 -0700
+
+Match chapters by calibrated n-gram overlap instead of a fixed threshold
+
+subplz gates chapter matching on fuzz.ratio &gt; 40. That constant is calibrated
+for Japanese and does not transfer: measured noise floor between unrelated
+chapters is 23-26 for Japanese but 45-47 for English and 44 for Spanish, so for
+Latin scripts the gate sits below the noise and accepts anything. The cause is
+alphabet size, not typography - a generic punctuation strip moved English only
+45.3 to 42.4.
+
+Replace it with three things, in backend/chapters.py:
+
+- Character 4-gram overlap rather than edit distance. Separation between the
+  true chapter and the runner-up goes from 2.1x to 9.5x, and it works on
+  scripts with no word boundaries, where a word-level metric collapses.
+- A threshold calibrated from the book in hand, by sampling unrelated chapter
+  pairs, so one rule covers a noise floor of 2.5 or of 45.
+- A runner-up test. A different book in the same language scores high because
+  it shares a vocabulary; what it cannot do is make one chapter stand out.
+  Measured: right book 78-87 at 2.7-2.9x confidence, an unrelated Russian novel
+  55-60 at 1.03x - rejected, though it clears subplz&#x27;s threshold comfortably.
+
+Sampling is now adaptive and skips chapter 0, where publisher announcements
+live. A confident pair costs ~8s.
+
+</pre><pre> README.md           | 115 ++++++++++++++----------
+ backend/chapters.py | 245 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ backend/matching.py | 145 ++++++++++++++++++++-----------
+ 3 files changed, 408 insertions(+), 97 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 8e1752f..df7ba2e 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -85,56 +85,79 @@ See [Will this text even match?](#will-this-text-even-match).</span>
+ subplz fails late and unhelpfully when the text does not match the audio: it
+ transcribes the whole book, then reports &quot;the generated transcript and the
+ provided text file are too different&quot; and writes a `.subfail`. On CPU that is a
+<span class="d">-wasted hour.</span>
+<span class="a">+wasted hour. This app answers the question on upload, in seconds — and answers it</span>
+<span class="a">+better than subplz can.</span>
+ 
+<span class="d">-So the app asks the same question on upload, using subplz&#x27;s own rule —</span>
+<span class="d">-transcribe a 60-second sample from the start of up to three chapters, score each</span>
+<span class="d">-against every chapter of the book with `rapidfuzz.fuzz.ratio`, and compare</span>
+<span class="d">-against subplz&#x27;s `SCORE_THRESHOLD = 40`. It costs a few seconds.</span>
+<span class="a">+### Why a fixed threshold cannot work</span>
+ 
+<span class="d">-Measured on real files:</span>
+<span class="a">+subplz compares chapters with `rapidfuzz.fuzz.ratio` against a constant</span>
+<span class="a">+`SCORE_THRESHOLD = 40`. What two *unrelated* chapters score depends entirely on</span>
+<span class="a">+how many characters the script has:</span>
+ 
+<span class="d">-| Pair | Score | Verdict |</span>
+<span class="d">-|---|---|---|</span>
+<span class="d">-| Moskva-Petushki audio + its own epub | **74.4** | good |</span>
+<span class="d">-| Moskva-Petushki audio + an unrelated Russian novel | **40.5** | poor |</span>
+<span class="d">-</span>
+<span class="d">-That second row is the important one. An unrelated book in the same language</span>
+<span class="d">-still clears subplz&#x27;s threshold of 40, because two prose texts in one language</span>
+<span class="d">-are roughly 40% similar character-by-character whatever they say. So the bands</span>
+<span class="d">-here sit well above it: good at ≥60, marginal at ≥48, poor below. A poor score</span>
+<span class="d">-warns and relabels the button &quot;Start anyway&quot; — it never blocks, because the</span>
+<span class="d">-check only samples, and it is your book.</span>
+<span class="d">-</span>
+<span class="d">-### What actually improves the score</span>
+<span class="d">-</span>
+<span class="d">-Two things were tried and measured, and only one of them works.</span>
+<span class="d">-</span>
+<span class="d">-**Chapter structure — decisive.** subplz compares the *opening* of each audio</span>
+<span class="d">-chapter against the *opening* of each text chapter, capped at 2000 characters.</span>
+<span class="d">-It splits an epub into one text chapter per spine document, but a `.txt` into</span>
+<span class="d">-exactly one chapter for the whole file. Same book, same audio:</span>
+<span class="d">-</span>
+<span class="d">-| Text given to subplz | Score |</span>
+<span class="a">+| noise floor, unrelated chapters of one book | `fuzz.ratio` |</span>
+ |---|---|
+<span class="d">-| epub, per chapter | **69.1** |</span>
+<span class="d">-| identical text as one flat file | **38.6** — *below the threshold* |</span>
+<span class="d">-</span>
+<span class="d">-A flat text file turns a perfectly good book into a failed run. That is why</span>
+<span class="d">-`convert.py` emits a chaptered epub rather than plain text, and why the app</span>
+<span class="d">-warns when a one-document book is paired with multi-chapter audio.</span>
+<span class="d">-</span>
+<span class="d">-**Typographic cleanup — no effect, so it was dropped.** Normalising curly</span>
+<span class="d">-quotes, em dashes, soft hyphens, non-breaking spaces and footnote markers</span>
+<span class="d">-measured **+0.0** against a real transcript. Joining paragraphs with a space</span>
+<span class="d">-instead of subplz&#x27;s empty string was worth +0.3. Both are noise next to</span>
+<span class="d">-chapterisation, and shipping them would have been dead code. (This is the one</span>
+<span class="d">-place it matters that `ats/lang.py` implements only Japanese and English —</span>
+<span class="d">-every other language falls back to `English`, whose `clean()` is nothing but</span>
+<span class="d">-`.lower()`, so punctuation is compared verbatim. It still does not move the</span>
+<span class="d">-number.)</span>
+<span class="d">-</span>
+<span class="d">-Disable the check with `SUBPLZ_WEB_MATCH_CHECK=false`.</span>
+<span class="a">+| Japanese | 23 – 26 |</span>
+<span class="a">+| Russian | 39 |</span>
+<span class="a">+| Spanish | 44 |</span>
+<span class="a">+| English | 45 – 47 |</span>
+<span class="a">+</span>
+<span class="a">+For English and Spanish the floor is **above 40**, so unrelated chapters clear</span>
+<span class="a">+the gate and it discriminates nothing. The constant suits Japanese, which is what</span>
+<span class="a">+it was tuned on: thousands of distinct characters make coincidental similarity</span>
+<span class="a">+rare, while twenty-six letters make it inevitable. Cleaning does not help — a</span>
+<span class="a">+generic punctuation strip moved English only 45.3 → 42.4, because the cause is</span>
+<span class="a">+alphabet size, not typography.</span>
+<span class="a">+</span>
+<span class="a">+### What this app does instead — `backend/chapters.py`</span>
+<span class="a">+</span>
+<span class="a">+**Character 4-gram overlap, not edit distance.** Measured against the same audio:</span>
+<span class="a">+</span>
+<span class="a">+| metric | ru floor | en floor | ja floor | true match | runner-up | separation |</span>
+<span class="a">+|---|---|---|---|---|---|---|</span>
+<span class="a">+| `fuzz.ratio` | 39.2 | 45.1 | 26.1 | 86.3 | 40.8 | 2.1× |</span>
+<span class="a">+| word Jaccard | 10.4 | 17.7 | 1.9 | 63.2 | 14.8 | 4.3× |</span>
+<span class="a">+| **4-gram Jaccard** | **4.8** | **10.6** | **2.5** | 53.3 | 5.6 | **9.5×** |</span>
+<span class="a">+</span>
+<span class="a">+n-grams rather than words because many languages do not separate words with</span>
+<span class="a">+spaces — a word-level metric collapses on Japanese, where a &quot;word&quot; is a whole run</span>
+<span class="a">+of characters. Set intersection is also cheaper than edit distance.</span>
+<span class="a">+</span>
+<span class="a">+**A threshold calibrated per book, not per release.** Before judging anything,</span>
+<span class="a">+the app samples ~150 unrelated chapter pairs *from the book in hand* to learn what</span>
+<span class="a">+it scores by chance, then requires a match to clear that floor. One rule that</span>
+<span class="a">+behaves correctly whether the floor is 2.5 or 45, with no constant to re-tune.</span>
+<span class="a">+</span>
+<span class="a">+**A runner-up test, which is what actually catches a wrong book.** A different</span>
+<span class="a">+book in the same language scores *high* — it shares a vocabulary. What it cannot</span>
+<span class="a">+do is make one chapter stand out. Measured, same audio:</span>
+<span class="a">+</span>
+<span class="a">+| book | best | runner-up | confidence | accept_at | verdict |</span>
+<span class="a">+|---|---|---|---|---|---|</span>
+<span class="a">+| the right one | 78 – 87 | ~30 | **2.7 – 2.9×** | 30.7 | accepted 4/4 |</span>
+<span class="a">+| an unrelated Russian novel | 55 – 60 | 53 – 58 | **1.0×** | 92.1 | rejected 4/4 |</span>
+<span class="a">+</span>
+<span class="a">+Note the second row clears subplz&#x27;s threshold of 40 comfortably and is still</span>
+<span class="a">+rejected here, on both tests independently: its own noise floor is 57.6, so</span>
+<span class="a">+`accept_at` rises to 92, and nothing stands out from the crowd.</span>
+<span class="a">+</span>
+<span class="a">+**Adaptive sampling.** Chapters are sampled from across the book, skipping</span>
+<span class="a">+chapter 0 — publisher announcements and credits live there, so it is the least</span>
+<span class="a">+representative chapter in the book. Sampling stops as soon as one chapter matches</span>
+<span class="a">+confidently, so a good pair typically costs ~8s and a doubtful one ~20s.</span>
+<span class="a">+</span>
+<span class="a">+A poor verdict warns and relabels the button &quot;Start anyway&quot;; it never blocks,</span>
+<span class="a">+because the check only samples and it is your book. Disable it entirely with</span>
+<span class="a">+`SUBPLZ_WEB_MATCH_CHECK=false`.</span>
+<span class="a">+</span>
+<span class="a">+### Measured and rejected</span>
+<span class="a">+</span>
+<span class="a">+- **Typographic normalisation** of quotes, dashes, soft hyphens, NBSP and</span>
+<span class="a">+  footnote markers: **+0.0**. Built, measured, deleted.</span>
+<span class="a">+- **Un-gluing sentence boundaries** (`роса…Мне` → `роса… Мне`): multi-sentence</span>
+<span class="a">+  lines 13.6% → 12.4%, because pysbd does not treat `…` as a terminator for</span>
+<span class="a">+  Russian. Not worth the epub rewrite.</span>
+<span class="a">+- **`token_set_ratio` / `token_sort_ratio`**: *worse* than `fuzz.ratio` on long</span>
+<span class="a">+  texts — nearly every common word appears in both chapters.</span>
+ 
+ ---
+ 
+diff --git a/backend/chapters.py b/backend/chapters.py
+new file mode 100644
+index 0000000..d182600
+--- /dev/null
++++ b/backend/chapters.py
+<span class="h">@@ -0,0 +1,245 @@</span>
+<span class="a">+&quot;&quot;&quot;Chapter matching that works on any script.</span>
+<span class="a">+</span>
+<span class="a">+The alignment backend decides which text chapter belongs to which audio chapter</span>
+<span class="a">+by character-level edit similarity (`rapidfuzz.fuzz.ratio`) against a fixed</span>
+<span class="a">+threshold of 40. That is calibrated for Japanese and does not transfer. Measured</span>
+<span class="a">+noise floor between *unrelated* chapters of the same book:</span>
+<span class="a">+</span>
+<span class="a">+    Japanese   23-26      &lt;- threshold 40 discriminates well</span>
+<span class="a">+    Russian    39         &lt;- borderline</span>
+<span class="a">+    Spanish    44</span>
+<span class="a">+    English    45-47      &lt;- unrelated chapters clear the threshold</span>
+<span class="a">+</span>
+<span class="a">+With twenty-six letters, any two prose texts are ~45% similar by chance, so for</span>
+<span class="a">+Latin scripts the gate is *below the noise* and accepts anything. Cleaning does</span>
+<span class="a">+not fix it (a generic punctuation strip moved English only 45.3 -&gt; 42.4); the</span>
+<span class="a">+cause is alphabet size, not typography.</span>
+<span class="a">+</span>
+<span class="a">+This module scores on character n-gram overlap instead, and calibrates the</span>
+<span class="a">+threshold against the book it is actually looking at. Measured on the same data:</span>
+<span class="a">+</span>
+<span class="a">+    metric            ru floor  en floor  ja floor   true   runner-up   ratio</span>
+<span class="a">+    fuzz.ratio            39.2      45.1      26.1   86.3        40.8   2.1x</span>
+<span class="a">+    word jaccard          10.4      17.7       1.9   63.2        14.8   4.3x</span>
+<span class="a">+    4-gram jaccard         4.8      10.6       2.5   53.3         5.6   9.5x</span>
+<span class="a">+</span>
+<span class="a">+n-grams rather than words because plenty of languages do not put spaces between</span>
+<span class="a">+them; a word-level metric collapses on Japanese, where a &quot;word&quot; is a whole run of</span>
+<span class="a">+characters.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import random</span>
+<span class="a">+import statistics as st</span>
+<span class="a">+import unicodedata</span>
+<span class="a">+from dataclasses import dataclass</span>
+<span class="a">+</span>
+<span class="a">+import regex</span>
+<span class="a">+</span>
+<span class="a">+NGRAM = 4</span>
+<span class="a">+</span>
+<span class="a">+# Everything that is not a letter or a number: punctuation, spacing, marks.</span>
+<span class="a">+# Dropped so typography cannot influence the comparison.</span>
+<span class="a">+_NOISE = regex.compile(r&quot;[^\p{L}\p{N}]+&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def normalize(text: str) -&gt; str:</span>
+<span class="a">+    return _NOISE.sub(&quot;&quot;, unicodedata.normalize(&quot;NFKD&quot;, text.casefold()))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def fingerprint(text: str, n: int = NGRAM) -&gt; frozenset[str]:</span>
+<span class="a">+    &quot;&quot;&quot;The set of character n-grams in `text`, after normalisation.</span>
+<span class="a">+</span>
+<span class="a">+    Computed once per chapter and reused: comparing two fingerprints is a set</span>
+<span class="a">+    intersection, which is far cheaper than an edit distance over the same text.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    s = normalize(text)</span>
+<span class="a">+    if len(s) &lt; n:</span>
+<span class="a">+        return frozenset()</span>
+<span class="a">+    return frozenset(s[i : i + n] for i in range(len(s) - n + 1))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def jaccard(a: frozenset[str], b: frozenset[str]) -&gt; float:</span>
+<span class="a">+    if not a or not b:</span>
+<span class="a">+        return 0.0</span>
+<span class="a">+    return 100.0 * len(a &amp; b) / len(a | b)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def containment(probe: frozenset[str], reference: frozenset[str]) -&gt; float:</span>
+<span class="a">+    &quot;&quot;&quot;How much of `probe` appears in `reference`, as a percentage.</span>
+<span class="a">+</span>
+<span class="a">+    Used when a short transcript sample is compared against a whole chapter:</span>
+<span class="a">+    Jaccard would punish the length difference through the union term, since a</span>
+<span class="a">+    three-minute sample cannot cover a thirty-minute chapter. Containment asks</span>
+<span class="a">+    the question we actually mean - &quot;is this passage in that chapter&quot; - and is</span>
+<span class="a">+    unaffected by how much longer the chapter is.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if not probe or not reference:</span>
+<span class="a">+        return 0.0</span>
+<span class="a">+    return 100.0 * len(probe &amp; reference) / len(probe)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Calibration:</span>
+<span class="a">+    &quot;&quot;&quot;The similarity this book produces by chance.</span>
+<span class="a">+</span>
+<span class="a">+    Sampled from the book itself, so it adapts to script, vocabulary and</span>
+<span class="a">+    register instead of relying on a constant that only suits one language.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    floor: float</span>
+<span class="a">+    high: float  # worst case seen among unrelated pairs</span>
+<span class="a">+    samples: int</span>
+<span class="a">+</span>
+<span class="a">+    # A real match must clear the floor by this factor...</span>
+<span class="a">+    FLOOR_MULTIPLE = 1.6</span>
+<span class="a">+    # ...and beat whatever came second by this much. This is the test a fixed</span>
+<span class="a">+    # threshold cannot do, and the one that catches a wrong book whose language</span>
+<span class="a">+    # alone makes every chapter score alike.</span>
+<span class="a">+    RUNNER_UP_MULTIPLE = 1.5</span>
+<span class="a">+</span>
+<span class="a">+    @property</span>
+<span class="a">+    def accept_at(self) -&gt; float:</span>
+<span class="a">+        &quot;&quot;&quot;Minimum score worth taking seriously for this book.&quot;&quot;&quot;</span>
+<span class="a">+        return max(self.floor * self.FLOOR_MULTIPLE, self.high * 1.15, 1.0)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def calibrate(</span>
+<span class="a">+    chapter_texts: list[str],</span>
+<span class="a">+    pairs: int = 150,</span>
+<span class="a">+    seed: int = 0,</span>
+<span class="a">+    probe_chars: int = 2000,</span>
+<span class="a">+) -&gt; Calibration:</span>
+<span class="a">+    &quot;&quot;&quot;Estimate the chance-similarity floor from unrelated pairs of this book.</span>
+<span class="a">+</span>
+<span class="a">+    Calibrated with the *same* measure and the *same shape* of comparison that</span>
+<span class="a">+    real matching uses: a short probe against a whole chapter. Measuring the</span>
+<span class="a">+    floor with Jaccard while matching with containment would put the threshold</span>
+<span class="a">+    on a different scale from the scores it gates.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    usable = [t for t in chapter_texts if len(normalize(t)) &gt; probe_chars // 2]</span>
+<span class="a">+    if len(usable) &lt; 3:</span>
+<span class="a">+        # Too little to calibrate against; fall back to something conservative.</span>
+<span class="a">+        return Calibration(floor=20.0, high=40.0, samples=0)</span>
+<span class="a">+</span>
+<span class="a">+    references = [fingerprint(t) for t in usable]</span>
+<span class="a">+    # A probe is a slice the size of a transcript sample, so the floor reflects</span>
+<span class="a">+    # what an unrelated passage of this length scores against a full chapter.</span>
+<span class="a">+    probes = [fingerprint(normalize(t)[:probe_chars]) for t in usable]</span>
+<span class="a">+</span>
+<span class="a">+    rng = random.Random(seed)</span>
+<span class="a">+    scores = []</span>
+<span class="a">+    for _ in range(pairs):</span>
+<span class="a">+        a, b = rng.sample(range(len(usable)), 2)</span>
+<span class="a">+        scores.append(containment(probes[a], references[b]))</span>
+<span class="a">+</span>
+<span class="a">+    scores.sort()</span>
+<span class="a">+    return Calibration(</span>
+<span class="a">+        floor=st.median(scores),</span>
+<span class="a">+        high=scores[min(len(scores) - 1, int(0.95 * len(scores)))],</span>
+<span class="a">+        samples=len(scores),</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Match:</span>
+<span class="a">+    text_index: int | None</span>
+<span class="a">+    score: float</span>
+<span class="a">+    runner_up: float</span>
+<span class="a">+    accepted: bool</span>
+<span class="a">+    calibration: Calibration</span>
+<span class="a">+</span>
+<span class="a">+    @property</span>
+<span class="a">+    def confidence(self) -&gt; float:</span>
+<span class="a">+        &quot;&quot;&quot;How far clear of the runner-up this match is. 1.0 means a tie.&quot;&quot;&quot;</span>
+<span class="a">+        if self.runner_up &lt;= 0:</span>
+<span class="a">+            return float(&quot;inf&quot;) if self.score &gt; 0 else 0.0</span>
+<span class="a">+        return self.score / self.runner_up</span>
+<span class="a">+</span>
+<span class="a">+    @property</span>
+<span class="a">+    def margin_over_noise(self) -&gt; float:</span>
+<span class="a">+        if self.calibration.floor &lt;= 0:</span>
+<span class="a">+            return float(&quot;inf&quot;) if self.score &gt; 0 else 0.0</span>
+<span class="a">+        return self.score / self.calibration.floor</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def best_match(</span>
+<span class="a">+    probe: frozenset[str],</span>
+<span class="a">+    chapters: list[frozenset[str]],</span>
+<span class="a">+    calibration: Calibration,</span>
+<span class="a">+    exclude: set[int] | None = None,</span>
+<span class="a">+) -&gt; Match:</span>
+<span class="a">+    &quot;&quot;&quot;Find the chapter a sample of audio came from.</span>
+<span class="a">+</span>
+<span class="a">+    Accepting requires clearing the book&#x27;s own noise floor *and* beating the</span>
+<span class="a">+    runner-up. The second test is what a fixed threshold cannot do: if two</span>
+<span class="a">+    chapters score alike, the winner is arbitrary, however high the number.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    skip = exclude or set()</span>
+<span class="a">+    ranked = sorted(</span>
+<span class="a">+        (</span>
+<span class="a">+            (containment(probe, ch), i)</span>
+<span class="a">+            for i, ch in enumerate(chapters)</span>
+<span class="a">+            if i not in skip and ch</span>
+<span class="a">+        ),</span>
+<span class="a">+        reverse=True,</span>
+<span class="a">+    )</span>
+<span class="a">+    if not ranked:</span>
+<span class="a">+        return Match(None, 0.0, 0.0, False, calibration)</span>
+<span class="a">+</span>
+<span class="a">+    score, index = ranked[0]</span>
+<span class="a">+    runner_up = ranked[1][0] if len(ranked) &gt; 1 else 0.0</span>
+<span class="a">+</span>
+<span class="a">+    accepted = score &gt;= calibration.accept_at and (</span>
+<span class="a">+        runner_up &lt;= 0 or score &gt;= runner_up * Calibration.RUNNER_UP_MULTIPLE</span>
+<span class="a">+    )</span>
+<span class="a">+    return Match(index if accepted else None, score, runner_up, accepted, calibration)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def assign_monotonic(matrix: list[list[float]], accept_at: float) -&gt; list[int | None]:</span>
+<span class="a">+    &quot;&quot;&quot;Pair audio chapters to text chapters in order, maximising total score.</span>
+<span class="a">+</span>
+<span class="a">+    The backend&#x27;s own matcher walks audio chapters in order and *consumes* text</span>
+<span class="a">+    chapters as it goes, with no backtracking: an early chapter - usually</span>
+<span class="a">+    chapter 0, where publisher announcements live and which is therefore the</span>
+<span class="a">+    least representative chapter in the book - can permanently take the text</span>
+<span class="a">+    that belonged to another.</span>
+<span class="a">+</span>
+<span class="a">+    This solves the whole assignment at once, and requires it to be</span>
+<span class="a">+    order-preserving, which is true of every book: chapter k cannot come from</span>
+<span class="a">+    text that precedes chapter k-1&#x27;s. Skips are allowed on both sides, for front</span>
+<span class="a">+    matter and for chapters nobody narrated.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    n_audio, n_text = len(matrix), (len(matrix[0]) if matrix else 0)</span>
+<span class="a">+    if not n_audio or not n_text:</span>
+<span class="a">+        return [None] * n_audio</span>
+<span class="a">+</span>
+<span class="a">+    NEG = float(&quot;-inf&quot;)</span>
+<span class="a">+    # best[i][j] = best total score pairing the first i audio with first j text</span>
+<span class="a">+    best = [[0.0] * (n_text + 1) for _ in range(n_audio + 1)]</span>
+<span class="a">+    back = [[0] * (n_text + 1) for _ in range(n_audio + 1)]  # 0 skip-a,1 skip-t,2 pair</span>
+<span class="a">+</span>
+<span class="a">+    for i in range(1, n_audio + 1):</span>
+<span class="a">+        for j in range(1, n_text + 1):</span>
+<span class="a">+            skip_audio = best[i - 1][j]</span>
+<span class="a">+            skip_text = best[i][j - 1]</span>
+<span class="a">+            score = matrix[i - 1][j - 1]</span>
+<span class="a">+            pair = best[i - 1][j - 1] + (score if score &gt;= accept_at else NEG)</span>
+<span class="a">+</span>
+<span class="a">+            chosen = max(skip_audio, skip_text, pair)</span>
+<span class="a">+            best[i][j] = chosen</span>
+<span class="a">+            back[i][j] = 2 if chosen == pair else (0 if chosen == skip_audio else 1)</span>
+<span class="a">+</span>
+<span class="a">+    out: list[int | None] = [None] * n_audio</span>
+<span class="a">+    i, j = n_audio, n_text</span>
+<span class="a">+    while i &gt; 0 and j &gt; 0:</span>
+<span class="a">+        move = back[i][j]</span>
+<span class="a">+        if move == 2:</span>
+<span class="a">+            out[i - 1] = j - 1</span>
+<span class="a">+            i, j = i - 1, j - 1</span>
+<span class="a">+        elif move == 0:</span>
+<span class="a">+            i -= 1</span>
+<span class="a">+        else:</span>
+<span class="a">+            j -= 1</span>
+<span class="a">+    return out</span>
+diff --git a/backend/matching.py b/backend/matching.py
+index 4400dd7..82b1a7c 100644
+--- a/backend/matching.py
++++ b/backend/matching.py
+<span class="h">@@ -25,14 +25,14 @@ from dataclasses import dataclass, field</span>
+ from functools import lru_cache
+ from pathlib import Path
+ 
+<span class="a">+from . import chapters as chapters_mod</span>
+ from .settings import settings
+ 
+ log = logging.getLogger(__name__)
+ 
+<span class="d">-# Scoring compares chapter openings, so a sample from the start of a chapter is</span>
+<span class="d">-# the relevant thing to transcribe - and a short one is enough. subplz caps the</span>
+<span class="d">-# comparison at 2000 characters, which is a couple of minutes of speech.</span>
+<span class="d">-SAMPLE_SECONDS = 60</span>
+<span class="a">+# Enough speech to fingerprint a chapter confidently. Sampling is adaptive, so</span>
+<span class="a">+# a book that matches well normally pays for one of these and stops.</span>
+<span class="a">+SAMPLE_SECONDS = 120</span>
+ MAX_SAMPLES = 3
+ 
+ 
+<span class="h">@@ -41,11 +41,16 @@ class ChapterScore:</span>
+     audio_chapter: int
+     best_score: float
+     best_text_chapter: int | None
+<span class="a">+    runner_up: float = 0.0</span>
+<span class="a">+    # How far clear of the runner-up. 1.0 means every chapter looked alike,</span>
+<span class="a">+    # which is the signature of the wrong book rather than a poor recording.</span>
+<span class="a">+    confidence: float = 0.0</span>
+<span class="a">+    accepted: bool = False</span>
+     transcript_head: str = &quot;&quot;
+ 
+     @property
+     def matched(self) -&gt; bool:
+<span class="d">-        return self.best_text_chapter is not None</span>
+<span class="a">+        return self.accepted</span>
+ 
+ 
+ @dataclass
+<span class="h">@@ -54,6 +59,8 @@ class MatchReport:</span>
+     scores: list[ChapterScore] = field(default_factory=list)
+     text_chapters: int = 0
+     audio_chapters: int = 0
+<span class="a">+    accept_at: float = 0.0</span>
+<span class="a">+    noise_floor: float = 0.0</span>
+     verdict: str = &quot;unknown&quot;  # good | marginal | poor | unknown
+     summary: str = &quot;&quot;
+     warnings: list[str] = field(default_factory=list)
+<span class="h">@@ -71,9 +78,15 @@ class MatchReport:</span>
+     def matched(self) -&gt; int:
+         return sum(1 for s in self.scores if s.matched)
+ 
+<span class="a">+    @property</span>
+<span class="a">+    def confidence(self) -&gt; float:</span>
+<span class="a">+        return max((s.confidence for s in self.scores), default=0.0)</span>
+<span class="a">+</span>
+     def as_dict(self) -&gt; dict:
+         return {
+<span class="d">-            &quot;threshold&quot;: self.threshold,</span>
+<span class="a">+            &quot;threshold&quot;: round(self.accept_at, 1),</span>
+<span class="a">+            &quot;noise_floor&quot;: round(self.noise_floor, 1),</span>
+<span class="a">+            &quot;confidence&quot;: round(self.confidence, 2),</span>
+             &quot;verdict&quot;: self.verdict,
+             &quot;summary&quot;: self.summary,
+             &quot;best&quot;: round(self.best, 1),
+<span class="h">@@ -88,6 +101,8 @@ class MatchReport:</span>
+                 {
+                     &quot;audio_chapter&quot;: s.audio_chapter,
+                     &quot;score&quot;: round(s.best_score, 1),
+<span class="a">+                    &quot;runner_up&quot;: round(s.runner_up, 1),</span>
+<span class="a">+                    &quot;confidence&quot;: round(s.confidence, 2),</span>
+                     &quot;text_chapter&quot;: s.best_text_chapter,
+                 }
+                 for s in self.scores
+<span class="h">@@ -186,7 +201,7 @@ def _model():</span>
+ 
+ def transcribe_sample(samples, language: str) -&gt; str:
+     segments, _ = _model().transcribe(
+<span class="d">-        samples, language=language, beam_size=1, without_timestamps=True</span>
+<span class="a">+        samples, language=language, beam_size=5, without_timestamps=True</span>
+     )
+     return &quot;&quot;.join(seg.text for seg in segments)
+ 
+<span class="h">@@ -222,13 +237,18 @@ def check(audio: Path, text: Path, language: str, aligner) -&gt; MatchReport:</span>
+                 f&quot;more reliably.&quot;
+             )
+ 
+<span class="d">-        # Sample from the start of chapters spread across the book, because the</span>
+<span class="d">-        # score is about how chapters open.</span>
+<span class="a">+        # Learn what this book scores by chance before judging any match</span>
+<span class="a">+        # against it. See backend/chapters.py for why a fixed threshold cannot</span>
+<span class="a">+        # work across scripts.</span>
+<span class="a">+        fingerprints = [chapters_mod.fingerprint(c) for c in chapters]</span>
+<span class="a">+        calibration = chapters_mod.calibrate(chapters)</span>
+<span class="a">+        report.accept_at = calibration.accept_at</span>
+<span class="a">+        report.noise_floor = calibration.floor</span>
+<span class="a">+</span>
+<span class="a">+        # Sample chapters spread through the book, skipping the first: it is</span>
+<span class="a">+        # where publisher announcements and credits live, so it is the least</span>
+<span class="a">+        # representative chapter there is.</span>
+         picks = _spread(len(starts), MAX_SAMPLES)
+<span class="d">-        scorer = (</span>
+<span class="d">-            aligner.for_language(language)</span>
+<span class="d">-            if hasattr(aligner, &quot;for_language&quot;) else aligner</span>
+<span class="d">-        )</span>
+ 
+         for idx in picks:
+             samples = read_samples(audio, starts[idx], SAMPLE_SECONDS)
+<span class="h">@@ -238,20 +258,23 @@ def check(audio: Path, text: Path, language: str, aligner) -&gt; MatchReport:</span>
+             if len(transcript.strip()) &lt; 40:
+                 continue
+ 
+<span class="d">-            best, best_i = 0.0, None</span>
+<span class="d">-            for ci, chapter in enumerate(chapters):</span>
+<span class="d">-                score = scorer.score_pair(transcript, chapter)</span>
+<span class="d">-                if score &gt; best:</span>
+<span class="d">-                    best, best_i = score, ci</span>
+<span class="d">-</span>
+<span class="a">+            match = chapters_mod.best_match(</span>
+<span class="a">+                chapters_mod.fingerprint(transcript), fingerprints, calibration</span>
+<span class="a">+            )</span>
+             report.scores.append(
+                 ChapterScore(
+                     audio_chapter=idx,
+<span class="d">-                    best_score=best,</span>
+<span class="d">-                    best_text_chapter=best_i if best &gt; report.threshold else None,</span>
+<span class="a">+                    best_score=match.score,</span>
+<span class="a">+                    best_text_chapter=match.text_index,</span>
+<span class="a">+                    runner_up=match.runner_up,</span>
+<span class="a">+                    confidence=match.confidence,</span>
+<span class="a">+                    accepted=match.accepted,</span>
+                     transcript_head=transcript.strip()[:160],
+                 )
+             )
+<span class="a">+            # A confident match is enough; only keep sampling when unsure.</span>
+<span class="a">+            if match.accepted and match.confidence &gt;= 2.0:</span>
+<span class="a">+                break</span>
+ 
+         _verdict(report)
+         return report
+<span class="h">@@ -263,52 +286,72 @@ def check(audio: Path, text: Path, language: str, aligner) -&gt; MatchReport:</span>
+ 
+ 
+ def _spread(n: int, k: int) -&gt; list[int]:
+<span class="d">-    &quot;&quot;&quot;Up to k indices spread across range(n), always including the first.&quot;&quot;&quot;</span>
+<span class="d">-    if n &lt;= k:</span>
+<span class="d">-        return list(range(n))</span>
+<span class="d">-    step = n / k</span>
+<span class="d">-    return sorted({min(n - 1, int(i * step)) for i in range(k)})</span>
+<span class="a">+    &quot;&quot;&quot;Up to k chapter indices spread across the book.</span>
+<span class="a">+</span>
+<span class="a">+    Skips chapter 0 when there is anything else to choose. It is where</span>
+<span class="a">+    publisher announcements, credits and &quot;read by&quot; cards live - material that</span>
+<span class="a">+    is in the audio and not in the book - so it is the least representative</span>
+<span class="a">+    chapter there is, and the worst one to judge a whole book on.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if n &lt;= 1:</span>
+<span class="a">+        return [0]</span>
+<span class="a">+    first = 1 if n &gt; 3 else 0</span>
+<span class="a">+    usable = n - first</span>
+<span class="a">+    if usable &lt;= k:</span>
+<span class="a">+        return list(range(first, n))</span>
+<span class="a">+    step = usable / k</span>
+<span class="a">+    return sorted({min(n - 1, first + int(i * step)) for i in range(k)})</span>
+ 
+ 
+ def _verdict(report: MatchReport) -&gt; None:
+<span class="d">-    &quot;&quot;&quot;Turn the raw score into advice.</span>
+<span class="d">-</span>
+<span class="d">-    The bands sit well above the backend&#x27;s own threshold, deliberately.</span>
+<span class="d">-    Measured on real files: the right book scored 74, while a completely</span>
+<span class="d">-    unrelated Russian novel still scored 40.5 - barely clearing subplz&#x27;s</span>
+<span class="d">-    threshold of 40. Two prose texts in the same language are roughly 40%</span>
+<span class="d">-    similar character-by-character whatever they say, so &quot;just over the</span>
+<span class="d">-    threshold&quot; means &quot;probably wrong&quot;, not &quot;probably fine&quot;.</span>
+<span class="a">+    &quot;&quot;&quot;Turn the measurements into advice.</span>
+<span class="a">+</span>
+<span class="a">+    Two separate questions, and the second is the one a fixed threshold cannot</span>
+<span class="a">+    answer:</span>
+<span class="a">+</span>
+<span class="a">+    * Is the best chapter similar enough to be a real match at all?</span>
+<span class="a">+    * Is it *distinctly* the best, or did every chapter score alike?</span>
+<span class="a">+</span>
+<span class="a">+    A different book in the same language scores high on the first and fails</span>
+<span class="a">+    the second - its chapters all look equally plausible because they share a</span>
+<span class="a">+    language, not a story.</span>
+     &quot;&quot;&quot;
+     if not report.scores:
+         report.verdict = &quot;unknown&quot;
+         report.summary = &quot;Could not sample enough audio to check the match.&quot;
+         return
+ 
+<span class="d">-    t = report.threshold or 40.0</span>
+<span class="d">-    good_at, weak_at = t * 1.5, t * 1.2  # 60 and 48 for subplz</span>
+     best = report.best
+<span class="d">-    total = len(report.scores)</span>
+<span class="d">-    strong = sum(1 for s in report.scores if s.best_score &gt;= good_at)</span>
+<span class="a">+    confidence = report.confidence</span>
+<span class="a">+    accepted = report.matched</span>
+ 
+<span class="d">-    if best &gt;= good_at:</span>
+<span class="a">+    if accepted and confidence &gt;= 2.0:</span>
+         report.verdict = &quot;good&quot;
+<span class="d">-        report.summary = f&quot;Text and audio line up ({best:.0f}/100 on the best sample).&quot;</span>
+<span class="d">-        if total &gt; 1 and strong &lt; total:</span>
+<span class="d">-            report.warnings.append(</span>
+<span class="d">-                f&quot;Only {strong} of {total} sampled chapters scored well. The &quot;</span>
+<span class="d">-                f&quot;timing may drift in parts of the book.&quot;</span>
+<span class="d">-            )</span>
+<span class="d">-    elif best &gt;= weak_at:</span>
+<span class="a">+        report.summary = (</span>
+<span class="a">+            f&quot;Text and audio line up - the matching chapter scores {best:.0f}, &quot;</span>
+<span class="a">+            f&quot;{confidence:.1f}x clear of the next best.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+    elif accepted:</span>
+         report.verdict = &quot;marginal&quot;
+         report.summary = (
+<span class="d">-            f&quot;Weak match ({best:.0f}/100). This may be a different edition or &quot;</span>
+<span class="d">-            f&quot;an abridgement. Alignment can still work, but expect drift.&quot;</span>
+<span class="a">+            f&quot;Probable match ({best:.0f}), but only {confidence:.1f}x clear of &quot;</span>
+<span class="a">+            f&quot;the next best chapter. Expect some drift.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+    elif best &gt;= report.accept_at:</span>
+<span class="a">+        # Similar enough, but nothing stood out.</span>
+<span class="a">+        report.verdict = &quot;poor&quot;</span>
+<span class="a">+        report.summary = (</span>
+<span class="a">+            f&quot;Every chapter of this book scores about the same ({best:.0f} vs &quot;</span>
+<span class="a">+            f&quot;{report.scores[0].runner_up:.0f}), so nothing actually matches.&quot;</span>
+<span class="a">+        )</span>
+<span class="a">+        report.warnings.append(</span>
+<span class="a">+            &quot;That pattern means a different book in the same language - the &quot;</span>
+<span class="a">+            &quot;words are familiar but the story is not. Check you uploaded the &quot;</span>
+<span class="a">+            &quot;right book and the right edition.&quot;</span>
+         )
+     else:
+         report.verdict = &quot;poor&quot;
+         report.summary = (
+<span class="d">-            f&quot;This text does not look like this audio ({best:.0f}/100). Two &quot;</span>
+<span class="d">-            f&quot;unrelated books in the same language score about this well, so &quot;</span>
+<span class="d">-            f&quot;it is probably the wrong book, edition or abridgement.&quot;</span>
+<span class="a">+            f&quot;This text does not look like this audio ({best:.0f}, and this &quot;</span>
+<span class="a">+            f&quot;book needs {report.accept_at:.0f} to count as a match).&quot;</span>
+         )</pre>
+</div></body></html>

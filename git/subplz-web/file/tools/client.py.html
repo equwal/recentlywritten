@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/tools/client.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tools/client.py (9055 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Command-line client for the SubPlz web API.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> Useful on its own for batch work, and it doubles as a worked example of the
+<a id="l4" href="#l4">4</a> three-call flow the browser uses.
+<a id="l5" href="#l5">5</a> 
+<a id="l6" href="#l6">6</a>     python tools/client.py submit &quot;book.m4b&quot; &quot;book.epub&quot; [--language ru] [--wait]
+<a id="l7" href="#l7">7</a>     python tools/client.py list
+<a id="l8" href="#l8">8</a>     python tools/client.py get &lt;job_id&gt;
+<a id="l9" href="#l9">9</a>     python tools/client.py download &lt;job_id&gt; [--dir out/]
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> Uses only the standard library so it runs anywhere, and sends multipart bodies
+<a id="l12" href="#l12">12</a> itself so non-ASCII filenames survive (curl on a non-UTF-8 console mangles them).
+<a id="l13" href="#l13">13</a> &quot;&quot;&quot;
+<a id="l14" href="#l14">14</a> 
+<a id="l15" href="#l15">15</a> from __future__ import annotations
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> import argparse
+<a id="l18" href="#l18">18</a> import http.client
+<a id="l19" href="#l19">19</a> import json
+<a id="l20" href="#l20">20</a> import mimetypes
+<a id="l21" href="#l21">21</a> import os
+<a id="l22" href="#l22">22</a> import sys
+<a id="l23" href="#l23">23</a> import time
+<a id="l24" href="#l24">24</a> import urllib.parse
+<a id="l25" href="#l25">25</a> import uuid
+<a id="l26" href="#l26">26</a> from pathlib import Path
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> DEFAULT_BASE = os.environ.get(&quot;SUBPLZ_WEB_URL&quot;, &quot;http://127.0.0.1:8420&quot;)
+<a id="l29" href="#l29">29</a> COOKIE_FILE = Path.home() / &quot;.subplz_web_cookie&quot;
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> class Client:
+<a id="l33" href="#l33">33</a>     def __init__(self, base: str):
+<a id="l34" href="#l34">34</a>         parts = urllib.parse.urlsplit(base)
+<a id="l35" href="#l35">35</a>         self.host = parts.hostname or &quot;127.0.0.1&quot;
+<a id="l36" href="#l36">36</a>         self.port = parts.port or (443 if parts.scheme == &quot;https&quot; else 80)
+<a id="l37" href="#l37">37</a>         self.https = parts.scheme == &quot;https&quot;
+<a id="l38" href="#l38">38</a>         self.cookie = COOKIE_FILE.read_text().strip() if COOKIE_FILE.exists() else &quot;&quot;
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a>     def _conn(self):
+<a id="l41" href="#l41">41</a>         cls = http.client.HTTPSConnection if self.https else http.client.HTTPConnection
+<a id="l42" href="#l42">42</a>         return cls(self.host, self.port, timeout=900)
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a>     def _headers(self, extra: dict | None = None) -&gt; dict:
+<a id="l45" href="#l45">45</a>         h = {&quot;Accept&quot;: &quot;application/json&quot;}
+<a id="l46" href="#l46">46</a>         if self.cookie:
+<a id="l47" href="#l47">47</a>             h[&quot;Cookie&quot;] = self.cookie
+<a id="l48" href="#l48">48</a>         h.update(extra or {})
+<a id="l49" href="#l49">49</a>         return h
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a>     def _remember_cookie(self, resp) -&gt; None:
+<a id="l52" href="#l52">52</a>         raw = resp.getheader(&quot;set-cookie&quot;)
+<a id="l53" href="#l53">53</a>         if raw:
+<a id="l54" href="#l54">54</a>             self.cookie = raw.split(&quot;;&quot;, 1)[0]
+<a id="l55" href="#l55">55</a>             try:
+<a id="l56" href="#l56">56</a>                 COOKIE_FILE.write_text(self.cookie)
+<a id="l57" href="#l57">57</a>             except OSError:
+<a id="l58" href="#l58">58</a>                 pass
+<a id="l59" href="#l59">59</a> 
+<a id="l60" href="#l60">60</a>     def request(self, method: str, path: str, body=None, headers=None):
+<a id="l61" href="#l61">61</a>         conn = self._conn()
+<a id="l62" href="#l62">62</a>         conn.request(method, path, body, self._headers(headers))
+<a id="l63" href="#l63">63</a>         resp = conn.getresponse()
+<a id="l64" href="#l64">64</a>         raw = resp.read().decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+<a id="l65" href="#l65">65</a>         self._remember_cookie(resp)
+<a id="l66" href="#l66">66</a>         conn.close()
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a>         if resp.status &gt;= 400:
+<a id="l69" href="#l69">69</a>             try:
+<a id="l70" href="#l70">70</a>                 detail = json.loads(raw).get(&quot;detail&quot;, raw)
+<a id="l71" href="#l71">71</a>             except json.JSONDecodeError:
+<a id="l72" href="#l72">72</a>                 detail = raw[:500]
+<a id="l73" href="#l73">73</a>             raise SystemExit(f&quot;error {resp.status}: {detail}&quot;)
+<a id="l74" href="#l74">74</a>         return json.loads(raw) if raw else None
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a>     def upload(self, audio: list[Path], text: Path) -&gt; dict:
+<a id="l77" href="#l77">77</a>         boundary = &quot;----subplz&quot; + uuid.uuid4().hex
+<a id="l78" href="#l78">78</a>         body = bytearray()
+<a id="l79" href="#l79">79</a>         for path in [*audio, text]:
+<a id="l80" href="#l80">80</a>             ctype = mimetypes.guess_type(path.name)[0] or &quot;application/octet-stream&quot;
+<a id="l81" href="#l81">81</a>             disposition = (
+<a id="l82" href="#l82">82</a>                 f&#x27;--{boundary}\r\n&#x27;
+<a id="l83" href="#l83">83</a>                 f&#x27;Content-Disposition: form-data; name=&quot;files&quot;; &#x27;
+<a id="l84" href="#l84">84</a>                 f&#x27;filename=&quot;{path.name}&quot;\r\n&#x27;
+<a id="l85" href="#l85">85</a>                 f&quot;Content-Type: {ctype}\r\n\r\n&quot;
+<a id="l86" href="#l86">86</a>             )
+<a id="l87" href="#l87">87</a>             # The header is encoded as UTF-8, which is what browsers send and
+<a id="l88" href="#l88">88</a>             # what Starlette decodes - this is the bit curl gets wrong.
+<a id="l89" href="#l89">89</a>             body += disposition.encode(&quot;utf-8&quot;)
+<a id="l90" href="#l90">90</a>             body += path.read_bytes()
+<a id="l91" href="#l91">91</a>             body += b&quot;\r\n&quot;
+<a id="l92" href="#l92">92</a>         body += f&quot;--{boundary}--\r\n&quot;.encode()
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a>         return self.request(
+<a id="l95" href="#l95">95</a>             &quot;POST&quot;, &quot;/api/uploads&quot;, bytes(body),
+<a id="l96" href="#l96">96</a>             {&quot;Content-Type&quot;: f&quot;multipart/form-data; boundary={boundary}&quot;},
+<a id="l97" href="#l97">97</a>         )
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a>     def start(self, job_id: str, language: str | None) -&gt; dict:
+<a id="l100" href="#l100">100</a>         payload = json.dumps({&quot;language&quot;: language} if language else {})
+<a id="l101" href="#l101">101</a>         return self.request(
+<a id="l102" href="#l102">102</a>             &quot;POST&quot;, f&quot;/api/jobs/{job_id}/start&quot;,
+<a id="l103" href="#l103">103</a>             payload.encode(), {&quot;Content-Type&quot;: &quot;application/json&quot;},
+<a id="l104" href="#l104">104</a>         )
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a>     def get(self, job_id: str) -&gt; dict:
+<a id="l107" href="#l107">107</a>         return self.request(&quot;GET&quot;, f&quot;/api/jobs/{job_id}&quot;)
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a>     def list(self) -&gt; list:
+<a id="l110" href="#l110">110</a>         return self.request(&quot;GET&quot;, &quot;/api/jobs&quot;)
+<a id="l111" href="#l111">111</a> 
+<a id="l112" href="#l112">112</a>     def download(self, job_id: str, kind: str, out_dir: Path) -&gt; Path | None:
+<a id="l113" href="#l113">113</a>         job = self.get(job_id)
+<a id="l114" href="#l114">114</a>         art = next((a for a in job[&quot;artifacts&quot;] if a[&quot;kind&quot;] == kind), None)
+<a id="l115" href="#l115">115</a>         if art is None:
+<a id="l116" href="#l116">116</a>             return None
+<a id="l117" href="#l117">117</a>         conn = self._conn()
+<a id="l118" href="#l118">118</a>         conn.request(&quot;GET&quot;, art[&quot;url&quot;], None, self._headers())
+<a id="l119" href="#l119">119</a>         resp = conn.getresponse()
+<a id="l120" href="#l120">120</a>         data = resp.read()
+<a id="l121" href="#l121">121</a>         conn.close()
+<a id="l122" href="#l122">122</a>         if resp.status &gt;= 400:
+<a id="l123" href="#l123">123</a>             raise SystemExit(f&quot;download failed: {resp.status}&quot;)
+<a id="l124" href="#l124">124</a>         out_dir.mkdir(parents=True, exist_ok=True)
+<a id="l125" href="#l125">125</a>         dest = out_dir / art[&quot;filename&quot;]
+<a id="l126" href="#l126">126</a>         dest.write_bytes(data)
+<a id="l127" href="#l127">127</a>         return dest
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a> 
+<a id="l130" href="#l130">130</a> def _fmt(job: dict) -&gt; str:
+<a id="l131" href="#l131">131</a>     pct = int(job[&quot;progress&quot;] * 100)
+<a id="l132" href="#l132">132</a>     return (
+<a id="l133" href="#l133">133</a>         f&quot;{job[&#x27;id&#x27;]}  {job[&#x27;status&#x27;]:&lt;10} {pct:&gt;3}%  &quot;
+<a id="l134" href="#l134">134</a>         f&quot;{job[&#x27;stage&#x27;]:&lt;34} {job[&#x27;language_name&#x27;]}  {job[&#x27;audio_filename&#x27;]}&quot;
+<a id="l135" href="#l135">135</a>     )
+<a id="l136" href="#l136">136</a> 
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a> def wait(client: Client, job_id: str) -&gt; dict:
+<a id="l139" href="#l139">139</a>     last = None
+<a id="l140" href="#l140">140</a>     while True:
+<a id="l141" href="#l141">141</a>         job = client.get(job_id)
+<a id="l142" href="#l142">142</a>         line = _fmt(job)
+<a id="l143" href="#l143">143</a>         if line != last:
+<a id="l144" href="#l144">144</a>             print(line, flush=True)
+<a id="l145" href="#l145">145</a>             last = line
+<a id="l146" href="#l146">146</a>         if job[&quot;status&quot;] in (&quot;succeeded&quot;, &quot;failed&quot;, &quot;canceled&quot;):
+<a id="l147" href="#l147">147</a>             return job
+<a id="l148" href="#l148">148</a>         time.sleep(3)
+<a id="l149" href="#l149">149</a> 
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a> def main() -&gt; int:
+<a id="l152" href="#l152">152</a>     ap = argparse.ArgumentParser(description=__doc__)
+<a id="l153" href="#l153">153</a>     ap.add_argument(&quot;--base&quot;, default=DEFAULT_BASE)
+<a id="l154" href="#l154">154</a>     sub = ap.add_subparsers(dest=&quot;cmd&quot;, required=True)
+<a id="l155" href="#l155">155</a> 
+<a id="l156" href="#l156">156</a>     s = sub.add_parser(&quot;submit&quot;, help=&quot;upload a pair and start aligning&quot;)
+<a id="l157" href="#l157">157</a>     s.add_argument(&quot;audio&quot;)
+<a id="l158" href="#l158">158</a>     s.add_argument(&quot;text&quot;)
+<a id="l159" href="#l159">159</a>     s.add_argument(&quot;--language&quot;, help=&quot;override the detected language&quot;)
+<a id="l160" href="#l160">160</a>     s.add_argument(&quot;--wait&quot;, action=&quot;store_true&quot;)
+<a id="l161" href="#l161">161</a>     s.add_argument(&quot;--dir&quot;, default=&quot;subplz-out&quot;, help=&quot;where to save on --wait&quot;)
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a>     sub.add_parser(&quot;list&quot;, help=&quot;list your jobs&quot;)
+<a id="l164" href="#l164">164</a> 
+<a id="l165" href="#l165">165</a>     g = sub.add_parser(&quot;get&quot;, help=&quot;show one job&quot;)
+<a id="l166" href="#l166">166</a>     g.add_argument(&quot;job_id&quot;)
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a>     w = sub.add_parser(&quot;watch&quot;, help=&quot;follow a job to completion&quot;)
+<a id="l169" href="#l169">169</a>     w.add_argument(&quot;job_id&quot;)
+<a id="l170" href="#l170">170</a> 
+<a id="l171" href="#l171">171</a>     d = sub.add_parser(&quot;download&quot;, help=&quot;save a finished job&#x27;s files&quot;)
+<a id="l172" href="#l172">172</a>     d.add_argument(&quot;job_id&quot;)
+<a id="l173" href="#l173">173</a>     d.add_argument(&quot;--dir&quot;, default=&quot;subplz-out&quot;)
+<a id="l174" href="#l174">174</a> 
+<a id="l175" href="#l175">175</a>     args = ap.parse_args()
+<a id="l176" href="#l176">176</a>     client = Client(args.base)
+<a id="l177" href="#l177">177</a> 
+<a id="l178" href="#l178">178</a>     if args.cmd == &quot;submit&quot;:
+<a id="l179" href="#l179">179</a>         audio_arg, text = Path(args.audio), Path(args.text)
+<a id="l180" href="#l180">180</a>         if not text.exists():
+<a id="l181" href="#l181">181</a>             raise SystemExit(f&quot;no such file: {text}&quot;)
+<a id="l182" href="#l182">182</a> 
+<a id="l183" href="#l183">183</a>         if audio_arg.is_dir():
+<a id="l184" href="#l184">184</a>             # A folder of per-chapter files. Order is settled server-side.
+<a id="l185" href="#l185">185</a>             exts = {&quot;.m4b&quot;, &quot;.m4a&quot;, &quot;.mp3&quot;, &quot;.opus&quot;, &quot;.ogg&quot;, &quot;.oga&quot;, &quot;.flac&quot;,
+<a id="l186" href="#l186">186</a>                     &quot;.wav&quot;, &quot;.aac&quot;, &quot;.wma&quot;, &quot;.mka&quot;, &quot;.mkv&quot;, &quot;.mp4&quot;, &quot;.webm&quot;}
+<a id="l187" href="#l187">187</a>             audio = sorted(
+<a id="l188" href="#l188">188</a>                 p for p in audio_arg.iterdir()
+<a id="l189" href="#l189">189</a>                 if p.is_file() and p.suffix.lower() in exts
+<a id="l190" href="#l190">190</a>             )
+<a id="l191" href="#l191">191</a>             if not audio:
+<a id="l192" href="#l192">192</a>                 raise SystemExit(f&quot;no audio files in {audio_arg}&quot;)
+<a id="l193" href="#l193">193</a>         else:
+<a id="l194" href="#l194">194</a>             if not audio_arg.exists():
+<a id="l195" href="#l195">195</a>                 raise SystemExit(f&quot;no such file: {audio_arg}&quot;)
+<a id="l196" href="#l196">196</a>             audio = [audio_arg]
+<a id="l197" href="#l197">197</a> 
+<a id="l198" href="#l198">198</a>         size_mb = (sum(p.stat().st_size for p in audio) + text.stat().st_size) / 1024**2
+<a id="l199" href="#l199">199</a>         label = f&quot;{len(audio)} audio files&quot; if len(audio) &gt; 1 else audio[0].name
+<a id="l200" href="#l200">200</a>         print(f&quot;uploading {label}, {size_mb:.0f} MB ...&quot;, flush=True)
+<a id="l201" href="#l201">201</a>         res = client.upload(audio, text)
+<a id="l202" href="#l202">202</a> 
+<a id="l203" href="#l203">203</a>         job, det = res[&quot;job&quot;], res[&quot;detected&quot;]
+<a id="l204" href="#l204">204</a>         print(f&quot;paired: audio={job[&#x27;audio_filename&#x27;]} text={job[&#x27;text_filename&#x27;]}&quot;)
+<a id="l205" href="#l205">205</a>         if det[&quot;code&quot;]:
+<a id="l206" href="#l206">206</a>             print(
+<a id="l207" href="#l207">207</a>                 f&quot;detected language: {det[&#x27;name&#x27;]} ({det[&#x27;code&#x27;]}) &quot;
+<a id="l208" href="#l208">208</a>                 f&quot;{det[&#x27;confidence&#x27;] * 100:.1f}% confident&quot;
+<a id="l209" href="#l209">209</a>                 + (&quot;&quot; if det[&quot;supported&quot;] else &quot;  [NOT SUPPORTED - pass --language]&quot;)
+<a id="l210" href="#l210">210</a>             )
+<a id="l211" href="#l211">211</a>         lang = args.language or job[&quot;language&quot;]
+<a id="l212" href="#l212">212</a>         print(f&quot;starting with language={lang}&quot;)
+<a id="l213" href="#l213">213</a>         started = client.start(job[&quot;id&quot;], args.language)
+<a id="l214" href="#l214">214</a>         print(_fmt(started))
+<a id="l215" href="#l215">215</a> 
+<a id="l216" href="#l216">216</a>         if args.wait:
+<a id="l217" href="#l217">217</a>             final = wait(client, job[&quot;id&quot;])
+<a id="l218" href="#l218">218</a>             if final[&quot;status&quot;] == &quot;succeeded&quot;:
+<a id="l219" href="#l219">219</a>                 for kind in (&quot;srt&quot;, &quot;metadata&quot;):
+<a id="l220" href="#l220">220</a>                     dest = client.download(job[&quot;id&quot;], kind, Path(args.dir))
+<a id="l221" href="#l221">221</a>                     if dest:
+<a id="l222" href="#l222">222</a>                         print(f&quot;saved {dest}&quot;)
+<a id="l223" href="#l223">223</a>                 return 0
+<a id="l224" href="#l224">224</a>             print(f&quot;job {final[&#x27;status&#x27;]}: {final.get(&#x27;error&#x27;) or &#x27;&#x27;}&quot;)
+<a id="l225" href="#l225">225</a>             return 1
+<a id="l226" href="#l226">226</a>         return 0
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a>     if args.cmd == &quot;list&quot;:
+<a id="l229" href="#l229">229</a>         jobs = client.list()
+<a id="l230" href="#l230">230</a>         if not jobs:
+<a id="l231" href="#l231">231</a>             print(&quot;no jobs&quot;)
+<a id="l232" href="#l232">232</a>         for j in jobs:
+<a id="l233" href="#l233">233</a>             print(_fmt(j))
+<a id="l234" href="#l234">234</a>         return 0
+<a id="l235" href="#l235">235</a> 
+<a id="l236" href="#l236">236</a>     if args.cmd == &quot;get&quot;:
+<a id="l237" href="#l237">237</a>         print(json.dumps(client.get(args.job_id), indent=2, ensure_ascii=False))
+<a id="l238" href="#l238">238</a>         return 0
+<a id="l239" href="#l239">239</a> 
+<a id="l240" href="#l240">240</a>     if args.cmd == &quot;watch&quot;:
+<a id="l241" href="#l241">241</a>         final = wait(client, args.job_id)
+<a id="l242" href="#l242">242</a>         return 0 if final[&quot;status&quot;] == &quot;succeeded&quot; else 1
+<a id="l243" href="#l243">243</a> 
+<a id="l244" href="#l244">244</a>     if args.cmd == &quot;download&quot;:
+<a id="l245" href="#l245">245</a>         any_saved = False
+<a id="l246" href="#l246">246</a>         for kind in (&quot;srt&quot;, &quot;metadata&quot;, &quot;log&quot;):
+<a id="l247" href="#l247">247</a>             dest = client.download(args.job_id, kind, Path(args.dir))
+<a id="l248" href="#l248">248</a>             if dest:
+<a id="l249" href="#l249">249</a>                 print(f&quot;saved {dest}&quot;)
+<a id="l250" href="#l250">250</a>                 any_saved = True
+<a id="l251" href="#l251">251</a>         if not any_saved:
+<a id="l252" href="#l252">252</a>             print(&quot;nothing to download yet&quot;)
+<a id="l253" href="#l253">253</a>         return 0
+<a id="l254" href="#l254">254</a> 
+<a id="l255" href="#l255">255</a>     return 1
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> 
+<a id="l258" href="#l258">258</a> if __name__ == &quot;__main__&quot;:
+<a id="l259" href="#l259">259</a>     sys.exit(main())</pre>
+</div></body></html>

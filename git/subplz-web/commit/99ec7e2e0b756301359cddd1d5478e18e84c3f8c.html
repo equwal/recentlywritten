@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 99ec7e2e - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 99ec7e2e0b756301359cddd1d5478e18e84c3f8c
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 16:19:51 -0700
+
+Dev sign-in links are an explicit opt-in, never inferred
+
+With no SMTP host, /api/auth/request returned the sign-in link in its
+response whenever billing was off - on the assumption that billing off
+means localhost. A public server can have billing off (this one does), and
+there it let anyone sign in as any address. It is now refused unless
+SUBPLZ_WEB_DEV_LOGIN_LINKS is set, and the link is no longer logged.
+
+</pre><pre> .env.example        |  8 +++++---
+ .gitattributes      |  1 +
+ backend/api.py      | 14 +++++---------
+ backend/mailer.py   |  8 ++++----
+ backend/settings.py | 11 +++++++++--
+ tests/test_auth.py  | 17 +++++++++++------
+ 6 files changed, 35 insertions(+), 24 deletions(-)
+</pre><pre>diff --git a/.env.example b/.env.example
+index b164734..48b6822 100644
+--- a/.env.example
++++ b/.env.example
+<span class="h">@@ -68,14 +68,16 @@ SUBPLZ_WEB_FREE_WINDOW_HOURS=24</span>
+ # SUBPLZ_WEB_STRIPE_SECRET_KEY=
+ # SUBPLZ_WEB_STRIPE_WEBHOOK_SECRET=
+ 
+<span class="d">-# Sign-in links go out over SMTP, so any provider works. With no host set the</span>
+<span class="d">-# link is written to the server log instead (and sign-in is refused outright</span>
+<span class="d">-# when billing is on, since there would be no safe way to deliver it).</span>
+<span class="a">+# Sign-in links go out over SMTP, so any provider works. With no host set,</span>
+<span class="a">+# sign-in is unavailable: there would be no safe way to deliver the link.</span>
+ # SUBPLZ_WEB_SMTP_HOST=smtp.example.com
+ # SUBPLZ_WEB_SMTP_PORT=587
+ # SUBPLZ_WEB_SMTP_USER=
+ # SUBPLZ_WEB_SMTP_PASSWORD=
+ # SUBPLZ_WEB_SMTP_FROM=SubRead &lt;login@subread.space&gt;
+<span class="a">+# Development only: return the sign-in link in the API response instead of</span>
+<span class="a">+# mailing it. This signs anyone in as any address - never set it in public.</span>
+<span class="a">+# SUBPLZ_WEB_DEV_LOGIN_LINKS=true</span>
+ # Override the plan catalogue (see backend/pricing.py for the shape).
+ # SUBPLZ_WEB_PLANS_JSON=[...]
+ 
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..dfdb8b7
+--- /dev/null
++++ b/.gitattributes
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+*.sh text eol=lf</span>
+diff --git a/backend/api.py b/backend/api.py
+index 573e835..7220f1e 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -281,9 +281,7 @@ def _account_out(session: Session, account: Account) -&gt; AccountOut:</span>
+         email=account.email,
+         billing_enabled=settings.billing_enabled,
+         payments_available=settings.payments_configured,
+<span class="d">-        email_sign_in_available=(</span>
+<span class="d">-            settings.email_configured or not settings.billing_enabled</span>
+<span class="d">-        ),</span>
+<span class="a">+        email_sign_in_available=settings.sign_in_available,</span>
+         free_allowance=ent.free_allowance,
+         free_window_hours=ent.window_hours,
+         free_tier_summary=pricing.free_tier_summary(),
+<span class="h">@@ -329,9 +327,9 @@ def request_sign_in(</span>
+     except accounts.InvalidEmail as exc:
+         raise HTTPException(400, str(exc)) from exc
+ 
+<span class="d">-    # A public server that cannot send mail has no safe way to do this: the</span>
+<span class="d">-    # only fallback is showing the link, which would sign anyone in as anyone.</span>
+<span class="d">-    if settings.billing_enabled and not settings.email_configured:</span>
+<span class="a">+    # A server that cannot send mail has no safe way to do this: the only</span>
+<span class="a">+    # fallback is showing the link, which would sign anyone in as anyone.</span>
+<span class="a">+    if not settings.sign_in_available:</span>
+         raise HTTPException(
+             503, &quot;Email sign-in is not set up on this server yet.&quot;
+         )
+<span class="h">@@ -347,9 +345,7 @@ def request_sign_in(</span>
+         raise HTTPException(502, str(exc)) from exc
+ 
+     out = {&quot;sent&quot;: sent, &quot;email&quot;: email}
+<span class="d">-    if not sent:</span>
+<span class="d">-        # Localhost only (guarded above): there is no mailbox to check, so</span>
+<span class="d">-        # hand the link straight back.</span>
+<span class="a">+    if not sent and settings.dev_login_links:</span>
+         out[&quot;dev_link&quot;] = link
+     return out
+ 
+diff --git a/backend/mailer.py b/backend/mailer.py
+index a753569..64705e0 100644
+--- a/backend/mailer.py
++++ b/backend/mailer.py
+<span class="h">@@ -16,13 +16,13 @@ class MailError(RuntimeError):</span>
+ 
+ 
+ def send_login_link(to: str, url: str) -&gt; bool:
+<span class="d">-    &quot;&quot;&quot;Email a sign-in link. Returns False when it was only logged.</span>
+<span class="a">+    &quot;&quot;&quot;Email a sign-in link. Returns False when there is no mail server.</span>
+ 
+<span class="d">-    With no SMTP host configured the link goes to the server log, which keeps</span>
+<span class="d">-    sign-in usable on localhost without an email account to send from.</span>
+<span class="a">+    That only happens in development (dev_login_links), where the API hands</span>
+<span class="a">+    the link back itself. It is deliberately not logged: a sign-in link in a</span>
+<span class="a">+    log file is a credential in a log file.</span>
+     &quot;&quot;&quot;
+     if not settings.email_configured:
+<span class="d">-        log.info(&quot;sign-in link for %s: %s&quot;, to, url)</span>
+         return False
+ 
+     minutes = settings.login_link_minutes
+diff --git a/backend/settings.py b/backend/settings.py
+index 8911388..4583922 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -79,8 +79,7 @@ class Settings(BaseSettings):</span>
+     stripe_webhook_secret: str = &quot;&quot;
+ 
+     # Sign-in links go out over plain SMTP, so any provider works. With no
+<span class="d">-    # host set the link is written to the server log instead - fine for</span>
+<span class="d">-    # localhost, and it keeps sign-in testable without an email account.</span>
+<span class="a">+    # host set, sign-in is simply unavailable (see dev_login_links below).</span>
+     smtp_host: str = &quot;&quot;
+     smtp_port: int = 587
+     smtp_user: str = &quot;&quot;
+<span class="h">@@ -88,6 +87,10 @@ class Settings(BaseSettings):</span>
+     smtp_from: str = &quot;SubRead &lt;login@subread.space&gt;&quot;
+     smtp_starttls: bool = True
+     login_link_minutes: int = 30
+<span class="a">+    # Hand the sign-in link back in the API response instead of mailing it.</span>
+<span class="a">+    # For development ONLY: it signs anyone in as any address. Never inferred</span>
+<span class="a">+    # from other settings - a public server with billing off is still public.</span>
+<span class="a">+    dev_login_links: bool = False</span>
+ 
+     # --- match check -------------------------------------------------------
+     # Transcribe a few short samples on upload and score them against the book,
+<span class="h">@@ -119,6 +122,10 @@ class Settings(BaseSettings):</span>
+     def email_configured(self) -&gt; bool:
+         return bool(self.smtp_host)
+ 
+<span class="a">+    @property</span>
+<span class="a">+    def sign_in_available(self) -&gt; bool:</span>
+<span class="a">+        return self.email_configured or self.dev_login_links</span>
+<span class="a">+</span>
+     @property
+     def resolved_database_url(self) -&gt; str:
+         if self.database_url:
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index f8147d4..c7d388d 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+<span class="h">@@ -117,16 +117,21 @@ def test_requests_are_rate_limited(client, outbox):</span>
+     assert codes[:5] == [200] * 5 and set(codes[5:]) == {429}
+ 
+ 
+<span class="d">-def test_public_server_without_smtp_refuses_instead_of_leaking_the_link(client):</span>
+<span class="d">-    # billing on (public) + no SMTP host: showing the link would let anyone</span>
+<span class="d">-    # sign in as anyone.</span>
+<span class="a">+@pytest.mark.parametrize(&quot;billing&quot;, [True, False])</span>
+<span class="a">+def test_server_without_smtp_refuses_instead_of_leaking_the_link(</span>
+<span class="a">+    client, monkeypatch, billing</span>
+<span class="a">+):</span>
+<span class="a">+    # No mail server: showing the link instead would let anyone sign in as</span>
+<span class="a">+    # anyone. Billing being off must not soften this - a public server can</span>
+<span class="a">+    # perfectly well have billing off.</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;billing_enabled&quot;, billing)</span>
+     r = client.post(&quot;/api/auth/request&quot;, json={&quot;email&quot;: &quot;x@example.com&quot;})
+<span class="d">-    assert r.status_code == 503</span>
+<span class="a">+    assert r.status_code == 503 and &quot;dev_link&quot; not in r.text</span>
+     assert client.get(&quot;/api/account&quot;).json()[&quot;email_sign_in_available&quot;] is False
+ 
+ 
+<span class="d">-def test_localhost_hands_the_link_back(client, monkeypatch):</span>
+<span class="d">-    monkeypatch.setattr(settings, &quot;billing_enabled&quot;, False)</span>
+<span class="a">+def test_dev_mode_hands_the_link_back_only_when_asked_to(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;dev_login_links&quot;, True)</span>
+     r = client.post(&quot;/api/auth/request&quot;, json={&quot;email&quot;: &quot;dev@example.com&quot;})
+     assert r.status_code == 200 and r.json()[&quot;sent&quot;] is False
+     link = r.json()[&quot;dev_link&quot;]</pre>
+</div></body></html>

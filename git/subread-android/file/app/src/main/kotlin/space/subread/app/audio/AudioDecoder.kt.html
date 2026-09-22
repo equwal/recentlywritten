@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android/app/src/main/kotlin/space/subread/app/audio/AudioDecoder.kt - Recently Written</title>
+<link rel="stylesheet" href="../../../../../../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../../../../../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../../../../../../../../../subread-android/index.html">Log</a> | <a href="../../../../../../../../../../subread-android/files.html">Files</a> | <a href="../../../../../../../../../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>app/src/main/kotlin/space/subread/app/audio/AudioDecoder.kt (8795 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package space.subread.app.audio
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import android.content.Context
+<a id="l4" href="#l4">4</a> import android.media.MediaCodec
+<a id="l5" href="#l5">5</a> import android.media.MediaExtractor
+<a id="l6" href="#l6">6</a> import android.media.MediaFormat
+<a id="l7" href="#l7">7</a> import android.net.Uri
+<a id="l8" href="#l8">8</a> import java.io.Closeable
+<a id="l9" href="#l9">9</a> import java.nio.ByteOrder
+<a id="l10" href="#l10">10</a> import kotlin.math.abs
+<a id="l11" href="#l11">11</a> import kotlin.math.max
+<a id="l12" href="#l12">12</a> import kotlin.math.min
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> /**
+<a id="l15" href="#l15">15</a>  * Streams any audio file the platform can play as 16 kHz mono float chunks,
+<a id="l16" href="#l16">16</a>  * which is the only thing the speech model accepts.
+<a id="l17" href="#l17">17</a>  *
+<a id="l18" href="#l18">18</a>  * A ten-hour book is over two gigabytes as PCM, so it is never held whole:
+<a id="l19" href="#l19">19</a>  * each call to [next] decodes a couple of minutes, cuts at the quietest moment
+<a id="l20" href="#l20">20</a>  * near the end (so no word is split across two transcriptions) and carries the
+<a id="l21" href="#l21">21</a>  * remainder into the next chunk.
+<a id="l22" href="#l22">22</a>  */
+<a id="l23" href="#l23">23</a> class AudioDecoder(context: Context, uri: Uri, startAtSeconds: Double = 0.0) : Closeable {
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a>     class Chunk(val samples: FloatArray, val startSeconds: Double) {
+<a id="l26" href="#l26">26</a>         val endSeconds: Double get() = startSeconds + samples.size / TARGET_RATE.toDouble()
+<a id="l27" href="#l27">27</a>     }
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a>     private val extractor = MediaExtractor()
+<a id="l30" href="#l30">30</a>     private val codec: MediaCodec
+<a id="l31" href="#l31">31</a>     private val info = MediaCodec.BufferInfo()
+<a id="l32" href="#l32">32</a> 
+<a id="l33" href="#l33">33</a>     val durationSeconds: Double
+<a id="l34" href="#l34">34</a>     private var sourceRate: Int
+<a id="l35" href="#l35">35</a>     private var channels: Int
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a>     private var inputDone = false
+<a id="l38" href="#l38">38</a>     private var outputDone = false
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a>     /** Decoded, mono, still at the source rate; what did not fit the last chunk. */
+<a id="l41" href="#l41">41</a>     private var pending = FloatBuffer()
+<a id="l42" href="#l42">42</a>     /** Time of pending[0], in seconds. Taken from the decoder, so seeking stays honest. */
+<a id="l43" href="#l43">43</a>     private var pendingStart = -1.0
+<a id="l44" href="#l44">44</a>     /**
+<a id="l45" href="#l45">45</a>      * A seek lands on the frame *before* the one asked for. Audio ahead of this
+<a id="l46" href="#l46">46</a>      * point was transcribed in an earlier session and is thrown away, or the
+<a id="l47" href="#l47">47</a>      * resumed chunk would overlap the last one and repeat its final words.
+<a id="l48" href="#l48">48</a>      */
+<a id="l49" href="#l49">49</a>     private val skipUntil = startAtSeconds
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a>     init {
+<a id="l52" href="#l52">52</a>         extractor.setDataSource(context, uri, null)
+<a id="l53" href="#l53">53</a>         val track = (0 until extractor.trackCount).firstOrNull {
+<a id="l54" href="#l54">54</a>             extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME).orEmpty().startsWith(&quot;audio/&quot;)
+<a id="l55" href="#l55">55</a>         } ?: throw IllegalArgumentException(&quot;No audio track in this file.&quot;)
+<a id="l56" href="#l56">56</a>         extractor.selectTrack(track)
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a>         val format = extractor.getTrackFormat(track)
+<a id="l59" href="#l59">59</a>         durationSeconds = if (format.containsKey(MediaFormat.KEY_DURATION))
+<a id="l60" href="#l60">60</a>             format.getLong(MediaFormat.KEY_DURATION) / 1e6 else 0.0
+<a id="l61" href="#l61">61</a>         sourceRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+<a id="l62" href="#l62">62</a>         channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a>         if (startAtSeconds &gt; 0) {
+<a id="l65" href="#l65">65</a>             extractor.seekTo((startAtSeconds * 1e6).toLong(), MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+<a id="l66" href="#l66">66</a>         }
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a>         codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+<a id="l69" href="#l69">69</a>         codec.configure(format, null, null, 0)
+<a id="l70" href="#l70">70</a>         codec.start()
+<a id="l71" href="#l71">71</a>     }
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a>     /** The next chunk, or null at the end of the file. */
+<a id="l74" href="#l74">74</a>     fun next(targetSeconds: Int = CHUNK_SECONDS): Chunk? {
+<a id="l75" href="#l75">75</a>         // Re-read the rate each time round: HE-AAC files announce half of what
+<a id="l76" href="#l76">76</a>         // the decoder actually produces, and only say so once decoding starts.
+<a id="l77" href="#l77">77</a>         while (pending.size &lt; targetSeconds.toLong() * sourceRate &amp;&amp; !outputDone) pump()
+<a id="l78" href="#l78">78</a>         if (pending.size == 0) return null
+<a id="l79" href="#l79">79</a>         val want = targetSeconds.toLong() * sourceRate
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a>         val cut = if (outputDone &amp;&amp; pending.size &lt;= want) pending.size
+<a id="l82" href="#l82">82</a>         else quietestPoint(pending, sourceRate, min(want, pending.size.toLong()).toInt())
+<a id="l83" href="#l83">83</a> 
+<a id="l84" href="#l84">84</a>         val head = pending.take(cut)
+<a id="l85" href="#l85">85</a>         val start = pendingStart
+<a id="l86" href="#l86">86</a>         pending = pending.drop(cut)
+<a id="l87" href="#l87">87</a>         pendingStart = start + cut / sourceRate.toDouble()
+<a id="l88" href="#l88">88</a>         return Chunk(resample(head, sourceRate), start)
+<a id="l89" href="#l89">89</a>     }
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a>     private fun pump() {
+<a id="l92" href="#l92">92</a>         if (!inputDone) {
+<a id="l93" href="#l93">93</a>             val i = codec.dequeueInputBuffer(10_000)
+<a id="l94" href="#l94">94</a>             if (i &gt;= 0) {
+<a id="l95" href="#l95">95</a>                 val buffer = codec.getInputBuffer(i)!!
+<a id="l96" href="#l96">96</a>                 val n = extractor.readSampleData(buffer, 0)
+<a id="l97" href="#l97">97</a>                 if (n &lt; 0) {
+<a id="l98" href="#l98">98</a>                     codec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+<a id="l99" href="#l99">99</a>                     inputDone = true
+<a id="l100" href="#l100">100</a>                 } else {
+<a id="l101" href="#l101">101</a>                     codec.queueInputBuffer(i, 0, n, extractor.sampleTime, 0)
+<a id="l102" href="#l102">102</a>                     extractor.advance()
+<a id="l103" href="#l103">103</a>                 }
+<a id="l104" href="#l104">104</a>             }
+<a id="l105" href="#l105">105</a>         }
+<a id="l106" href="#l106">106</a> 
+<a id="l107" href="#l107">107</a>         when (val o = codec.dequeueOutputBuffer(info, 10_000)) {
+<a id="l108" href="#l108">108</a>             MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -&gt; {
+<a id="l109" href="#l109">109</a>                 // The container can be wrong about these; the decoder is not.
+<a id="l110" href="#l110">110</a>                 val f = codec.outputFormat
+<a id="l111" href="#l111">111</a>                 sourceRate = f.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+<a id="l112" href="#l112">112</a>                 channels = f.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+<a id="l113" href="#l113">113</a>             }
+<a id="l114" href="#l114">114</a>             in 0..Int.MAX_VALUE -&gt; {
+<a id="l115" href="#l115">115</a>                 if (info.size &gt; 0) {
+<a id="l116" href="#l116">116</a>                     val bufferStart = info.presentationTimeUs / 1e6
+<a id="l117" href="#l117">117</a>                     val shorts = codec.getOutputBuffer(o)!!.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+<a id="l118" href="#l118">118</a>                     val frames = shorts.remaining() / channels
+<a id="l119" href="#l119">119</a>                     val skip = if (bufferStart &gt;= skipUntil) 0
+<a id="l120" href="#l120">120</a>                     else min(frames, ((skipUntil - bufferStart) * sourceRate).toInt())
+<a id="l121" href="#l121">121</a>                     shorts.position(shorts.position() + skip * channels)
+<a id="l122" href="#l122">122</a>                     if (frames &gt; skip &amp;&amp; pendingStart &lt; 0) {
+<a id="l123" href="#l123">123</a>                         pendingStart = bufferStart + skip / sourceRate.toDouble()
+<a id="l124" href="#l124">124</a>                     }
+<a id="l125" href="#l125">125</a>                     pending.ensure(frames - skip)
+<a id="l126" href="#l126">126</a>                     for (f in skip until frames) {
+<a id="l127" href="#l127">127</a>                         var sum = 0
+<a id="l128" href="#l128">128</a>                         for (c in 0 until channels) sum += shorts.get()
+<a id="l129" href="#l129">129</a>                         pending.add(sum / (32768f * channels))
+<a id="l130" href="#l130">130</a>                     }
+<a id="l131" href="#l131">131</a>                 }
+<a id="l132" href="#l132">132</a>                 codec.releaseOutputBuffer(o, false)
+<a id="l133" href="#l133">133</a>                 if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+<a id="l134" href="#l134">134</a>             }
+<a id="l135" href="#l135">135</a>         }
+<a id="l136" href="#l136">136</a>     }
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a>     override fun close() {
+<a id="l139" href="#l139">139</a>         runCatching { codec.stop() }
+<a id="l140" href="#l140">140</a>         runCatching { codec.release() }
+<a id="l141" href="#l141">141</a>         runCatching { extractor.release() }
+<a id="l142" href="#l142">142</a>     }
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a>     companion object {
+<a id="l145" href="#l145">145</a>         const val TARGET_RATE = 16_000
+<a id="l146" href="#l146">146</a>         const val CHUNK_SECONDS = 120
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a>         /** How far back from the end of a chunk to look for a pause. */
+<a id="l149" href="#l149">149</a>         private const val SEARCH_SECONDS = 12
+<a id="l150" href="#l150">150</a>         private const val WINDOW_SECONDS = 0.25
+<a id="l151" href="#l151">151</a> 
+<a id="l152" href="#l152">152</a>         /** Index at which to cut: the middle of the quietest quarter second near [limit]. */
+<a id="l153" href="#l153">153</a>         internal fun quietestPoint(buf: FloatBuffer, rate: Int, limit: Int): Int {
+<a id="l154" href="#l154">154</a>             val window = (WINDOW_SECONDS * rate).toInt()
+<a id="l155" href="#l155">155</a>             val from = max(0, limit - SEARCH_SECONDS * rate)
+<a id="l156" href="#l156">156</a>             if (limit - from &lt;= window * 2) return limit
+<a id="l157" href="#l157">157</a> 
+<a id="l158" href="#l158">158</a>             var energy = 0.0
+<a id="l159" href="#l159">159</a>             for (i in from until from + window) energy += abs(buf[i])
+<a id="l160" href="#l160">160</a>             var best = energy
+<a id="l161" href="#l161">161</a>             var bestAt = from
+<a id="l162" href="#l162">162</a>             var i = from
+<a id="l163" href="#l163">163</a>             while (i + window &lt; limit) {
+<a id="l164" href="#l164">164</a>                 energy += abs(buf[i + window]) - abs(buf[i])
+<a id="l165" href="#l165">165</a>                 i++
+<a id="l166" href="#l166">166</a>                 if (energy &lt; best) { best = energy; bestAt = i }
+<a id="l167" href="#l167">167</a>             }
+<a id="l168" href="#l168">168</a>             return bestAt + window / 2
+<a id="l169" href="#l169">169</a>         }
+<a id="l170" href="#l170">170</a> 
+<a id="l171" href="#l171">171</a>         /**
+<a id="l172" href="#l172">172</a>          * To 16 kHz with a triangular kernel as wide as the rate ratio: a
+<a id="l173" href="#l173">173</a>          * low-pass and an interpolator in one pass. Plenty for speech
+<a id="l174" href="#l174">174</a>          * recognition, and it costs a handful of multiplies per sample.
+<a id="l175" href="#l175">175</a>          */
+<a id="l176" href="#l176">176</a>         internal fun resample(src: FloatArray, rate: Int): FloatArray {
+<a id="l177" href="#l177">177</a>             if (rate == TARGET_RATE) return src
+<a id="l178" href="#l178">178</a>             val step = rate / TARGET_RATE.toDouble()
+<a id="l179" href="#l179">179</a>             val half = max(step, 1.0)
+<a id="l180" href="#l180">180</a>             val out = FloatArray((src.size / step).toInt())
+<a id="l181" href="#l181">181</a>             for (o in out.indices) {
+<a id="l182" href="#l182">182</a>                 val centre = o * step
+<a id="l183" href="#l183">183</a>                 val lo = max(0, (centre - half).toInt() + 1)
+<a id="l184" href="#l184">184</a>                 val hi = min(src.size - 1, (centre + half).toInt())
+<a id="l185" href="#l185">185</a>                 var sum = 0.0
+<a id="l186" href="#l186">186</a>                 var weight = 0.0
+<a id="l187" href="#l187">187</a>                 for (k in lo..hi) {
+<a id="l188" href="#l188">188</a>                     val w = 1.0 - abs(k - centre) / half
+<a id="l189" href="#l189">189</a>                     if (w &gt; 0) { sum += w * src[k]; weight += w }
+<a id="l190" href="#l190">190</a>                 }
+<a id="l191" href="#l191">191</a>                 out[o] = if (weight &gt; 0) (sum / weight).toFloat() else 0f
+<a id="l192" href="#l192">192</a>             }
+<a id="l193" href="#l193">193</a>             return out
+<a id="l194" href="#l194">194</a>         }
+<a id="l195" href="#l195">195</a>     }
+<a id="l196" href="#l196">196</a> }
+<a id="l197" href="#l197">197</a> 
+<a id="l198" href="#l198">198</a> /** A growable float array. Minutes of audio as boxed Floats would be absurd. */
+<a id="l199" href="#l199">199</a> internal class FloatBuffer(capacity: Int = 1 shl 16) {
+<a id="l200" href="#l200">200</a>     private var data = FloatArray(capacity)
+<a id="l201" href="#l201">201</a>     var size = 0
+<a id="l202" href="#l202">202</a>         private set
+<a id="l203" href="#l203">203</a> 
+<a id="l204" href="#l204">204</a>     operator fun get(i: Int) = data[i]
+<a id="l205" href="#l205">205</a> 
+<a id="l206" href="#l206">206</a>     fun ensure(extra: Int) {
+<a id="l207" href="#l207">207</a>         if (size + extra &gt; data.size) data = data.copyOf(max(data.size * 2, size + extra))
+<a id="l208" href="#l208">208</a>     }
+<a id="l209" href="#l209">209</a> 
+<a id="l210" href="#l210">210</a>     fun add(v: Float) { data[size++] = v }
+<a id="l211" href="#l211">211</a> 
+<a id="l212" href="#l212">212</a>     fun take(n: Int): FloatArray = data.copyOf(n)
+<a id="l213" href="#l213">213</a> 
+<a id="l214" href="#l214">214</a>     fun drop(n: Int): FloatBuffer = FloatBuffer(max(size - n, 1 shl 16)).also {
+<a id="l215" href="#l215">215</a>         System.arraycopy(data, n, it.data, 0, size - n)
+<a id="l216" href="#l216">216</a>         it.size = size - n
+<a id="l217" href="#l217">217</a>     }
+<a id="l218" href="#l218">218</a> }</pre>
+</div></body></html>

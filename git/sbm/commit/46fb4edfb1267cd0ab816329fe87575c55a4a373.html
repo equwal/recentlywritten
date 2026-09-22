@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm 46fb4edf - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm</h1><span class="desc">dmenu bookmarks. Instantly fuzzy search thousands of bookmarks and plumb them. LOOKING FOR SUCKLESS SOFTWARE EDITION? GO TO sbm-suckless INSTEAD</span><p class="url">git clone https://github.com/equwal/sbm</p><p><a href="../../sbm/index.html">Log</a> | <a href="../../sbm/files.html">Files</a> | <a href="../../sbm/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 46fb4edfb1267cd0ab816329fe87575c55a4a373
+Spenser Truex &lt;truex@equwal.com&gt;
+2026-09-21 14:02:47 -0700
+
+bm, bm-sync: a write lock, so that no change is lost
+
+bm and bm-sync changed the bookmark file without a lock. A line that bm
+added between the check and the write of bm-sync was lost. A delete or
+an edit that read the file before the write of bm-sync and wrote it
+after, removed the merged lines, and the next sync then deleted them on
+the server and on all devices. bm-sync could also read a delete of bm
+half written, and send a file that lacks lines.
+
+Now both take the write lock, the directory $BOOKMARKS.lock:
+- bm for each add, merge and delete, and for the whole editor session
+  of bm -e;
+- bm-sync to read the file that it sends, and from its check to its
+  write. It holds no lock while the request runs.
+A lock whose process is gone is taken over. After $SBM_LOCK_WAIT seconds
+(default 10) bm stops with a message, and bm-sync stops without a write;
+the next change in bm syncs again.
+
+The 9 new tests fail with the old bm and bm-sync.
+
+</pre><pre> README      |  6 ++++
+ bm          | 43 +++++++++++++++++++++++++++
+ bm-sync     | 51 ++++++++++++++++++++++++++-----
+ test/run.sh | 99 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 191 insertions(+), 8 deletions(-)
+</pre><pre>diff --git a/README b/README
+index 86b5931..d39c3f9 100644
+--- a/README
++++ b/README
+<span class="h">@@ -205,6 +205,11 @@ network. The sign-in token is kept in ~/.config/sbm/sync.</span>
+ An empty or missing bookmark file removes nothing on the other devices:
+ bm-sync gets all the bookmarks back from the server.
+ 
+<span class="a">+bm and bm-sync lock the file for each change, with the directory</span>
+<span class="a">+$BOOKMARKS.lock, so that neither writes over a change of the other. bm -e</span>
+<span class="a">+holds the lock until the editor ends; bm-sync waits for it, and bm syncs</span>
+<span class="a">+the edit after. A lock left by a process that is gone is taken over.</span>
+<span class="a">+</span>
+ The server is sbm-sync (https://github.com/equwal/sbm-sync). bm-sync uses
+ https://sbm.subread.space unless you give another server: create an account
+ there. The server is free software, so you can run your own:
+<span class="h">@@ -238,6 +243,7 @@ All through the environment, all optional.</span>
+     SBM_COPY      command that reads the new clipboard contents from stdin
+     SBM_PASTE     command that writes the clipboard contents to stdout
+     SBM_OPEN      command that opens the URL given as its argument
+<span class="a">+    SBM_LOCK_WAIT seconds that bm and bm-sync wait for the lock (default 10)</span>
+ 
+ With a display bm uses dmenu; fzf is only used when dmenu is missing or
+ there is no X11 or Wayland display. A custom SBM_MENU is called with the
+diff --git a/bm b/bm
+index 8baff33..af6345d 100755
+--- a/bm
++++ b/bm
+<span class="h">@@ -14,6 +14,8 @@ USERTAGS=${USERTAGS:-$DATADIR/usertags}</span>
+ ENGINES=${SBM_ENGINES:-$DATADIR/engines}
+ SEARCH=${SBM_SEARCH:-https://duckduckgo.com/?q=%s}
+ USAGE=$BOOKMARKS.usage
+<span class="a">+WLOCK=$BOOKMARKS.lock</span>
+<span class="a">+locked=</span>
+ TAB=$(printf &#x27;\t&#x27;)
+ 
+ # Two URLs are the same bookmark when they differ only in scheme, a leading
+<span class="h">@@ -301,6 +303,36 @@ rewrite () {</span>
+     return $rc
+ }
+ 
+<span class="a">+# lock: take the write lock of the bookmark file, a directory beside it. bm</span>
+<span class="a">+# holds it while it changes the file, and bm-sync while it reads or writes</span>
+<span class="a">+# the file, so that neither writes over a change of the other. A lock whose</span>
+<span class="a">+# process is gone is taken over. After $SBM_LOCK_WAIT seconds (default 10)</span>
+<span class="a">+# bm stops.</span>
+<span class="a">+lock () {</span>
+<span class="a">+    waited=0</span>
+<span class="a">+    until mkdir &quot;$WLOCK&quot; 2&gt;/dev/null; do</span>
+<span class="a">+        pid=$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)</span>
+<span class="a">+        if [ -n &quot;$pid&quot; ] &amp;&amp; ! kill -0 &quot;$pid&quot; 2&gt;/dev/null; then</span>
+<span class="a">+            [ &quot;$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)&quot; != &quot;$pid&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        [ &quot;$waited&quot; -lt &quot;${SBM_LOCK_WAIT:-10}&quot; ] \</span>
+<span class="a">+            || die &quot;$BOOKMARKS is in use (bm -e or bm-sync). If neither runs, remove $WLOCK&quot;</span>
+<span class="a">+        sleep 1</span>
+<span class="a">+        waited=$((waited + 1))</span>
+<span class="a">+    done</span>
+<span class="a">+    echo $$ &gt; &quot;$WLOCK/pid&quot;</span>
+<span class="a">+    locked=1</span>
+<span class="a">+    # Also in the subshell of add_inside, which does not keep these traps.</span>
+<span class="a">+    trap unlock EXIT</span>
+<span class="a">+    trap &#x27;exit 1&#x27; HUP INT TERM</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+unlock () {</span>
+<span class="a">+    [ -z &quot;$locked&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+    locked=</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ # bump &lt;url&gt;: count a use, for the &quot;used&quot; order. The counts live beside the
+ # bookmark file, which stays a plain list: url, count, time of last use.
+ # srand() returns the previous seed, and the first seed is the time of day:
+<span class="h">@@ -345,19 +377,26 @@ open_url () {</span>
+     opener &quot;$1&quot;
+ }
+ 
+<span class="a">+# The editor reads the file when it starts and writes it when you save, so</span>
+<span class="a">+# bm holds the lock until the editor ends. bm-sync then waits, and syncs the</span>
+<span class="a">+# edit after it.</span>
+ edit_url () {
+<span class="a">+    lock</span>
+     line=$(SBM_URL=$1 awk -F&#x27;\t&#x27; \
+            &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { print NR; exit }&#x27; &quot;$BOOKMARKS&quot;)
+     ${VISUAL:-${EDITOR:-vi}} &quot;+${line:-1}&quot; &quot;$BOOKMARKS&quot;
+<span class="a">+    unlock</span>
+     changed &#x27;bm: edit&#x27;
+ }
+ 
+ delete_url () {
+<span class="a">+    lock</span>
+     for file in &quot;$BOOKMARKS&quot; &quot;$USAGE&quot;; do
+         [ -e &quot;$file&quot; ] || continue
+         SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 != ENVIRON[&quot;SBM_URL&quot;]&#x27; &quot;$file&quot; \
+             | rewrite &quot;$file&quot; || die &quot;could not rewrite $file&quot;
+     done
+<span class="a">+    unlock</span>
+     changed &quot;bm: delete $1&quot;
+ }
+ 
+<span class="h">@@ -431,7 +470,9 @@ add () {</span>
+     printf &#x27;%s\n&#x27; &quot;$names&quot; | learn_tags
+     tags=$(printf &#x27;%s\n&#x27; &quot;$names&quot; | paste -sd &#x27; &#x27; -)
+ 
+<span class="a">+    lock</span>
+     printf &#x27;%s\t%s\t%s\n&#x27; &quot;$url&quot; &quot;$desc&quot; &quot;$tags&quot; &gt;&gt; &quot;$BOOKMARKS&quot;
+<span class="a">+    unlock</span>
+     changed &quot;bm: add $url&quot;
+ }
+ 
+<span class="h">@@ -439,6 +480,7 @@ add () {</span>
+ # known yet are appended. This is how the output of bm-import gets in.
+ merge () {
+     new=$(tmpfile &quot;$BOOKMARKS&quot;) || die &#x27;cannot create a temporary file&#x27;
+<span class="a">+    lock</span>
+     SBM_FILE=$BOOKMARKS SBM_NEW=$new awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;
+         BEGIN {
+             while ((getline line &lt; ENVIRON[&quot;SBM_FILE&quot;]) &gt; 0) {
+<span class="h">@@ -452,6 +494,7 @@ merge () {</span>
+         END { printf &quot;added %d, skipped %d duplicates\n&quot;, added, skipped }&#x27;
+     cut -f3 &quot;$new&quot; | tr &#x27; &#x27; &#x27;\n&#x27; | sort -u | learn_tags
+     cat &quot;$new&quot; &gt;&gt; &quot;$BOOKMARKS&quot;
+<span class="a">+    unlock</span>
+     rm -f &quot;$new&quot;
+     changed &#x27;bm: merge&#x27;
+ }
+diff --git a/bm-sync b/bm-sync
+index 8fdb56e..2e441b2 100755
+--- a/bm-sync
++++ b/bm-sync
+<span class="h">@@ -13,6 +13,7 @@ CONFIG=${SBM_SYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sbm/sync}</span>
+ SERVER=https://sbm.subread.space
+ STATE=$BOOKMARKS.sync   # name of the version of the last sync
+ LOCK=$BOOKMARKS.sync.lock
+<span class="a">+WLOCK=$BOOKMARKS.lock   # the write lock of bm</span>
+ quiet=
+ 
+ usage () {
+<span class="h">@@ -51,6 +52,33 @@ private () {</span>
+ cleanup () {
+     rm -rf &quot;$work&quot;
+     [ -z &quot;$locked&quot; ] || rm -rf &quot;$LOCK&quot;
+<span class="a">+    wunlock</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# wlock: take the write lock of bm, as bm does. bm holds it while it changes</span>
+<span class="a">+# the file: while bm -e runs, that is until the editor ends. After</span>
+<span class="a">+# $SBM_LOCK_WAIT seconds (default 10) bm-sync stops, and the next change in</span>
+<span class="a">+# bm syncs again.</span>
+<span class="a">+wlock () {</span>
+<span class="a">+    waited=0</span>
+<span class="a">+    until mkdir &quot;$WLOCK&quot; 2&gt;/dev/null; do</span>
+<span class="a">+        pid=$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)</span>
+<span class="a">+        if [ -n &quot;$pid&quot; ] &amp;&amp; ! kill -0 &quot;$pid&quot; 2&gt;/dev/null; then</span>
+<span class="a">+            [ &quot;$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)&quot; != &quot;$pid&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        [ &quot;$waited&quot; -lt &quot;${SBM_LOCK_WAIT:-10}&quot; ] \</span>
+<span class="a">+            || die &quot;$BOOKMARKS is in use (bm -e?): sync again later&quot;</span>
+<span class="a">+        sleep 1</span>
+<span class="a">+        waited=$((waited + 1))</span>
+<span class="a">+    done</span>
+<span class="a">+    echo $$ &gt; &quot;$WLOCK/pid&quot;</span>
+<span class="a">+    wlocked=1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+wunlock () {</span>
+<span class="a">+    [ -z &quot;$wlocked&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+    wlocked=</span>
+ }
+ 
+ login () {
+<span class="h">@@ -137,7 +165,12 @@ sync () {</span>
+     tries=0
+     while :; do
+         rm -f &quot;$LOCK/again&quot;
+<span class="a">+        # bm writes a delete as an empty file and then the new text. Without</span>
+<span class="a">+        # the lock, bm-sync could send the half-written file, and the server</span>
+<span class="a">+        # would delete the lines that it lacks.</span>
+<span class="a">+        wlock</span>
+         cat &quot;$BOOKMARKS&quot; &gt; &quot;$work/sent&quot;
+<span class="a">+        wunlock</span>
+         # An empty file with a version would delete all bookmarks on the
+         # server, and then on all devices. Without a version, the server
+         # deletes nothing, and sends all bookmarks back.
+<span class="h">@@ -155,19 +188,18 @@ sync () {</span>
+         version=$(tr -d &#x27;\r&#x27; &lt; &quot;$work/head&quot; | sed -n &#x27;s/^[Ss][Bb][Mm]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]: *//p&#x27;)
+         [ -n &quot;$version&quot; ] || die &#x27;the server gave no version&#x27;
+ 
+<span class="a">+        # Hold the lock from the check to the write, so that no change of bm</span>
+<span class="a">+        # comes between them.</span>
+<span class="a">+        wlock</span>
+         # bm changed the file while it was away: send the new file. The
+         # answer to the old one is of no use.
+         if ! cmp -s &quot;$work/sent&quot; &quot;$BOOKMARKS&quot;; then
+<span class="a">+            wunlock</span>
+             tries=$((tries + 1))
+             [ $tries -lt 5 ] || die &#x27;the file changes all the time: try again later&#x27;
+             continue
+         fi
+<span class="d">-        # A known race: bm and bm-sync do not lock the file against each</span>
+<span class="d">-        # other. If bm adds a line after the cmp above and before the write</span>
+<span class="d">-        # below, the write removes that line. If bm reads the file for a</span>
+<span class="d">-        # delete or an edit before the write and writes it after the write,</span>
+<span class="d">-        # bm removes the merged lines. The next sync then deletes them on the</span>
+<span class="d">-        # server. A fix needs a lock that bm and bm-sync take for each write.</span>
+<span class="a">+        wrote=</span>
+         if ! cmp -s &quot;$work/out&quot; &quot;$BOOKMARKS&quot;; then
+             # Forget the version first, and keep the new one only after the
+             # write. If the write stops part way (a full disk), the next sync
+<span class="h">@@ -175,9 +207,13 @@ sync () {</span>
+             rm -f &quot;$STATE&quot;
+             # Through cat, not mv, as in bm: a symlinked file stays a symlink.
+             cat &quot;$work/out&quot; &gt; &quot;$BOOKMARKS&quot; || die &quot;cannot write $BOOKMARKS&quot;
+<span class="d">-            if command -v bm-commit &gt;/dev/null 2&gt;&amp;1; then bm-commit &#x27;bm-sync: merge&#x27;; fi</span>
+<span class="a">+            wrote=1</span>
+         fi
+         printf &#x27;%s\n&#x27; &quot;$version&quot; &gt; &quot;$STATE&quot;
+<span class="a">+        wunlock</span>
+<span class="a">+        if [ -n &quot;$wrote&quot; ] &amp;&amp; command -v bm-commit &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+            bm-commit &#x27;bm-sync: merge&#x27;</span>
+<span class="a">+        fi</span>
+         [ -e &quot;$LOCK/again&quot; ] || break
+     done
+     say &quot;in sync: $(grep -c -v -e &#x27;^#&#x27; -e &#x27;^[[:space:]]*$&#x27; &quot;$BOOKMARKS&quot;) bookmarks&quot;
+<span class="h">@@ -199,6 +235,7 @@ command -v curl &gt;/dev/null 2&gt;&amp;1 || die &#x27;curl is not installed&#x27;</span>
+ work=${TMPDIR:-/tmp}/bm-sync.$$
+ mkdir -m 700 &quot;$work&quot; || die &quot;cannot create $work&quot;
+ locked=
+<span class="a">+wlocked=</span>
+ trap cleanup EXIT
+ trap &#x27;exit 1&#x27; INT TERM
+ 
+diff --git a/test/run.sh b/test/run.sh
+index fbf9dc7..083a1f1 100755
+--- a/test/run.sh
++++ b/test/run.sh
+<span class="h">@@ -950,7 +950,9 @@ fi</span>
+ # $srv/code, the server refuses with that status. With $srv/touch, bm adds a
+ # bookmark while the request runs. Without a version, the server deletes
+ # nothing, as the real one: it keeps its file and adds the new lines. With
+<span class="d">-# $srv/broken, the answer is a directory, so bm-sync cannot write it.</span>
+<span class="a">+# $srv/broken, the answer is a directory, so bm-sync cannot write it. With</span>
+<span class="a">+# $srv/hold, a process takes the write lock of bm while the request runs,</span>
+<span class="a">+# and keeps it; its pid goes to $srv/holder.</span>
+ srv=&quot;$work/srv&quot;
+ mkdir &quot;$srv&quot; &quot;$work/syncnet&quot;
+ cat &gt; &quot;$work/syncnet/curl&quot; &lt;&lt;&#x27;FAKE&#x27;
+<span class="h">@@ -998,6 +1000,11 @@ if [ -e &quot;$SBM_TEST_SRV/touch&quot; ]; then</span>
+     rm -f &quot;$SBM_TEST_SRV/touch&quot;
+     printf &#x27;https://c.example\tC\t\n&#x27; &gt;&gt; &quot;$BOOKMARKS&quot;
+ fi
+<span class="a">+if [ -e &quot;$SBM_TEST_SRV/hold&quot; ]; then</span>
+<span class="a">+    sleep 30 &gt;/dev/null 2&gt;&amp;1 &amp;</span>
+<span class="a">+    echo $! &gt; &quot;$SBM_TEST_SRV/holder&quot;</span>
+<span class="a">+    mkdir &quot;$BOOKMARKS.lock&quot; &amp;&amp; echo $! &gt; &quot;$BOOKMARKS.lock/pid&quot;</span>
+<span class="a">+fi</span>
+ printf 200
+ FAKE
+ chmod +x &quot;$work/syncnet/curl&quot;
+<span class="h">@@ -1071,6 +1078,36 @@ bmsync -q</span>
+ eq &#x27;after a failed write, the next sync has no version, so the server deletes nothing&#x27; \
+     &quot;$(kept)&quot; &#x27;:kept:back&#x27;
+ 
+<span class="a">+# While bm holds its write lock, bm-sync neither reads nor writes the file.</span>
+<span class="a">+export SBM_LOCK_WAIT=1</span>
+<span class="a">+cp &quot;$BOOKMARKS&quot; &quot;$work/before&quot;</span>
+<span class="a">+cp &quot;$BOOKMARKS.sync&quot; &quot;$work/state&quot;</span>
+<span class="a">+printf &#x27;https://other.example\tOther\t\n&#x27; &gt; &quot;$srv/other&quot;</span>
+<span class="a">+sleep 30 &gt;/dev/null 2&gt;&amp;1 &amp;</span>
+<span class="a">+holder=$!</span>
+<span class="a">+mkdir &quot;$BOOKMARKS.lock&quot; &amp;&amp; echo &quot;$holder&quot; &gt; &quot;$BOOKMARKS.lock/pid&quot;</span>
+<span class="a">+bmsync -q 2&gt;&quot;$work/err&quot;</span>
+<span class="a">+rc=$?</span>
+<span class="a">+kill &quot;$holder&quot;</span>
+<span class="a">+rm -rf &quot;$BOOKMARKS.lock&quot;</span>
+<span class="a">+eq &#x27;bm-sync does not read the file while bm holds the lock, and says why&#x27; \</span>
+<span class="a">+    &quot;$rc:$(grep -c &#x27;in use&#x27; &quot;$work/err&quot;):$(cmp -s &quot;$work/before&quot; &quot;$BOOKMARKS&quot; &amp;&amp; echo same)&quot; \</span>
+<span class="a">+    &#x27;1:1:same&#x27;</span>
+<span class="a">+# bm takes the lock while the request runs: bm-sync must not write.</span>
+<span class="a">+: &gt; &quot;$srv/hold&quot;</span>
+<span class="a">+bmsync -q 2&gt;&quot;$work/err&quot;</span>
+<span class="a">+rc=$?</span>
+<span class="a">+kill &quot;$(cat &quot;$srv/holder&quot;)&quot;</span>
+<span class="a">+rm -rf &quot;$BOOKMARKS.lock&quot; &quot;$srv/hold&quot;</span>
+<span class="a">+eq &#x27;bm-sync does not write while bm holds the lock, and keeps the old version&#x27; \</span>
+<span class="a">+    &quot;$rc:$(cmp -s &quot;$work/before&quot; &quot;$BOOKMARKS&quot; &amp;&amp; echo same):$(cmp -s &quot;$work/state&quot; &quot;$BOOKMARKS.sync&quot; &amp;&amp; echo same)&quot; \</span>
+<span class="a">+    &#x27;1:same:same&#x27;</span>
+<span class="a">+printf &#x27;https://other.example\tOther\t\n&#x27; &gt; &quot;$srv/other&quot;</span>
+<span class="a">+bmsync -q</span>
+<span class="a">+eq &#x27;after the lock is free, the next sync brings the change of the other device&#x27; \</span>
+<span class="a">+    &quot;$(grep -c other.example &quot;$BOOKMARKS&quot;):$(ls -d &quot;$BOOKMARKS.lock&quot; 2&gt;/dev/null)&quot; &#x27;1:&#x27;</span>
+<span class="a">+unset SBM_LOCK_WAIT</span>
+<span class="a">+</span>
+ bmsync -q logout
+ eq &#x27;bm-sync logout forgets the token and signs out on the server&#x27; \
+     &quot;$([ -e &quot;$SBM_SYNC_CONFIG&quot; ] || echo gone) $(cat &quot;$srv/log&quot;)&quot; &#x27;gone logout&#x27;
+<span class="h">@@ -1095,6 +1132,66 @@ done</span>
+ eq &#x27;bm starts bm-sync with the config of the tests, never the real one&#x27; \
+     &quot;$(sort -u &quot;$work/stubsync.log&quot;)&quot; &quot;$work/sync.conf&quot;
+ 
+<span class="a">+# ---- the write lock of the bookmark file ----</span>
+<span class="a">+</span>
+<span class="a">+# hold: a live process takes the write lock; its pid goes to $holder.</span>
+<span class="a">+hold () {</span>
+<span class="a">+    sleep 30 &gt;/dev/null 2&gt;&amp;1 &amp;</span>
+<span class="a">+    holder=$!</span>
+<span class="a">+    mkdir &quot;$BOOKMARKS.lock&quot; &amp;&amp; echo &quot;$holder&quot; &gt; &quot;$BOOKMARKS.lock/pid&quot;</span>
+<span class="a">+}</span>
+<span class="a">+free () {</span>
+<span class="a">+    kill &quot;$holder&quot; 2&gt;/dev/null</span>
+<span class="a">+    rm -rf &quot;$BOOKMARKS.lock&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+reset</span>
+<span class="a">+# The other process adds a line after two seconds, and then frees the lock.</span>
+<span class="a">+mkdir &quot;$BOOKMARKS.lock&quot;</span>
+<span class="a">+( sleep 2; printf &#x27;https://first.example\tFirst\t\n&#x27; &gt;&gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+  rm -rf &quot;$BOOKMARKS.lock&quot; ) &amp;</span>
+<span class="a">+first=$!</span>
+<span class="a">+echo &quot;$first&quot; &gt; &quot;$BOOKMARKS.lock/pid&quot;</span>
+<span class="a">+answers &#x27;Second&#x27; &#x27;&#x27;</span>
+<span class="a">+SBM_LOCK_WAIT=10 $BM -a https://second.example 2&gt;/dev/null</span>
+<span class="a">+wait &quot;$first&quot;</span>
+<span class="a">+eq &#x27;add waits for the lock, and adds after the change of the other process&#x27; \</span>
+<span class="a">+    &quot;$(cut -f1 &quot;$BOOKMARKS&quot; | paste -sd &#x27; &#x27; -)&quot; &#x27;https://first.example https://second.example&#x27;</span>
+<span class="a">+</span>
+<span class="a">+reset</span>
+<span class="a">+printf &#x27;https://kept.example\tKept\t\n&#x27; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+hold</span>
+<span class="a">+answers &#x27;New&#x27; &#x27;&#x27;</span>
+<span class="a">+SBM_LOCK_WAIT=1 $BM -a https://new.example 2&gt;&quot;$work/err&quot;</span>
+<span class="a">+eq &#x27;add stops when the lock stays, says why, and changes nothing&#x27; \</span>
+<span class="a">+    &quot;$?:$(grep -c &#x27;in use&#x27; &quot;$work/err&quot;):$(cut -f1 &quot;$BOOKMARKS&quot;)&quot; &#x27;1:1:https://kept.example&#x27;</span>
+<span class="a">+answers &#x27;Kept&#x27;</span>
+<span class="a">+SBM_LOCK_WAIT=1 $BM -d &gt;/dev/null 2&gt;&amp;1</span>
+<span class="a">+eq &#x27;delete waits for the lock too&#x27; &quot;$(cut -f1 &quot;$BOOKMARKS&quot;)&quot; &#x27;https://kept.example&#x27;</span>
+<span class="a">+printf &#x27;https://merged.example\n&#x27; | SBM_LOCK_WAIT=1 $BM -m &gt;/dev/null 2&gt;&amp;1</span>
+<span class="a">+eq &#x27;merge waits for the lock too&#x27; &quot;$(cut -f1 &quot;$BOOKMARKS&quot;)&quot; &#x27;https://kept.example&#x27;</span>
+<span class="a">+free</span>
+<span class="a">+</span>
+<span class="a">+reset</span>
+<span class="a">+sh -c &#x27;exit 0&#x27; &amp;</span>
+<span class="a">+gone=$!</span>
+<span class="a">+wait &quot;$gone&quot;</span>
+<span class="a">+mkdir &quot;$BOOKMARKS.lock&quot; &amp;&amp; echo &quot;$gone&quot; &gt; &quot;$BOOKMARKS.lock/pid&quot;</span>
+<span class="a">+answers &#x27;After&#x27; &#x27;&#x27;</span>
+<span class="a">+SBM_LOCK_WAIT=1 $BM -a https://after.example 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;add takes over the lock of a process that is gone, and frees it&#x27; \</span>
+<span class="a">+    &quot;$(cut -f1 &quot;$BOOKMARKS&quot;):$(ls -d &quot;$BOOKMARKS.lock&quot; 2&gt;/dev/null)&quot; &#x27;https://after.example:&#x27;</span>
+<span class="a">+</span>
+<span class="a">+reset</span>
+<span class="a">+printf &#x27;https://ed.example\tEd\t\n&#x27; &gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+printf &#x27;#!/bin/sh\n[ -d &quot;%s&quot; ] &amp;&amp; echo locked &gt; &quot;%s&quot;\n&#x27; \</span>
+<span class="a">+    &quot;$BOOKMARKS.lock&quot; &quot;$work/edit.log&quot; &gt; &quot;$work/editor&quot;</span>
+<span class="a">+chmod +x &quot;$work/editor&quot;</span>
+<span class="a">+answers &#x27;Ed&#x27;</span>
+<span class="a">+VISUAL=&quot;$work/editor&quot; $BM -e 2&gt;/dev/null</span>
+<span class="a">+eq &#x27;edit holds the lock while the editor runs, and frees it after&#x27; \</span>
+<span class="a">+    &quot;$(cat &quot;$work/edit.log&quot; 2&gt;/dev/null):$(ls -d &quot;$BOOKMARKS.lock&quot; 2&gt;/dev/null)&quot; &#x27;locked:&#x27;</span>
+<span class="a">+</span>
+ # ---- make install ----
+ 
+ if command -v make &gt;/dev/null 2&gt;&amp;1; then</pre>
+</div></body></html>

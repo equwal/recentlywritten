@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android 4545f4eb - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../subread-android/index.html">Log</a> | <a href="../../subread-android/files.html">Files</a> | <a href="../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 4545f4ebea19ebc41bc6da5a6eaadd58038ac722
+equwal &lt;truex@equwal.com&gt;
+2026-09-21 01:15:58 -0700
+
+Add H264Still: hand-made &quot;no change&quot; frames for a still video
+
+An encoder spends kilobytes on a frame that shows no change, because its
+rate control has bits to use. H264Still writes that frame as one P slice
+of skipped macroblocks, about ten bytes. It also gives the H.264 level
+for a picture size and frame rate, and raises the level of a parameter
+set.
+
+The test gives the frames to ffmpeg. Each frame must decode to the
+picture of the key frame.
+
+</pre><pre> .../main/kotlin/space/subread/core/H264Still.kt    | 227 +++++++++++++++++++++
+ .../kotlin/space/subread/core/H264StillTest.kt     | 142 +++++++++++++
+ 2 files changed, 369 insertions(+)
+</pre><pre>diff --git a/core/src/main/kotlin/space/subread/core/H264Still.kt b/core/src/main/kotlin/space/subread/core/H264Still.kt
+new file mode 100644
+index 0000000..edb537f
+--- /dev/null
++++ b/core/src/main/kotlin/space/subread/core/H264Still.kt
+<span class="h">@@ -0,0 +1,227 @@</span>
+<span class="a">+package space.subread.core</span>
+<span class="a">+</span>
+<span class="a">+import java.io.ByteArrayOutputStream</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * &quot;No change&quot; frames for an H.264 video of a still picture.</span>
+<span class="a">+ *</span>
+<span class="a">+ * An encoder is given the picture once and makes one key frame. Each frame</span>
+<span class="a">+ * after it is written here by hand: a P slice in which each macroblock is</span>
+<span class="a">+ * skipped. A decoder shows the key frame again, bit for bit, and the frame</span>
+<span class="a">+ * costs about ten bytes. An encoder asked for the same frame spends kilobytes</span>
+<span class="a">+ * on it, because its rate control has bits to use.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Only streams with CAVLC entropy coding, one slice group and frame</span>
+<span class="a">+ * macroblocks are handled (Baseline profile is always like that). For another</span>
+<span class="a">+ * stream, [skipFrames] throws [Unsupported] and the caller must use the</span>
+<span class="a">+ * encoder&#x27;s own frames.</span>
+<span class="a">+ */</span>
+<span class="a">+object H264Still {</span>
+<span class="a">+    class Unsupported(message: String) : Exception(message)</span>
+<span class="a">+</span>
+<span class="a">+    private val HIGH_PROFILES = setOf(100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135)</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The frames that follow a key frame, in order. Frame `i` of the result is</span>
+<span class="a">+     * frame `i + 1` of the group of pictures. Each is one NAL unit with a</span>
+<span class="a">+     * four-byte start code, as MediaCodec gives and MediaMuxer takes.</span>
+<span class="a">+     *</span>
+<span class="a">+     * @param sps the sequence parameter set, with or without a start code</span>
+<span class="a">+     * @param pps the picture parameter set, with or without a start code</span>
+<span class="a">+     */</span>
+<span class="a">+    fun skipFrames(sps: ByteArray, pps: ByteArray, count: Int): List&lt;ByteArray&gt; {</span>
+<span class="a">+        try {</span>
+<span class="a">+            val s = Sps(BitReader(unescape(payload(sps, 7))))</span>
+<span class="a">+            val p = Pps(BitReader(unescape(payload(pps, 8))))</span>
+<span class="a">+            return (1..count).map { slice(s, p, it) }</span>
+<span class="a">+        } catch (e: IndexOutOfBoundsException) {</span>
+<span class="a">+            throw Unsupported(&quot;The parameter sets are cut short.&quot;)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** level_idc, the largest frame in macroblocks, the most macroblocks in a second (H.264 table A-1). */</span>
+<span class="a">+    private val LEVELS = listOf(</span>
+<span class="a">+        Triple(31, 3_600, 108_000), Triple(32, 5_120, 216_000), Triple(40, 8_192, 245_760),</span>
+<span class="a">+        Triple(42, 8_704, 522_240), Triple(50, 22_080, 589_824), Triple(51, 36_864, 983_040),</span>
+<span class="a">+        Triple(52, 36_864, 2_073_600), Triple(60, 139_264, 4_177_920), Triple(61, 139_264, 8_355_840),</span>
+<span class="a">+        Triple(62, 139_264, 16_711_680),</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+    /** The lowest level that allows this picture size at this frame rate. */</span>
+<span class="a">+    fun level(width: Int, height: Int, fps: Int): Int {</span>
+<span class="a">+        val macroblocks = ((width + 15) / 16) * ((height + 15) / 16)</span>
+<span class="a">+        return LEVELS.firstOrNull { (_, frame, second) -&gt; macroblocks &lt;= frame &amp;&amp; macroblocks.toLong() * fps &lt;= second }?.first</span>
+<span class="a">+            ?: throw Unsupported(&quot;no H.264 level allows ${width}x$height at $fps frames a second&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The sequence parameter set with its level raised to [level]. The encoder</span>
+<span class="a">+     * sees one frame and declares a level for that; the file holds more frames</span>
+<span class="a">+     * in a second, and a decoder must be told the truth. Never lowers a level.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun withLevel(sps: ByteArray, level: Int): ByteArray {</span>
+<span class="a">+        val at = sps.size - payload(sps, 7).size + 2      // profile_idc, constraint flags, level_idc</span>
+<span class="a">+        val out = sps.copyOf()</span>
+<span class="a">+        if (out[at].toInt() and 0xff &lt; level) out[at] = level.toByte()</span>
+<span class="a">+        return out</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private class Sps(r: BitReader) {</span>
+<span class="a">+        val log2MaxFrameNum: Int</span>
+<span class="a">+        val pocType: Int</span>
+<span class="a">+        var log2MaxPocLsb = 0</span>
+<span class="a">+        var deltaPocAlwaysZero = false</span>
+<span class="a">+        val macroblocks: Int</span>
+<span class="a">+</span>
+<span class="a">+        init {</span>
+<span class="a">+            val profile = r.bits(8)</span>
+<span class="a">+            r.bits(16)                      // constraint flags, level</span>
+<span class="a">+            r.ue()                          // seq_parameter_set_id</span>
+<span class="a">+            if (profile in HIGH_PROFILES) {</span>
+<span class="a">+                val chroma = r.ue()</span>
+<span class="a">+                if (chroma == 3 &amp;&amp; r.bit() == 1) throw Unsupported(&quot;separate colour planes&quot;)</span>
+<span class="a">+                r.ue(); r.ue(); r.bit()     // bit depths, transform bypass</span>
+<span class="a">+                if (r.bit() == 1) throw Unsupported(&quot;scaling matrix&quot;)</span>
+<span class="a">+            }</span>
+<span class="a">+            log2MaxFrameNum = r.ue() + 4</span>
+<span class="a">+            pocType = r.ue()</span>
+<span class="a">+            when (pocType) {</span>
+<span class="a">+                0 -&gt; log2MaxPocLsb = r.ue() + 4</span>
+<span class="a">+                1 -&gt; {</span>
+<span class="a">+                    deltaPocAlwaysZero = r.bit() == 1</span>
+<span class="a">+                    r.se(); r.se()</span>
+<span class="a">+                    repeat(r.ue()) { r.se() }</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+            r.ue(); r.bit()                 // max_num_ref_frames, gaps allowed</span>
+<span class="a">+            val width = r.ue() + 1</span>
+<span class="a">+            val height = r.ue() + 1</span>
+<span class="a">+            if (r.bit() == 0) throw Unsupported(&quot;field macroblocks&quot;)</span>
+<span class="a">+            macroblocks = width * height</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private class Pps(r: BitReader) {</span>
+<span class="a">+        val id = r.ue()</span>
+<span class="a">+        val bottomFieldPoc: Boolean</span>
+<span class="a">+        val deblockingControl: Boolean</span>
+<span class="a">+        val redundantPicCnt: Boolean</span>
+<span class="a">+</span>
+<span class="a">+        init {</span>
+<span class="a">+            r.ue()                          // seq_parameter_set_id</span>
+<span class="a">+            if (r.bit() == 1) throw Unsupported(&quot;CABAC&quot;)</span>
+<span class="a">+            bottomFieldPoc = r.bit() == 1</span>
+<span class="a">+            if (r.ue() != 0) throw Unsupported(&quot;slice groups&quot;)</span>
+<span class="a">+            r.ue(); r.ue()                  // default reference counts</span>
+<span class="a">+            if (r.bit() == 1) throw Unsupported(&quot;weighted prediction&quot;)</span>
+<span class="a">+            r.bits(2)</span>
+<span class="a">+            r.se(); r.se(); r.se()          // initial QP, QS, chroma QP offset</span>
+<span class="a">+            deblockingControl = r.bit() == 1</span>
+<span class="a">+            r.bit()</span>
+<span class="a">+            redundantPicCnt = r.bit() == 1</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Frame [n] after the key frame: slice header, one run of skipped macroblocks, end. */</span>
+<span class="a">+    private fun slice(s: Sps, p: Pps, n: Int): ByteArray {</span>
+<span class="a">+        val w = BitWriter()</span>
+<span class="a">+        w.ue(0)                             // first_mb_in_slice</span>
+<span class="a">+        w.ue(5)                             // slice_type: P, and so is every slice of the picture</span>
+<span class="a">+        w.ue(p.id)</span>
+<span class="a">+        w.bits(n % (1 shl s.log2MaxFrameNum), s.log2MaxFrameNum)</span>
+<span class="a">+        if (s.pocType == 0) {</span>
+<span class="a">+            w.bits((2 * n) % (1 shl s.log2MaxPocLsb), s.log2MaxPocLsb)</span>
+<span class="a">+            if (p.bottomFieldPoc) w.se(0)</span>
+<span class="a">+        }</span>
+<span class="a">+        if (s.pocType == 1 &amp;&amp; !s.deltaPocAlwaysZero) {</span>
+<span class="a">+            w.se(0)</span>
+<span class="a">+            if (p.bottomFieldPoc) w.se(0)</span>
+<span class="a">+        }</span>
+<span class="a">+        if (p.redundantPicCnt) w.ue(0)</span>
+<span class="a">+        w.bit(1); w.ue(0)                   // one reference picture: the frame before</span>
+<span class="a">+        w.bit(0)                            // no reference list modification</span>
+<span class="a">+        w.bit(0)                            // sliding-window reference marking</span>
+<span class="a">+        w.se(0)                             // slice_qp_delta</span>
+<span class="a">+        if (p.deblockingControl) w.ue(1)    // no deblocking: there is nothing to smooth</span>
+<span class="a">+        w.ue(s.macroblocks)                 // mb_skip_run: all of them</span>
+<span class="a">+        val rbsp = w.trailing()</span>
+<span class="a">+</span>
+<span class="a">+        val out = ByteArrayOutputStream()</span>
+<span class="a">+        out.write(byteArrayOf(0, 0, 0, 1, 0x41))    // start code; reference picture, non-IDR slice</span>
+<span class="a">+        out.write(escape(rbsp))</span>
+<span class="a">+        return out.toByteArray()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The bytes after the NAL header, which must be of [type]. */</span>
+<span class="a">+    private fun payload(nal: ByteArray, type: Int): ByteArray {</span>
+<span class="a">+        var at = 0</span>
+<span class="a">+        while (at &lt; nal.size &amp;&amp; nal[at].toInt() == 0) at++</span>
+<span class="a">+        if (at &gt; 0 &amp;&amp; at &lt; nal.size &amp;&amp; nal[at].toInt() == 1) at++ else at = 0</span>
+<span class="a">+        if (at &gt;= nal.size || nal[at].toInt() and 0x1f != type) throw Unsupported(&quot;not a NAL unit of type $type&quot;)</span>
+<span class="a">+        return nal.copyOfRange(at + 1, nal.size)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Puts in the 0x03 bytes that keep a start code from showing up inside a NAL unit. */</span>
+<span class="a">+    internal fun escape(rbsp: ByteArray): ByteArray {</span>
+<span class="a">+        val out = ByteArrayOutputStream(rbsp.size + 4)</span>
+<span class="a">+        var zeros = 0</span>
+<span class="a">+        for (b in rbsp) {</span>
+<span class="a">+            if (zeros &gt;= 2 &amp;&amp; b.toInt() and 0xff &lt;= 3) { out.write(3); zeros = 0 }</span>
+<span class="a">+            out.write(b.toInt())</span>
+<span class="a">+            zeros = if (b.toInt() == 0) zeros + 1 else 0</span>
+<span class="a">+        }</span>
+<span class="a">+        return out.toByteArray()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    internal fun unescape(nal: ByteArray): ByteArray {</span>
+<span class="a">+        val out = ByteArrayOutputStream(nal.size)</span>
+<span class="a">+        var zeros = 0</span>
+<span class="a">+        for (b in nal) {</span>
+<span class="a">+            if (zeros &gt;= 2 &amp;&amp; b.toInt() == 3) { zeros = 0; continue }</span>
+<span class="a">+            out.write(b.toInt())</span>
+<span class="a">+            zeros = if (b.toInt() == 0) zeros + 1 else 0</span>
+<span class="a">+        }</span>
+<span class="a">+        return out.toByteArray()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    internal class BitReader(private val data: ByteArray) {</span>
+<span class="a">+        private var at = 0</span>
+<span class="a">+        fun bit(): Int {</span>
+<span class="a">+            if (at shr 3 &gt;= data.size) throw IndexOutOfBoundsException()</span>
+<span class="a">+            val b = (data[at shr 3].toInt() shr (7 - (at and 7))) and 1</span>
+<span class="a">+            at++</span>
+<span class="a">+            return b</span>
+<span class="a">+        }</span>
+<span class="a">+        fun bits(n: Int): Int { var v = 0; repeat(n) { v = (v shl 1) or bit() }; return v }</span>
+<span class="a">+        fun ue(): Int {</span>
+<span class="a">+            var zeros = 0</span>
+<span class="a">+            while (bit() == 0) if (++zeros &gt; 31) throw Unsupported(&quot;bad Exp-Golomb code&quot;)</span>
+<span class="a">+            return (1 shl zeros) - 1 + bits(zeros)</span>
+<span class="a">+        }</span>
+<span class="a">+        fun se(): Int { val k = ue(); return if (k and 1 == 1) (k + 1) / 2 else -(k / 2) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    internal class BitWriter {</span>
+<span class="a">+        private val out = ByteArrayOutputStream()</span>
+<span class="a">+        private var current = 0</span>
+<span class="a">+        private var filled = 0</span>
+<span class="a">+        fun bit(b: Int) {</span>
+<span class="a">+            current = (current shl 1) or (b and 1)</span>
+<span class="a">+            if (++filled == 8) { out.write(current); current = 0; filled = 0 }</span>
+<span class="a">+        }</span>
+<span class="a">+        fun bits(v: Int, count: Int) { for (i in count - 1 downTo 0) bit(v shr i) }</span>
+<span class="a">+        fun ue(v: Int) {</span>
+<span class="a">+            val x = v + 1</span>
+<span class="a">+            val length = 32 - Integer.numberOfLeadingZeros(x)</span>
+<span class="a">+            bits(0, length - 1)</span>
+<span class="a">+            bits(x, length)</span>
+<span class="a">+        }</span>
+<span class="a">+        fun se(v: Int) = ue(if (v &gt; 0) 2 * v - 1 else -2 * v)</span>
+<span class="a">+        /** The stop bit, then zeros to the end of the byte. */</span>
+<span class="a">+        fun trailing(): ByteArray {</span>
+<span class="a">+            bit(1)</span>
+<span class="a">+            while (filled != 0) bit(0)</span>
+<span class="a">+            return out.toByteArray()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/core/src/test/kotlin/space/subread/core/H264StillTest.kt b/core/src/test/kotlin/space/subread/core/H264StillTest.kt
+new file mode 100644
+index 0000000..265fa43
+--- /dev/null
++++ b/core/src/test/kotlin/space/subread/core/H264StillTest.kt
+<span class="h">@@ -0,0 +1,142 @@</span>
+<span class="a">+package space.subread.core</span>
+<span class="a">+</span>
+<span class="a">+import org.junit.Assert.assertArrayEquals</span>
+<span class="a">+import org.junit.Assert.assertEquals</span>
+<span class="a">+import org.junit.Assert.assertFalse</span>
+<span class="a">+import org.junit.Assert.assertThrows</span>
+<span class="a">+import org.junit.Assert.assertTrue</span>
+<span class="a">+import org.junit.Assume.assumeTrue</span>
+<span class="a">+import org.junit.Test</span>
+<span class="a">+import java.io.File</span>
+<span class="a">+import java.nio.file.Files</span>
+<span class="a">+import kotlin.random.Random</span>
+<span class="a">+</span>
+<span class="a">+class H264StillTest {</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun expGolombCodesRoundTrip() {</span>
+<span class="a">+        val random = Random(1)</span>
+<span class="a">+        repeat(2000) {</span>
+<span class="a">+            val unsigned = List(20) { if (it % 2 == 0) random.nextInt(0, 40) else random.nextInt(0, 1 shl 20) }</span>
+<span class="a">+            val signed = unsigned.map { if (random.nextBoolean()) it else -it }</span>
+<span class="a">+            val w = H264Still.BitWriter()</span>
+<span class="a">+            unsigned.forEach(w::ue)</span>
+<span class="a">+            signed.forEach(w::se)</span>
+<span class="a">+            val r = H264Still.BitReader(w.trailing())</span>
+<span class="a">+            assertEquals(unsigned, List(unsigned.size) { r.ue() })</span>
+<span class="a">+            assertEquals(signed, List(signed.size) { r.se() })</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun escapedBytesRoundTripAndHoldNoStartCode() {</span>
+<span class="a">+        val random = Random(2)</span>
+<span class="a">+        repeat(5000) {</span>
+<span class="a">+            // Mostly small values: runs of zeros are what the escape is for.</span>
+<span class="a">+            val rbsp = ByteArray(random.nextInt(0, 40)) { if (random.nextInt(4) == 0) random.nextInt(256).toByte() else random.nextInt(4).toByte() }</span>
+<span class="a">+            val nal = H264Still.escape(rbsp)</span>
+<span class="a">+            assertArrayEquals(rbsp, H264Still.unescape(nal))</span>
+<span class="a">+            for (i in 0..nal.size - 3) {</span>
+<span class="a">+                assertFalse(&quot;start code in ${nal.toList()}&quot;, nal[i].toInt() == 0 &amp;&amp; nal[i + 1].toInt() == 0 &amp;&amp; nal[i + 2].toInt() in 0..2)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** A real decoder is the judge: each hand-made frame must decode to the key frame&#x27;s exact picture. */</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aDecoderShowsTheKeyFrameAgainForEachSkipFrame() {</span>
+<span class="a">+        val dir = Files.createTempDirectory(&quot;h264still&quot;).toFile()</span>
+<span class="a">+        try {</span>
+<span class="a">+            val key = encodeKeyFrame(dir, &quot;baseline&quot;)</span>
+<span class="a">+            val nals = split(key)</span>
+<span class="a">+            val sps = nals.first { it[0].toInt() and 0x1f == 7 }</span>
+<span class="a">+            val pps = nals.first { it[0].toInt() and 0x1f == 8 }</span>
+<span class="a">+</span>
+<span class="a">+            // 70 frames: more than frame_num and the picture order count can hold, so both wrap.</span>
+<span class="a">+            val frames = H264Still.skipFrames(sps, pps, 70)</span>
+<span class="a">+            assertTrue(&quot;a skip frame is ${frames.maxOf { it.size }} bytes&quot;, frames.all { it.size &lt;= 16 })</span>
+<span class="a">+            val stream = File(dir, &quot;still.h264&quot;)</span>
+<span class="a">+            stream.writeBytes(key + frames.reduce { a, b -&gt; a + b })</span>
+<span class="a">+</span>
+<span class="a">+            val (code, out, err) = run(dir, &quot;ffmpeg&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-xerror&quot;, &quot;-i&quot;, stream.name, &quot;-f&quot;, &quot;framemd5&quot;, &quot;-&quot;)</span>
+<span class="a">+            assertEquals(err, 0, code)</span>
+<span class="a">+            assertEquals(&quot;decoder messages&quot;, &quot;&quot;, err.trim())</span>
+<span class="a">+            val hashes = out.lines().filter { it.isNotBlank() &amp;&amp; !it.startsWith(&quot;#&quot;) }.map { it.substringAfterLast(&#x27;,&#x27;).trim() }</span>
+<span class="a">+            assertEquals(71, hashes.size)</span>
+<span class="a">+            assertEquals(&quot;each frame is the same picture&quot;, 1, hashes.toSet().size)</span>
+<span class="a">+        } finally {</span>
+<span class="a">+            dir.deleteRecursively()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aStreamWithCabacIsRefused() {</span>
+<span class="a">+        val dir = Files.createTempDirectory(&quot;h264still&quot;).toFile()</span>
+<span class="a">+        try {</span>
+<span class="a">+            val nals = split(encodeKeyFrame(dir, &quot;main&quot;))</span>
+<span class="a">+            val sps = nals.first { it[0].toInt() and 0x1f == 7 }</span>
+<span class="a">+            val pps = nals.first { it[0].toInt() and 0x1f == 8 }</span>
+<span class="a">+            assertThrows(H264Still.Unsupported::class.java) { H264Still.skipFrames(sps, pps, 1) }</span>
+<span class="a">+        } finally {</span>
+<span class="a">+            dir.deleteRecursively()</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun theLevelFollowsThePictureSizeAndTheFrameRate() {</span>
+<span class="a">+        assertEquals(31, H264Still.level(1280, 720, 1))</span>
+<span class="a">+        assertEquals(31, H264Still.level(1280, 720, 30))</span>
+<span class="a">+        assertEquals(32, H264Still.level(1280, 720, 60))</span>
+<span class="a">+        assertEquals(40, H264Still.level(1920, 1080, 30))</span>
+<span class="a">+        assertEquals(42, H264Still.level(1920, 1080, 60))</span>
+<span class="a">+        assertEquals(50, H264Still.level(2560, 1440, 30))</span>
+<span class="a">+        assertEquals(51, H264Still.level(2560, 1440, 60))</span>
+<span class="a">+        assertEquals(52, H264Still.level(3840, 2160, 60))</span>
+<span class="a">+        assertEquals(61, H264Still.level(7680, 4320, 60))</span>
+<span class="a">+        assertThrows(H264Still.Unsupported::class.java) { H264Still.level(16384, 8640, 60) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun theLevelOfAParameterSetIsRaisedAndNeverLowered() {</span>
+<span class="a">+        val sps = byteArrayOf(0, 0, 0, 1, 0x67, 0x42, 0xC0.toByte(), 31, 0x55)</span>
+<span class="a">+        assertArrayEquals(byteArrayOf(0, 0, 0, 1, 0x67, 0x42, 0xC0.toByte(), 42, 0x55), H264Still.withLevel(sps, 42))</span>
+<span class="a">+        assertArrayEquals(sps, H264Still.withLevel(sps, 30))</span>
+<span class="a">+        assertArrayEquals(byteArrayOf(0x67, 0x42, 0, 51), H264Still.withLevel(byteArrayOf(0x67, 0x42, 0, 40), 51))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun cutParameterSetsAreRefused() {</span>
+<span class="a">+        assertThrows(H264Still.Unsupported::class.java) { H264Still.skipFrames(byteArrayOf(0x67, 0x42), byteArrayOf(0x68), 1) }</span>
+<span class="a">+        assertThrows(H264Still.Unsupported::class.java) { H264Still.skipFrames(byteArrayOf(0x68, 0x42), byteArrayOf(0x68), 1) }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** One key frame of a test card. Skips the test on a machine with no ffmpeg that can encode H.264. */</span>
+<span class="a">+    private fun encodeKeyFrame(dir: File, profile: String): ByteArray {</span>
+<span class="a">+        val cabac = if (profile == &quot;main&quot;) arrayOf(&quot;-coder&quot;, &quot;cabac&quot;) else emptyArray()</span>
+<span class="a">+        val made = listOf(&quot;libx264&quot; to profile, &quot;libopenh264&quot; to profile.replace(&quot;baseline&quot;, &quot;constrained_baseline&quot;)).any { (encoder, name) -&gt;</span>
+<span class="a">+            runCatching {</span>
+<span class="a">+                run(dir, &quot;ffmpeg&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;, &quot;-f&quot;, &quot;lavfi&quot;, &quot;-i&quot;, &quot;testsrc=size=320x240:rate=1&quot;, &quot;-frames:v&quot;, &quot;1&quot;,</span>
+<span class="a">+                    &quot;-c:v&quot;, encoder, &quot;-profile:v&quot;, name, *cabac, &quot;-pix_fmt&quot;, &quot;yuv420p&quot;, &quot;-f&quot;, &quot;h264&quot;, &quot;key.h264&quot;).first == 0</span>
+<span class="a">+            }.getOrDefault(false)</span>
+<span class="a">+        }</span>
+<span class="a">+        assumeTrue(&quot;no ffmpeg with an H.264 encoder on the PATH&quot;, made)</span>
+<span class="a">+        return File(dir, &quot;key.h264&quot;).readBytes()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private fun run(dir: File, vararg command: String): Triple&lt;Int, String, String&gt; {</span>
+<span class="a">+        val out = File(dir, &quot;stdout.txt&quot;)</span>
+<span class="a">+        val err = File(dir, &quot;stderr.txt&quot;)</span>
+<span class="a">+        val process = ProcessBuilder(*command).directory(dir).redirectOutput(out).redirectError(err).start()</span>
+<span class="a">+        return Triple(process.waitFor(), out.readText(), err.readText())</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** NAL units of an Annex B stream, without their start codes. */</span>
+<span class="a">+    private fun split(stream: ByteArray): List&lt;ByteArray&gt; {</span>
+<span class="a">+        val starts = (0..stream.size - 3).filter { stream[it].toInt() == 0 &amp;&amp; stream[it + 1].toInt() == 0 &amp;&amp; stream[it + 2].toInt() == 1 }</span>
+<span class="a">+        return starts.mapIndexed { k, at -&gt;</span>
+<span class="a">+            var end = if (k + 1 &lt; starts.size) starts[k + 1] else stream.size</span>
+<span class="a">+            while (end &gt; at + 3 &amp;&amp; stream[end - 1].toInt() == 0) end--</span>
+<span class="a">+            stream.copyOfRange(at + 3, end)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span></pre>
+</div></body></html>

@@ -7,313 +7,403 @@
 <div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
 <h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
 <div id="content">
-<p>src/mcp.js (13507 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0). No dependencies, so the plugin
+<p>src/mcp.js (18999 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Minimal MCP server over stdio (newline-delimited JSON-RPC 2.0). No dependencies, so the plugin
 <a id="l2" href="#l2">2</a> // runs straight from a git checkout with nothing to install.
 <a id="l3" href="#l3">3</a> 
 <a id="l4" href="#l4">4</a> import fs from &#x27;node:fs&#x27;;
-<a id="l5" href="#l5">5</a> import readline from &#x27;node:readline&#x27;;
-<a id="l6" href="#l6">6</a> import { fileURLToPath } from &#x27;node:url&#x27;;
-<a id="l7" href="#l7">7</a> import { headlessTriage } from &#x27;./claude.js&#x27;;
-<a id="l8" href="#l8">8</a> import { renderAdded, renderBoard, renderIdea } from &#x27;./render.js&#x27;;
-<a id="l9" href="#l9">9</a> import { BATCH_SCHEMA, MODELS, pendingIdeas, triagePrompt } from &#x27;./rubric.js&#x27;;
-<a id="l10" href="#l10">10</a> import { addIdeas, applyTriage, counts, FILTERS, findIdea, lane, load, pickNext, STATUSES, updateIdea } from &#x27;./store.js&#x27;;
-<a id="l11" href="#l11">11</a> import { clip, splitIdeas } from &#x27;./text.js&#x27;;
-<a id="l12" href="#l12">12</a> 
-<a id="l13" href="#l13">13</a> const ROOT = new URL(&#x27;..&#x27;, import.meta.url);
-<a id="l14" href="#l14">14</a> const VERSION = JSON.parse(fs.readFileSync(new URL(&#x27;package.json&#x27;, ROOT), &#x27;utf8&#x27;)).version;
-<a id="l15" href="#l15">15</a> const PROTOCOL_VERSIONS = [&#x27;2025-11-25&#x27;, &#x27;2025-06-18&#x27;, &#x27;2025-03-26&#x27;, &#x27;2024-11-05&#x27;];
+<a id="l5" href="#l5">5</a> import path from &#x27;node:path&#x27;;
+<a id="l6" href="#l6">6</a> import readline from &#x27;node:readline&#x27;;
+<a id="l7" href="#l7">7</a> import { fileURLToPath } from &#x27;node:url&#x27;;
+<a id="l8" href="#l8">8</a> import * as archive from &#x27;./archive.js&#x27;;
+<a id="l9" href="#l9">9</a> import { headlessTriage, triageFirst } from &#x27;./claude.js&#x27;;
+<a id="l10" href="#l10">10</a> import * as embed from &#x27;./embed.js&#x27;;
+<a id="l11" href="#l11">11</a> import { knownProjects } from &#x27;./projects.js&#x27;;
+<a id="l12" href="#l12">12</a> import { renderAdded, renderBoard, renderFound, renderGroups, renderIdea } from &#x27;./render.js&#x27;;
+<a id="l13" href="#l13">13</a> import { BATCH_SCHEMA, MODELS, pendingIdeas, triagePrompt } from &#x27;./rubric.js&#x27;;
+<a id="l14" href="#l14">14</a> import { counts, FILTERS, findIdea, lane, listIdeas, load, pickNext, STATUSES } from &#x27;./store.js&#x27;;
+<a id="l15" href="#l15">15</a> import { clip, splitIdeas } from &#x27;./text.js&#x27;;
 <a id="l16" href="#l16">16</a> 
-<a id="l17" href="#l17">17</a> const INSTRUCTIONS =
-<a id="l18" href="#l18">18</a>   &#x27;ideamine is the user\&#x27;s idea archive, shared by every session, project, and model. When the user tosses out an &#x27; +
-<a id="l19" href="#l19">19</a>   &#x27;idea for later (&quot;idea: ...&quot;, &quot;save this idea&quot;, &quot;someday we should ...&quot;), save it with idea_add and continue the &#x27; +
-<a id="l20" href="#l20">20</a>   &#x27;current task. Do not start building a saved idea unless the user asks.&#x27;;
-<a id="l21" href="#l21">21</a> 
-<a id="l22" href="#l22">22</a> const currentProject = () =&gt; process.env.CLAUDE_PROJECT_DIR || process.cwd();
-<a id="l23" href="#l23">23</a> 
-<a id="l24" href="#l24">24</a> const MODEL_ENUM = MODELS.map((m) =&gt; m.alias);
+<a id="l17" href="#l17">17</a> const ROOT = new URL(&#x27;..&#x27;, import.meta.url);
+<a id="l18" href="#l18">18</a> const VERSION = JSON.parse(fs.readFileSync(new URL(&#x27;package.json&#x27;, ROOT), &#x27;utf8&#x27;)).version;
+<a id="l19" href="#l19">19</a> const PROTOCOL_VERSIONS = [&#x27;2025-11-25&#x27;, &#x27;2025-06-18&#x27;, &#x27;2025-03-26&#x27;, &#x27;2024-11-05&#x27;];
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> const INSTRUCTIONS =
+<a id="l22" href="#l22">22</a>   &#x27;ideamine is the user\&#x27;s idea archive, shared by every session, project, and model. When the user tosses out an &#x27; +
+<a id="l23" href="#l23">23</a>   &#x27;idea for later (&quot;idea: ...&quot;, &quot;save this idea&quot;, &quot;someday we should ...&quot;), save it with idea_add and continue the &#x27; +
+<a id="l24" href="#l24">24</a>   &#x27;current task. Do not start building a saved idea unless the user asks.&#x27;;
 <a id="l25" href="#l25">25</a> 
-<a id="l26" href="#l26">26</a> const TOOLS = [
-<a id="l27" href="#l27">27</a>   {
-<a id="l28" href="#l28">28</a>     name: &#x27;idea_add&#x27;,
-<a id="l29" href="#l29">29</a>     description:
-<a id="l30" href="#l30">30</a>       &#x27;Save an idea to the ideamine archive. Use when the user shares an idea to keep for later. Only save it: &#x27; +
-<a id="l31" href="#l31">31</a>       &#x27;do not plan or build it, and continue what you were doing. A bulleted list becomes one idea per bullet.&#x27;,
-<a id="l32" href="#l32">32</a>     inputSchema: {
-<a id="l33" href="#l33">33</a>       type: &#x27;object&#x27;,
-<a id="l34" href="#l34">34</a>       properties: {
-<a id="l35" href="#l35">35</a>         text: { type: &#x27;string&#x27;, description: &#x27;The idea, verbatim.&#x27; },
-<a id="l36" href="#l36">36</a>         tags: { type: &#x27;array&#x27;, items: { type: &#x27;string&#x27; } },
-<a id="l37" href="#l37">37</a>         project: { type: &#x27;string&#x27;, description: &#x27;Project directory the idea belongs to. Default: current project.&#x27; },
-<a id="l38" href="#l38">38</a>       },
-<a id="l39" href="#l39">39</a>       required: [&#x27;text&#x27;],
-<a id="l40" href="#l40">40</a>       additionalProperties: false,
-<a id="l41" href="#l41">41</a>     },
-<a id="l42" href="#l42">42</a>     annotations: { title: &#x27;Save idea&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-<a id="l43" href="#l43">43</a>   },
-<a id="l44" href="#l44">44</a>   {
-<a id="l45" href="#l45">45</a>     name: &#x27;idea_list&#x27;,
-<a id="l46" href="#l46">46</a>     description: &#x27;Show the idea board, or one idea in full when id is given.&#x27;,
-<a id="l47" href="#l47">47</a>     inputSchema: {
-<a id="l48" href="#l48">48</a>       type: &#x27;object&#x27;,
-<a id="l49" href="#l49">49</a>       properties: {
-<a id="l50" href="#l50">50</a>         id: { type: &#x27;integer&#x27;, description: &#x27;Show this idea in full.&#x27; },
-<a id="l51" href="#l51">51</a>         filter: { type: &#x27;string&#x27;, enum: FILTERS, description: &#x27;Default: open (doing, do, maybe, inbox).&#x27; },
-<a id="l52" href="#l52">52</a>         query: { type: &#x27;string&#x27;, description: &#x27;Only ideas containing all of these words.&#x27; },
-<a id="l53" href="#l53">53</a>         here: { type: &#x27;boolean&#x27;, description: &#x27;Only ideas from the current project.&#x27; },
-<a id="l54" href="#l54">54</a>         limit: { type: &#x27;integer&#x27; },
-<a id="l55" href="#l55">55</a>       },
-<a id="l56" href="#l56">56</a>       additionalProperties: false,
-<a id="l57" href="#l57">57</a>     },
-<a id="l58" href="#l58">58</a>     annotations: { title: &#x27;List ideas&#x27;, readOnlyHint: true, openWorldHint: false },
-<a id="l59" href="#l59">59</a>   },
-<a id="l60" href="#l60">60</a>   {
-<a id="l61" href="#l61">61</a>     name: &#x27;idea_triage&#x27;,
-<a id="l62" href="#l62">62</a>     description:
-<a id="l63" href="#l63">63</a>       &#x27;Triage ideas: decide which are worth doing and the cheapest model that can build each. headless=true &#x27; +
-<a id="l64" href="#l64">64</a>       &#x27;does it in a separate minimal Claude Code call (cheapest; your context is not used). Otherwise call with &#x27; +
-<a id="l65" href="#l65">65</a>       &#x27;no verdicts to get the rubric and the untriaged ideas, then call once more with all verdicts.&#x27;,
-<a id="l66" href="#l66">66</a>     inputSchema: {
-<a id="l67" href="#l67">67</a>       type: &#x27;object&#x27;,
-<a id="l68" href="#l68">68</a>       properties: {
-<a id="l69" href="#l69">69</a>         headless: { type: &#x27;boolean&#x27;, description: &#x27;Triage the inbox in a separate low-cost `claude -p` call.&#x27; },
-<a id="l70" href="#l70">70</a>         model: { type: &#x27;string&#x27;, enum: MODEL_ENUM, description: &#x27;Model for headless triage (default sonnet).&#x27; },
-<a id="l71" href="#l71">71</a>         verdicts: BATCH_SCHEMA.properties.verdicts,
-<a id="l72" href="#l72">72</a>         ids: { type: &#x27;array&#x27;, items: { type: &#x27;integer&#x27; }, description: &#x27;Re-triage these ideas instead of the inbox.&#x27; },
-<a id="l73" href="#l73">73</a>         limit: { type: &#x27;integer&#x27;, description: &#x27;Max ideas (default 20 headless, 30 otherwise).&#x27; },
-<a id="l74" href="#l74">74</a>         by: { type: &#x27;string&#x27;, description: &#x27;Your model name, recorded with the verdicts.&#x27; },
-<a id="l75" href="#l75">75</a>       },
-<a id="l76" href="#l76">76</a>       additionalProperties: false,
-<a id="l77" href="#l77">77</a>     },
-<a id="l78" href="#l78">78</a>     annotations: { title: &#x27;Triage ideas&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-<a id="l79" href="#l79">79</a>   },
-<a id="l80" href="#l80">80</a>   {
-<a id="l81" href="#l81">81</a>     name: &#x27;idea_update&#x27;,
-<a id="l82" href="#l82">82</a>     description: &#x27;Change an idea: status, text, title, tags, model override, project, or append a note.&#x27;,
-<a id="l83" href="#l83">83</a>     inputSchema: {
-<a id="l84" href="#l84">84</a>       type: &#x27;object&#x27;,
-<a id="l85" href="#l85">85</a>       properties: {
-<a id="l86" href="#l86">86</a>         id: { type: &#x27;integer&#x27; },
-<a id="l87" href="#l87">87</a>         status: { type: &#x27;string&#x27;, enum: [...STATUSES, &#x27;reopen&#x27;] },
-<a id="l88" href="#l88">88</a>         note: { type: &#x27;string&#x27;, description: &#x27;Appended to the idea\&#x27;s notes, e.g. the outcome.&#x27; },
-<a id="l89" href="#l89">89</a>         title: { type: &#x27;string&#x27; },
-<a id="l90" href="#l90">90</a>         text: { type: &#x27;string&#x27; },
-<a id="l91" href="#l91">91</a>         tags: { type: &#x27;array&#x27;, items: { type: &#x27;string&#x27; } },
-<a id="l92" href="#l92">92</a>         model: { type: &#x27;string&#x27;, enum: MODEL_ENUM },
-<a id="l93" href="#l93">93</a>         project: { type: &#x27;string&#x27; },
-<a id="l94" href="#l94">94</a>       },
-<a id="l95" href="#l95">95</a>       required: [&#x27;id&#x27;],
-<a id="l96" href="#l96">96</a>       additionalProperties: false,
-<a id="l97" href="#l97">97</a>     },
-<a id="l98" href="#l98">98</a>     annotations: { title: &#x27;Update idea&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-<a id="l99" href="#l99">99</a>   },
-<a id="l100" href="#l100">100</a>   {
-<a id="l101" href="#l101">101</a>     name: &#x27;idea_next&#x27;,
-<a id="l102" href="#l102">102</a>     description:
-<a id="l103" href="#l103">103</a>       &#x27;Pick the idea to build next (verdict &quot;do&quot;, best value per effort, current project first), or fetch one &#x27; +
-<a id="l104" href="#l104">104</a>       &#x27;by id. Returns its brief, project, and the model recommended to build it.&#x27;,
-<a id="l105" href="#l105">105</a>     inputSchema: {
-<a id="l106" href="#l106">106</a>       type: &#x27;object&#x27;,
-<a id="l107" href="#l107">107</a>       properties: {
-<a id="l108" href="#l108">108</a>         id: { type: &#x27;integer&#x27; },
-<a id="l109" href="#l109">109</a>         here: { type: &#x27;boolean&#x27;, description: &#x27;Only consider ideas from the current project.&#x27; },
-<a id="l110" href="#l110">110</a>       },
-<a id="l111" href="#l111">111</a>       additionalProperties: false,
-<a id="l112" href="#l112">112</a>     },
-<a id="l113" href="#l113">113</a>     annotations: { title: &#x27;Next idea&#x27;, readOnlyHint: true, openWorldHint: false },
-<a id="l114" href="#l114">114</a>   },
-<a id="l115" href="#l115">115</a> ];
-<a id="l116" href="#l116">116</a> 
-<a id="l117" href="#l117">117</a> // Slash commands for clients that load this server without the plugin (the plugin ships skills instead).
-<a id="l118" href="#l118">118</a> // The prompt text is the matching SKILL.md body, so both stay in sync.
-<a id="l119" href="#l119">119</a> const PROMPTS = [
-<a id="l120" href="#l120">120</a>   { name: &#x27;idea&#x27;, skill: &#x27;idea&#x27;, description: &#x27;Save an idea for later&#x27;, arguments: [{ name: &#x27;text&#x27;, required: true }] },
-<a id="l121" href="#l121">121</a>   { name: &#x27;ideas&#x27;, skill: &#x27;ideas&#x27;, description: &#x27;Show the idea board&#x27;, arguments: [{ name: &#x27;request&#x27;, required: false }] },
-<a id="l122" href="#l122">122</a>   { name: &#x27;idea-triage&#x27;, skill: &#x27;idea-triage&#x27;, description: &#x27;Score the untriaged ideas&#x27;, arguments: [] },
-<a id="l123" href="#l123">123</a>   { name: &#x27;idea-go&#x27;, skill: &#x27;idea-go&#x27;, description: &#x27;Build the top idea with its model&#x27;, arguments: [{ name: &#x27;id&#x27;, required: false }] },
-<a id="l124" href="#l124">124</a> ];
-<a id="l125" href="#l125">125</a> 
-<a id="l126" href="#l126">126</a> function skillBody(name, args) {
-<a id="l127" href="#l127">127</a>   const file = new URL(`skills/${name}/SKILL.md`, ROOT);
-<a id="l128" href="#l128">128</a>   const text = fs.readFileSync(fileURLToPath(file), &#x27;utf8&#x27;).replace(/^---[\s\S]*?\n---\s*\n/, &#x27;&#x27;);
-<a id="l129" href="#l129">129</a>   return text.replaceAll(&#x27;$ARGUMENTS&#x27;, args || &#x27;&#x27;).trim();
-<a id="l130" href="#l130">130</a> }
-<a id="l131" href="#l131">131</a> 
-<a id="l132" href="#l132">132</a> function summarizeTriage(results, how = &#x27;&#x27;) {
-<a id="l133" href="#l133">133</a>   const ok = results.filter((r) =&gt; !r.error);
-<a id="l134" href="#l134">134</a>   const tally = [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;].map((v) =&gt; `${ok.filter((r) =&gt; r.verdict === v).length} ${v}`).join(&#x27; · &#x27;);
-<a id="l135" href="#l135">135</a>   const lines = [`Saved ${ok.length} verdict${ok.length === 1 ? &#x27;&#x27; : &#x27;s&#x27;}: ${tally}${how ? ` (${how})` : &#x27;&#x27;}`];
-<a id="l136" href="#l136">136</a>   for (const r of ok) lines.push(`  #${r.id} ${r.verdict}${r.verdict === &#x27;skip&#x27; ? &#x27;&#x27; : ` · ${r.model} · ${r.size.toUpperCase()}`}  ${clip(r.title, 60)}`);
-<a id="l137" href="#l137">137</a>   for (const r of results.filter((x) =&gt; x.error)) lines.push(`  #${r.id} not saved: ${r.error}`);
-<a id="l138" href="#l138">138</a>   const left = counts(load()).inbox;
-<a id="l139" href="#l139">139</a>   if (left) lines.push(`${left} still in inbox.`);
-<a id="l140" href="#l140">140</a>   return lines.join(&#x27;\n&#x27;);
-<a id="l141" href="#l141">141</a> }
-<a id="l142" href="#l142">142</a> 
-<a id="l143" href="#l143">143</a> // ---------------------------------------------------------------------------------------------
-<a id="l144" href="#l144">144</a> // Tool handlers return plain text for the model.
-<a id="l145" href="#l145">145</a> 
-<a id="l146" href="#l146">146</a> const handlers = {
-<a id="l147" href="#l147">147</a>   idea_add({ text, tags, project }) {
-<a id="l148" href="#l148">148</a>     const results = addIdeas(splitIdeas(text || &#x27;&#x27;), { source: &#x27;mcp&#x27;, project: project || currentProject(), tags });
-<a id="l149" href="#l149">149</a>     return renderAdded(results, load());
-<a id="l150" href="#l150">150</a>   },
-<a id="l151" href="#l151">151</a> 
-<a id="l152" href="#l152">152</a>   idea_list({ id, filter = &#x27;open&#x27;, query = &#x27;&#x27;, here = false, limit = 0 }) {
-<a id="l153" href="#l153">153</a>     const db = load();
-<a id="l154" href="#l154">154</a>     if (id != null) {
-<a id="l155" href="#l155">155</a>       const idea = findIdea(db, id);
-<a id="l156" href="#l156">156</a>       if (!idea) throw new Error(`no idea #${id}`);
-<a id="l157" href="#l157">157</a>       return renderIdea(idea);
-<a id="l158" href="#l158">158</a>     }
-<a id="l159" href="#l159">159</a>     return renderBoard(db, { filter, query, limit, project: here ? currentProject() : null, cwd: currentProject() });
-<a id="l160" href="#l160">160</a>   },
-<a id="l161" href="#l161">161</a> 
-<a id="l162" href="#l162">162</a>   async idea_triage({ verdicts, ids, limit, by, headless = false, model }) {
-<a id="l163" href="#l163">163</a>     if (headless) {
-<a id="l164" href="#l164">164</a>       const out = await headlessTriage({ model, limit: limit || 20 });
-<a id="l165" href="#l165">165</a>       return out.message || summarizeTriage(out.results, `${out.model}, ${out.tokens.input} in / ${out.tokens.output} out tokens`);
-<a id="l166" href="#l166">166</a>     }
-<a id="l167" href="#l167">167</a>     if (Array.isArray(verdicts) &amp;&amp; verdicts.length) {
-<a id="l168" href="#l168">168</a>       return summarizeTriage(applyTriage(verdicts, { by: by ? clip(by, 40) : &#x27;claude&#x27; }));
-<a id="l169" href="#l169">169</a>     }
-<a id="l170" href="#l170">170</a>     limit ||= 30;
-<a id="l171" href="#l171">171</a>     const db = load();
-<a id="l172" href="#l172">172</a>     const pending = pendingIdeas(db, { ids, limit });
-<a id="l173" href="#l173">173</a>     if (!pending.length) return &#x27;Nothing to triage: the inbox is empty.&#x27;;
-<a id="l174" href="#l174">174</a>     return (
-<a id="l175" href="#l175">175</a>       triagePrompt(db, pending) +
-<a id="l176" href="#l176">176</a>       &#x27;\n\nSave every verdict in ONE idea_triage call: &#x27; +
-<a id="l177" href="#l177">177</a>       &#x27;{&quot;verdicts&quot;:[{&quot;id&quot;:1,&quot;verdict&quot;:&quot;do&quot;,&quot;impact&quot;:3,&quot;size&quot;:&quot;s&quot;,&quot;model&quot;:&quot;sonnet&quot;,&quot;title&quot;:&quot;...&quot;,&quot;why&quot;:&quot;...&quot;,&quot;brief&quot;:&quot;...&quot;}]}&#x27;
-<a id="l178" href="#l178">178</a>     );
-<a id="l179" href="#l179">179</a>   },
-<a id="l180" href="#l180">180</a> 
-<a id="l181" href="#l181">181</a>   idea_update({ id, ...patch }) {
-<a id="l182" href="#l182">182</a>     const idea = updateIdea(id, patch);
-<a id="l183" href="#l183">183</a>     const bits = [`#${idea.id} ${clip(idea.title, 60)} · ${lane(idea)}`];
-<a id="l184" href="#l184">184</a>     if (patch.model) bits.push(`model ${idea.triage.model}`);
-<a id="l185" href="#l185">185</a>     if (patch.note) bits.push(&#x27;note added&#x27;);
-<a id="l186" href="#l186">186</a>     return `Updated ${bits.join(&#x27; · &#x27;)}`;
-<a id="l187" href="#l187">187</a>   },
-<a id="l188" href="#l188">188</a> 
-<a id="l189" href="#l189">189</a>   idea_next({ id, here = false }) {
-<a id="l190" href="#l190">190</a>     const db = load();
-<a id="l191" href="#l191">191</a>     let idea;
-<a id="l192" href="#l192">192</a>     if (id != null) {
-<a id="l193" href="#l193">193</a>       idea = findIdea(db, id);
-<a id="l194" href="#l194">194</a>       if (!idea) throw new Error(`no idea #${id}`);
-<a id="l195" href="#l195">195</a>     } else {
-<a id="l196" href="#l196">196</a>       idea = pickNext(db, { project: currentProject(), only: here });
-<a id="l197" href="#l197">197</a>     }
-<a id="l198" href="#l198">198</a>     if (!idea) {
-<a id="l199" href="#l199">199</a>       const c = counts(db);
-<a id="l200" href="#l200">200</a>       return c.inbox
-<a id="l201" href="#l201">201</a>         ? `No idea is ready to build. ${c.inbox} untriaged in the inbox: triage them first.`
-<a id="l202" href="#l202">202</a>         : &#x27;No idea is ready to build, and the inbox is empty.&#x27;;
-<a id="l203" href="#l203">203</a>     }
-<a id="l204" href="#l204">204</a>     const t = idea.triage;
-<a id="l205" href="#l205">205</a>     const lines = [renderIdea(idea), &#x27;&#x27;];
-<a id="l206" href="#l206">206</a>     if (!t) lines.push(&#x27;recommended model: none yet (untriaged)&#x27;);
-<a id="l207" href="#l207">207</a>     else lines.push(`recommended model: ${t.model}`);
-<a id="l208" href="#l208">208</a>     lines.push(`project dir: ${idea.project || &#x27;(none recorded)&#x27;}`);
-<a id="l209" href="#l209">209</a>     return lines.join(&#x27;\n&#x27;);
-<a id="l210" href="#l210">210</a>   },
-<a id="l211" href="#l211">211</a> };
-<a id="l212" href="#l212">212</a> 
-<a id="l213" href="#l213">213</a> // ---------------------------------------------------------------------------------------------
-<a id="l214" href="#l214">214</a> // JSON-RPC plumbing
-<a id="l215" href="#l215">215</a> 
-<a id="l216" href="#l216">216</a> function send(msg) {
-<a id="l217" href="#l217">217</a>   process.stdout.write(JSON.stringify(msg) + &#x27;\n&#x27;);
-<a id="l218" href="#l218">218</a> }
-<a id="l219" href="#l219">219</a> 
-<a id="l220" href="#l220">220</a> function result(id, value) {
-<a id="l221" href="#l221">221</a>   return { jsonrpc: &#x27;2.0&#x27;, id, result: value };
-<a id="l222" href="#l222">222</a> }
-<a id="l223" href="#l223">223</a> 
-<a id="l224" href="#l224">224</a> function error(id, code, message) {
-<a id="l225" href="#l225">225</a>   return { jsonrpc: &#x27;2.0&#x27;, id, error: { code, message } };
-<a id="l226" href="#l226">226</a> }
-<a id="l227" href="#l227">227</a> 
-<a id="l228" href="#l228">228</a> async function handleRequest(msg, { prompts }) {
-<a id="l229" href="#l229">229</a>   const { id, method, params = {} } = msg;
-<a id="l230" href="#l230">230</a>   switch (method) {
-<a id="l231" href="#l231">231</a>     case &#x27;initialize&#x27;: {
-<a id="l232" href="#l232">232</a>       const asked = params.protocolVersion;
-<a id="l233" href="#l233">233</a>       const protocolVersion = PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[0];
-<a id="l234" href="#l234">234</a>       const capabilities = { tools: { listChanged: false } };
-<a id="l235" href="#l235">235</a>       if (prompts) capabilities.prompts = { listChanged: false };
-<a id="l236" href="#l236">236</a>       return result(id, { protocolVersion, capabilities, serverInfo: { name: &#x27;ideamine&#x27;, version: VERSION }, instructions: INSTRUCTIONS });
-<a id="l237" href="#l237">237</a>     }
-<a id="l238" href="#l238">238</a>     case &#x27;ping&#x27;:
-<a id="l239" href="#l239">239</a>       return result(id, {});
-<a id="l240" href="#l240">240</a>     case &#x27;tools/list&#x27;:
-<a id="l241" href="#l241">241</a>       return result(id, { tools: TOOLS });
-<a id="l242" href="#l242">242</a>     case &#x27;tools/call&#x27;: {
-<a id="l243" href="#l243">243</a>       const handler = handlers[params.name];
-<a id="l244" href="#l244">244</a>       if (!handler) return error(id, -32602, `unknown tool: ${params.name}`);
-<a id="l245" href="#l245">245</a>       try {
-<a id="l246" href="#l246">246</a>         const text = await handler(params.arguments || {});
-<a id="l247" href="#l247">247</a>         return result(id, { content: [{ type: &#x27;text&#x27;, text }] });
-<a id="l248" href="#l248">248</a>       } catch (e) {
-<a id="l249" href="#l249">249</a>         return result(id, { content: [{ type: &#x27;text&#x27;, text: `Error: ${e.message}` }], isError: true });
-<a id="l250" href="#l250">250</a>       }
-<a id="l251" href="#l251">251</a>     }
-<a id="l252" href="#l252">252</a>     case &#x27;prompts/list&#x27;:
-<a id="l253" href="#l253">253</a>       return result(id, { prompts: prompts ? PROMPTS.map(({ skill, ...p }) =&gt; p) : [] });
-<a id="l254" href="#l254">254</a>     case &#x27;prompts/get&#x27;: {
-<a id="l255" href="#l255">255</a>       const p = prompts &amp;&amp; PROMPTS.find((x) =&gt; x.name === params.name);
-<a id="l256" href="#l256">256</a>       if (!p) return error(id, -32602, `unknown prompt: ${params.name}`);
-<a id="l257" href="#l257">257</a>       const args = Object.values(params.arguments || {}).filter(Boolean).join(&#x27; &#x27;);
-<a id="l258" href="#l258">258</a>       return result(id, {
-<a id="l259" href="#l259">259</a>         description: p.description,
-<a id="l260" href="#l260">260</a>         messages: [{ role: &#x27;user&#x27;, content: { type: &#x27;text&#x27;, text: skillBody(p.skill, args) } }],
-<a id="l261" href="#l261">261</a>       });
-<a id="l262" href="#l262">262</a>     }
-<a id="l263" href="#l263">263</a>     case &#x27;resources/list&#x27;:
-<a id="l264" href="#l264">264</a>       return result(id, { resources: [] });
-<a id="l265" href="#l265">265</a>     case &#x27;resources/templates/list&#x27;:
-<a id="l266" href="#l266">266</a>       return result(id, { resourceTemplates: [] });
-<a id="l267" href="#l267">267</a>     case &#x27;logging/setLevel&#x27;:
-<a id="l268" href="#l268">268</a>       return result(id, {});
-<a id="l269" href="#l269">269</a>     default:
-<a id="l270" href="#l270">270</a>       return error(id, -32601, `method not found: ${method}`);
-<a id="l271" href="#l271">271</a>   }
-<a id="l272" href="#l272">272</a> }
-<a id="l273" href="#l273">273</a> 
-<a id="l274" href="#l274">274</a> async function handleMessage(msg, opts) {
-<a id="l275" href="#l275">275</a>   if (!msg || typeof msg !== &#x27;object&#x27; || msg.jsonrpc !== &#x27;2.0&#x27;) return error(null, -32600, &#x27;invalid request&#x27;);
-<a id="l276" href="#l276">276</a>   if (typeof msg.method !== &#x27;string&#x27;) return null; // a response to a request we never send
-<a id="l277" href="#l277">277</a>   if (msg.id === undefined) return null; // notification (initialized, cancelled, ...)
-<a id="l278" href="#l278">278</a>   try {
-<a id="l279" href="#l279">279</a>     return await handleRequest(msg, opts);
-<a id="l280" href="#l280">280</a>   } catch (e) {
-<a id="l281" href="#l281">281</a>     return error(msg.id, -32603, e.message);
-<a id="l282" href="#l282">282</a>   }
-<a id="l283" href="#l283">283</a> }
-<a id="l284" href="#l284">284</a> 
-<a id="l285" href="#l285">285</a> async function handleLine(line, opts) {
-<a id="l286" href="#l286">286</a>   let msg;
-<a id="l287" href="#l287">287</a>   try {
-<a id="l288" href="#l288">288</a>     msg = JSON.parse(line);
-<a id="l289" href="#l289">289</a>   } catch {
-<a id="l290" href="#l290">290</a>     return error(null, -32700, &#x27;parse error&#x27;);
-<a id="l291" href="#l291">291</a>   }
-<a id="l292" href="#l292">292</a>   if (!Array.isArray(msg)) return handleMessage(msg, opts);
-<a id="l293" href="#l293">293</a>   const replies = (await Promise.all(msg.map((m) =&gt; handleMessage(m, opts)))).filter(Boolean);
-<a id="l294" href="#l294">294</a>   return replies.length ? replies : null;
-<a id="l295" href="#l295">295</a> }
-<a id="l296" href="#l296">296</a> 
-<a id="l297" href="#l297">297</a> /** Serve MCP on stdin/stdout. `prompts: false` when running as a plugin (skills cover slash commands). */
-<a id="l298" href="#l298">298</a> export function serve({ prompts = true } = {}) {
-<a id="l299" href="#l299">299</a>   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-<a id="l300" href="#l300">300</a>   const inFlight = new Set();
-<a id="l301" href="#l301">301</a>   // Requests run concurrently (a headless triage must not stall a ping); replies carry their ids.
-<a id="l302" href="#l302">302</a>   rl.on(&#x27;line&#x27;, (line) =&gt; {
-<a id="l303" href="#l303">303</a>     if (!line.trim()) return;
-<a id="l304" href="#l304">304</a>     const job = handleLine(line, { prompts }).then((reply) =&gt; reply &amp;&amp; send(reply));
-<a id="l305" href="#l305">305</a>     inFlight.add(job);
-<a id="l306" href="#l306">306</a>     job.finally(() =&gt; inFlight.delete(job));
-<a id="l307" href="#l307">307</a>   });
-<a id="l308" href="#l308">308</a>   rl.on(&#x27;close&#x27;, () =&gt; Promise.allSettled([...inFlight]).then(() =&gt; process.exit(0)));
-<a id="l309" href="#l309">309</a> }</pre>
+<a id="l26" href="#l26">26</a> const currentProject = () =&gt; process.env.CLAUDE_PROJECT_DIR || process.cwd();
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> const MODEL_ENUM = MODELS.map((m) =&gt; m.alias);
+<a id="l29" href="#l29">29</a> 
+<a id="l30" href="#l30">30</a> const TOOLS = [
+<a id="l31" href="#l31">31</a>   {
+<a id="l32" href="#l32">32</a>     name: &#x27;idea_add&#x27;,
+<a id="l33" href="#l33">33</a>     description:
+<a id="l34" href="#l34">34</a>       &#x27;Save an idea to the ideamine archive. Use when the user shares an idea to keep for later. Only save it: &#x27; +
+<a id="l35" href="#l35">35</a>       &#x27;do not plan or build it, and continue what you were doing. A bulleted list becomes one idea per bullet.&#x27;,
+<a id="l36" href="#l36">36</a>     inputSchema: {
+<a id="l37" href="#l37">37</a>       type: &#x27;object&#x27;,
+<a id="l38" href="#l38">38</a>       properties: {
+<a id="l39" href="#l39">39</a>         text: { type: &#x27;string&#x27;, description: &#x27;The idea, verbatim.&#x27; },
+<a id="l40" href="#l40">40</a>         tags: { type: &#x27;array&#x27;, items: { type: &#x27;string&#x27; } },
+<a id="l41" href="#l41">41</a>         project: { type: &#x27;string&#x27;, description: &#x27;Project directory the idea belongs to. Default: current project.&#x27; },
+<a id="l42" href="#l42">42</a>       },
+<a id="l43" href="#l43">43</a>       required: [&#x27;text&#x27;],
+<a id="l44" href="#l44">44</a>       additionalProperties: false,
+<a id="l45" href="#l45">45</a>     },
+<a id="l46" href="#l46">46</a>     annotations: { title: &#x27;Save idea&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+<a id="l47" href="#l47">47</a>   },
+<a id="l48" href="#l48">48</a>   {
+<a id="l49" href="#l49">49</a>     name: &#x27;idea_list&#x27;,
+<a id="l50" href="#l50">50</a>     description:
+<a id="l51" href="#l51">51</a>       &#x27;Show the idea board, or one idea in full when id is given. full=true shows every listed idea in full. &#x27; +
+<a id="l52" href="#l52">52</a>       &#x27;semantic=true ranks ideas by meaning for the query. groups=true groups the listed ideas by meaning.&#x27;,
+<a id="l53" href="#l53">53</a>     inputSchema: {
+<a id="l54" href="#l54">54</a>       type: &#x27;object&#x27;,
+<a id="l55" href="#l55">55</a>       properties: {
+<a id="l56" href="#l56">56</a>         id: { type: &#x27;integer&#x27;, description: &#x27;Show this idea in full.&#x27; },
+<a id="l57" href="#l57">57</a>         filter: { type: &#x27;string&#x27;, enum: FILTERS, description: &#x27;Default: open (doing, do, maybe, inbox).&#x27; },
+<a id="l58" href="#l58">58</a>         query: { type: &#x27;string&#x27;, description: &#x27;Only ideas containing all of these words (with semantic: ideas like it).&#x27; },
+<a id="l59" href="#l59">59</a>         semantic: { type: &#x27;boolean&#x27;, description: &#x27;Rank by meaning (nomic-embed-text), best first. Falls back to words.&#x27; },
+<a id="l60" href="#l60">60</a>         groups: { type: &#x27;boolean&#x27;, description: &#x27;Group the listed ideas by meaning.&#x27; },
+<a id="l61" href="#l61">61</a>         here: { type: &#x27;boolean&#x27;, description: &#x27;Only ideas from the current project.&#x27; },
+<a id="l62" href="#l62">62</a>         limit: { type: &#x27;integer&#x27; },
+<a id="l63" href="#l63">63</a>         full: { type: &#x27;boolean&#x27;, description: &#x27;Every listed idea in full (brief, text, notes), not one line each.&#x27; },
+<a id="l64" href="#l64">64</a>       },
+<a id="l65" href="#l65">65</a>       additionalProperties: false,
+<a id="l66" href="#l66">66</a>     },
+<a id="l67" href="#l67">67</a>     annotations: { title: &#x27;List ideas&#x27;, readOnlyHint: true, openWorldHint: false },
+<a id="l68" href="#l68">68</a>   },
+<a id="l69" href="#l69">69</a>   {
+<a id="l70" href="#l70">70</a>     name: &#x27;idea_triage&#x27;,
+<a id="l71" href="#l71">71</a>     description:
+<a id="l72" href="#l72">72</a>       &#x27;Triage ideas: decide which are worth doing and the cheapest model that can build each. headless=true &#x27; +
+<a id="l73" href="#l73">73</a>       &#x27;does it in a separate minimal Claude Code call (cheapest; your context is not used). Otherwise call with &#x27; +
+<a id="l74" href="#l74">74</a>       &#x27;no verdicts to get the rubric and the untriaged ideas, then call once more with all verdicts.&#x27;,
+<a id="l75" href="#l75">75</a>     inputSchema: {
+<a id="l76" href="#l76">76</a>       type: &#x27;object&#x27;,
+<a id="l77" href="#l77">77</a>       properties: {
+<a id="l78" href="#l78">78</a>         headless: { type: &#x27;boolean&#x27;, description: &#x27;Triage the inbox in a separate low-cost `claude -p` call.&#x27; },
+<a id="l79" href="#l79">79</a>         model: { type: &#x27;string&#x27;, enum: MODEL_ENUM, description: &#x27;Model for headless triage (default sonnet).&#x27; },
+<a id="l80" href="#l80">80</a>         verdicts: BATCH_SCHEMA.properties.verdicts,
+<a id="l81" href="#l81">81</a>         ids: { type: &#x27;array&#x27;, items: { type: &#x27;integer&#x27; }, description: &#x27;Re-triage these ideas instead of the inbox.&#x27; },
+<a id="l82" href="#l82">82</a>         limit: { type: &#x27;integer&#x27;, description: &#x27;Max ideas (default 20 headless, 30 otherwise).&#x27; },
+<a id="l83" href="#l83">83</a>         by: { type: &#x27;string&#x27;, description: &#x27;Your model name, recorded with the verdicts.&#x27; },
+<a id="l84" href="#l84">84</a>       },
+<a id="l85" href="#l85">85</a>       additionalProperties: false,
+<a id="l86" href="#l86">86</a>     },
+<a id="l87" href="#l87">87</a>     annotations: { title: &#x27;Triage ideas&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+<a id="l88" href="#l88">88</a>   },
+<a id="l89" href="#l89">89</a>   {
+<a id="l90" href="#l90">90</a>     name: &#x27;idea_update&#x27;,
+<a id="l91" href="#l91">91</a>     description: &#x27;Change an idea: status, text, title, tags, model override, project, or append a note.&#x27;,
+<a id="l92" href="#l92">92</a>     inputSchema: {
+<a id="l93" href="#l93">93</a>       type: &#x27;object&#x27;,
+<a id="l94" href="#l94">94</a>       properties: {
+<a id="l95" href="#l95">95</a>         id: { type: &#x27;integer&#x27; },
+<a id="l96" href="#l96">96</a>         status: { type: &#x27;string&#x27;, enum: [...STATUSES, &#x27;reopen&#x27;] },
+<a id="l97" href="#l97">97</a>         note: { type: &#x27;string&#x27;, description: &#x27;Appended to the idea\&#x27;s notes, e.g. the outcome.&#x27; },
+<a id="l98" href="#l98">98</a>         title: { type: &#x27;string&#x27; },
+<a id="l99" href="#l99">99</a>         text: { type: &#x27;string&#x27; },
+<a id="l100" href="#l100">100</a>         tags: { type: &#x27;array&#x27;, items: { type: &#x27;string&#x27; } },
+<a id="l101" href="#l101">101</a>         model: { type: &#x27;string&#x27;, enum: MODEL_ENUM },
+<a id="l102" href="#l102">102</a>         project: { type: &#x27;string&#x27; },
+<a id="l103" href="#l103">103</a>       },
+<a id="l104" href="#l104">104</a>       required: [&#x27;id&#x27;],
+<a id="l105" href="#l105">105</a>       additionalProperties: false,
+<a id="l106" href="#l106">106</a>     },
+<a id="l107" href="#l107">107</a>     annotations: { title: &#x27;Update idea&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+<a id="l108" href="#l108">108</a>   },
+<a id="l109" href="#l109">109</a>   {
+<a id="l110" href="#l110">110</a>     name: &#x27;idea_next&#x27;,
+<a id="l111" href="#l111">111</a>     description:
+<a id="l112" href="#l112">112</a>       &#x27;Pick the idea to build next (verdict &quot;do&quot; before &quot;maybe&quot;, current project first, then best value per &#x27; +
+<a id="l113" href="#l113">113</a>       &#x27;effort), or fetch one by id. Returns its brief, project, and the model recommended to build it. Without &#x27; +
+<a id="l114" href="#l114">114</a>       &#x27;id, it also returns the whole queue. triage=true first triages the untriaged candidates (the inbox, or &#x27; +
+<a id="l115" href="#l115">115</a>       &#x27;the given id) in one headless call.&#x27;,
+<a id="l116" href="#l116">116</a>     inputSchema: {
+<a id="l117" href="#l117">117</a>       type: &#x27;object&#x27;,
+<a id="l118" href="#l118">118</a>       properties: {
+<a id="l119" href="#l119">119</a>         id: { type: &#x27;integer&#x27; },
+<a id="l120" href="#l120">120</a>         here: { type: &#x27;boolean&#x27;, description: &#x27;Only consider ideas from the current project.&#x27; },
+<a id="l121" href="#l121">121</a>         triage: { type: &#x27;boolean&#x27;, description: &#x27;Triage untriaged candidates first, so the pick and the model are current.&#x27; },
+<a id="l122" href="#l122">122</a>       },
+<a id="l123" href="#l123">123</a>       additionalProperties: false,
+<a id="l124" href="#l124">124</a>     },
+<a id="l125" href="#l125">125</a>     annotations: { title: &#x27;Next idea&#x27;, readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+<a id="l126" href="#l126">126</a>   },
+<a id="l127" href="#l127">127</a>   {
+<a id="l128" href="#l128">128</a>     name: &#x27;idea_remove&#x27;,
+<a id="l129" href="#l129">129</a>     description:
+<a id="l130" href="#l130">130</a>       &#x27;Take ideas out of the queue: delete them from the archive for good, and return each one in full. &#x27; +
+<a id="l131" href="#l131">131</a>       &#x27;An unknown id is an error, and then nothing is deleted.&#x27;,
+<a id="l132" href="#l132">132</a>     inputSchema: {
+<a id="l133" href="#l133">133</a>       type: &#x27;object&#x27;,
+<a id="l134" href="#l134">134</a>       properties: {
+<a id="l135" href="#l135">135</a>         ids: { type: &#x27;array&#x27;, items: { type: &#x27;integer&#x27; }, description: &#x27;The ideas to delete.&#x27; },
+<a id="l136" href="#l136">136</a>       },
+<a id="l137" href="#l137">137</a>       required: [&#x27;ids&#x27;],
+<a id="l138" href="#l138">138</a>       additionalProperties: false,
+<a id="l139" href="#l139">139</a>     },
+<a id="l140" href="#l140">140</a>     annotations: { title: &#x27;Remove ideas&#x27;, readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+<a id="l141" href="#l141">141</a>   },
+<a id="l142" href="#l142">142</a> ];
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> // Slash commands for clients that load this server without the plugin (the plugin ships skills instead).
+<a id="l145" href="#l145">145</a> // The prompt text is the matching SKILL.md body, so both stay in sync.
+<a id="l146" href="#l146">146</a> const PROMPTS = [
+<a id="l147" href="#l147">147</a>   { name: &#x27;idea&#x27;, description: &#x27;Save an idea for later&#x27;, arguments: [{ name: &#x27;text&#x27;, required: true }] },
+<a id="l148" href="#l148">148</a>   { name: &#x27;ideas&#x27;, description: &#x27;Show the queue, or ask about your ideas&#x27;, arguments: [{ name: &#x27;question&#x27;, required: false }] },
+<a id="l149" href="#l149">149</a>   { name: &#x27;ideas-ls&#x27;, description: &#x27;List the queue, one lane, or every lane (-a)&#x27;, arguments: [{ name: &#x27;lane&#x27;, required: false }] },
+<a id="l150" href="#l150">150</a>   { name: &#x27;ideas-cat&#x27;, description: &#x27;Show ideas in full&#x27;, arguments: [{ name: &#x27;ids&#x27;, required: true }] },
+<a id="l151" href="#l151">151</a>   { name: &#x27;ideas-rm&#x27;, description: &#x27;Delete ideas for good&#x27;, arguments: [{ name: &#x27;ids&#x27;, required: true }] },
+<a id="l152" href="#l152">152</a>   { name: &#x27;ideas-find&#x27;, description: &#x27;Search ideas by meaning&#x27;, arguments: [{ name: &#x27;words&#x27;, required: true }] },
+<a id="l153" href="#l153">153</a>   { name: &#x27;ideas-groups&#x27;, description: &#x27;Show ideas grouped by meaning&#x27;, arguments: [{ name: &#x27;lane&#x27;, required: false }] },
+<a id="l154" href="#l154">154</a>   { name: &#x27;ideas-done&#x27;, description: &#x27;Mark an idea done&#x27;, arguments: [{ name: &#x27;id&#x27;, required: true }, { name: &#x27;note&#x27;, required: false }] },
+<a id="l155" href="#l155">155</a>   { name: &#x27;ideas-reopen&#x27;, description: &#x27;Put an idea back in the queue&#x27;, arguments: [{ name: &#x27;id&#x27;, required: true }] },
+<a id="l156" href="#l156">156</a>   { name: &#x27;ideas-go&#x27;, description: &#x27;Build the next idea on its recommended model&#x27;, arguments: [{ name: &#x27;id&#x27;, required: false }] },
+<a id="l157" href="#l157">157</a>   { name: &#x27;ideas-all&#x27;, description: &#x27;Do every idea that fits this chat&#x27;, arguments: [] },
+<a id="l158" href="#l158">158</a>   { name: &#x27;ideas-sort&#x27;, description: &#x27;Triage the inbox now and show the queue&#x27;, arguments: [] },
+<a id="l159" href="#l159">159</a>   { name: &#x27;ideas-watch&#x27;, description: &#x27;Turn the background watcher on or off&#x27;, arguments: [{ name: &#x27;off&#x27;, required: false }] },
+<a id="l160" href="#l160">160</a>   { name: &#x27;ideas-web&#x27;, description: &#x27;Start or stop the dashboard with buttons on this PC&#x27;, arguments: [{ name: &#x27;off&#x27;, required: false }] },
+<a id="l161" href="#l161">161</a>   { name: &#x27;ideas-sync&#x27;, description: &#x27;Share one archive between your machines through an ideamine server&#x27;, arguments: [{ name: &#x27;url&#x27;, required: false }] },
+<a id="l162" href="#l162">162</a> ];
+<a id="l163" href="#l163">163</a> 
+<a id="l164" href="#l164">164</a> function skillBody(name, args) {
+<a id="l165" href="#l165">165</a>   const file = new URL(`skills/${name}/SKILL.md`, ROOT);
+<a id="l166" href="#l166">166</a>   const text = fs.readFileSync(fileURLToPath(file), &#x27;utf8&#x27;).replace(/^---[\s\S]*?\n---\s*\n/, &#x27;&#x27;);
+<a id="l167" href="#l167">167</a>   return text.replaceAll(&#x27;$ARGUMENTS&#x27;, args || &#x27;&#x27;).trim();
+<a id="l168" href="#l168">168</a> }
+<a id="l169" href="#l169">169</a> 
+<a id="l170" href="#l170">170</a> function summarizeTriage(results, how = &#x27;&#x27;) {
+<a id="l171" href="#l171">171</a>   const ok = results.filter((r) =&gt; !r.error);
+<a id="l172" href="#l172">172</a>   const tally = [&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;].map((v) =&gt; `${ok.filter((r) =&gt; r.verdict === v).length} ${v}`).join(&#x27; · &#x27;);
+<a id="l173" href="#l173">173</a>   const lines = [`Saved ${ok.length} verdict${ok.length === 1 ? &#x27;&#x27; : &#x27;s&#x27;}: ${tally}${how ? ` (${how})` : &#x27;&#x27;}`];
+<a id="l174" href="#l174">174</a>   for (const r of ok) {
+<a id="l175" href="#l175">175</a>     const meta = r.verdict === &#x27;skip&#x27; ? &#x27;&#x27; : ` · ${r.model} · ${r.size.toUpperCase()}`;
+<a id="l176" href="#l176">176</a>     lines.push(`  #${r.id} ${r.verdict}${meta}  ${clip(r.title, 60)}${r.moved ? `  → ${path.basename(r.moved)}` : &#x27;&#x27;}`);
+<a id="l177" href="#l177">177</a>   }
+<a id="l178" href="#l178">178</a>   for (const r of results.filter((x) =&gt; x.error)) lines.push(`  #${r.id} not saved: ${r.error}`);
+<a id="l179" href="#l179">179</a>   const left = counts(load()).inbox;
+<a id="l180" href="#l180">180</a>   if (left) lines.push(`${left} still in inbox.`);
+<a id="l181" href="#l181">181</a>   return lines.join(&#x27;\n&#x27;);
+<a id="l182" href="#l182">182</a> }
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a> export function headlessSummary(out) {
+<a id="l185" href="#l185">185</a>   return out.message || summarizeTriage(out.results, `${out.model}, ${out.tokens.input} in / ${out.tokens.output} out tokens`);
+<a id="l186" href="#l186">186</a> }
+<a id="l187" href="#l187">187</a> 
+<a id="l188" href="#l188">188</a> /** The board after a triage, so the user sees every idea in its new place. */
+<a id="l189" href="#l189">189</a> function withBoard(text) {
+<a id="l190" href="#l190">190</a>   return `${text}\n\n${renderBoard(load(), { cwd: currentProject(), hints: true })}`;
+<a id="l191" href="#l191">191</a> }
+<a id="l192" href="#l192">192</a> 
+<a id="l193" href="#l193">193</a> // ---------------------------------------------------------------------------------------------
+<a id="l194" href="#l194">194</a> // Tool handlers return plain text for the model.
+<a id="l195" href="#l195">195</a> 
+<a id="l196" href="#l196">196</a> const handlers = {
+<a id="l197" href="#l197">197</a>   async idea_add({ text, tags, project }) {
+<a id="l198" href="#l198">198</a>     const results = await archive.add(splitIdeas(text || &#x27;&#x27;), { source: &#x27;mcp&#x27;, project: project || currentProject(), tags });
+<a id="l199" href="#l199">199</a>     return results.queued ? `Saved on this machine. ${archive.queuedText(results)}` : renderAdded(results, load());
+<a id="l200" href="#l200">200</a>   },
+<a id="l201" href="#l201">201</a> 
+<a id="l202" href="#l202">202</a>   async idea_list({ id, filter = &#x27;open&#x27;, query = &#x27;&#x27;, here = false, limit = 0, full = false, semantic = false, groups = false }) {
+<a id="l203" href="#l203">203</a>     const db = await archive.fresh();
+<a id="l204" href="#l204">204</a>     if (id != null) {
+<a id="l205" href="#l205">205</a>       const idea = findIdea(db, id);
+<a id="l206" href="#l206">206</a>       if (!idea) throw new Error(`no idea #${id}`);
+<a id="l207" href="#l207">207</a>       return renderIdea(idea);
+<a id="l208" href="#l208">208</a>     }
+<a id="l209" href="#l209">209</a>     const project = here ? currentProject() : null;
+<a id="l210" href="#l210">210</a>     if (semantic &amp;&amp; query) {
+<a id="l211" href="#l211">211</a>       const found = await embed.find(db, query, { filter, project, limit: limit || 10 });
+<a id="l212" href="#l212">212</a>       if (!full) return renderFound(found, query, { cwd: currentProject() });
+<a id="l213" href="#l213">213</a>       return found.results.length ? found.results.map((r) =&gt; renderIdea(r.idea)).join(&#x27;\n\n&#x27;) : &#x27;No ideas match.&#x27;;
+<a id="l214" href="#l214">214</a>     }
+<a id="l215" href="#l215">215</a>     if (groups) {
+<a id="l216" href="#l216">216</a>       const ideas = listIdeas(db, { filter, query, limit, project });
+<a id="l217" href="#l217">217</a>       return renderGroups(await embed.groupIdeas(ideas), ideas, { cwd: currentProject(), scope: filter });
+<a id="l218" href="#l218">218</a>     }
+<a id="l219" href="#l219">219</a>     if (full) {
+<a id="l220" href="#l220">220</a>       const ideas = listIdeas(db, { filter, query, limit, project });
+<a id="l221" href="#l221">221</a>       return ideas.length ? ideas.map(renderIdea).join(&#x27;\n\n&#x27;) : &#x27;No ideas match.&#x27;;
+<a id="l222" href="#l222">222</a>     }
+<a id="l223" href="#l223">223</a>     return renderBoard(db, { filter, query, limit, project, cwd: currentProject() });
+<a id="l224" href="#l224">224</a>   },
+<a id="l225" href="#l225">225</a> 
+<a id="l226" href="#l226">226</a>   async idea_triage({ verdicts, ids, limit, by, headless = false, model }) {
+<a id="l227" href="#l227">227</a>     if (headless) {
+<a id="l228" href="#l228">228</a>       return withBoard(headlessSummary(await headlessTriage({ model, limit: limit || 20 })));
+<a id="l229" href="#l229">229</a>     }
+<a id="l230" href="#l230">230</a>     if (Array.isArray(verdicts) &amp;&amp; verdicts.length) {
+<a id="l231" href="#l231">231</a>       const projects = knownProjects(await archive.fresh());
+<a id="l232" href="#l232">232</a>       const results = await archive.triage(verdicts, { by: by ? clip(by, 40) : &#x27;claude&#x27;, projects });
+<a id="l233" href="#l233">233</a>       return results.queued ? archive.queuedText(results) : withBoard(summarizeTriage(results));
+<a id="l234" href="#l234">234</a>     }
+<a id="l235" href="#l235">235</a>     limit ||= 30;
+<a id="l236" href="#l236">236</a>     const db = await archive.fresh();
+<a id="l237" href="#l237">237</a>     const pending = pendingIdeas(db, { ids, limit });
+<a id="l238" href="#l238">238</a>     if (!pending.length) return &#x27;Nothing to triage: the inbox is empty.&#x27;;
+<a id="l239" href="#l239">239</a>     return (
+<a id="l240" href="#l240">240</a>       triagePrompt(db, pending, knownProjects(db)) +
+<a id="l241" href="#l241">241</a>       &#x27;\n\nSave every verdict in ONE idea_triage call: &#x27; +
+<a id="l242" href="#l242">242</a>       &#x27;{&quot;verdicts&quot;:[{&quot;id&quot;:1,&quot;verdict&quot;:&quot;do&quot;,&quot;impact&quot;:3,&quot;size&quot;:&quot;s&quot;,&quot;model&quot;:&quot;sonnet&quot;,&quot;title&quot;:&quot;...&quot;,&quot;why&quot;:&quot;...&quot;,&quot;brief&quot;:&quot;...&quot;,&quot;project&quot;:&quot;...&quot;}]}&#x27;
+<a id="l243" href="#l243">243</a>     );
+<a id="l244" href="#l244">244</a>   },
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a>   async idea_update({ id, ...patch }) {
+<a id="l247" href="#l247">247</a>     const idea = await archive.update(id, patch);
+<a id="l248" href="#l248">248</a>     if (idea.queued) return archive.queuedText(idea);
+<a id="l249" href="#l249">249</a>     const bits = [`#${idea.id} ${clip(idea.title, 60)} · ${lane(idea)}`];
+<a id="l250" href="#l250">250</a>     if (patch.model) bits.push(`model ${idea.triage.model}`);
+<a id="l251" href="#l251">251</a>     if (patch.note) bits.push(&#x27;note added&#x27;);
+<a id="l252" href="#l252">252</a>     return `Updated ${bits.join(&#x27; · &#x27;)}`;
+<a id="l253" href="#l253">253</a>   },
+<a id="l254" href="#l254">254</a> 
+<a id="l255" href="#l255">255</a>   async idea_next({ id, here = false, triage = false }) {
+<a id="l256" href="#l256">256</a>     const out = [];
+<a id="l257" href="#l257">257</a>     if (triage) {
+<a id="l258" href="#l258">258</a>       try {
+<a id="l259" href="#l259">259</a>         const res = await triageFirst({ id });
+<a id="l260" href="#l260">260</a>         if (res) out.push(headlessSummary(res));
+<a id="l261" href="#l261">261</a>       } catch (e) {
+<a id="l262" href="#l262">262</a>         out.push(`Triage failed: ${e.message}`);
+<a id="l263" href="#l263">263</a>       }
+<a id="l264" href="#l264">264</a>     }
+<a id="l265" href="#l265">265</a>     const db = await archive.fresh();
+<a id="l266" href="#l266">266</a>     let idea;
+<a id="l267" href="#l267">267</a>     if (id != null) {
+<a id="l268" href="#l268">268</a>       idea = findIdea(db, id);
+<a id="l269" href="#l269">269</a>       if (!idea) throw new Error(`no idea #${id}`);
+<a id="l270" href="#l270">270</a>     } else {
+<a id="l271" href="#l271">271</a>       idea = pickNext(db, { project: currentProject(), only: here });
+<a id="l272" href="#l272">272</a>     }
+<a id="l273" href="#l273">273</a>     if (!idea) {
+<a id="l274" href="#l274">274</a>       const c = counts(db);
+<a id="l275" href="#l275">275</a>       out.push(
+<a id="l276" href="#l276">276</a>         c.inbox
+<a id="l277" href="#l277">277</a>           ? `No idea is ready: ${c.inbox} untriaged in the inbox.${triage ? &#x27;&#x27; : &#x27; Pass triage: true to triage them first.&#x27;}`
+<a id="l278" href="#l278">278</a>           : `The queue is empty${here ? &#x27; for this project&#x27; : &#x27;&#x27;}.`,
+<a id="l279" href="#l279">279</a>       );
+<a id="l280" href="#l280">280</a>       return out.join(&#x27;\n\n&#x27;);
+<a id="l281" href="#l281">281</a>     }
+<a id="l282" href="#l282">282</a>     const t = idea.triage;
+<a id="l283" href="#l283">283</a>     const lines = [renderIdea(idea), &#x27;&#x27;];
+<a id="l284" href="#l284">284</a>     if (!t) lines.push(&#x27;recommended model: none yet (untriaged)&#x27;);
+<a id="l285" href="#l285">285</a>     else lines.push(`recommended model: ${t.model}`);
+<a id="l286" href="#l286">286</a>     // Ideas are saved from any session, so the recorded folder can be a scratch folder that is gone.
+<a id="l287" href="#l287">287</a>     const dir = idea.project;
+<a id="l288" href="#l288">288</a>     lines.push(`project dir: ${dir ? `${dir} (${fs.existsSync(dir) ? &#x27;exists&#x27; : &#x27;does not exist&#x27;})` : &#x27;(none recorded)&#x27;}`);
+<a id="l289" href="#l289">289</a>     out.push(lines.join(&#x27;\n&#x27;));
+<a id="l290" href="#l290">290</a>     // The whole queue, so the caller can choose an idea that fits its chat better than the first one.
+<a id="l291" href="#l291">291</a>     if (id == null) out.push(`The queue:\n${renderBoard(db, { cwd: currentProject() })}`);
+<a id="l292" href="#l292">292</a>     return out.join(&#x27;\n\n&#x27;);
+<a id="l293" href="#l293">293</a>   },
+<a id="l294" href="#l294">294</a> 
+<a id="l295" href="#l295">295</a>   async idea_remove({ ids = [] }) {
+<a id="l296" href="#l296">296</a>     if (!ids.length) throw new Error(&#x27;pass the ids to delete&#x27;);
+<a id="l297" href="#l297">297</a>     const gone = await archive.remove(ids);
+<a id="l298" href="#l298">298</a>     if (gone.queued) return archive.queuedText(gone);
+<a id="l299" href="#l299">299</a>     return [`Removed ${gone.length} idea${gone.length === 1 ? &#x27;&#x27; : &#x27;s&#x27;}.`, ...gone.map(renderIdea)].join(&#x27;\n\n&#x27;);
+<a id="l300" href="#l300">300</a>   },
+<a id="l301" href="#l301">301</a> };
+<a id="l302" href="#l302">302</a> 
+<a id="l303" href="#l303">303</a> // ---------------------------------------------------------------------------------------------
+<a id="l304" href="#l304">304</a> // JSON-RPC plumbing
+<a id="l305" href="#l305">305</a> 
+<a id="l306" href="#l306">306</a> function send(msg) {
+<a id="l307" href="#l307">307</a>   process.stdout.write(JSON.stringify(msg) + &#x27;\n&#x27;);
+<a id="l308" href="#l308">308</a> }
+<a id="l309" href="#l309">309</a> 
+<a id="l310" href="#l310">310</a> function result(id, value) {
+<a id="l311" href="#l311">311</a>   return { jsonrpc: &#x27;2.0&#x27;, id, result: value };
+<a id="l312" href="#l312">312</a> }
+<a id="l313" href="#l313">313</a> 
+<a id="l314" href="#l314">314</a> function error(id, code, message) {
+<a id="l315" href="#l315">315</a>   return { jsonrpc: &#x27;2.0&#x27;, id, error: { code, message } };
+<a id="l316" href="#l316">316</a> }
+<a id="l317" href="#l317">317</a> 
+<a id="l318" href="#l318">318</a> async function handleRequest(msg, { prompts }) {
+<a id="l319" href="#l319">319</a>   const { id, method, params = {} } = msg;
+<a id="l320" href="#l320">320</a>   switch (method) {
+<a id="l321" href="#l321">321</a>     case &#x27;initialize&#x27;: {
+<a id="l322" href="#l322">322</a>       const asked = params.protocolVersion;
+<a id="l323" href="#l323">323</a>       const protocolVersion = PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[0];
+<a id="l324" href="#l324">324</a>       const capabilities = { tools: { listChanged: false } };
+<a id="l325" href="#l325">325</a>       if (prompts) capabilities.prompts = { listChanged: false };
+<a id="l326" href="#l326">326</a>       return result(id, { protocolVersion, capabilities, serverInfo: { name: &#x27;ideamine&#x27;, version: VERSION }, instructions: INSTRUCTIONS });
+<a id="l327" href="#l327">327</a>     }
+<a id="l328" href="#l328">328</a>     case &#x27;ping&#x27;:
+<a id="l329" href="#l329">329</a>       return result(id, {});
+<a id="l330" href="#l330">330</a>     case &#x27;tools/list&#x27;:
+<a id="l331" href="#l331">331</a>       return result(id, { tools: TOOLS });
+<a id="l332" href="#l332">332</a>     case &#x27;tools/call&#x27;: {
+<a id="l333" href="#l333">333</a>       const handler = handlers[params.name];
+<a id="l334" href="#l334">334</a>       if (!handler) return error(id, -32602, `unknown tool: ${params.name}`);
+<a id="l335" href="#l335">335</a>       try {
+<a id="l336" href="#l336">336</a>         const text = await handler(params.arguments || {});
+<a id="l337" href="#l337">337</a>         return result(id, { content: [{ type: &#x27;text&#x27;, text }] });
+<a id="l338" href="#l338">338</a>       } catch (e) {
+<a id="l339" href="#l339">339</a>         return result(id, { content: [{ type: &#x27;text&#x27;, text: `Error: ${e.message}` }], isError: true });
+<a id="l340" href="#l340">340</a>       }
+<a id="l341" href="#l341">341</a>     }
+<a id="l342" href="#l342">342</a>     case &#x27;prompts/list&#x27;:
+<a id="l343" href="#l343">343</a>       return result(id, { prompts: prompts ? PROMPTS : [] });
+<a id="l344" href="#l344">344</a>     case &#x27;prompts/get&#x27;: {
+<a id="l345" href="#l345">345</a>       const p = prompts &amp;&amp; PROMPTS.find((x) =&gt; x.name === params.name);
+<a id="l346" href="#l346">346</a>       if (!p) return error(id, -32602, `unknown prompt: ${params.name}`);
+<a id="l347" href="#l347">347</a>       const args = Object.values(params.arguments || {}).filter(Boolean).join(&#x27; &#x27;);
+<a id="l348" href="#l348">348</a>       return result(id, {
+<a id="l349" href="#l349">349</a>         description: p.description,
+<a id="l350" href="#l350">350</a>         messages: [{ role: &#x27;user&#x27;, content: { type: &#x27;text&#x27;, text: skillBody(p.name, args) } }],
+<a id="l351" href="#l351">351</a>       });
+<a id="l352" href="#l352">352</a>     }
+<a id="l353" href="#l353">353</a>     case &#x27;resources/list&#x27;:
+<a id="l354" href="#l354">354</a>       return result(id, { resources: [] });
+<a id="l355" href="#l355">355</a>     case &#x27;resources/templates/list&#x27;:
+<a id="l356" href="#l356">356</a>       return result(id, { resourceTemplates: [] });
+<a id="l357" href="#l357">357</a>     case &#x27;logging/setLevel&#x27;:
+<a id="l358" href="#l358">358</a>       return result(id, {});
+<a id="l359" href="#l359">359</a>     default:
+<a id="l360" href="#l360">360</a>       return error(id, -32601, `method not found: ${method}`);
+<a id="l361" href="#l361">361</a>   }
+<a id="l362" href="#l362">362</a> }
+<a id="l363" href="#l363">363</a> 
+<a id="l364" href="#l364">364</a> async function handleMessage(msg, opts) {
+<a id="l365" href="#l365">365</a>   if (!msg || typeof msg !== &#x27;object&#x27; || msg.jsonrpc !== &#x27;2.0&#x27;) return error(null, -32600, &#x27;invalid request&#x27;);
+<a id="l366" href="#l366">366</a>   if (typeof msg.method !== &#x27;string&#x27;) return null; // a response to a request we never send
+<a id="l367" href="#l367">367</a>   if (msg.id === undefined) return null; // notification (initialized, cancelled, ...)
+<a id="l368" href="#l368">368</a>   try {
+<a id="l369" href="#l369">369</a>     return await handleRequest(msg, opts);
+<a id="l370" href="#l370">370</a>   } catch (e) {
+<a id="l371" href="#l371">371</a>     return error(msg.id, -32603, e.message);
+<a id="l372" href="#l372">372</a>   }
+<a id="l373" href="#l373">373</a> }
+<a id="l374" href="#l374">374</a> 
+<a id="l375" href="#l375">375</a> async function handleLine(line, opts) {
+<a id="l376" href="#l376">376</a>   let msg;
+<a id="l377" href="#l377">377</a>   try {
+<a id="l378" href="#l378">378</a>     msg = JSON.parse(line);
+<a id="l379" href="#l379">379</a>   } catch {
+<a id="l380" href="#l380">380</a>     return error(null, -32700, &#x27;parse error&#x27;);
+<a id="l381" href="#l381">381</a>   }
+<a id="l382" href="#l382">382</a>   if (!Array.isArray(msg)) return handleMessage(msg, opts);
+<a id="l383" href="#l383">383</a>   const replies = (await Promise.all(msg.map((m) =&gt; handleMessage(m, opts)))).filter(Boolean);
+<a id="l384" href="#l384">384</a>   return replies.length ? replies : null;
+<a id="l385" href="#l385">385</a> }
+<a id="l386" href="#l386">386</a> 
+<a id="l387" href="#l387">387</a> /** Serve MCP on stdin/stdout. `prompts: false` when running as a plugin (skills cover slash commands). */
+<a id="l388" href="#l388">388</a> export function serve({ prompts = true } = {}) {
+<a id="l389" href="#l389">389</a>   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+<a id="l390" href="#l390">390</a>   const inFlight = new Set();
+<a id="l391" href="#l391">391</a>   // Requests run concurrently (a headless triage must not stall a ping); replies carry their ids.
+<a id="l392" href="#l392">392</a>   rl.on(&#x27;line&#x27;, (line) =&gt; {
+<a id="l393" href="#l393">393</a>     if (!line.trim()) return;
+<a id="l394" href="#l394">394</a>     const job = handleLine(line, { prompts }).then((reply) =&gt; reply &amp;&amp; send(reply));
+<a id="l395" href="#l395">395</a>     inFlight.add(job);
+<a id="l396" href="#l396">396</a>     job.finally(() =&gt; inFlight.delete(job));
+<a id="l397" href="#l397">397</a>   });
+<a id="l398" href="#l398">398</a>   rl.on(&#x27;close&#x27;, () =&gt; Promise.allSettled([...inFlight]).then(() =&gt; process.exit(0)));
+<a id="l399" href="#l399">399</a> }</pre>
 </div></body></html>

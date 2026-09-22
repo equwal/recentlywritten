@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 7e1fe5c2 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 7e1fe5c203ee7184fea1591ec27ac6271af522d2
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 17:22:47 -0700
+
+The whole conversion, in the browser
+
+engine/media.js   ffmpeg.wasm: reads any audio format straight off the
+                  visitor&#x27;s disk (WORKERFS, no copy) two minutes at a time,
+                  and muxes the videos
+engine/asr.js     Whisper-tiny through transformers.js; WebGPU, else WASM
+                  threads. Language is always explicit - left to itself the
+                  model translates instead of transcribing
+engine/book.js    epub / fb2 / Aozora / text in the browser, with a zip
+                  reader built on DecompressionStream; language detection
+engine/job.js     the job: resumable (IndexedDB) transcription, alignment in
+                  a worker, videos on request. A still picture is encoded
+                  for one minute and repeated by stream copy, so a video
+                  costs seconds rather than an hour of WebAssembly x264
+
+tools/fetch_vendor.py pins and checksums the three libraries and serves them
+from our own origin; the page is cross-origin isolated so the runtime can
+use threads. lab.html exercises each piece; verified on a real sample: a
+clip from the middle of a novel finds its place in the whole epub, and both
+videos come out with the right streams.
+
+</pre><pre> .gitignore                      |   3 +
+ backend/main.py                 |  22 ++++
+ frontend/engine/align.worker.js |  11 ++
+ frontend/engine/asr.js          |  71 ++++++++++++
+ frontend/engine/book.js         | 224 ++++++++++++++++++++++++++++++++++++++
+ frontend/engine/job.js          | 234 ++++++++++++++++++++++++++++++++++++++++
+ frontend/engine/media.js        | 111 +++++++++++++++++++
+ frontend/lab.html               |  93 ++++++++++++++++
+ tools/fetch_vendor.py           |  88 +++++++++++++++
+ 9 files changed, 857 insertions(+)
+</pre><pre>diff --git a/.gitignore b/.gitignore
+index 6c69c5d..354a1ba 100644
+--- a/.gitignore
++++ b/.gitignore
+<span class="h">@@ -24,3 +24,6 @@ Thumbs.db</span>
+ 
+ # Whole-book test input; local only
+ tests/engine/golden-local/
+<span class="a">+</span>
+<span class="a">+# Browser-side libraries; tools/fetch_vendor.py downloads them, pinned</span>
+<span class="a">+frontend/vendor/</span>
+diff --git a/backend/main.py b/backend/main.py
+index 51a36b5..3fd7bc7 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -9,6 +9,7 @@ CORS config and no second server.</span>
+ from __future__ import annotations
+ 
+ import logging
+<span class="a">+import mimetypes</span>
+ from contextlib import asynccontextmanager
+ 
+ from fastapi import FastAPI
+<span class="h">@@ -29,6 +30,12 @@ log = logging.getLogger(&quot;subplz.web&quot;)</span>
+ 
+ FRONTEND = ROOT / &quot;frontend&quot;
+ 
+<span class="a">+# Python takes these from the OS, and Windows gets both wrong. A module served</span>
+<span class="a">+# as text/plain is refused outright, and WebAssembly will not stream-compile.</span>
+<span class="a">+mimetypes.add_type(&quot;text/javascript&quot;, &quot;.js&quot;)</span>
+<span class="a">+mimetypes.add_type(&quot;text/javascript&quot;, &quot;.mjs&quot;)</span>
+<span class="a">+mimetypes.add_type(&quot;application/wasm&quot;, &quot;.wasm&quot;)</span>
+<span class="a">+</span>
+ 
+ def _requeue_interrupted() -&gt; None:
+     &quot;&quot;&quot;Recover jobs that were mid-flight when the server last stopped.
+<span class="h">@@ -79,6 +86,21 @@ app = FastAPI(</span>
+ app.include_router(router)
+ 
+ 
+<span class="a">+@app.middleware(&quot;http&quot;)</span>
+<span class="a">+async def cross_origin_isolation(request, call_next):</span>
+<span class="a">+    &quot;&quot;&quot;Let the page use threads.</span>
+<span class="a">+</span>
+<span class="a">+    The speech model runs in the browser on WebAssembly threads, which need</span>
+<span class="a">+    SharedArrayBuffer, which browsers only hand to a cross-origin-isolated</span>
+<span class="a">+    page. &quot;credentialless&quot; rather than &quot;require-corp&quot;: the model weights come</span>
+<span class="a">+    from a third-party host that sends CORS headers but not CORP ones.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    response = await call_next(request)</span>
+<span class="a">+    response.headers[&quot;Cross-Origin-Opener-Policy&quot;] = &quot;same-origin&quot;</span>
+<span class="a">+    response.headers[&quot;Cross-Origin-Embedder-Policy&quot;] = &quot;credentialless&quot;</span>
+<span class="a">+    return response</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @app.get(&quot;/healthz&quot;)
+ def healthz():
+     return {
+diff --git a/frontend/engine/align.worker.js b/frontend/engine/align.worker.js
+new file mode 100644
+index 0000000..fb2fd4f
+--- /dev/null
++++ b/frontend/engine/align.worker.js
+<span class="h">@@ -0,0 +1,11 @@</span>
+<span class="a">+/* Alignment off the main thread: a long book is a few seconds of solid work. */</span>
+<span class="a">+import { alignBook, language, writeSrt } from &#x27;./align.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+self.onmessage = ({ data }) =&gt; {</span>
+<span class="a">+  try {</span>
+<span class="a">+    const result = alignBook(data.transcript, data.paragraphs, language(data.language));</span>
+<span class="a">+    self.postMessage({ ok: true, ...result, srt: writeSrt(result.cues) });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    self.postMessage({ ok: false, error: String(e?.message || e) });</span>
+<span class="a">+  }</span>
+<span class="a">+};</span>
+diff --git a/frontend/engine/asr.js b/frontend/engine/asr.js
+new file mode 100644
+index 0000000..6a48b9d
+--- /dev/null
++++ b/frontend/engine/asr.js
+<span class="h">@@ -0,0 +1,71 @@</span>
+<span class="a">+/* Speech recognition in the browser: Whisper-tiny on the ONNX runtime, through</span>
+<span class="a">+ * transformers.js. WebGPU where the browser has it (many times faster than real</span>
+<span class="a">+ * time on an ordinary laptop), WebAssembly threads where it does not.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The transcript only has to be good enough to line up against a book we</span>
+<span class="a">+ * already have the words of, which is why the smallest model will do.</span>
+<span class="a">+ */</span>
+<span class="a">+import { pipeline, env } from &#x27;/vendor/transformers/transformers.min.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+// Everything from our own origin except the model weights themselves.</span>
+<span class="a">+env.backends.onnx.wasm.wasmPaths = new URL(&#x27;/vendor/transformers/&#x27;, import.meta.url).href;</span>
+<span class="a">+env.allowLocalModels = false;</span>
+<span class="a">+</span>
+<span class="a">+const MODEL = &#x27;onnx-community/whisper-tiny&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+export async function hasWebGpu() {</span>
+<span class="a">+  try { return !!(navigator.gpu &amp;&amp; await navigator.gpu.requestAdapter()); } catch { return false; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export class Recogniser {</span>
+<span class="a">+  #pipe;</span>
+<span class="a">+  device;</span>
+<span class="a">+</span>
+<span class="a">+  /** @param onProgress ({file, loaded, total}) while the ~40 MB of weights download (cached after). */</span>
+<span class="a">+  static async open(onProgress) {</span>
+<span class="a">+    const r = new Recogniser();</span>
+<span class="a">+    r.device = (await hasWebGpu()) ? &#x27;webgpu&#x27; : &#x27;wasm&#x27;;</span>
+<span class="a">+    const options = (device) =&gt; ({</span>
+<span class="a">+      device,</span>
+<span class="a">+      // Full-precision encoder: quantising it is what ruins accuracy. The</span>
+<span class="a">+      // decoder tolerates 4-bit well and is where the time goes.</span>
+<span class="a">+      dtype: device === &#x27;webgpu&#x27;</span>
+<span class="a">+        ? { encoder_model: &#x27;fp32&#x27;, decoder_model_merged: &#x27;q4&#x27; }</span>
+<span class="a">+        : { encoder_model: &#x27;fp32&#x27;, decoder_model_merged: &#x27;q8&#x27; },</span>
+<span class="a">+      progress_callback: (p) =&gt; { if (p.status === &#x27;progress&#x27;) onProgress?.(p); },</span>
+<span class="a">+    });</span>
+<span class="a">+    try {</span>
+<span class="a">+      r.#pipe = await pipeline(&#x27;automatic-speech-recognition&#x27;, MODEL, options(r.device));</span>
+<span class="a">+    } catch (e) {</span>
+<span class="a">+      if (r.device !== &#x27;webgpu&#x27;) throw e;</span>
+<span class="a">+      // A GPU that is listed but cannot run the model: fall back rather than fail.</span>
+<span class="a">+      r.device = &#x27;wasm&#x27;;</span>
+<span class="a">+      r.#pipe = await pipeline(&#x27;automatic-speech-recognition&#x27;, MODEL, options(&#x27;wasm&#x27;));</span>
+<span class="a">+    }</span>
+<span class="a">+    return r;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /**</span>
+<span class="a">+   * @param pcm 16 kHz mono Float32Array</span>
+<span class="a">+   * @param language a Whisper code (&quot;ja&quot;, &quot;ru&quot;, ...), or null to let it decide</span>
+<span class="a">+   * @returns [{text, start, end}] with times offset by `offset` seconds</span>
+<span class="a">+   */</span>
+<span class="a">+  async transcribe(pcm, language, offset = 0) {</span>
+<span class="a">+    const out = await this.#pipe(pcm, {</span>
+<span class="a">+      return_timestamps: true,</span>
+<span class="a">+      chunk_length_s: 30,</span>
+<span class="a">+      stride_length_s: 5,</span>
+<span class="a">+      task: &#x27;transcribe&#x27;,</span>
+<span class="a">+      ...(language ? { language } : {}),</span>
+<span class="a">+    });</span>
+<span class="a">+    const segments = [];</span>
+<span class="a">+    for (const c of out.chunks ?? []) {</span>
+<span class="a">+      const text = (c.text ?? &#x27;&#x27;).trim();</span>
+<span class="a">+      const [s, e] = c.timestamp ?? [];</span>
+<span class="a">+      if (!text || s == null) continue;</span>
+<span class="a">+      // The last segment of a buffer can come back without an end.</span>
+<span class="a">+      segments.push({ text, start: offset + s, end: offset + (e ?? pcm.length / 16000) });</span>
+<span class="a">+    }</span>
+<span class="a">+    return segments;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/frontend/engine/book.js b/frontend/engine/book.js
+new file mode 100644
+index 0000000..3387daf
+--- /dev/null
++++ b/frontend/engine/book.js
+<span class="h">@@ -0,0 +1,224 @@</span>
+<span class="a">+/* A book as a flat list of paragraphs in reading order - read in the browser,</span>
+<span class="a">+ * never uploaded.</span>
+<span class="a">+ *</span>
+<span class="a">+ * epub (a zip of XHTML), fb2 (XML), Aozora Bunko (Shift_JIS text with ruby</span>
+<span class="a">+ * markup, usually zipped) and plain text. No zip library: the platform can</span>
+<span class="a">+ * inflate (DecompressionStream), and the little that is left of the format is</span>
+<span class="a">+ * a directory at the end of the file.</span>
+<span class="a">+ */</span>
+<span class="a">+</span>
+<span class="a">+const BLOCKS = &#x27;p, li, blockquote, h1, h2, h3, h4, h5, h6&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+export async function readBook(file) {</span>
+<span class="a">+  const name = file.name.toLowerCase();</span>
+<span class="a">+  const bytes = new Uint8Array(await file.arrayBuffer());</span>
+<span class="a">+  if (name.endsWith(&#x27;.epub&#x27;)) return epub(bytes);</span>
+<span class="a">+  if (name.endsWith(&#x27;.fb2.zip&#x27;) || name.endsWith(&#x27;.fbz&#x27;)) return fb2(decode(await firstEntry(bytes, /\.fb2$/i)));</span>
+<span class="a">+  if (name.endsWith(&#x27;.zip&#x27;)) return aozora(decode(await firstEntry(bytes, /\.txt$/i)));</span>
+<span class="a">+  if (name.endsWith(&#x27;.fb2&#x27;)) return fb2(decode(bytes));</span>
+<span class="a">+  return plain(decode(bytes));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ----------------------------------------------------------------------- zip */</span>
+<span class="a">+</span>
+<span class="a">+const u16 = (b, o) =&gt; b[o] | (b[o + 1] &lt;&lt; 8);</span>
+<span class="a">+const u32 = (b, o) =&gt; (b[o] | (b[o + 1] &lt;&lt; 8) | (b[o + 2] &lt;&lt; 16) | (b[o + 3] &lt;&lt; 24)) &gt;&gt;&gt; 0;</span>
+<span class="a">+</span>
+<span class="a">+/** name -&gt; () =&gt; Promise&lt;Uint8Array&gt;, in directory order. */</span>
+<span class="a">+export function zipEntries(bytes) {</span>
+<span class="a">+  let eocd = -1;</span>
+<span class="a">+  for (let i = bytes.length - 22; i &gt;= Math.max(0, bytes.length - 65557); i--) {</span>
+<span class="a">+    if (u32(bytes, i) === 0x06054b50) { eocd = i; break; }</span>
+<span class="a">+  }</span>
+<span class="a">+  if (eocd &lt; 0) throw new Error(&#x27;This file is not a readable zip archive.&#x27;);</span>
+<span class="a">+  const entries = new Map();</span>
+<span class="a">+  let o = u32(bytes, eocd + 16);</span>
+<span class="a">+  for (let n = u16(bytes, eocd + 10); n &gt; 0 &amp;&amp; u32(bytes, o) === 0x02014b50; n--) {</span>
+<span class="a">+    const method = u16(bytes, o + 10), size = u32(bytes, o + 20);</span>
+<span class="a">+    const nameLen = u16(bytes, o + 28), extraLen = u16(bytes, o + 30), commentLen = u16(bytes, o + 32);</span>
+<span class="a">+    const local = u32(bytes, o + 42);</span>
+<span class="a">+    const name = new TextDecoder().decode(bytes.subarray(o + 46, o + 46 + nameLen));</span>
+<span class="a">+    if (!name.endsWith(&#x27;/&#x27;)) {</span>
+<span class="a">+      entries.set(name, async () =&gt; {</span>
+<span class="a">+        const start = local + 30 + u16(bytes, local + 26) + u16(bytes, local + 28);</span>
+<span class="a">+        const raw = bytes.subarray(start, start + size);</span>
+<span class="a">+        if (method === 0) return raw;</span>
+<span class="a">+        if (method !== 8) throw new Error(`Unsupported zip compression in ${name}.`);</span>
+<span class="a">+        const stream = new Blob([raw]).stream().pipeThrough(new DecompressionStream(&#x27;deflate-raw&#x27;));</span>
+<span class="a">+        return new Uint8Array(await new Response(stream).arrayBuffer());</span>
+<span class="a">+      });</span>
+<span class="a">+    }</span>
+<span class="a">+    o += 46 + nameLen + extraLen + commentLen;</span>
+<span class="a">+  }</span>
+<span class="a">+  return entries;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function firstEntry(bytes, pattern) {</span>
+<span class="a">+  for (const [name, read] of zipEntries(bytes)) if (pattern.test(name)) return read();</span>
+<span class="a">+  throw new Error(&#x27;Nothing readable was found inside that archive.&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** UTF-8 unless it plainly is not; then whatever the file declares, or Shift_JIS. */</span>
+<span class="a">+function decode(bytes) {</span>
+<span class="a">+  try {</span>
+<span class="a">+    return new TextDecoder(&#x27;utf-8&#x27;, { fatal: true }).decode(bytes).replace(/^﻿/, &#x27;&#x27;);</span>
+<span class="a">+  } catch { /* not UTF-8 */ }</span>
+<span class="a">+  const head = new TextDecoder(&#x27;latin1&#x27;).decode(bytes.subarray(0, 200));</span>
+<span class="a">+  const declared = /encoding=[&quot;&#x27;]([\w-]+)[&quot;&#x27;]/i.exec(head)?.[1];</span>
+<span class="a">+  for (const label of [declared, &#x27;shift_jis&#x27;, &#x27;windows-1251&#x27;]) {</span>
+<span class="a">+    if (!label) continue;</span>
+<span class="a">+    try { return new TextDecoder(label).decode(bytes); } catch { /* unknown label */ }</span>
+<span class="a">+  }</span>
+<span class="a">+  return new TextDecoder().decode(bytes);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ---------------------------------------------------------------------- epub */</span>
+<span class="a">+</span>
+<span class="a">+function resolve(base, href) {</span>
+<span class="a">+  const parts = base ? base.split(&#x27;/&#x27;) : [];</span>
+<span class="a">+  for (const seg of href.split(&#x27;/&#x27;)) {</span>
+<span class="a">+    if (seg === &#x27;&#x27; || seg === &#x27;.&#x27;) continue;</span>
+<span class="a">+    if (seg === &#x27;..&#x27;) parts.pop(); else parts.push(seg);</span>
+<span class="a">+  }</span>
+<span class="a">+  return parts.join(&#x27;/&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * An epub page is XHTML, and has to be parsed as XML first: to an HTML parser</span>
+<span class="a">+ * a self-closing &lt;title/&gt; never closes, and swallows the whole book as its text.</span>
+<span class="a">+ * Plenty of epubs are not well-formed, though, so HTML is the fallback.</span>
+<span class="a">+ */</span>
+<span class="a">+function page(source) {</span>
+<span class="a">+  const xml = new DOMParser().parseFromString(source, &#x27;application/xhtml+xml&#x27;);</span>
+<span class="a">+  if (!xml.querySelector(&#x27;parsererror&#x27;)) return xml;</span>
+<span class="a">+  return new DOMParser().parseFromString(source, &#x27;text/html&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function epub(bytes) {</span>
+<span class="a">+  const entries = zipEntries(bytes);</span>
+<span class="a">+  const text = async (name) =&gt; decode(await entries.get(name)());</span>
+<span class="a">+  const xml = (s) =&gt; new DOMParser().parseFromString(s, &#x27;application/xml&#x27;);</span>
+<span class="a">+  const isPage = (n) =&gt; /\.(xhtml|html|htm)$/i.test(n);</span>
+<span class="a">+</span>
+<span class="a">+  let order = null;</span>
+<span class="a">+  try {</span>
+<span class="a">+    const opfPath = xml(await text(&#x27;META-INF/container.xml&#x27;)).querySelector(&#x27;rootfile&#x27;).getAttribute(&#x27;full-path&#x27;);</span>
+<span class="a">+    const opf = xml(await text(opfPath));</span>
+<span class="a">+    const base = opfPath.includes(&#x27;/&#x27;) ? opfPath.slice(0, opfPath.lastIndexOf(&#x27;/&#x27;)) : &#x27;&#x27;;</span>
+<span class="a">+    const hrefs = new Map([...opf.querySelectorAll(&#x27;manifest &gt; item&#x27;)].map((i) =&gt; [i.getAttribute(&#x27;id&#x27;), i.getAttribute(&#x27;href&#x27;)]));</span>
+<span class="a">+    order = [...opf.querySelectorAll(&#x27;spine &gt; itemref&#x27;)]</span>
+<span class="a">+      // linear=&quot;no&quot; is auxiliary content outside the reading order.</span>
+<span class="a">+      .filter((r) =&gt; r.getAttribute(&#x27;linear&#x27;) !== &#x27;no&#x27;)</span>
+<span class="a">+      .map((r) =&gt; hrefs.get(r.getAttribute(&#x27;idref&#x27;)))</span>
+<span class="a">+      .filter(Boolean)</span>
+<span class="a">+      .map((h) =&gt; resolve(base, decodeURIComponent(h.split(&#x27;#&#x27;)[0])))</span>
+<span class="a">+      .filter((p) =&gt; entries.has(p));</span>
+<span class="a">+  } catch { /* malformed package file: fall through */ }</span>
+<span class="a">+  if (!order?.length) order = [...entries.keys()].filter(isPage).sort();</span>
+<span class="a">+</span>
+<span class="a">+  const out = [];</span>
+<span class="a">+  let cover = null;</span>
+<span class="a">+  for (const path of order) {</span>
+<span class="a">+    const doc = page(await text(path));</span>
+<span class="a">+    const body = doc.querySelector(&#x27;body&#x27;) ?? doc.documentElement;</span>
+<span class="a">+    // Furigana would otherwise be read twice: once as kanji, once as kana.</span>
+<span class="a">+    doc.querySelectorAll(&#x27;rt, rp&#x27;).forEach((n) =&gt; n.remove());</span>
+<span class="a">+    // A quote holding paragraphs would yield its text twice; keep the leaves.</span>
+<span class="a">+    const blocks = [...body.querySelectorAll(BLOCKS)].filter((b) =&gt; !b.querySelector(BLOCKS));</span>
+<span class="a">+    for (const b of blocks.length ? blocks : [body]) {</span>
+<span class="a">+      const t = b.textContent.replace(/\s+/g, &#x27; &#x27;).trim();</span>
+<span class="a">+      if (t) out.push(t);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // The largest image is almost always the cover, and this works on the</span>
+<span class="a">+  // malformed epubs that converted books usually are.</span>
+<span class="a">+  const images = [...entries.keys()].filter((n) =&gt; /\.(jpe?g|png|webp)$/i.test(n));</span>
+<span class="a">+  if (images.length) {</span>
+<span class="a">+    const sized = await Promise.all(images.map(async (n) =&gt; [n, (await entries.get(n)()).length]));</span>
+<span class="a">+    const [name, size] = sized.sort((a, b) =&gt; b[1] - a[1])[0];</span>
+<span class="a">+    if (size &gt;= 1024) cover = { name, bytes: await entries.get(name)() };</span>
+<span class="a">+  }</span>
+<span class="a">+  return { paragraphs: out, cover };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ------------------------------------------------------------ other formats */</span>
+<span class="a">+</span>
+<span class="a">+function fb2(source) {</span>
+<span class="a">+  const doc = new DOMParser().parseFromString(source, &#x27;application/xml&#x27;);</span>
+<span class="a">+  const bodies = [...doc.getElementsByTagName(&#x27;body&#x27;)]</span>
+<span class="a">+    // Footnotes live in a second body; nobody narrates them.</span>
+<span class="a">+    .filter((b) =&gt; (b.getAttribute(&#x27;name&#x27;) || &#x27;&#x27;) !== &#x27;notes&#x27;);</span>
+<span class="a">+  const out = [];</span>
+<span class="a">+  for (const body of bodies) {</span>
+<span class="a">+    for (const p of body.querySelectorAll(&#x27;p, v, subtitle, text-author&#x27;)) {</span>
+<span class="a">+      const t = p.textContent.replace(/\s+/g, &#x27; &#x27;).trim();</span>
+<span class="a">+      if (t) out.push(t);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  return { paragraphs: out, cover: null };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Aozora Bunko: strip the legend, the colophon, ruby readings and editorial notes. */</span>
+<span class="a">+export function aozora(raw) {</span>
+<span class="a">+  let lines = raw.replace(/\r\n/g, &#x27;\n&#x27;).split(&#x27;\n&#x27;);</span>
+<span class="a">+  const rules = lines.flatMap((l, i) =&gt; (l.startsWith(&#x27;-----&#x27;) ? [i] : []));</span>
+<span class="a">+  if (rules.length &gt;= 2) lines = lines.slice(rules[1] + 1);</span>
+<span class="a">+  const colophon = lines.findIndex((l) =&gt; l.startsWith(&#x27;底本：&#x27;));</span>
+<span class="a">+  if (colophon &gt;= 0) lines = lines.slice(0, colophon);</span>
+<span class="a">+  const paragraphs = lines</span>
+<span class="a">+    .map((l) =&gt; l.replace(/［＃[^］]*］/g, &#x27;&#x27;).replace(/《[^》]*》/g, &#x27;&#x27;).replaceAll(&#x27;｜&#x27;, &#x27;&#x27;).trim())</span>
+<span class="a">+    .filter(Boolean);</span>
+<span class="a">+  return { paragraphs, cover: null };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function plain(text) {</span>
+<span class="a">+  if (text.includes(&#x27;《&#x27;) &amp;&amp; text.includes(&#x27;底本：&#x27;)) return aozora(text);</span>
+<span class="a">+  return { paragraphs: text.replace(/\r\n/g, &#x27;\n&#x27;).split(&#x27;\n&#x27;).map((l) =&gt; l.trim()).filter(Boolean), cover: null };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ------------------------------------------------------------------ language */</span>
+<span class="a">+</span>
+<span class="a">+// The commonest little words of each language. Crude, and enough: a book is</span>
+<span class="a">+// tens of thousands of words, and the visitor can always overrule the guess.</span>
+<span class="a">+const STOPWORDS = {</span>
+<span class="a">+  en: &#x27;the and of to in that was his he it with as for had you not be her on at by which have from this&#x27;,</span>
+<span class="a">+  es: &#x27;de la que el en y a los del se las por un para con no una su al lo como más pero sus le ya&#x27;,</span>
+<span class="a">+  pt: &#x27;de a o que e do da em um para é com não uma os no se na por mais as dos como mas foi ao ele&#x27;,</span>
+<span class="a">+  fr: &#x27;de la le et les des en un du une que est pour qui dans a par plus pas au sur ne se ce il sont&#x27;,</span>
+<span class="a">+  de: &#x27;der die und in den von zu das mit sich des auf für ist im dem nicht ein eine als auch es an er&#x27;,</span>
+<span class="a">+  it: &#x27;di e il la che in a per un è del non le si con i da una dei più al come ma lo gli nel alla&#x27;,</span>
+<span class="a">+  nl: &#x27;de van het een en in is dat op te zijn voor met die niet aan er om ook als dan maar bij hij&#x27;,</span>
+<span class="a">+  sv: &#x27;och i att det som en på är av för med till den har de inte om ett han men var jag sig från&#x27;,</span>
+<span class="a">+  fi: &#x27;ja on ei että oli hän se en mutta niin kun kuin joka hänen ole sen olen mitä minä jos nyt vain&#x27;,</span>
+<span class="a">+  pl: &#x27;i w nie na z że się do to jest jak a o po ale co tak za od go był przez już tylko jego&#x27;,</span>
+<span class="a">+  tr: &#x27;bir ve bu da de için ile ne o ben gibi çok daha ama kadar sonra en var mi diye her olan&#x27;,</span>
+<span class="a">+  ru: &#x27;и в не на я что он с как а то это все она так его но да ты к у же вы за бы по только&#x27;,</span>
+<span class="a">+  uk: &#x27;і в не на я що він з як а то це все вона так його але та ти до у ж ви за би по тільки&#x27;,</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+/** Best guess at a Whisper language code for `paragraphs`, or null. */</span>
+<span class="a">+export function detectLanguage(paragraphs) {</span>
+<span class="a">+  const sample = paragraphs.join(&#x27; &#x27;).slice(0, 60000);</span>
+<span class="a">+  const count = (re) =&gt; (sample.match(re) || []).length;</span>
+<span class="a">+  const kana = count(/[぀-ヿ]/g), han = count(/[一-鿿]/g), hangul = count(/[가-힯]/g);</span>
+<span class="a">+  if (kana &gt; 50) return &#x27;ja&#x27;;</span>
+<span class="a">+  if (hangul &gt; 50) return &#x27;ko&#x27;;</span>
+<span class="a">+  if (han &gt; 200) return &#x27;zh&#x27;;</span>
+<span class="a">+  if (count(/[Ͱ-Ͽ]/g) &gt; 200) return &#x27;el&#x27;;</span>
+<span class="a">+  if (count(/[֐-׿]/g) &gt; 200) return &#x27;he&#x27;;</span>
+<span class="a">+  if (count(/[؀-ۿ]/g) &gt; 200) return &#x27;ar&#x27;;</span>
+<span class="a">+  if (count(/[฀-๿]/g) &gt; 200) return &#x27;th&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+  const words = sample.toLowerCase().match(/\p{L}+/gu) || [];</span>
+<span class="a">+  if (words.length &lt; 50) return null;</span>
+<span class="a">+  const tally = new Map();</span>
+<span class="a">+  for (const w of words) tally.set(w, (tally.get(w) || 0) + 1);</span>
+<span class="a">+  let best = null, bestScore = 0;</span>
+<span class="a">+  for (const [code, list] of Object.entries(STOPWORDS)) {</span>
+<span class="a">+    const score = list.split(&#x27; &#x27;).reduce((n, w) =&gt; n + (tally.get(w) || 0), 0);</span>
+<span class="a">+    if (score &gt; bestScore) { best = code; bestScore = score; }</span>
+<span class="a">+  }</span>
+<span class="a">+  // Fewer than one word in twelve a stopword of the winner: not one of ours.</span>
+<span class="a">+  return bestScore / words.length &gt; 0.08 ? best : null;</span>
+<span class="a">+}</span>
+diff --git a/frontend/engine/job.js b/frontend/engine/job.js
+new file mode 100644
+index 0000000..c2c6c16
+--- /dev/null
++++ b/frontend/engine/job.js
+<span class="h">@@ -0,0 +1,234 @@</span>
+<span class="a">+/* One conversion, start to finish, in this tab.</span>
+<span class="a">+ *</span>
+<span class="a">+ *   audio --ffmpeg--&gt; two-minute chunks --whisper--&gt; rough transcript</span>
+<span class="a">+ *   book  ----------&gt; paragraphs</span>
+<span class="a">+ *   transcript + paragraphs --align--&gt; subtitles (.srt)</span>
+<span class="a">+ *   cover + audio (+ subtitles) --ffmpeg--&gt; video, on request</span>
+<span class="a">+ *</span>
+<span class="a">+ * Nothing leaves the machine. The transcript is saved to IndexedDB after every</span>
+<span class="a">+ * chunk, because transcribing a book takes hours and tabs get closed: opening</span>
+<span class="a">+ * the same files again carries on from the last chunk, and aligning the same</span>
+<span class="a">+ * audio against a different edition of the book costs seconds.</span>
+<span class="a">+ */</span>
+<span class="a">+import { Media, quietestPoint, SAMPLE_RATE } from &#x27;./media.js&#x27;;</span>
+<span class="a">+import { Recogniser } from &#x27;./asr.js&#x27;;</span>
+<span class="a">+import { readBook } from &#x27;./book.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const CHUNK_SECONDS = 120;</span>
+<span class="a">+</span>
+<span class="a">+export class Cancelled extends Error { constructor() { super(&#x27;Stopped.&#x27;); } }</span>
+<span class="a">+</span>
+<span class="a">+/* ------------------------------------------------------------ saved progress */</span>
+<span class="a">+</span>
+<span class="a">+const db = () =&gt; new Promise((resolve, reject) =&gt; {</span>
+<span class="a">+  const open = indexedDB.open(&#x27;subread&#x27;, 1);</span>
+<span class="a">+  open.onupgradeneeded = () =&gt; open.result.createObjectStore(&#x27;transcripts&#x27;);</span>
+<span class="a">+  open.onsuccess = () =&gt; resolve(open.result);</span>
+<span class="a">+  open.onerror = () =&gt; reject(open.error);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+async function store(mode, fn) {</span>
+<span class="a">+  const d = await db();</span>
+<span class="a">+  return new Promise((resolve, reject) =&gt; {</span>
+<span class="a">+    const tx = d.transaction(&#x27;transcripts&#x27;, mode);</span>
+<span class="a">+    const req = fn(tx.objectStore(&#x27;transcripts&#x27;));</span>
+<span class="a">+    tx.oncomplete = () =&gt; resolve(req?.result);</span>
+<span class="a">+    tx.onerror = () =&gt; reject(tx.error);</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The same files picked again resume, whatever route they were picked by. */</span>
+<span class="a">+const keyFor = (files, language) =&gt; files.map((f) =&gt; `${f.name}|${f.size}`).join(&#x27;//&#x27;) + `#${language}`;</span>
+<span class="a">+</span>
+<span class="a">+export async function savedProgress(files, language) {</span>
+<span class="a">+  try { return (await store(&#x27;readonly&#x27;, (s) =&gt; s.get(keyFor(files, language)))) ?? null; } catch { return null; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* ------------------------------------------------------------------- the job */</span>
+<span class="a">+</span>
+<span class="a">+export class Job {</span>
+<span class="a">+  #media = null;</span>
+<span class="a">+  #paths = [];</span>
+<span class="a">+  #cancelled = false;</span>
+<span class="a">+  #book = null;</span>
+<span class="a">+</span>
+<span class="a">+  constructor({ audio, book, language, onStatus }) {</span>
+<span class="a">+    this.audio = audio;          // File[], in playback order</span>
+<span class="a">+    this.bookFile = book;        // File</span>
+<span class="a">+    this.language = language;    // Whisper code; always explicit, see asr.js</span>
+<span class="a">+    this.onStatus = onStatus ?? (() =&gt; {});</span>
+<span class="a">+    this.result = null;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  cancel() { this.#cancelled = true; }</span>
+<span class="a">+  #check() { if (this.#cancelled) throw new Cancelled(); }</span>
+<span class="a">+  #status(phase, detail, fraction, extra = {}) { this.onStatus({ phase, detail, fraction, ...extra }); }</span>
+<span class="a">+</span>
+<span class="a">+  async run() {</span>
+<span class="a">+    this.#status(&#x27;preparing&#x27;, &#x27;Reading the book&#x27;, 0);</span>
+<span class="a">+    this.#book = await readBook(this.bookFile);</span>
+<span class="a">+    if (!this.#book.paragraphs.length) throw new Error(`No text could be read from ${this.bookFile.name}.`);</span>
+<span class="a">+</span>
+<span class="a">+    this.#status(&#x27;preparing&#x27;, &#x27;Starting the audio decoder&#x27;, 0);</span>
+<span class="a">+    this.#media = await Media.open();</span>
+<span class="a">+    const parts = [];</span>
+<span class="a">+    for (const [i, file] of this.audio.entries()) {</span>
+<span class="a">+      const path = await this.#media.mount(file, `/in${i}`);</span>
+<span class="a">+      parts.push({ path, ...(await this.#media.probe(path)) });</span>
+<span class="a">+      this.#paths.push(path);</span>
+<span class="a">+    }</span>
+<span class="a">+    const total = parts.reduce((n, p) =&gt; n + p.duration, 0);</span>
+<span class="a">+</span>
+<span class="a">+    const transcript = await this.#transcribe(parts, total);</span>
+<span class="a">+    this.#check();</span>
+<span class="a">+</span>
+<span class="a">+    this.#status(&#x27;aligning&#x27;, &#x27;Matching the book to the narration&#x27;, 0.97);</span>
+<span class="a">+    const aligned = await alignInWorker(transcript, this.#book.paragraphs, this.language);</span>
+<span class="a">+    const stem = (this.audio.length &gt; 1 ? this.bookFile : this.audio[0]).name.replace(/\.[^.]+$/, &#x27;&#x27;);</span>
+<span class="a">+    this.result = {</span>
+<span class="a">+      ...aligned, stem, duration: total, parts,</span>
+<span class="a">+      srtName: `${stem}.${this.language}.srt`,</span>
+<span class="a">+      segments: transcript.length,</span>
+<span class="a">+    };</span>
+<span class="a">+    this.#status(&#x27;done&#x27;, &#x27;Done&#x27;, 1);</span>
+<span class="a">+    return this.result;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  async #transcribe(parts, total) {</span>
+<span class="a">+    const key = keyFor(this.audio, this.language);</span>
+<span class="a">+    const saved = (await savedProgress(this.audio, this.language)) ?? { doneUntil: 0, segments: [], complete: false };</span>
+<span class="a">+    if (saved.complete) return saved.segments;</span>
+<span class="a">+</span>
+<span class="a">+    this.#status(&#x27;preparing&#x27;, &#x27;Loading the speech model&#x27;, 0, { indeterminate: true });</span>
+<span class="a">+    const asr = await Recogniser.open((p) =&gt; {</span>
+<span class="a">+      if (p.total) this.#status(&#x27;preparing&#x27;, &#x27;Downloading the speech model (once)&#x27;, p.loaded / p.total * 0.02);</span>
+<span class="a">+    });</span>
+<span class="a">+    this.device = asr.device;</span>
+<span class="a">+</span>
+<span class="a">+    const resumedAt = saved.doneUntil, started = performance.now();</span>
+<span class="a">+    let base = 0;   // where the current part starts on the whole book&#x27;s clock</span>
+<span class="a">+    for (const part of parts) {</span>
+<span class="a">+      let pos = Math.max(0, saved.doneUntil - base);</span>
+<span class="a">+      while (pos &lt; part.duration - 0.05) {</span>
+<span class="a">+        this.#check();</span>
+<span class="a">+        let pcm = await this.#media.pcm(part.path, pos, CHUNK_SECONDS);</span>
+<span class="a">+        if (!pcm.length) break;</span>
+<span class="a">+        const last = pos + pcm.length / SAMPLE_RATE &gt;= part.duration - 0.5;</span>
+<span class="a">+        // Cut where the narrator pauses, so no word straddles two chunks.</span>
+<span class="a">+        if (!last) pcm = pcm.subarray(0, quietestPoint(pcm));</span>
+<span class="a">+</span>
+<span class="a">+        const at = base + pos;</span>
+<span class="a">+        saved.segments.push(...await asr.transcribe(pcm, this.language, at));</span>
+<span class="a">+        pos += pcm.length / SAMPLE_RATE;</span>
+<span class="a">+        saved.doneUntil = base + pos;</span>
+<span class="a">+        await store(&#x27;readwrite&#x27;, (s) =&gt; s.put(saved, key)).catch(() =&gt; {});</span>
+<span class="a">+</span>
+<span class="a">+        const elapsed = (performance.now() - started) / 1000;</span>
+<span class="a">+        const speed = (saved.doneUntil - resumedAt) / elapsed;</span>
+<span class="a">+        this.#status(&#x27;transcribing&#x27;, `Listening: ${clock(saved.doneUntil)} of ${clock(total)}`,</span>
+<span class="a">+          0.02 + 0.94 * saved.doneUntil / total,</span>
+<span class="a">+          { eta: elapsed &gt; 10 ? (total - saved.doneUntil) / speed : null, speed: elapsed &gt; 10 ? speed : null });</span>
+<span class="a">+      }</span>
+<span class="a">+      base += part.duration;</span>
+<span class="a">+    }</span>
+<span class="a">+    saved.complete = true;</span>
+<span class="a">+    await store(&#x27;readwrite&#x27;, (s) =&gt; s.put(saved, key)).catch(() =&gt; {});</span>
+<span class="a">+    return saved.segments;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /**</span>
+<span class="a">+   * The video, made on request: a still image over the audio.</span>
+<span class="a">+   * kind &quot;mkv&quot; carries the subtitles inside the file (MPV, VLC);</span>
+<span class="a">+   * kind &quot;mp4&quot; is clean, for YouTube, where the .srt is uploaded alongside.</span>
+<span class="a">+   *</span>
+<span class="a">+   * A still picture does not need encoding for ten hours. One minute of it is</span>
+<span class="a">+   * encoded once and then repeated by stream copy, so the cost is that of</span>
+<span class="a">+   * copying the audio - seconds, not an hour.</span>
+<span class="a">+   */</span>
+<span class="a">+  async video(kind, { coverFile, onProgress } = {}) {</span>
+<span class="a">+    const m = this.#media, r = this.result;</span>
+<span class="a">+    const still = await canvasPng(coverFile ?? this.#book.cover);</span>
+<span class="a">+    await m.write(&#x27;canvas.png&#x27;, still);</span>
+<span class="a">+    await m.run([&#x27;-loop&#x27;, &#x27;1&#x27;, &#x27;-framerate&#x27;, &#x27;1&#x27;, &#x27;-i&#x27;, &#x27;canvas.png&#x27;, &#x27;-t&#x27;, &#x27;60&#x27;,</span>
+<span class="a">+      &#x27;-c:v&#x27;, &#x27;libx264&#x27;, &#x27;-preset&#x27;, &#x27;veryfast&#x27;, &#x27;-tune&#x27;, &#x27;stillimage&#x27;, &#x27;-pix_fmt&#x27;, &#x27;yuv420p&#x27;,</span>
+<span class="a">+      &#x27;-r&#x27;, &#x27;1&#x27;, &#x27;-g&#x27;, &#x27;60&#x27;, &#x27;still.mp4&#x27;]);</span>
+<span class="a">+</span>
+<span class="a">+    let audioIn;</span>
+<span class="a">+    if (this.#paths.length === 1) audioIn = [&#x27;-i&#x27;, this.#paths[0]];</span>
+<span class="a">+    else {</span>
+<span class="a">+      const list = this.#paths.map((p) =&gt; `file &#x27;${p.replaceAll(&quot;&#x27;&quot;, &quot;&#x27;\\&#x27;&#x27;&quot;)}&#x27;`).join(&#x27;\n&#x27;);</span>
+<span class="a">+      await m.write(&#x27;parts.txt&#x27;, new TextEncoder().encode(list));</span>
+<span class="a">+      audioIn = [&#x27;-f&#x27;, &#x27;concat&#x27;, &#x27;-safe&#x27;, &#x27;0&#x27;, &#x27;-i&#x27;, &#x27;parts.txt&#x27;];</span>
+<span class="a">+    }</span>
+<span class="a">+    // Copy the audio when the container can hold it; re-encoding a whole book</span>
+<span class="a">+    // in WebAssembly is the one slow thing here, so only when there is no choice.</span>
+<span class="a">+    const copyable = kind === &#x27;mkv&#x27;</span>
+<span class="a">+      ? [&#x27;aac&#x27;, &#x27;mp3&#x27;, &#x27;opus&#x27;, &#x27;vorbis&#x27;, &#x27;flac&#x27;, &#x27;ac3&#x27;, &#x27;alac&#x27;]</span>
+<span class="a">+      : [&#x27;aac&#x27;, &#x27;mp3&#x27;, &#x27;ac3&#x27;, &#x27;alac&#x27;];</span>
+<span class="a">+    const codecs = new Set(r.parts.map((p) =&gt; p.codec));</span>
+<span class="a">+    const audioCodec = codecs.size === 1 &amp;&amp; copyable.includes([...codecs][0]) ? [&#x27;-c:a&#x27;, &#x27;copy&#x27;] : [&#x27;-c:a&#x27;, &#x27;aac&#x27;, &#x27;-b:a&#x27;, &#x27;128k&#x27;];</span>
+<span class="a">+</span>
+<span class="a">+    const out = `out.${kind}`;</span>
+<span class="a">+    const args = [&#x27;-stream_loop&#x27;, &#x27;-1&#x27;, &#x27;-i&#x27;, &#x27;still.mp4&#x27;, ...audioIn];</span>
+<span class="a">+    if (kind === &#x27;mkv&#x27;) {</span>
+<span class="a">+      await m.write(&#x27;subs.srt&#x27;, new TextEncoder().encode(r.srt));</span>
+<span class="a">+      args.push(&#x27;-f&#x27;, &#x27;srt&#x27;, &#x27;-i&#x27;, &#x27;subs.srt&#x27;, &#x27;-map&#x27;, &#x27;0:v&#x27;, &#x27;-map&#x27;, &#x27;1:a:0&#x27;, &#x27;-map&#x27;, &#x27;2:s&#x27;,</span>
+<span class="a">+        &#x27;-c:v&#x27;, &#x27;copy&#x27;, ...audioCodec, &#x27;-c:s&#x27;, &#x27;srt&#x27;, &#x27;-disposition:s:0&#x27;, &#x27;default&#x27;,</span>
+<span class="a">+        &#x27;-metadata:s:s:0&#x27;, &#x27;title=Aligned subtitles&#x27;);</span>
+<span class="a">+    } else {</span>
+<span class="a">+      args.push(&#x27;-map&#x27;, &#x27;0:v&#x27;, &#x27;-map&#x27;, &#x27;1:a:0&#x27;, &#x27;-c:v&#x27;, &#x27;copy&#x27;, ...audioCodec);</span>
+<span class="a">+    }</span>
+<span class="a">+    args.push(&#x27;-map_chapters&#x27;, &#x27;1&#x27;, &#x27;-t&#x27;, r.duration.toFixed(3), out);</span>
+<span class="a">+</span>
+<span class="a">+    try {</span>
+<span class="a">+      await m.run(args, onProgress);</span>
+<span class="a">+      const bytes = await m.read(out);</span>
+<span class="a">+      return new File([bytes], `${r.stem}.${this.language}.${kind}`,</span>
+<span class="a">+        { type: kind === &#x27;mkv&#x27; ? &#x27;video/x-matroska&#x27; : &#x27;video/mp4&#x27; });</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      for (const f of [out, &#x27;still.mp4&#x27;, &#x27;canvas.png&#x27;, &#x27;subs.srt&#x27;, &#x27;parts.txt&#x27;]) await m.remove(f);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  close() { this.#media?.close(); }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function alignInWorker(transcript, paragraphs, language) {</span>
+<span class="a">+  return new Promise((resolve, reject) =&gt; {</span>
+<span class="a">+    const worker = new Worker(new URL(&#x27;./align.worker.js&#x27;, import.meta.url), { type: &#x27;module&#x27; });</span>
+<span class="a">+    worker.onmessage = ({ data }) =&gt; {</span>
+<span class="a">+      worker.terminate();</span>
+<span class="a">+      if (data.ok) resolve(data); else reject(new Error(data.error));</span>
+<span class="a">+    };</span>
+<span class="a">+    worker.onerror = (e) =&gt; { worker.terminate(); reject(new Error(e.message || &#x27;The aligner crashed.&#x27;)); };</span>
+<span class="a">+    worker.postMessage({ transcript, paragraphs, language });</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The cover, letterboxed onto a 1920x1080 card; a plain dark card when there is none. */</span>
+<span class="a">+async function canvasPng(cover) {</span>
+<span class="a">+  const W = 1920, H = 1080;</span>
+<span class="a">+  const canvas = new OffscreenCanvas(W, H);</span>
+<span class="a">+  const ctx = canvas.getContext(&#x27;2d&#x27;);</span>
+<span class="a">+  ctx.fillStyle = &#x27;#16161a&#x27;;</span>
+<span class="a">+  ctx.fillRect(0, 0, W, H);</span>
+<span class="a">+  if (cover) {</span>
+<span class="a">+    try {</span>
+<span class="a">+      const blob = cover instanceof Blob ? cover : new Blob([cover.bytes]);</span>
+<span class="a">+      const img = await createImageBitmap(blob);</span>
+<span class="a">+      const scale = Math.min(W / img.width, H / img.height);</span>
+<span class="a">+      const w = img.width * scale, h = img.height * scale;</span>
+<span class="a">+      ctx.fillStyle = &#x27;#000&#x27;;</span>
+<span class="a">+      ctx.fillRect(0, 0, W, H);</span>
+<span class="a">+      ctx.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);</span>
+<span class="a">+    } catch { /* an image the browser cannot decode: keep the plain card */ }</span>
+<span class="a">+  }</span>
+<span class="a">+  const png = await canvas.convertToBlob({ type: &#x27;image/png&#x27; });</span>
+<span class="a">+  return new Uint8Array(await png.arrayBuffer());</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function clock(seconds) {</span>
+<span class="a">+  const s = Math.max(0, Math.floor(seconds)), pad = (v) =&gt; String(v).padStart(2, &#x27;0&#x27;);</span>
+<span class="a">+  return s &gt;= 3600 ? `${Math.floor(s / 3600)}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`</span>
+<span class="a">+    : `${Math.floor(s / 60)}:${pad(s % 60)}`;</span>
+<span class="a">+}</span>
+diff --git a/frontend/engine/media.js b/frontend/engine/media.js
+new file mode 100644
+index 0000000..7ad378c
+--- /dev/null
++++ b/frontend/engine/media.js
+<span class="h">@@ -0,0 +1,111 @@</span>
+<span class="a">+/* Reading and writing media in the browser, with ffmpeg compiled to WebAssembly.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The visitor&#x27;s file is never copied anywhere: it is mounted read-only into</span>
+<span class="a">+ * ffmpeg&#x27;s filesystem (WORKERFS), which reads straight from the File on disk.</span>
+<span class="a">+ * That is what makes a 600 MB audiobook workable - the only audio ever held in</span>
+<span class="a">+ * memory is the couple of minutes being transcribed.</span>
+<span class="a">+ *</span>
+<span class="a">+ * ffmpeg runs in its own worker; everything here is async message-passing.</span>
+<span class="a">+ */</span>
+<span class="a">+import { FFmpeg } from &#x27;/vendor/ffmpeg/index.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const CORE = new URL(&#x27;/vendor/ffmpeg/ffmpeg-core.js&#x27;, import.meta.url).href;</span>
+<span class="a">+const RATE = 16000;</span>
+<span class="a">+</span>
+<span class="a">+export class Media {</span>
+<span class="a">+  #ffmpeg = new FFmpeg();</span>
+<span class="a">+  #log = [];</span>
+<span class="a">+  #mounted = [];</span>
+<span class="a">+</span>
+<span class="a">+  /** Bytes fetched so far while the 32 MB core downloads, for a progress bar. */</span>
+<span class="a">+  static async open(onLog) {</span>
+<span class="a">+    const m = new Media();</span>
+<span class="a">+    m.#ffmpeg.on(&#x27;log&#x27;, ({ message }) =&gt; {</span>
+<span class="a">+      m.#log.push(message);</span>
+<span class="a">+      if (m.#log.length &gt; 400) m.#log.shift();</span>
+<span class="a">+      onLog?.(message);</span>
+<span class="a">+    });</span>
+<span class="a">+    await m.#ffmpeg.load({ coreURL: CORE });</span>
+<span class="a">+    return m;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /** Make `file` readable by ffmpeg at the returned path, without copying it. */</span>
+<span class="a">+  async mount(file, dir) {</span>
+<span class="a">+    await this.#ffmpeg.createDir(dir).catch(() =&gt; {});</span>
+<span class="a">+    await this.#ffmpeg.mount(&#x27;WORKERFS&#x27;, { files: [file] }, dir);</span>
+<span class="a">+    this.#mounted.push(dir);</span>
+<span class="a">+    return `${dir}/${file.name}`;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /** Duration in seconds and chapter marks, read from ffmpeg&#x27;s own banner. */</span>
+<span class="a">+  async probe(path) {</span>
+<span class="a">+    this.#log.length = 0;</span>
+<span class="a">+    await this.#ffmpeg.exec([&#x27;-hide_banner&#x27;, &#x27;-i&#x27;, path]);   // &quot;fails&quot;: no output given. Expected.</span>
+<span class="a">+    const text = this.#log.join(&#x27;\n&#x27;);</span>
+<span class="a">+    const d = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(text);</span>
+<span class="a">+    if (!d) throw new Error(&#x27;This file does not look like audio ffmpeg can read.&#x27;);</span>
+<span class="a">+    const audio = /Stream #\d+:\d+.*?: Audio: ([a-z0-9_]+)/i.exec(text);</span>
+<span class="a">+    return {</span>
+<span class="a">+      duration: (+d[1]) * 3600 + (+d[2]) * 60 + (+d[3]),</span>
+<span class="a">+      codec: audio ? audio[1].toLowerCase() : null,</span>
+<span class="a">+      chapters: [...text.matchAll(/Chapter #\d+:\d+: start ([\d.]+), end ([\d.]+)/g)]</span>
+<span class="a">+        .map((c) =&gt; ({ start: +c[1], end: +c[2] })),</span>
+<span class="a">+    };</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /** `seconds` of audio from `start`, as the 16 kHz mono float PCM the speech model takes. */</span>
+<span class="a">+  async pcm(path, start, seconds) {</span>
+<span class="a">+    const out = &#x27;chunk.f32&#x27;;</span>
+<span class="a">+    const code = await this.#ffmpeg.exec([</span>
+<span class="a">+      &#x27;-hide_banner&#x27;, &#x27;-v&#x27;, &#x27;error&#x27;,</span>
+<span class="a">+      // Tolerate damaged files: drop what cannot be decoded, keep going.</span>
+<span class="a">+      &#x27;-err_detect&#x27;, &#x27;ignore_err&#x27;, &#x27;-fflags&#x27;, &#x27;+discardcorrupt&#x27;,</span>
+<span class="a">+      &#x27;-ss&#x27;, String(start), &#x27;-t&#x27;, String(seconds), &#x27;-i&#x27;, path,</span>
+<span class="a">+      &#x27;-map&#x27;, &#x27;0:a:0&#x27;, &#x27;-vn&#x27;, &#x27;-sn&#x27;, &#x27;-ac&#x27;, &#x27;1&#x27;, &#x27;-ar&#x27;, String(RATE), &#x27;-f&#x27;, &#x27;f32le&#x27;, out,</span>
+<span class="a">+    ]);</span>
+<span class="a">+    if (code !== 0) throw new Error(`Could not decode the audio at ${Math.round(start)}s.`);</span>
+<span class="a">+    const bytes = await this.#ffmpeg.readFile(out);</span>
+<span class="a">+    await this.#ffmpeg.deleteFile(out);</span>
+<span class="a">+    return new Float32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength &gt;&gt; 2);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  async write(name, data) { await this.#ffmpeg.writeFile(name, data); }</span>
+<span class="a">+  async read(name) { return this.#ffmpeg.readFile(name); }</span>
+<span class="a">+  async remove(name) { await this.#ffmpeg.deleteFile(name).catch(() =&gt; {}); }</span>
+<span class="a">+</span>
+<span class="a">+  /** Run ffmpeg; throws with the tail of its log when it fails. */</span>
+<span class="a">+  async run(args, onProgress) {</span>
+<span class="a">+    this.#log.length = 0;</span>
+<span class="a">+    const handler = onProgress &amp;&amp; (({ progress }) =&gt; onProgress(Math.min(Math.max(progress, 0), 1)));</span>
+<span class="a">+    if (handler) this.#ffmpeg.on(&#x27;progress&#x27;, handler);</span>
+<span class="a">+    try {</span>
+<span class="a">+      const code = await this.#ffmpeg.exec([&#x27;-hide_banner&#x27;, &#x27;-y&#x27;, ...args]);</span>
+<span class="a">+      if (code !== 0) throw new Error(this.#log.slice(-3).join(&#x27; | &#x27;) || `ffmpeg exited with ${code}`);</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      if (handler) this.#ffmpeg.off(&#x27;progress&#x27;, handler);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  close() { this.#ffmpeg.terminate(); }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Where to cut a chunk: the quietest quarter second in its last few seconds,</span>
+<span class="a">+ * so that no word is split across two transcriptions.</span>
+<span class="a">+ * Returns a sample index into `pcm`.</span>
+<span class="a">+ */</span>
+<span class="a">+export function quietestPoint(pcm, searchSeconds = 12, windowSeconds = 0.25) {</span>
+<span class="a">+  const window = Math.floor(windowSeconds * RATE);</span>
+<span class="a">+  const from = Math.max(0, pcm.length - searchSeconds * RATE);</span>
+<span class="a">+  if (pcm.length - from &lt;= window * 2) return pcm.length;</span>
+<span class="a">+  let energy = 0;</span>
+<span class="a">+  for (let i = from; i &lt; from + window; i++) energy += Math.abs(pcm[i]);</span>
+<span class="a">+  let best = energy, bestAt = from;</span>
+<span class="a">+  for (let i = from; i + window &lt; pcm.length; i++) {</span>
+<span class="a">+    energy += Math.abs(pcm[i + window]) - Math.abs(pcm[i]);</span>
+<span class="a">+    if (energy &lt; best) { best = energy; bestAt = i + 1; }</span>
+<span class="a">+  }</span>
+<span class="a">+  return bestAt + (window &gt;&gt; 1);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export const SAMPLE_RATE = RATE;</span>
+diff --git a/frontend/lab.html b/frontend/lab.html
+new file mode 100644
+index 0000000..24bd965
+--- /dev/null
++++ b/frontend/lab.html
+<span class="h">@@ -0,0 +1,93 @@</span>
+<span class="a">+&lt;!DOCTYPE html&gt;</span>
+<span class="a">+&lt;meta charset=&quot;utf-8&quot;&gt;</span>
+<span class="a">+&lt;title&gt;engine lab&lt;/title&gt;</span>
+<span class="a">+&lt;body style=&quot;font:14px/1.5 ui-monospace,monospace;padding:20px;max-width:900px&quot;&gt;</span>
+<span class="a">+&lt;h3&gt;Browser engine lab&lt;/h3&gt;</span>
+<span class="a">+&lt;p&gt;Proves the client-side pieces one at a time. Not linked from the site.&lt;/p&gt;</span>
+<span class="a">+&lt;input type=&quot;file&quot; id=&quot;f&quot;&gt; &lt;button id=&quot;go&quot;&gt;run on /vendor/lab/ru.mp3&lt;/button&gt;</span>
+<span class="a">+&lt;pre id=&quot;out&quot;&gt;&lt;/pre&gt;</span>
+<span class="a">+&lt;script type=&quot;module&quot;&gt;</span>
+<span class="a">+import { Media, quietestPoint } from &#x27;/engine/media.js&#x27;;</span>
+<span class="a">+import { Recogniser, hasWebGpu } from &#x27;/engine/asr.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const out = document.getElementById(&#x27;out&#x27;);</span>
+<span class="a">+const log = (...a) =&gt; { out.textContent += a.join(&#x27; &#x27;) + &#x27;\n&#x27;; };</span>
+<span class="a">+window.lab = { done: false, error: null, results: {} };</span>
+<span class="a">+</span>
+<span class="a">+async function run(file) {</span>
+<span class="a">+  try {</span>
+<span class="a">+    log(&#x27;crossOriginIsolated:&#x27;, crossOriginIsolated, &#x27;| threads:&#x27;, navigator.hardwareConcurrency,</span>
+<span class="a">+        &#x27;| webgpu:&#x27;, await hasWebGpu());</span>
+<span class="a">+    let t = performance.now();</span>
+<span class="a">+    const media = await Media.open();</span>
+<span class="a">+    log(`ffmpeg loaded in ${((performance.now() - t) / 1000).toFixed(1)}s`);</span>
+<span class="a">+</span>
+<span class="a">+    const path = await media.mount(file, &#x27;/in&#x27;);</span>
+<span class="a">+    const info = await media.probe(path);</span>
+<span class="a">+    log(&#x27;probe:&#x27;, JSON.stringify(info));</span>
+<span class="a">+</span>
+<span class="a">+    t = performance.now();</span>
+<span class="a">+    const pcm = await media.pcm(path, 0, 60);</span>
+<span class="a">+    log(`decoded ${(pcm.length / 16000).toFixed(1)}s of audio in ${((performance.now() - t) / 1000).toFixed(2)}s;`,</span>
+<span class="a">+        &#x27;cut at&#x27;, (quietestPoint(pcm) / 16000).toFixed(2) + &#x27;s&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+    t = performance.now();</span>
+<span class="a">+    const asr = await Recogniser.open((p) =&gt; { window.lab.results.download = `${p.file} ${Math.round(p.progress)}%`; });</span>
+<span class="a">+    log(`model ready on ${asr.device} in ${((performance.now() - t) / 1000).toFixed(1)}s`);</span>
+<span class="a">+</span>
+<span class="a">+    const lang = new URLSearchParams(location.search).get(&#x27;lang&#x27;) || null;</span>
+<span class="a">+    t = performance.now();</span>
+<span class="a">+    await asr.transcribe(pcm.subarray(0, 16000 * 20), lang, 0);</span>
+<span class="a">+    log(`warm-up pass (shader compile) ${((performance.now() - t) / 1000).toFixed(1)}s, language=${lang}`);</span>
+<span class="a">+    t = performance.now();</span>
+<span class="a">+    const segments = await asr.transcribe(pcm, lang, 0);</span>
+<span class="a">+    const took = (performance.now() - t) / 1000;</span>
+<span class="a">+    log(`transcribed in ${took.toFixed(1)}s = ${(pcm.length / 16000 / took).toFixed(1)}x real time, ${segments.length} segments`);</span>
+<span class="a">+    for (const s of segments.slice(0, 8)) log(`  ${s.start.toFixed(2)}-${s.end.toFixed(2)}  ${s.text}`);</span>
+<span class="a">+    window.lab.results = { info, device: asr.device, took, segments };</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    log(&#x27;FAILED:&#x27;, e?.stack || e);</span>
+<span class="a">+    window.lab.error = String(e?.message || e);</span>
+<span class="a">+  }</span>
+<span class="a">+  window.lab.done = true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+document.getElementById(&#x27;go&#x27;).onclick = async () =&gt; {</span>
+<span class="a">+  const blob = await (await fetch(&#x27;/vendor/lab/ru.mp3&#x27;)).blob();</span>
+<span class="a">+  run(new File([blob], &#x27;ru.mp3&#x27;));</span>
+<span class="a">+};</span>
+<span class="a">+// The whole job: decode, transcribe, align, then both videos.</span>
+<span class="a">+window.fullJob = async () =&gt; {</span>
+<span class="a">+  window.lab = { done: false, error: null, results: {} };</span>
+<span class="a">+  out.textContent = &#x27;&#x27;;</span>
+<span class="a">+  try {</span>
+<span class="a">+    const { Job } = await import(&#x27;/engine/job.js&#x27;);</span>
+<span class="a">+    const { detectLanguage, readBook } = await import(&#x27;/engine/book.js&#x27;);</span>
+<span class="a">+    const get = async (n) =&gt; new File([await (await fetch(&#x27;/vendor/lab/&#x27; + n)).blob()], n);</span>
+<span class="a">+    const audio = await get(&#x27;ru.mp3&#x27;), book = await get(&#x27;moskva.epub&#x27;);</span>
+<span class="a">+    const parsed = await readBook(book);</span>
+<span class="a">+    const lang = detectLanguage(parsed.paragraphs);</span>
+<span class="a">+    log(`book: ${parsed.paragraphs.length} paragraphs, cover ${parsed.cover ? parsed.cover.name : &#x27;none&#x27;}, detected language ${lang}`);</span>
+<span class="a">+    let last = &#x27;&#x27;;</span>
+<span class="a">+    const job = new Job({ audio: [audio], book, language: lang, onStatus: (st) =&gt; {</span>
+<span class="a">+      const line = `${st.phase}: ${st.detail}`;</span>
+<span class="a">+      if (line !== last) { last = line; log(&#x27;  &#x27; + line, st.speed ? `(${st.speed.toFixed(1)}x)` : &#x27;&#x27;); }</span>
+<span class="a">+    }});</span>
+<span class="a">+    let t = performance.now();</span>
+<span class="a">+    const r = await job.run();</span>
+<span class="a">+    log(`job done in ${((performance.now() - t) / 1000).toFixed(1)}s on ${job.device}: ${r.cues.length} cues, ` +</span>
+<span class="a">+        `${(r.matchRate * 100).toFixed(0)}% matched, ${r.paragraphsDropped}/${r.paragraphsDropped + r.paragraphsUsed} paragraphs dropped`);</span>
+<span class="a">+    log(r.srt.split(&#x27;\n&#x27;).slice(0, 16).join(&#x27;\n&#x27;));</span>
+<span class="a">+    for (const kind of [&#x27;mkv&#x27;, &#x27;mp4&#x27;]) {</span>
+<span class="a">+      t = performance.now();</span>
+<span class="a">+      const file = await job.video(kind);</span>
+<span class="a">+      log(`${kind}: ${file.name} ${(file.size / 1e6).toFixed(2)} MB in ${((performance.now() - t) / 1000).toFixed(1)}s`);</span>
+<span class="a">+      window.lab.results[kind] = file;</span>
+<span class="a">+    }</span>
+<span class="a">+    window.lab.results.srt = r.srt;</span>
+<span class="a">+  } catch (e) { log(&#x27;FAILED:&#x27;, e?.stack || e); window.lab.error = String(e?.message || e); }</span>
+<span class="a">+  window.lab.done = true;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+document.getElementById(&#x27;f&#x27;).onchange = (e) =&gt; run(e.target.files[0]);</span>
+<span class="a">+&lt;/script&gt;</span>
+diff --git a/tools/fetch_vendor.py b/tools/fetch_vendor.py
+new file mode 100644
+index 0000000..1cdf69a
+--- /dev/null
++++ b/tools/fetch_vendor.py
+<span class="h">@@ -0,0 +1,88 @@</span>
+<span class="a">+&quot;&quot;&quot;Download the browser-side libraries into frontend/vendor/.</span>
+<span class="a">+</span>
+<span class="a">+Processing happens in the visitor&#x27;s browser, which needs three things that are</span>
+<span class="a">+far too big to commit: ffmpeg compiled to WebAssembly (reads any audio format,</span>
+<span class="a">+muxes the video), the ONNX runtime, and transformers.js to drive Whisper on it.</span>
+<span class="a">+They are pinned here by exact version and unpacked from the npm registry, then</span>
+<span class="a">+served from our own origin - no CDN in the page, so nothing third-party has to</span>
+<span class="a">+be trusted or kept alive, and cross-origin isolation stays simple.</span>
+<span class="a">+</span>
+<span class="a">+    python tools/fetch_vendor.py          # idempotent; run on every deploy</span>
+<span class="a">+</span>
+<span class="a">+Standard library only, on purpose: this runs on the server before anything else</span>
+<span class="a">+is installed.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import hashlib</span>
+<span class="a">+import io</span>
+<span class="a">+import json</span>
+<span class="a">+import sys</span>
+<span class="a">+import tarfile</span>
+<span class="a">+import urllib.request</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+VENDOR = Path(__file__).resolve().parent.parent / &quot;frontend&quot; / &quot;vendor&quot;</span>
+<span class="a">+</span>
+<span class="a">+# package, version, {path inside the tarball: path under vendor/}</span>
+<span class="a">+PACKAGES = [</span>
+<span class="a">+    (&quot;@ffmpeg/ffmpeg&quot;, &quot;0.12.15&quot;, {</span>
+<span class="a">+        f&quot;package/dist/esm/{name}&quot;: f&quot;ffmpeg/{name}&quot;</span>
+<span class="a">+        for name in (&quot;index.js&quot;, &quot;classes.js&quot;, &quot;const.js&quot;, &quot;errors.js&quot;, &quot;types.js&quot;, &quot;utils.js&quot;, &quot;worker.js&quot;)</span>
+<span class="a">+    }),</span>
+<span class="a">+    (&quot;@ffmpeg/core&quot;, &quot;0.12.10&quot;, {</span>
+<span class="a">+        &quot;package/dist/esm/ffmpeg-core.js&quot;: &quot;ffmpeg/ffmpeg-core.js&quot;,</span>
+<span class="a">+        &quot;package/dist/esm/ffmpeg-core.wasm&quot;: &quot;ffmpeg/ffmpeg-core.wasm&quot;,</span>
+<span class="a">+    }),</span>
+<span class="a">+    (&quot;@huggingface/transformers&quot;, &quot;4.3.0&quot;, {</span>
+<span class="a">+        &quot;package/dist/transformers.min.js&quot;: &quot;transformers/transformers.min.js&quot;,</span>
+<span class="a">+    }),</span>
+<span class="a">+    # Must be exactly the build transformers.js was made against.</span>
+<span class="a">+    (&quot;onnxruntime-web&quot;, &quot;1.31.0-dev.20260914-8d85527a0&quot;, {</span>
+<span class="a">+        f&quot;package/dist/{name}&quot;: f&quot;transformers/{name}&quot;</span>
+<span class="a">+        for name in (&quot;ort.webgpu.bundle.min.mjs&quot;, &quot;ort-wasm-simd-threaded.asyncify.mjs&quot;,</span>
+<span class="a">+                     &quot;ort-wasm-simd-threaded.asyncify.wasm&quot;)</span>
+<span class="a">+    }),</span>
+<span class="a">+]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def fetch(package: str, version: str) -&gt; bytes:</span>
+<span class="a">+    meta_url = f&quot;https://registry.npmjs.org/{package.replace(&#x27;/&#x27;, &#x27;%2F&#x27;)}/{version}&quot;</span>
+<span class="a">+    with urllib.request.urlopen(meta_url, timeout=60) as r:</span>
+<span class="a">+        dist = json.load(r)[&quot;dist&quot;]</span>
+<span class="a">+    with urllib.request.urlopen(dist[&quot;tarball&quot;], timeout=600) as r:</span>
+<span class="a">+        blob = r.read()</span>
+<span class="a">+    # The registry&#x27;s own checksum: a tampered or truncated download stops here.</span>
+<span class="a">+    if hashlib.sha1(blob).hexdigest() != dist[&quot;shasum&quot;]:</span>
+<span class="a">+        sys.exit(f&quot;{package}@{version}: checksum mismatch&quot;)</span>
+<span class="a">+    return blob</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main() -&gt; None:</span>
+<span class="a">+    stamp = VENDOR / &quot;versions.json&quot;</span>
+<span class="a">+    want = {p: v for p, v, _ in PACKAGES}</span>
+<span class="a">+    have = json.loads(stamp.read_text()) if stamp.exists() else {}</span>
+<span class="a">+</span>
+<span class="a">+    for package, version, files in PACKAGES:</span>
+<span class="a">+        targets = [VENDOR / dest for dest in files.values()]</span>
+<span class="a">+        if have.get(package) == version and all(t.exists() for t in targets):</span>
+<span class="a">+            print(f&quot;ok       {package}@{version}&quot;)</span>
+<span class="a">+            continue</span>
+<span class="a">+        print(f&quot;fetching {package}@{version}&quot;)</span>
+<span class="a">+        with tarfile.open(fileobj=io.BytesIO(fetch(package, version)), mode=&quot;r:gz&quot;) as tar:</span>
+<span class="a">+            for src, dest in files.items():</span>
+<span class="a">+                member = tar.extractfile(src)</span>
+<span class="a">+                if member is None:</span>
+<span class="a">+                    sys.exit(f&quot;{package}@{version}: {src} is not in the package&quot;)</span>
+<span class="a">+                out = VENDOR / dest</span>
+<span class="a">+                out.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+                out.write_bytes(member.read())</span>
+<span class="a">+</span>
+<span class="a">+    stamp.write_text(json.dumps(want, indent=2))</span>
+<span class="a">+    total = sum(f.stat().st_size for f in VENDOR.rglob(&quot;*&quot;) if f.is_file())</span>
+<span class="a">+    print(f&quot;vendor/ is {total / 1e6:.0f} MB&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    main()</span></pre>
+</div></body></html>

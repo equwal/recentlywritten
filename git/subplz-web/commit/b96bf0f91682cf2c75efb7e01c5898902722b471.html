@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web b96bf0f9 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit b96bf0f91682cf2c75efb7e01c5898902722b471
+equwal &lt;truex@equwal.com&gt;
+2026-09-20 17:29:04 -0700
+
+The site converts in the browser; the server keeps the books
+
+Dropping the two files no longer uploads anything. The book is read and its
+language detected in the tab, the job runs there (engine/), and only the
+finished .srt and its metadata are sent back, so history still follows the
+account to another device.
+
+The server&#x27;s part is now entitlement and record-keeping:
+  POST /api/local/jobs            may this start? (free window / credit)
+  POST /api/local/jobs/{id}/finish  keep the subtitles
+  POST /api/local/jobs/{id}/fail    hand back what the job held
+  POST /api/convert               mobi/azw3 -&gt; epub, the one format family
+                                  that needs a real parser
+Reopening the same book resumes under the job already paid for; a tab closed
+for good releases its slot or credit after 48 hours.
+
+Videos are made on request in the tab, in seconds. Paying to unlock one opens
+checkout in a new tab, since the finished job only exists in this one.
+
+</pre><pre> backend/api.py               | 175 +++++++++++++++++++
+ backend/db.py                |   3 +
+ backend/main.py              |   5 +-
+ frontend/app.js              | 390 +++++++++++++++++++++++++++----------------
+ frontend/engine/languages.js |  20 +++
+ frontend/index.html          |  30 +++-
+ frontend/style.css           |   9 +
+ tests/test_local_jobs.py     | 122 ++++++++++++++
+ 8 files changed, 607 insertions(+), 147 deletions(-)
+</pre><pre>diff --git a/backend/api.py b/backend/api.py
+index 7220f1e..437e55e 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -145,6 +145,7 @@ class JobOut(BaseModel):</span>
+     audio_duration_seconds: float | None
+     error: str | None
+     created_at: str
+<span class="a">+    local: bool = False</span>
+     tier: str = billing.FREE
+     artifacts: list[ArtifactOut] = Field(default_factory=list)
+ 
+<span class="h">@@ -189,6 +190,28 @@ class AccountOut(BaseModel):</span>
+     queue_depth: int
+ 
+ 
+<span class="a">+class LocalJobIn(BaseModel):</span>
+<span class="a">+    &quot;&quot;&quot;A conversion about to run in the visitor&#x27;s browser.&quot;&quot;&quot;</span>
+<span class="a">+    audio_filename: str = Field(max_length=512)</span>
+<span class="a">+    audio_parts: int = Field(default=1, ge=1, le=2000)</span>
+<span class="a">+    audio_bytes: int = Field(default=0, ge=0)</span>
+<span class="a">+    audio_duration_seconds: float | None = None</span>
+<span class="a">+    text_filename: str = Field(max_length=512)</span>
+<span class="a">+    language: str = Field(max_length=16)</span>
+<span class="a">+    tier: Literal[&quot;free&quot;, &quot;youtube&quot;] = &quot;free&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class LocalFinishIn(BaseModel):</span>
+<span class="a">+    # A twenty-hour book is a few megabytes of subtitles.</span>
+<span class="a">+    srt: str = Field(max_length=8_000_000)</span>
+<span class="a">+    filename: str = Field(max_length=512)</span>
+<span class="a">+    metadata: dict = Field(default_factory=dict)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class LocalFailIn(BaseModel):</span>
+<span class="a">+    error: str = Field(default=&quot;&quot;, max_length=4000)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ class EmailIn(BaseModel):
+     email: str
+ 
+<span class="h">@@ -222,6 +245,7 @@ def _job_out(job: Job, arts: list[Artifact]) -&gt; JobOut:</span>
+         audio_duration_seconds=job.audio_duration_seconds,
+         error=job.error,
+         created_at=job.created_at.isoformat(),
+<span class="a">+        local=bool(job.local),</span>
+         tier=job.tier or billing.FREE,
+         artifacts=[
+             ArtifactOut(
+<span class="h">@@ -646,6 +670,157 @@ def start_job(</span>
+     return _job_out(job, [])
+ 
+ 
+<span class="a">+# --------------------------------------------------------------------------</span>
+<span class="a">+# jobs that run in the browser</span>
+<span class="a">+# --------------------------------------------------------------------------</span>
+<span class="a">+#</span>
+<span class="a">+# The audio never reaches us. The server&#x27;s part is to say whether the job may</span>
+<span class="a">+# start (the free window, or a credit), and to keep the finished subtitles so</span>
+<span class="a">+# they are still there on another device. Nothing here can be enforced against</span>
+<span class="a">+# someone who edits the page&#x27;s JavaScript, and that is accepted: see billing.py.</span>
+<span class="a">+</span>
+<span class="a">+_LOCAL_STALE_HOURS = 48</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/local/jobs&quot;, response_model=JobOut)</span>
+<span class="a">+def start_local_job(</span>
+<span class="a">+    body: LocalJobIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    # The same book started again - a closed tab, a reload - carries on under</span>
+<span class="a">+    # the job it already paid for rather than being charged a second time.</span>
+<span class="a">+    running = (</span>
+<span class="a">+        session.query(Job)</span>
+<span class="a">+        .filter(</span>
+<span class="a">+            Job.account_id == account.id, Job.local == 1,</span>
+<span class="a">+            Job.status == JobStatus.running,</span>
+<span class="a">+            Job.audio_filename == body.audio_filename,</span>
+<span class="a">+            Job.audio_bytes == body.audio_bytes,</span>
+<span class="a">+        )</span>
+<span class="a">+        .order_by(Job.created_at.desc())</span>
+<span class="a">+        .first()</span>
+<span class="a">+    )</span>
+<span class="a">+    if running is not None:</span>
+<span class="a">+        if body.tier == billing.YOUTUBE and running.tier != billing.YOUTUBE:</span>
+<span class="a">+            try:</span>
+<span class="a">+                billing.unlock(session, account, running)</span>
+<span class="a">+            except billing.PaymentRequired as exc:</span>
+<span class="a">+                session.rollback()</span>
+<span class="a">+                raise HTTPException(402, str(exc)) from exc</span>
+<span class="a">+        running.language = body.language</span>
+<span class="a">+        session.commit()</span>
+<span class="a">+        return _job_out(running, [])</span>
+<span class="a">+</span>
+<span class="a">+    job = Job(</span>
+<span class="a">+        account_id=account.id, status=JobStatus.running, local=1,</span>
+<span class="a">+        language=body.language, splitter=&quot;browser&quot;, model=&quot;whisper-tiny&quot;,</span>
+<span class="a">+        audio_filename=body.audio_filename, text_filename=body.text_filename,</span>
+<span class="a">+        audio_parts=body.audio_parts, audio_bytes=body.audio_bytes,</span>
+<span class="a">+        audio_duration_seconds=body.audio_duration_seconds,</span>
+<span class="a">+        stage=&quot;Running in your browser&quot;, started_at=utcnow(),</span>
+<span class="a">+    )</span>
+<span class="a">+    session.add(job)</span>
+<span class="a">+    try:</span>
+<span class="a">+        billing.authorize_start(session, account, job, body.tier)</span>
+<span class="a">+    except billing.PaymentRequired as exc:</span>
+<span class="a">+        session.rollback()</span>
+<span class="a">+        raise HTTPException(402, str(exc)) from exc</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return _job_out(job, [])</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/local/jobs/{job_id}/finish&quot;, response_model=JobOut)</span>
+<span class="a">+def finish_local_job(</span>
+<span class="a">+    job_id: str,</span>
+<span class="a">+    body: LocalFinishIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    job = _load(session, account, job_id)</span>
+<span class="a">+    if not job.local or job.status != JobStatus.running:</span>
+<span class="a">+        raise HTTPException(409, f&quot;Job is already {job.status.value}.&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    import json</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    name = Path(body.filename).name or &quot;subtitles.srt&quot;</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as tmp:</span>
+<span class="a">+        for kind, filename, content in (</span>
+<span class="a">+            (&quot;srt&quot;, name, body.srt),</span>
+<span class="a">+            (&quot;metadata&quot;, &quot;metadata.json&quot;,</span>
+<span class="a">+             json.dumps({&quot;job_id&quot;: job.id, **body.metadata}, ensure_ascii=False, indent=2)),</span>
+<span class="a">+        ):</span>
+<span class="a">+            src = Path(tmp) / filename</span>
+<span class="a">+            # Bytes, not text: on Windows write_text would turn every line ending into CRLF.</span>
+<span class="a">+            src.write_bytes(content.encode(&quot;utf-8&quot;))</span>
+<span class="a">+            key = f&quot;{job.id}/{filename}&quot;</span>
+<span class="a">+            size = storage.put_file(key, src)</span>
+<span class="a">+            session.add(Artifact(job_id=job.id, kind=kind, filename=filename,</span>
+<span class="a">+                                 storage_key=key, size_bytes=size))</span>
+<span class="a">+</span>
+<span class="a">+    job.status = JobStatus.succeeded</span>
+<span class="a">+    job.stage, job.progress, job.finished_at = &quot;Done&quot;, 1.0, utcnow()</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return _job_out(job, _artifacts(session, job.id))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/local/jobs/{job_id}/fail&quot;, response_model=JobOut)</span>
+<span class="a">+def fail_local_job(</span>
+<span class="a">+    job_id: str,</span>
+<span class="a">+    body: LocalFailIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    job = _load(session, account, job_id)</span>
+<span class="a">+    if not job.local or job.status != JobStatus.running:</span>
+<span class="a">+        raise HTTPException(409, f&quot;Job is already {job.status.value}.&quot;)</span>
+<span class="a">+    job.status = JobStatus.failed</span>
+<span class="a">+    job.stage, job.error, job.finished_at = &quot;Failed&quot;, body.error or &quot;Failed in the browser.&quot;, utcnow()</span>
+<span class="a">+    # Whatever went wrong, they got nothing: the free slot or the credit goes back.</span>
+<span class="a">+    billing.refund(session, job)</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return _job_out(job, [])</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def expire_stale_local_jobs(session: Session) -&gt; int:</span>
+<span class="a">+    &quot;&quot;&quot;A tab that was closed for good never reports back. Release what it held.&quot;&quot;&quot;</span>
+<span class="a">+    from datetime import timedelta</span>
+<span class="a">+</span>
+<span class="a">+    stale = (</span>
+<span class="a">+        session.query(Job)</span>
+<span class="a">+        .filter(Job.local == 1, Job.status == JobStatus.running,</span>
+<span class="a">+                Job.created_at &lt; utcnow() - timedelta(hours=_LOCAL_STALE_HOURS))</span>
+<span class="a">+        .all()</span>
+<span class="a">+    )</span>
+<span class="a">+    for job in stale:</span>
+<span class="a">+        job.status, job.stage, job.finished_at = JobStatus.canceled, &quot;Abandoned&quot;, utcnow()</span>
+<span class="a">+        billing.refund(session, job)</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return len(stale)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/convert&quot;)</span>
+<span class="a">+async def convert_book(file: Annotated[UploadFile, File()]):</span>
+<span class="a">+    &quot;&quot;&quot;mobi / azw3 to epub. The one thing the browser cannot do for itself:</span>
+<span class="a">+    those formats need a real parser, and a book is small enough to send.&quot;&quot;&quot;</span>
+<span class="a">+    name = Path(file.filename or &quot;book&quot;).name</span>
+<span class="a">+    if not convert.needs_conversion(name):</span>
+<span class="a">+        raise HTTPException(400, &quot;That format does not need converting.&quot;)</span>
+<span class="a">+    import tempfile</span>
+<span class="a">+</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as tmp:</span>
+<span class="a">+        src = Path(tmp) / name</span>
+<span class="a">+        await _save(file, src)</span>
+<span class="a">+        try:</span>
+<span class="a">+            out = convert.to_readable(src, Path(tmp) / &quot;converted&quot;)</span>
+<span class="a">+        except convert.ConversionError as exc:</span>
+<span class="a">+            raise HTTPException(400, str(exc)) from exc</span>
+<span class="a">+        data = out.read_bytes()</span>
+<span class="a">+    return Response(data, media_type=&quot;application/epub+zip&quot;,</span>
+<span class="a">+                    headers={&quot;X-Filename&quot;: Path(name).stem + &quot;.epub&quot;})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @router.get(&quot;/jobs&quot;, response_model=list[JobOut])
+ def list_jobs(
+     account: Annotated[Account, Depends(get_account)],
+diff --git a/backend/db.py b/backend/db.py
+index 864bde4..245db7b 100644
+--- a/backend/db.py
++++ b/backend/db.py
+<span class="h">@@ -143,6 +143,9 @@ class Job(Base):</span>
+     tier: Mapped[str] = mapped_column(
+         String(16), default=&quot;free&quot;, server_default=text(&quot;&#x27;free&#x27;&quot;)
+     )
+<span class="a">+    # 1 when the work happens in the visitor&#x27;s browser and the server only</span>
+<span class="a">+    # keeps the books: nothing to queue, nothing to resume after a restart.</span>
+<span class="a">+    local: Mapped[int] = mapped_column(Integer, default=0, server_default=text(&quot;0&quot;))</span>
+     # 1 if a credit was spent on this job, so a failed run can hand it back.
+     credit_spent: Mapped[int] = mapped_column(
+         Integer, default=0, server_default=text(&quot;0&quot;)
+diff --git a/backend/main.py b/backend/main.py
+index 3fd7bc7..484ace4 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -46,7 +46,7 @@ def _requeue_interrupted() -&gt; None:</span>
+     with SessionLocal() as s:
+         stale = (
+             s.query(Job)
+<span class="d">-            .filter(Job.status.in_([JobStatus.running, JobStatus.queued]))</span>
+<span class="a">+            .filter(Job.status.in_([JobStatus.running, JobStatus.queued]), Job.local == 0)</span>
+             .all()
+         )
+         for job in stale:
+<span class="h">@@ -73,6 +73,9 @@ async def lifespan(_: FastAPI):</span>
+         &quot;on&quot; if settings.billing_enabled else &quot;off&quot;,
+     )
+     _requeue_interrupted()
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        from .api import expire_stale_local_jobs</span>
+<span class="a">+        expire_stale_local_jobs(s)</span>
+     yield
+     queue.shutdown()
+ 
+diff --git a/frontend/app.js b/frontend/app.js
+index 3905319..a8b4f96 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+<span class="h">@@ -22,6 +22,9 @@ const el = {</span>
+   signinNote: $(&#x27;signin-note&#x27;),
+   pricingDialog: $(&#x27;pricing-dialog&#x27;), pricingWhy: $(&#x27;pricing-why&#x27;),
+   plans: $(&#x27;plans&#x27;), toast: $(&#x27;toast&#x27;),
+<span class="a">+  working: $(&#x27;working&#x27;), workTitle: $(&#x27;work-title&#x27;), workBar: $(&#x27;work-bar&#x27;),</span>
+<span class="a">+  workMeta: $(&#x27;work-meta&#x27;), stop: $(&#x27;stop&#x27;), results: $(&#x27;results&#x27;),</span>
+<span class="a">+  resultFiles: $(&#x27;result-files&#x27;), another: $(&#x27;another&#x27;),</span>
+ };
+ 
+ let languages = [];
+<span class="h">@@ -73,7 +76,8 @@ async function api(path, opts = {}) {</span>
+ /* ---------------- setup ---------------- */
+ 
+ async function loadLanguages() {
+<span class="d">-  languages = await api(&#x27;/api/languages&#x27;);</span>
+<span class="a">+  // Whisper&#x27;s own list: the speech model is the only thing that cares.</span>
+<span class="a">+  ({ LANGUAGES: languages } = await import(&#x27;/engine/languages.js&#x27;));</span>
+   el.language.innerHTML = &#x27;&#x27;;
+   for (const l of languages) {
+     const o = document.createElement(&#x27;option&#x27;);
+<span class="h">@@ -95,7 +99,6 @@ function setLanguage(code) {</span>
+     el.language.appendChild(o);
+     el.language.value = code;
+   }
+<span class="d">-  updateSplitNote();</span>
+ }
+ 
+ async function refreshAccount() {
+<span class="h">@@ -227,7 +230,7 @@ function addFiles(files) {</span>
+   renderStaged();
+   if (!audio.length &amp;&amp; !text.length) return;  // an image alone is not a job
+   if (staged.audio.length &amp;&amp; staged.text) {
+<span class="d">-    uploadFiles([...staged.audio, staged.text]);</span>
+<span class="a">+    prepare();</span>
+   }
+ }
+ 
+<span class="h">@@ -281,65 +284,47 @@ document.querySelectorAll(&#x27;.slot-x&#x27;).forEach((btn) =&gt; {</span>
+   });
+ });
+ 
+<span class="d">-function uploadFiles(files) {</span>
+<span class="d">-  clearError();</span>
+<span class="d">-  const list = [...files];</span>
+<span class="a">+/* Nothing is uploaded. Once both halves are here the book is read in this tab,</span>
+<span class="a">+   its language guessed, and the visitor asked to confirm before hours of work. */</span>
+<span class="a">+const NEEDS_CONVERTING = /\.(mobi|azw|azw3|prc)$/i;</span>
+<span class="a">+const natural = new Intl.Collator(undefined, { numeric: true, sensitivity: &#x27;base&#x27; });</span>
+ 
+<span class="a">+async function prepare() {</span>
+<span class="a">+  clearError();</span>
+   el.dropzone.hidden = true;
+   el.staged.hidden = true;
+   el.confirm.hidden = true;
+   el.uploading.hidden = false;
+<span class="d">-  el.upbar.style.width = &#x27;0%&#x27;;</span>
+<span class="d">-  el.uptext.textContent = &#x27;Starting…&#x27;;</span>
+<span class="d">-</span>
+<span class="d">-  const form = new FormData();</span>
+<span class="d">-  for (const f of list) form.append(&#x27;files&#x27;, f, f.name);</span>
+<span class="d">-  if (staged.cover &amp;&amp; signedIn) form.append(&#x27;files&#x27;, staged.cover, staged.cover.name);</span>
+<span class="d">-</span>
+<span class="d">-  // XHR rather than fetch: it reports upload progress, and these files are big.</span>
+<span class="d">-  const xhr = new XMLHttpRequest();</span>
+<span class="d">-  xhr.open(&#x27;POST&#x27;, &#x27;/api/uploads&#x27;);</span>
+<span class="d">-  xhr.withCredentials = true;</span>
+<span class="d">-</span>
+<span class="d">-  xhr.upload.onprogress = (e) =&gt; {</span>
+<span class="d">-    if (!e.lengthComputable) return;</span>
+<span class="d">-    const pct = Math.round((e.loaded / e.total) * 100);</span>
+<span class="d">-    el.upbar.style.width = `${pct}%`;</span>
+<span class="d">-    el.uptext.textContent = pct &lt; 100</span>
+<span class="d">-      ? `${pct}% — ${fmtBytes(e.loaded)} of ${fmtBytes(e.total)}`</span>
+<span class="d">-      : &#x27;Analysing the book…&#x27;;</span>
+<span class="d">-  };</span>
+<span class="a">+  el.upbar.style.width = &#x27;100%&#x27;;</span>
+<span class="a">+  el.uptext.textContent = &#x27;Reading the book…&#x27;;</span>
+ 
+<span class="d">-  xhr.onload = () =&gt; {</span>
+<span class="d">-    el.uploading.hidden = true;</span>
+<span class="d">-    if (xhr.status &gt;= 200 &amp;&amp; xhr.status &lt; 300) {</span>
+<span class="d">-      try {</span>
+<span class="d">-        const body = JSON.parse(xhr.responseText);</span>
+<span class="d">-        if (body.cover_requires_sign_in) {</span>
+<span class="d">-          showError(&#x27;Your cover image was not used — that needs an account. &#x27; +</span>
+<span class="d">-                    &#x27;Everything else ran normally.&#x27;);</span>
+<span class="d">-        }</span>
+<span class="d">-        showConfirm(body);</span>
+<span class="d">-      }</span>
+<span class="d">-      catch { showError(&#x27;Server sent an unreadable response.&#x27;); resetToDrop(); }</span>
+<span class="d">-    } else {</span>
+<span class="d">-      let msg = `Upload failed (${xhr.status}).`;</span>
+<span class="d">-      try {</span>
+<span class="d">-        const b = JSON.parse(xhr.responseText);</span>
+<span class="d">-        if (b.detail) msg = typeof b.detail === &#x27;string&#x27; ? b.detail : msg;</span>
+<span class="d">-      } catch { /* keep the generic message */ }</span>
+<span class="d">-      showError(msg);</span>
+<span class="d">-      resetToDrop();</span>
+<span class="a">+  try {</span>
+<span class="a">+    const { readBook, detectLanguage } = await import(&#x27;/engine/book.js&#x27;);</span>
+<span class="a">+    let book = staged.text;</span>
+<span class="a">+    if (NEEDS_CONVERTING.test(book.name)) {</span>
+<span class="a">+      // The one thing the browser cannot do itself: Kindle formats need a real</span>
+<span class="a">+      // parser. A book is small; the audio still never leaves this machine.</span>
+<span class="a">+      el.uptext.textContent = &#x27;Converting the book to epub…&#x27;;</span>
+<span class="a">+      const form = new FormData();</span>
+<span class="a">+      form.append(&#x27;file&#x27;, book, book.name);</span>
+<span class="a">+      const res = await fetch(&#x27;/api/convert&#x27;, { method: &#x27;POST&#x27;, body: form, credentials: &#x27;same-origin&#x27; });</span>
+<span class="a">+      if (!res.ok) throw new Error((await res.json().catch(() =&gt; ({}))).detail || &#x27;Could not convert that book.&#x27;);</span>
+<span class="a">+      book = new File([await res.blob()], res.headers.get(&#x27;X-Filename&#x27;) || &#x27;book.epub&#x27;);</span>
+     }
+<span class="d">-  };</span>
+<span class="d">-</span>
+<span class="d">-  xhr.onerror = () =&gt; {</span>
+<span class="a">+    const parsed = await readBook(book);</span>
+<span class="a">+    if (!parsed.paragraphs.length) {</span>
+<span class="a">+      throw new Error(`No text could be read from ${book.name}. A scanned, image-only book cannot be aligned.`);</span>
+<span class="a">+    }</span>
+<span class="a">+    // 9.mp3 before 10.mp3: playback order is what the timeline is built from.</span>
+<span class="a">+    const audio = staged.audio.slice().sort((a, b) =&gt; natural.compare(a.name, b.name));</span>
+<span class="a">+    draft = { audio, book, cover: staged.cover, detected: detectLanguage(parsed.paragraphs) };</span>
+<span class="a">+    el.uploading.hidden = true;</span>
+<span class="a">+    showConfirm();</span>
+<span class="a">+  } catch (e) {</span>
+     el.uploading.hidden = true;
+<span class="d">-    showError(&#x27;Upload failed: lost connection to the server.&#x27;);</span>
+<span class="a">+    showError(e.message);</span>
+     resetToDrop();
+<span class="d">-  };</span>
+<span class="d">-</span>
+<span class="d">-  xhr.send(form);</span>
+<span class="a">+  }</span>
+ }
+ 
+ function resetToDrop() {
+<span class="h">@@ -348,117 +333,219 @@ function resetToDrop() {</span>
+   el.dropzone.hidden = false;
+   el.confirm.hidden = true;
+   el.uploading.hidden = true;
+<span class="a">+  el.working.hidden = true;</span>
+   el.picker.value = &#x27;&#x27;;
+ }
+ 
+ /* ---------------- confirm ---------------- */
+ 
+<span class="d">-async function showConfirm(payload) {</span>
+<span class="d">-  // The options must exist before we can select the detected language.</span>
+<span class="d">-  try { await languagesReady; } catch { /* handled at boot */ }</span>
+<span class="d">-</span>
+<span class="d">-  draft = payload.job;</span>
+<span class="d">-  const d = payload.detected;</span>
+<span class="d">-</span>
+<span class="d">-  const dur = fmtDuration(draft.audio_duration_seconds);</span>
+<span class="d">-  const bits = [</span>
+<span class="d">-    draft.audio_parts &gt; 1 ? `${draft.audio_parts} parts` : null,</span>
+<span class="d">-    fmtBytes(draft.audio_bytes),</span>
+<span class="d">-    dur,</span>
+<span class="d">-  ].filter(Boolean);</span>
+<span class="d">-  el.cAudio.innerHTML =</span>
+<span class="d">-    `${escapeHtml(draft.audio_filename)} &lt;span class=&quot;meta&quot;&gt;${bits.join(&#x27; · &#x27;)}&lt;/span&gt;`;</span>
+<span class="d">-  el.cText.textContent = draft.text_filename;</span>
+<span class="d">-</span>
+<span class="d">-  setLanguage(draft.language);</span>
+<span class="d">-</span>
+<span class="d">-  if (d.code &amp;&amp; d.supported) {</span>
+<span class="d">-    const pct = Math.round(d.confidence * 100);</span>
+<span class="d">-    el.detected.textContent = `detected ${d.name} · ${pct}%`;</span>
+<span class="d">-    el.detected.classList.toggle(&#x27;low&#x27;, d.confidence &lt; 0.7);</span>
+<span class="d">-    el.detected.hidden = false;</span>
+<span class="d">-  } else if (d.code) {</span>
+<span class="d">-    el.detected.textContent = `detected ${d.name} — not supported, pick one`;</span>
+<span class="d">-    el.detected.classList.add(&#x27;low&#x27;);</span>
+<span class="d">-    el.detected.hidden = false;</span>
+<span class="a">+async function showConfirm() {</span>
+<span class="a">+  const bytes = draft.audio.reduce((n, f) =&gt; n + f.size, 0);</span>
+<span class="a">+  const name = draft.audio.length &gt; 1</span>
+<span class="a">+    ? `${draft.audio[0].name} + ${draft.audio.length - 1} more` : draft.audio[0].name;</span>
+<span class="a">+  el.cAudio.innerHTML = `${escapeHtml(name)} &lt;span class=&quot;meta&quot;&gt;${fmtBytes(bytes)}&lt;/span&gt;`;</span>
+<span class="a">+  el.cText.textContent = draft.book.name;</span>
+<span class="a">+</span>
+<span class="a">+  if (draft.detected) {</span>
+<span class="a">+    setLanguage(draft.detected);</span>
+<span class="a">+    el.detected.textContent = &#x27;detected from the book&#x27;;</span>
+<span class="a">+    el.detected.classList.remove(&#x27;low&#x27;);</span>
+   } else {
+<span class="d">-    el.detected.hidden = true;</span>
+<span class="a">+    el.detected.textContent = &#x27;could not tell — please choose&#x27;;</span>
+<span class="a">+    el.detected.classList.add(&#x27;low&#x27;);</span>
+   }
+<span class="d">-</span>
+<span class="d">-  renderMatch(payload.match);</span>
+<span class="d">-</span>
+<span class="d">-  el.eta.textContent = draft.audio_duration_seconds</span>
+<span class="d">-    ? `Alignment usually takes a fraction of the book&#x27;s length, but on CPU it can approach it. ${dur} of audio — expect a long run.`</span>
+<span class="d">-    : &#x27;&#x27;;</span>
+<span class="d">-</span>
+<span class="a">+  el.detected.hidden = false;</span>
+<span class="a">+  el.match.hidden = true;</span>
+<span class="a">+</span>
+<span class="a">+  // Only the speech model decides how long this takes, and only the GPU</span>
+<span class="a">+  // decides how fast the speech model is. Say which it will be.</span>
+<span class="a">+  const { hasWebGpu } = await import(&#x27;/engine/asr.js&#x27;);</span>
+<span class="a">+  const gpu = await hasWebGpu();</span>
+<span class="a">+  const { savedProgress } = await import(&#x27;/engine/job.js&#x27;);</span>
+<span class="a">+  const saved = await savedProgress(draft.audio, el.language.value);</span>
+<span class="a">+  el.eta.textContent =</span>
+<span class="a">+    (saved?.complete ? &#x27;This audio was transcribed here before, so this will take seconds. &#x27;</span>
+<span class="a">+      : saved?.doneUntil ? `Picks up where it stopped, ${fmtDuration(saved.doneUntil)} in. ` : &#x27;&#x27;) +</span>
+<span class="a">+    &#x27;Everything runs in this tab: nothing is uploaded, and it has to stay open. &#x27; +</span>
+<span class="a">+    (saved?.complete ? &#x27;&#x27; : gpu ? &#x27;Expect roughly a quarter of the book\&#x27;s length.&#x27;</span>
+<span class="a">+      : &#x27;This browser has no WebGPU, so expect about the book\&#x27;s own length — Chrome or Edge on a computer with a graphics card is several times faster.&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+  el.start.textContent = saved?.doneUntil &amp;&amp; !saved.complete ? &#x27;Continue&#x27; : &#x27;Start&#x27;;</span>
+   el.confirm.hidden = false;
+   el.start.disabled = false;
+   el.confirm.scrollIntoView({ behavior: &#x27;smooth&#x27;, block: &#x27;nearest&#x27; });
+ }
+ 
+<span class="d">-/* The preflight score, using the backend&#x27;s own matching rule. A poor score is</span>
+<span class="d">-   shown but never blocks: the check samples the audio, so it can be wrong, and</span>
+<span class="d">-   it is the user&#x27;s book. */</span>
+<span class="d">-function renderMatch(m) {</span>
+<span class="d">-  if (!m || m.skipped || m.verdict === &#x27;unknown&#x27;) {</span>
+<span class="d">-    el.match.hidden = true;</span>
+<span class="d">-    el.start.textContent = &#x27;Start alignment&#x27;;</span>
+<span class="a">+el.discard.addEventListener(&#x27;click&#x27;, () =&gt; { clearError(); resetToDrop(); });</span>
+<span class="a">+</span>
+<span class="a">+/* ---------------- the job, in this tab ---------------- */</span>
+<span class="a">+</span>
+<span class="a">+let running = null;    // { job, serverId }</span>
+<span class="a">+let wakeLock = null;</span>
+<span class="a">+</span>
+<span class="a">+el.start.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+  if (!draft || running) return;</span>
+<span class="a">+  el.start.disabled = true;</span>
+<span class="a">+  clearError();</span>
+<span class="a">+  const language = el.language.value;</span>
+<span class="a">+  const tier = chosenTier();</span>
+<span class="a">+</span>
+<span class="a">+  // Ask first: the free window and credits are the server&#x27;s to say.</span>
+<span class="a">+  let registered;</span>
+<span class="a">+  try {</span>
+<span class="a">+    registered = await api(&#x27;/api/local/jobs&#x27;, {</span>
+<span class="a">+      method: &#x27;POST&#x27;,</span>
+<span class="a">+      headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+      body: JSON.stringify({</span>
+<span class="a">+        audio_filename: draft.audio.length &gt; 1 ? `${draft.audio[0].name} + ${draft.audio.length - 1} more` : draft.audio[0].name,</span>
+<span class="a">+        audio_parts: draft.audio.length,</span>
+<span class="a">+        audio_bytes: draft.audio.reduce((n, f) =&gt; n + f.size, 0),</span>
+<span class="a">+        text_filename: draft.book.name, language, tier,</span>
+<span class="a">+      }),</span>
+<span class="a">+    });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    // 402 is not an error to apologise for; it is the price list&#x27;s cue.</span>
+<span class="a">+    if (e.status === 402) openPricing(e.message); else showError(e.message);</span>
+<span class="a">+    el.start.disabled = false;</span>
+     return;
+   }
+ 
+<span class="d">-  el.match.hidden = false;</span>
+<span class="d">-  el.match.className = `match ${m.verdict}`;</span>
+<span class="d">-  el.matchBadge.textContent =</span>
+<span class="d">-    { good: &#x27;match&#x27;, marginal: &#x27;weak match&#x27;, poor: &#x27;no match&#x27; }[m.verdict] || m.verdict;</span>
+<span class="d">-  el.matchSummary.textContent = m.summary;</span>
+<span class="d">-</span>
+<span class="d">-  el.matchWarnings.innerHTML = &#x27;&#x27;;</span>
+<span class="d">-  for (const w of m.warnings || []) {</span>
+<span class="d">-    const li = document.createElement(&#x27;li&#x27;);</span>
+<span class="d">-    li.textContent = w;</span>
+<span class="d">-    el.matchWarnings.appendChild(li);</span>
+<span class="a">+  const { Job, Cancelled } = await import(&#x27;/engine/job.js&#x27;);</span>
+<span class="a">+  const job = new Job({ audio: draft.audio, book: draft.book, language, onStatus: renderWorking });</span>
+<span class="a">+  running = { job, serverId: registered.id, tier: registered.tier, cover: draft.cover };</span>
+<span class="a">+  el.confirm.hidden = true;</span>
+<span class="a">+  el.working.hidden = false;</span>
+<span class="a">+  el.results.hidden = true;</span>
+<span class="a">+  el.stop.hidden = false;</span>
+<span class="a">+  renderWorking({ phase: &#x27;preparing&#x27;, detail: &#x27;Starting&#x27;, fraction: 0 });</span>
+<span class="a">+  refreshAccount();</span>
+<span class="a">+  try { wakeLock = await navigator.wakeLock?.request(&#x27;screen&#x27;); } catch { /* not granted: fine */ }</span>
+<span class="a">+</span>
+<span class="a">+  try {</span>
+<span class="a">+    const result = await job.run();</span>
+<span class="a">+    await api(`/api/local/jobs/${registered.id}/finish`, {</span>
+<span class="a">+      method: &#x27;POST&#x27;,</span>
+<span class="a">+      headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+      body: JSON.stringify({</span>
+<span class="a">+        srt: result.srt, filename: result.srtName,</span>
+<span class="a">+        metadata: {</span>
+<span class="a">+          source: { audio_parts: draft.audio.length, text_filename: draft.book.name,</span>
+<span class="a">+                    audio_duration_seconds: result.duration },</span>
+<span class="a">+          alignment: { where: &#x27;in the browser&#x27;, device: job.device ?? &#x27;cached transcript&#x27;, model: &#x27;whisper-tiny&#x27;,</span>
+<span class="a">+                       language, mode: &#x27;forced alignment against supplied text&#x27; },</span>
+<span class="a">+          output: { filename: result.srtName, cue_count: result.cues.length,</span>
+<span class="a">+                    match_rate: result.matchRate, paragraphs_dropped: result.paragraphsDropped },</span>
+<span class="a">+        },</span>
+<span class="a">+      }),</span>
+<span class="a">+    }).catch(() =&gt; { /* the subtitles are still here to download; only the history entry is missing */ });</span>
+<span class="a">+    showResults(result);</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    const stopped = e instanceof Cancelled;</span>
+<span class="a">+    await api(`/api/local/jobs/${registered.id}/fail`, {</span>
+<span class="a">+      method: &#x27;POST&#x27;, headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+      body: JSON.stringify({ error: stopped ? &#x27;Stopped.&#x27; : String(e.message || e) }),</span>
+<span class="a">+    }).catch(() =&gt; {});</span>
+<span class="a">+    job.close();</span>
+<span class="a">+    running = null;</span>
+<span class="a">+    el.working.hidden = true;</span>
+<span class="a">+    if (stopped) { toast(&#x27;Stopped. What was transcribed is kept — the same files will carry on from there.&#x27;); el.confirm.hidden = false; el.start.disabled = false; }</span>
+<span class="a">+    else { showError(e.message || String(e)); resetToDrop(); }</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    wakeLock?.release?.().catch(() =&gt; {});</span>
+<span class="a">+    refreshAccount();</span>
+<span class="a">+    refreshJobs();</span>
+   }
+<span class="a">+});</span>
+ 
+<span class="d">-  // Make the user&#x27;s choice explicit when we expect this to fail.</span>
+<span class="d">-  el.start.textContent =</span>
+<span class="d">-    m.verdict === &#x27;poor&#x27; ? &#x27;Start anyway&#x27; : &#x27;Start alignment&#x27;;</span>
+<span class="a">+el.stop.addEventListener(&#x27;click&#x27;, () =&gt; { running?.job.cancel(); el.stop.disabled = true; });</span>
+<span class="a">+</span>
+<span class="a">+function renderWorking(st) {</span>
+<span class="a">+  el.workTitle.textContent = st.detail;</span>
+<span class="a">+  el.workBar.style.width = `${Math.round((st.fraction || 0) * 100)}%`;</span>
+<span class="a">+  el.workBar.parentElement.classList.toggle(&#x27;indeterminate&#x27;, !!st.indeterminate);</span>
+<span class="a">+  el.workMeta.textContent = [</span>
+<span class="a">+    `${Math.round((st.fraction || 0) * 100)}%`,</span>
+<span class="a">+    st.eta != null ? `about ${fmtDuration(st.eta)} left` : null,</span>
+<span class="a">+    st.speed ? `${st.speed.toFixed(1)}× real time` : null,</span>
+<span class="a">+  ].filter(Boolean).join(&#x27;  ·  &#x27;);</span>
+ }
+ 
+<span class="d">-function updateSplitNote() {</span>
+<span class="d">-  // The note comes from the server, so the UI carries no knowledge of which</span>
+<span class="d">-  // alignment backend is running or how it splits sentences.</span>
+<span class="d">-  const lang = languages.find((l) =&gt; l.code === el.language.value);</span>
+<span class="d">-  el.splitnote.textContent = (lang &amp;&amp; lang.note) || &#x27;&#x27;;</span>
+<span class="a">+function showResults(r) {</span>
+<span class="a">+  el.stop.hidden = true;</span>
+<span class="a">+  el.stop.disabled = false;</span>
+<span class="a">+  el.results.hidden = false;</span>
+<span class="a">+  const pct = Math.round(r.matchRate * 100);</span>
+<span class="a">+  el.workTitle.textContent = `Done — ${r.cues.length} lines, ${pct}% found in the book`;</span>
+<span class="a">+  el.workBar.style.width = &#x27;100%&#x27;;</span>
+<span class="a">+  el.workMeta.textContent =</span>
+<span class="a">+    (pct &lt; 80 ? &#x27;That is low: usually a different edition or translation, or the wrong language. &#x27; : &#x27;&#x27;) +</span>
+<span class="a">+    (r.paragraphsDropped ? `${r.paragraphsDropped} paragraphs of the book were never narrated (front matter, notes) and were left out.` : &#x27;&#x27;);</span>
+<span class="a">+  renderResultButtons();</span>
+ }
+ 
+<span class="d">-el.language.addEventListener(&#x27;change&#x27;, updateSplitNote);</span>
+<span class="d">-</span>
+<span class="d">-el.discard.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="d">-  if (draft) { try { await api(`/api/jobs/${draft.id}`, { method: &#x27;DELETE&#x27; }); } catch {} }</span>
+<span class="d">-  clearError();</span>
+<span class="d">-  resetToDrop();</span>
+<span class="d">-  refreshJobs();</span>
+<span class="d">-});</span>
+<span class="a">+function renderResultButtons() {</span>
+<span class="a">+  const r = running.job.result;</span>
+<span class="a">+  const paid = !account?.billing_enabled || running.tier === &#x27;youtube&#x27;;</span>
+<span class="a">+  el.resultFiles.innerHTML = &#x27;&#x27;;</span>
+<span class="a">+  const button = (label, hint, cls, onClick) =&gt; {</span>
+<span class="a">+    const b = document.createElement(&#x27;button&#x27;);</span>
+<span class="a">+    b.type = &#x27;button&#x27;; b.className = `dl ${cls}`; b.title = hint; b.textContent = label;</span>
+<span class="a">+    b.addEventListener(&#x27;click&#x27;, () =&gt; onClick(b));</span>
+<span class="a">+    el.resultFiles.appendChild(b);</span>
+<span class="a">+  };</span>
+<span class="a">+  button(&#x27;⬇ Subtitles (.srt)&#x27;, &#x27;For Hoshi Reader, or to upload alongside the YouTube video&#x27;, &#x27;&#x27;,</span>
+<span class="a">+    () =&gt; save(new File([r.srt], r.srtName, { type: &#x27;application/x-subrip&#x27; })));</span>
+<span class="a">+  button(&#x27;⬇ Video with subs built in (.mkv)&#x27;, &#x27;Subtitles inside the file, for MPV or VLC&#x27;, &#x27;&#x27;,</span>
+<span class="a">+    (b) =&gt; makeVideo(&#x27;mkv&#x27;, b));</span>
+<span class="a">+  button(paid ? &#x27;⬇ Video for YouTube (.mp4)&#x27; : &#x27;🔒 Unlock the YouTube video (.mp4)&#x27;,</span>
+<span class="a">+    paid ? &#x27;No subtitles baked in — add the .srt in YouTube Studio&#x27;</span>
+<span class="a">+      : &#x27;Part of the YouTube tier — one credit, or the unlimited plan&#x27;,</span>
+<span class="a">+    paid ? &#x27;&#x27; : &#x27;locked&#x27;, (b) =&gt; (paid ? makeVideo(&#x27;mp4&#x27;, b) : unlockRunning(b)));</span>
+<span class="a">+}</span>
+ 
+<span class="d">-el.start.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="d">-  if (!draft) return;</span>
+<span class="d">-  el.start.disabled = true;</span>
+<span class="d">-  clearError();</span>
+<span class="a">+async function makeVideo(kind, btn) {</span>
+<span class="a">+  const label = btn.textContent;</span>
+<span class="a">+  btn.disabled = true;</span>
+   try {
+<span class="d">-    await api(`/api/jobs/${draft.id}/start`, {</span>
+<span class="d">-      method: &#x27;POST&#x27;,</span>
+<span class="d">-      headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="d">-      body: JSON.stringify({ language: el.language.value, tier: chosenTier() }),</span>
+<span class="a">+    const file = await running.job.video(kind, {</span>
+<span class="a">+      coverFile: signedIn ? running.cover : null,</span>
+<span class="a">+      onProgress: (f) =&gt; { btn.textContent = `Making the ${kind}… ${Math.round(f * 100)}%`; },</span>
+     });
+<span class="d">-    resetToDrop();</span>
+<span class="d">-    refreshJobs();</span>
+<span class="a">+    save(file);</span>
+<span class="a">+  } catch (e) { showError(`Could not make the ${kind}: ${e.message}`); }</span>
+<span class="a">+  btn.textContent = label;</span>
+<span class="a">+  btn.disabled = false;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function unlockRunning(btn) {</span>
+<span class="a">+  btn.disabled = true;</span>
+<span class="a">+  try {</span>
+<span class="a">+    const j = await api(`/api/jobs/${running.serverId}/unlock`, { method: &#x27;POST&#x27; });</span>
+<span class="a">+    running.tier = j.tier;</span>
+<span class="a">+    toast(&#x27;Unlocked.&#x27;);</span>
+<span class="a">+    renderResultButtons();</span>
+     refreshAccount();
+   } catch (e) {
+<span class="d">-    // 402 is not an error to apologise for; it is the price list&#x27;s cue.</span>
+<span class="d">-    if (e.status === 402) openPricing(e.message);</span>
+<span class="d">-    else showError(e.message);</span>
+<span class="d">-    el.start.disabled = false;</span>
+<span class="a">+    if (e.status === 402) { unlockJobId = running.serverId; openPricing(e.message); } else showError(e.message);</span>
+<span class="a">+    btn.disabled = false;</span>
+   }
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function save(file) {</span>
+<span class="a">+  const a = document.createElement(&#x27;a&#x27;);</span>
+<span class="a">+  a.href = URL.createObjectURL(file);</span>
+<span class="a">+  a.download = file.name;</span>
+<span class="a">+  document.body.appendChild(a);</span>
+<span class="a">+  a.click();</span>
+<span class="a">+  a.remove();</span>
+<span class="a">+  setTimeout(() =&gt; URL.revokeObjectURL(a.href), 60_000);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+el.another.addEventListener(&#x27;click&#x27;, () =&gt; { running?.job.close(); running = null; resetToDrop(); });</span>
+<span class="a">+</span>
+<span class="a">+// Hours of work live in this tab. Make closing it a decision, not an accident.</span>
+<span class="a">+window.addEventListener(&#x27;beforeunload&#x27;, (e) =&gt; {</span>
+<span class="a">+  if (running &amp;&amp; !running.job.result) { e.preventDefault(); e.returnValue = &#x27;&#x27;; }</span>
+ });
+ 
+ /* ---------------- jobs ---------------- */
+<span class="h">@@ -473,7 +560,9 @@ function jobCard(j) {</span>
+   const li = document.createElement(&#x27;li&#x27;);
+   li.className = &#x27;job&#x27;;
+ 
+<span class="d">-  const active = j.status === &#x27;running&#x27; || j.status === &#x27;queued&#x27;;</span>
+<span class="a">+  // A browser-run job reports no progress to the server; it is either ours</span>
+<span class="a">+  // (shown above, in the working panel) or running in some other tab.</span>
+<span class="a">+  const active = !j.local &amp;&amp; (j.status === &#x27;running&#x27; || j.status === &#x27;queued&#x27;);</span>
+   const pct = Math.round(j.progress * 100);
+ 
+   const meta = [
+<span class="h">@@ -498,6 +587,9 @@ function jobCard(j) {</span>
+       &lt;div class=&quot;job-stage&quot;&gt;&lt;span&gt;${escapeHtml(j.stage)}&lt;/span&gt;&lt;span&gt;${pct}%&lt;/span&gt;&lt;/div&gt;`;
+   }
+ 
+<span class="a">+  if (j.local &amp;&amp; j.status === &#x27;running&#x27;) {</span>
+<span class="a">+    html += &#x27;&lt;div class=&quot;job-stage&quot;&gt;&lt;span&gt;Running in a browser tab&lt;/span&gt;&lt;/div&gt;&#x27;;</span>
+<span class="a">+  }</span>
+   if (j.error) html += `&lt;div class=&quot;job-err&quot;&gt;${escapeHtml(j.error)}&lt;/div&gt;`;
+ 
+   const files = j.artifacts || [];
+<span class="h">@@ -564,12 +656,12 @@ async function refreshJobs() {</span>
+   catch { return; }
+ 
+   // Drafts live in the confirm panel, not the list.
+<span class="d">-  const visible = jobs.filter((j) =&gt; j.status !== &#x27;draft&#x27;);</span>
+<span class="a">+  const visible = jobs.filter((j) =&gt; j.status !== &#x27;draft&#x27; &amp;&amp; j.id !== running?.serverId);</span>
+   el.jobsSection.hidden = visible.length === 0;
+   el.jobs.innerHTML = &#x27;&#x27;;
+   for (const j of visible) el.jobs.appendChild(jobCard(j));
+ 
+<span class="d">-  const anyActive = visible.some((j) =&gt; j.status === &#x27;running&#x27; || j.status === &#x27;queued&#x27;);</span>
+<span class="a">+  const anyActive = visible.some((j) =&gt; !j.local &amp;&amp; (j.status === &#x27;running&#x27; || j.status === &#x27;queued&#x27;));</span>
+   clearTimeout(pollTimer);
+   if (anyActive) pollTimer = setTimeout(refreshJobs, 1500);
+ }
+<span class="h">@@ -723,6 +815,14 @@ async function checkout(planId, btn) {</span>
+       headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },
+       body: JSON.stringify({ plan_id: planId, job_id: unlockJobId }),
+     });
+<span class="a">+    if (running) {</span>
+<span class="a">+      // The finished job only exists in this tab. Pay in another one.</span>
+<span class="a">+      window.open(url, &#x27;_blank&#x27;, &#x27;noopener&#x27;);</span>
+<span class="a">+      el.pricingDialog.close();</span>
+<span class="a">+      toast(&#x27;Checkout opened in a new tab. Come back here when you have paid.&#x27;, 12000);</span>
+<span class="a">+      btn.disabled = false;</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+     window.location.href = url;  // Stripe&#x27;s page; we come back via /api/billing/return
+   } catch (e) {
+     el.pricingDialog.close();
+<span class="h">@@ -805,6 +905,16 @@ async function handleArrival() {</span>
+   }
+ }
+ 
+<span class="a">+// Back from paying in the other tab: the purchase unlocked this job server-side.</span>
+<span class="a">+window.addEventListener(&#x27;focus&#x27;, async () =&gt; {</span>
+<span class="a">+  if (!running?.job.result || running.tier === &#x27;youtube&#x27;) return;</span>
+<span class="a">+  try {</span>
+<span class="a">+    const j = await api(`/api/jobs/${running.serverId}`);</span>
+<span class="a">+    if (j.tier === &#x27;youtube&#x27;) { running.tier = j.tier; renderResultButtons(); toast(&#x27;Unlocked.&#x27;); }</span>
+<span class="a">+    refreshAccount();</span>
+<span class="a">+  } catch { /* try again on the next focus */ }</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ /* ---------------- boot ---------------- */
+ 
+ (async function init() {
+diff --git a/frontend/engine/languages.js b/frontend/engine/languages.js
+new file mode 100644
+index 0000000..69ad7fb
+--- /dev/null
++++ b/frontend/engine/languages.js
+<span class="h">@@ -0,0 +1,20 @@</span>
+<span class="a">+/* The languages Whisper transcribes, by its own codes. */</span>
+<span class="a">+export const LANGUAGES = Object.entries({</span>
+<span class="a">+  af: &#x27;Afrikaans&#x27;, sq: &#x27;Albanian&#x27;, am: &#x27;Amharic&#x27;, ar: &#x27;Arabic&#x27;, hy: &#x27;Armenian&#x27;, as: &#x27;Assamese&#x27;,</span>
+<span class="a">+  az: &#x27;Azerbaijani&#x27;, ba: &#x27;Bashkir&#x27;, eu: &#x27;Basque&#x27;, be: &#x27;Belarusian&#x27;, bn: &#x27;Bengali&#x27;, bs: &#x27;Bosnian&#x27;,</span>
+<span class="a">+  br: &#x27;Breton&#x27;, bg: &#x27;Bulgarian&#x27;, my: &#x27;Burmese&#x27;, yue: &#x27;Cantonese&#x27;, ca: &#x27;Catalan&#x27;, zh: &#x27;Chinese&#x27;,</span>
+<span class="a">+  hr: &#x27;Croatian&#x27;, cs: &#x27;Czech&#x27;, da: &#x27;Danish&#x27;, nl: &#x27;Dutch&#x27;, en: &#x27;English&#x27;, et: &#x27;Estonian&#x27;,</span>
+<span class="a">+  fo: &#x27;Faroese&#x27;, fi: &#x27;Finnish&#x27;, fr: &#x27;French&#x27;, gl: &#x27;Galician&#x27;, ka: &#x27;Georgian&#x27;, de: &#x27;German&#x27;,</span>
+<span class="a">+  el: &#x27;Greek&#x27;, gu: &#x27;Gujarati&#x27;, ht: &#x27;Haitian Creole&#x27;, ha: &#x27;Hausa&#x27;, haw: &#x27;Hawaiian&#x27;, he: &#x27;Hebrew&#x27;,</span>
+<span class="a">+  hi: &#x27;Hindi&#x27;, hu: &#x27;Hungarian&#x27;, is: &#x27;Icelandic&#x27;, id: &#x27;Indonesian&#x27;, it: &#x27;Italian&#x27;, ja: &#x27;Japanese&#x27;,</span>
+<span class="a">+  jw: &#x27;Javanese&#x27;, kn: &#x27;Kannada&#x27;, kk: &#x27;Kazakh&#x27;, km: &#x27;Khmer&#x27;, ko: &#x27;Korean&#x27;, lo: &#x27;Lao&#x27;, la: &#x27;Latin&#x27;,</span>
+<span class="a">+  lv: &#x27;Latvian&#x27;, ln: &#x27;Lingala&#x27;, lt: &#x27;Lithuanian&#x27;, lb: &#x27;Luxembourgish&#x27;, mk: &#x27;Macedonian&#x27;,</span>
+<span class="a">+  mg: &#x27;Malagasy&#x27;, ms: &#x27;Malay&#x27;, ml: &#x27;Malayalam&#x27;, mt: &#x27;Maltese&#x27;, mi: &#x27;Maori&#x27;, mr: &#x27;Marathi&#x27;,</span>
+<span class="a">+  mn: &#x27;Mongolian&#x27;, ne: &#x27;Nepali&#x27;, no: &#x27;Norwegian&#x27;, nn: &#x27;Nynorsk&#x27;, oc: &#x27;Occitan&#x27;, ps: &#x27;Pashto&#x27;,</span>
+<span class="a">+  fa: &#x27;Persian&#x27;, pl: &#x27;Polish&#x27;, pt: &#x27;Portuguese&#x27;, pa: &#x27;Punjabi&#x27;, ro: &#x27;Romanian&#x27;, ru: &#x27;Russian&#x27;,</span>
+<span class="a">+  sa: &#x27;Sanskrit&#x27;, sr: &#x27;Serbian&#x27;, sn: &#x27;Shona&#x27;, sd: &#x27;Sindhi&#x27;, si: &#x27;Sinhala&#x27;, sk: &#x27;Slovak&#x27;,</span>
+<span class="a">+  sl: &#x27;Slovenian&#x27;, so: &#x27;Somali&#x27;, es: &#x27;Spanish&#x27;, su: &#x27;Sundanese&#x27;, sw: &#x27;Swahili&#x27;, sv: &#x27;Swedish&#x27;,</span>
+<span class="a">+  tl: &#x27;Tagalog&#x27;, tg: &#x27;Tajik&#x27;, ta: &#x27;Tamil&#x27;, tt: &#x27;Tatar&#x27;, te: &#x27;Telugu&#x27;, th: &#x27;Thai&#x27;, bo: &#x27;Tibetan&#x27;,</span>
+<span class="a">+  tr: &#x27;Turkish&#x27;, tk: &#x27;Turkmen&#x27;, uk: &#x27;Ukrainian&#x27;, ur: &#x27;Urdu&#x27;, uz: &#x27;Uzbek&#x27;, vi: &#x27;Vietnamese&#x27;,</span>
+<span class="a">+  cy: &#x27;Welsh&#x27;, yi: &#x27;Yiddish&#x27;, yo: &#x27;Yoruba&#x27;,</span>
+<span class="a">+}).map(([code, name]) =&gt; ({ code, name })).sort((a, b) =&gt; a.name.localeCompare(b.name));</span>
+diff --git a/frontend/index.html b/frontend/index.html
+index e39d819..9fe5dfe 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+<span class="h">@@ -4,7 +4,7 @@</span>
+ &lt;meta charset=&quot;utf-8&quot;&gt;
+ &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;
+ &lt;title&gt;SubRead — read along with your audiobook&lt;/title&gt;
+<span class="d">-&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=9&quot;&gt;</span>
+<span class="a">+&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=10&quot;&gt;</span>
+ &lt;link rel=&quot;icon&quot; href=&quot;data:image/svg+xml,&lt;svg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 100 100&#x27;&gt;&lt;text y=&#x27;.9em&#x27; font-size=&#x27;90&#x27;&gt;🎧&lt;/text&gt;&lt;/svg&gt;&quot;&gt;
+ &lt;/head&gt;
+ &lt;body&gt;
+<span class="h">@@ -31,7 +31,8 @@</span>
+     &lt;p&gt;
+       Drop in an audiobook and the ebook it was read from. You get back subtitles
+       timed to the narration, with the wording taken from your own book — not
+<span class="d">-      from a machine&#x27;s guess at what it heard.</span>
+<span class="a">+      from a machine&#x27;s guess at what it heard. It all happens in this tab:</span>
+<span class="a">+      &lt;strong&gt;your files are never uploaded&lt;/strong&gt;.</span>
+     &lt;/p&gt;
+     &lt;ul class=&quot;uses&quot;&gt;
+       &lt;li&gt;&lt;strong&gt;HoshiReader read-along&lt;/strong&gt; — the .srt timing file, to match
+<span class="h">@@ -99,7 +100,7 @@</span>
+   &lt;div id=&quot;uploading&quot; class=&quot;panel uploading&quot; hidden&gt;
+     &lt;div class=&quot;spinner&quot; aria-hidden=&quot;true&quot;&gt;&lt;/div&gt;
+     &lt;div class=&quot;up-body&quot;&gt;
+<span class="d">-      &lt;p class=&quot;up-title&quot;&gt;Uploading &amp;amp; analysing…&lt;/p&gt;</span>
+<span class="a">+      &lt;p class=&quot;up-title&quot;&gt;Getting ready…&lt;/p&gt;</span>
+       &lt;div class=&quot;bar&quot;&gt;&lt;div id=&quot;upbar&quot; class=&quot;bar-fill&quot;&gt;&lt;/div&gt;&lt;/div&gt;
+       &lt;p id=&quot;uptext&quot; class=&quot;muted small&quot;&gt;0%&lt;/p&gt;
+     &lt;/div&gt;
+<span class="h">@@ -159,7 +160,23 @@</span>
+     &lt;p class=&quot;muted small&quot; id=&quot;eta&quot;&gt;&lt;/p&gt;
+   &lt;/section&gt;
+ 
+<span class="d">-  &lt;!-- step 3: jobs --&gt;</span>
+<span class="a">+  &lt;!-- step 3: the job, running in this tab --&gt;</span>
+<span class="a">+  &lt;section id=&quot;working&quot; class=&quot;panel working&quot; hidden&gt;</span>
+<span class="a">+    &lt;p class=&quot;up-title&quot; id=&quot;work-title&quot;&gt;Starting&lt;/p&gt;</span>
+<span class="a">+    &lt;div class=&quot;bar&quot;&gt;&lt;div id=&quot;work-bar&quot; class=&quot;bar-fill&quot;&gt;&lt;/div&gt;&lt;/div&gt;</span>
+<span class="a">+    &lt;p id=&quot;work-meta&quot; class=&quot;muted small&quot;&gt;&lt;/p&gt;</span>
+<span class="a">+    &lt;div class=&quot;actions&quot;&gt;</span>
+<span class="a">+      &lt;button id=&quot;stop&quot; class=&quot;ghost&quot;&gt;Stop (progress is kept)&lt;/button&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+    &lt;div id=&quot;results&quot; hidden&gt;</span>
+<span class="a">+      &lt;div id=&quot;result-files&quot; class=&quot;job-files&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+      &lt;p class=&quot;muted small&quot;&gt;Videos are made here when you ask for them, in seconds.</span>
+<span class="a">+        They are not kept anywhere: make them before closing this tab.&lt;/p&gt;</span>
+<span class="a">+      &lt;div class=&quot;actions&quot;&gt;&lt;button id=&quot;another&quot; class=&quot;ghost&quot;&gt;Convert another book&lt;/button&gt;&lt;/div&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+  &lt;/section&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;!-- step 4: history --&gt;</span>
+   &lt;section id=&quot;jobs-section&quot; hidden&gt;
+     &lt;h2 class=&quot;section-title&quot;&gt;Your conversions&lt;/h2&gt;
+     &lt;ul id=&quot;jobs&quot; class=&quot;jobs&quot;&gt;&lt;/ul&gt;
+<span class="h">@@ -168,7 +185,8 @@</span>
+ 
+ &lt;footer&gt;
+   &lt;p class=&quot;muted small&quot;&gt;
+<span class="d">-    Alignment by &lt;a href=&quot;https://github.com/kanjieater/SubPlz&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;SubPlz&lt;/a&gt;.</span>
+<span class="a">+    Alignment method from &lt;a href=&quot;https://github.com/kanjieater/SubPlz&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;SubPlz&lt;/a&gt;;</span>
+<span class="a">+    speech model &lt;a href=&quot;https://github.com/openai/whisper&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;Whisper&lt;/a&gt;.</span>
+     Every line of text comes from the book you upload, so names and spelling stay right.
+   &lt;/p&gt;
+ &lt;/footer&gt;
+<span class="h">@@ -199,6 +217,6 @@</span>
+ 
+ &lt;div id=&quot;toast&quot; class=&quot;toast&quot; hidden role=&quot;status&quot;&gt;&lt;/div&gt;
+ 
+<span class="d">-&lt;script src=&quot;/app.js?v=9&quot;&gt;&lt;/script&gt;</span>
+<span class="a">+&lt;script type=&quot;module&quot; src=&quot;/app.js?v=10&quot;&gt;&lt;/script&gt;</span>
+ &lt;/body&gt;
+ &lt;/html&gt;
+diff --git a/frontend/style.css b/frontend/style.css
+index 831fe42..7f362c2 100644
+--- a/frontend/style.css
++++ b/frontend/style.css
+<span class="h">@@ -277,6 +277,15 @@ button.ghost:hover { color: var(--ink); border-color: var(--muted); }</span>
+ .dl.secondary { background: transparent; color: var(--muted); border-color: var(--line); }
+ .dl.secondary:hover { color: var(--ink); border-color: var(--muted); }
+ 
+<span class="a">+/* ---------- the running job ---------- */</span>
+<span class="a">+.working .up-title { margin: 0 0 10px; font-weight: 600; }</span>
+<span class="a">+.working .job-files { margin-top: 16px; }</span>
+<span class="a">+button.dl { font: inherit; font-weight: 500; cursor: pointer; border: 1px solid transparent; border-radius: 9px; }</span>
+<span class="a">+button.dl:disabled { opacity: .6; cursor: progress; }</span>
+<span class="a">+.bar.indeterminate .bar-fill { width: 35% !important; animation: slide 1.4s ease-in-out infinite; }</span>
+<span class="a">+@keyframes slide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }</span>
+<span class="a">+@media (prefers-reduced-motion: reduce) { .bar.indeterminate .bar-fill { animation: none; margin-left: 0; } }</span>
+<span class="a">+</span>
+ /* ---------- account bar ---------- */
+ .account { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+ .who { color: var(--muted); font-size: 13px; max-width: 220px;
+diff --git a/tests/test_local_jobs.py b/tests/test_local_jobs.py
+new file mode 100644
+index 0000000..b5b3dae
+--- /dev/null
++++ b/tests/test_local_jobs.py
+<span class="h">@@ -0,0 +1,122 @@</span>
+<span class="a">+&quot;&quot;&quot;Jobs that run in the visitor&#x27;s browser: the server only keeps the books.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import time</span>
+<span class="a">+from datetime import timedelta</span>
+<span class="a">+</span>
+<span class="a">+from backend import api</span>
+<span class="a">+from backend.db import Job, JobStatus, SessionLocal, utcnow</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import account_id, checkout_event, get_job_row, post_webhook</span>
+<span class="a">+</span>
+<span class="a">+BOOK = {</span>
+<span class="a">+    &quot;audio_filename&quot;: &quot;book.m4b&quot;, &quot;audio_bytes&quot;: 123456, &quot;audio_duration_seconds&quot;: 3600.0,</span>
+<span class="a">+    &quot;text_filename&quot;: &quot;book.epub&quot;, &quot;language&quot;: &quot;ja&quot;,</span>
+<span class="a">+}</span>
+<span class="a">+SRT = &quot;1\n00:00:00,000 --&gt; 00:00:01,000\nこんにちは\n\n&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def begin(client, **over):</span>
+<span class="a">+    return client.post(&quot;/api/local/jobs&quot;, json={**BOOK, **over})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def buy(client, plan=&quot;single&quot;, email=&quot;local@example.com&quot;):</span>
+<span class="a">+    sid = f&quot;cs_{time.time_ns()}&quot;</span>
+<span class="a">+    assert post_webhook(client, checkout_event(sid, account_id(client), plan, email=email)).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_free_job_runs_finishes_and_keeps_its_subtitles(client):</span>
+<span class="a">+    r = begin(client)</span>
+<span class="a">+    assert r.status_code == 200</span>
+<span class="a">+    job = r.json()</span>
+<span class="a">+    assert job[&quot;local&quot;] is True and job[&quot;status&quot;] == &quot;running&quot; and job[&quot;tier&quot;] == &quot;free&quot;</span>
+<span class="a">+</span>
+<span class="a">+    done = client.post(f&quot;/api/local/jobs/{job[&#x27;id&#x27;]}/finish&quot;,</span>
+<span class="a">+                       json={&quot;srt&quot;: SRT, &quot;filename&quot;: &quot;book.ja.srt&quot;, &quot;metadata&quot;: {&quot;cues&quot;: 1}})</span>
+<span class="a">+    assert done.status_code == 200 and done.json()[&quot;status&quot;] == &quot;succeeded&quot;</span>
+<span class="a">+    kinds = {a[&quot;kind&quot;] for a in done.json()[&quot;artifacts&quot;]}</span>
+<span class="a">+    assert kinds == {&quot;srt&quot;, &quot;metadata&quot;}</span>
+<span class="a">+</span>
+<span class="a">+    got = client.get(f&quot;/api/jobs/{job[&#x27;id&#x27;]}/files/srt&quot;)</span>
+<span class="a">+    assert got.status_code == 200 and got.content.decode(&quot;utf-8&quot;) == SRT</span>
+<span class="a">+    assert job[&quot;id&quot;] in {j[&quot;id&quot;] for j in client.get(&quot;/api/jobs&quot;).json()}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_free_window_applies_to_browser_jobs_too(client):</span>
+<span class="a">+    assert begin(client).status_code == 200</span>
+<span class="a">+    second = begin(client, audio_filename=&quot;another.m4b&quot;, audio_bytes=999)</span>
+<span class="a">+    assert second.status_code == 402</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_reopening_the_same_book_does_not_charge_twice(client):</span>
+<span class="a">+    first = begin(client).json()</span>
+<span class="a">+    again = begin(client)          # closed tab, same files</span>
+<span class="a">+    assert again.status_code == 200 and again.json()[&quot;id&quot;] == first[&quot;id&quot;]</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        assert s.query(Job).filter(Job.account_id == account_id(client)).count() == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_youtube_tier_costs_a_credit_and_a_failure_returns_it(client):</span>
+<span class="a">+    assert begin(client, tier=&quot;youtube&quot;).status_code == 402</span>
+<span class="a">+</span>
+<span class="a">+    buy(client)</span>
+<span class="a">+    r = begin(client, tier=&quot;youtube&quot;)</span>
+<span class="a">+    assert r.status_code == 200 and r.json()[&quot;tier&quot;] == &quot;youtube&quot;</span>
+<span class="a">+    assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+    failed = client.post(f&quot;/api/local/jobs/{r.json()[&#x27;id&#x27;]}/fail&quot;, json={&quot;error&quot;: &quot;GPU lost&quot;})</span>
+<span class="a">+    assert failed.status_code == 200 and failed.json()[&quot;status&quot;] == &quot;failed&quot;</span>
+<span class="a">+    assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 1</span>
+<span class="a">+    # And the free book was never touched.</span>
+<span class="a">+    assert client.get(&quot;/api/account&quot;).json()[&quot;free_remaining&quot;] == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_upgrading_a_running_free_job_to_youtube(client):</span>
+<span class="a">+    job = begin(client).json()</span>
+<span class="a">+    assert begin(client, tier=&quot;youtube&quot;).status_code == 402     # no credit yet</span>
+<span class="a">+    buy(client, email=&quot;upgrade@example.com&quot;)</span>
+<span class="a">+    up = begin(client, tier=&quot;youtube&quot;)</span>
+<span class="a">+    assert up.status_code == 200 and up.json()[&quot;id&quot;] == job[&quot;id&quot;] and up.json()[&quot;tier&quot;] == &quot;youtube&quot;</span>
+<span class="a">+    assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_finish_is_once_only_and_owner_only(client, second_client):</span>
+<span class="a">+    job = begin(client).json()</span>
+<span class="a">+    body = {&quot;srt&quot;: SRT, &quot;filename&quot;: &quot;x.srt&quot;}</span>
+<span class="a">+    assert second_client.post(f&quot;/api/local/jobs/{job[&#x27;id&#x27;]}/finish&quot;, json=body).status_code == 404</span>
+<span class="a">+    assert client.post(f&quot;/api/local/jobs/{job[&#x27;id&#x27;]}/finish&quot;, json=body).status_code == 200</span>
+<span class="a">+    assert client.post(f&quot;/api/local/jobs/{job[&#x27;id&#x27;]}/finish&quot;, json=body).status_code == 409</span>
+<span class="a">+    assert client.post(f&quot;/api/local/jobs/{job[&#x27;id&#x27;]}/fail&quot;, json={}).status_code == 409</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_filename_cannot_escape_the_job_directory(client):</span>
+<span class="a">+    job = begin(client).json()</span>
+<span class="a">+    r = client.post(f&quot;/api/local/jobs/{job[&#x27;id&#x27;]}/finish&quot;,</span>
+<span class="a">+                    json={&quot;srt&quot;: SRT, &quot;filename&quot;: &quot;../../../etc/passwd&quot;})</span>
+<span class="a">+    assert r.status_code == 200</span>
+<span class="a">+    srt = next(a for a in r.json()[&quot;artifacts&quot;] if a[&quot;kind&quot;] == &quot;srt&quot;)</span>
+<span class="a">+    assert srt[&quot;filename&quot;] == &quot;passwd&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_abandoned_jobs_release_what_they_held(client):</span>
+<span class="a">+    job = begin(client).json()</span>
+<span class="a">+    assert begin(client, audio_filename=&quot;b.m4b&quot;, audio_bytes=2).status_code == 402</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        row = s.get(Job, job[&quot;id&quot;])</span>
+<span class="a">+        row.created_at = utcnow() - timedelta(hours=72)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert api.expire_stale_local_jobs(s) &gt;= 1</span>
+<span class="a">+    assert get_job_row(job[&quot;id&quot;]).status == JobStatus.canceled</span>
+<span class="a">+    assert begin(client, audio_filename=&quot;b.m4b&quot;, audio_bytes=2).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_restart_does_not_queue_browser_jobs(client, monkeypatch):</span>
+<span class="a">+    from backend import main</span>
+<span class="a">+</span>
+<span class="a">+    job = begin(client).json()</span>
+<span class="a">+    queued = []</span>
+<span class="a">+    monkeypatch.setattr(main.queue, &quot;enqueue&quot;, queued.append)</span>
+<span class="a">+    main._requeue_interrupted()</span>
+<span class="a">+    assert job[&quot;id&quot;] not in queued</span>
+<span class="a">+    assert get_job_row(job[&quot;id&quot;]).status == JobStatus.running</span></pre>
+</div></body></html>

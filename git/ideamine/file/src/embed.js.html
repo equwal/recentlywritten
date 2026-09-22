@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/src/embed.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/embed.js (13507 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Search by meaning, and groups of ideas that are close in meaning. This follows memstate
+<a id="l2" href="#l2">2</a> // (github.com/map588/memstate): nomic-embed-text with its task prefixes, one vector for each idea
+<a id="l3" href="#l3">3</a> // that a content hash keeps current, cosine similarity with a threshold, and word search when the
+<a id="l4" href="#l4">4</a> // embedding server does not answer. The groups and the &quot;related&quot; links come from the vectors, so
+<a id="l5" href="#l5">5</a> // ideamine needs no graph database.
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> import crypto from &#x27;node:crypto&#x27;;
+<a id="l8" href="#l8">8</a> import fs from &#x27;node:fs&#x27;;
+<a id="l9" href="#l9">9</a> import path from &#x27;node:path&#x27;;
+<a id="l10" href="#l10">10</a> import * as config from &#x27;./config.js&#x27;;
+<a id="l11" href="#l11">11</a> import { home, listIdeas, load, withLock, writeAtomic } from &#x27;./store.js&#x27;;
+<a id="l12" href="#l12">12</a> import { clip, wordSet } from &#x27;./text.js&#x27;;
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> const MAX_CHARS = 1500; // the first cut; embed() halves a text again when the server says it is too long
+<a id="l15" href="#l15">15</a> const MIN_CHARS = 100;
+<a id="l16" href="#l16">16</a> const BATCH = 32;
+<a id="l17" href="#l17">17</a> 
+<a id="l18" href="#l18">18</a> /** The embedding server cannot answer. Callers then use word search. */
+<a id="l19" href="#l19">19</a> export class EmbedError extends Error {}
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> const vectorsPath = () =&gt; path.join(home(), &#x27;vectors.json&#x27;);
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> /** The text that stands for an idea: its title (when the text does not start with it), text, and tags. */
+<a id="l24" href="#l24">24</a> export function ideaText(idea) {
+<a id="l25" href="#l25">25</a>   const text = String(idea.text || &#x27;&#x27;);
+<a id="l26" href="#l26">26</a>   const title = String(idea.title || &#x27;&#x27;).replace(/…$/, &#x27;&#x27;);
+<a id="l27" href="#l27">27</a>   const head = text.startsWith(title) ? text : `${idea.title}\n${text}`;
+<a id="l28" href="#l28">28</a>   return idea.tags?.length ? `${head}\ntags: ${idea.tags.join(&#x27;, &#x27;)}` : head;
+<a id="l29" href="#l29">29</a> }
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> // nomic-embed models expect a task prefix on each side of a search. Other models get the raw text.
+<a id="l32" href="#l32">32</a> const isNomic = (model) =&gt; /^nomic-embed/i.test(model);
+<a id="l33" href="#l33">33</a> export const documentText = (model, text) =&gt; (isNomic(model) ? `search_document: ${text}` : text);
+<a id="l34" href="#l34">34</a> export const queryText = (model, text) =&gt; (isNomic(model) ? `search_query: ${text}` : text);
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> /** Base64 of the vector as little-endian float32, the form that data.json and vectors.json use. */
+<a id="l37" href="#l37">37</a> export function encodeVec(vec) {
+<a id="l38" href="#l38">38</a>   const buf = Buffer.alloc(vec.length * 4);
+<a id="l39" href="#l39">39</a>   for (let i = 0; i &lt; vec.length; i++) buf.writeFloatLE(vec[i], i * 4);
+<a id="l40" href="#l40">40</a>   return buf.toString(&#x27;base64&#x27;);
+<a id="l41" href="#l41">41</a> }
+<a id="l42" href="#l42">42</a> 
+<a id="l43" href="#l43">43</a> export function decodeVec(b64) {
+<a id="l44" href="#l44">44</a>   const buf = Buffer.from(b64, &#x27;base64&#x27;);
+<a id="l45" href="#l45">45</a>   const vec = new Float32Array(buf.length &gt;&gt; 2);
+<a id="l46" href="#l46">46</a>   for (let i = 0; i &lt; vec.length; i++) vec[i] = buf.readFloatLE(i * 4);
+<a id="l47" href="#l47">47</a>   return vec;
+<a id="l48" href="#l48">48</a> }
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a> /** The vector scaled to length 1. */
+<a id="l51" href="#l51">51</a> export function unit(values) {
+<a id="l52" href="#l52">52</a>   const vec = Float32Array.from(values);
+<a id="l53" href="#l53">53</a>   let sum = 0;
+<a id="l54" href="#l54">54</a>   for (const x of vec) sum += x * x;
+<a id="l55" href="#l55">55</a>   const norm = Math.sqrt(sum);
+<a id="l56" href="#l56">56</a>   if (!norm || !Number.isFinite(norm)) throw new EmbedError(&#x27;the embedding server returned an empty vector&#x27;);
+<a id="l57" href="#l57">57</a>   for (let i = 0; i &lt; vec.length; i++) vec[i] /= norm;
+<a id="l58" href="#l58">58</a>   return vec;
+<a id="l59" href="#l59">59</a> }
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> /** Cosine similarity of two unit vectors. */
+<a id="l62" href="#l62">62</a> export function cosine(a, b) {
+<a id="l63" href="#l63">63</a>   let sum = 0;
+<a id="l64" href="#l64">64</a>   for (let i = 0; i &lt; a.length; i++) sum += a[i] * b[i];
+<a id="l65" href="#l65">65</a>   return sum;
+<a id="l66" href="#l66">66</a> }
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> /** Cut at a code point, never inside a surrogate pair. */
+<a id="l69" href="#l69">69</a> const cut = (text, max) =&gt; (text.length &lt;= max ? text : [...text].slice(0, max).join(&#x27;&#x27;));
+<a id="l70" href="#l70">70</a> 
+<a id="l71" href="#l71">71</a> async function post(texts, { url, model, timeoutMs }) {
+<a id="l72" href="#l72">72</a>   const endpoint = `${url.replace(/\/+$/, &#x27;&#x27;)}/embeddings`;
+<a id="l73" href="#l73">73</a>   let res;
+<a id="l74" href="#l74">74</a>   try {
+<a id="l75" href="#l75">75</a>     res = await fetch(endpoint, {
+<a id="l76" href="#l76">76</a>       method: &#x27;POST&#x27;,
+<a id="l77" href="#l77">77</a>       headers: { &#x27;content-type&#x27;: &#x27;application/json&#x27; },
+<a id="l78" href="#l78">78</a>       body: JSON.stringify({ model, input: texts }),
+<a id="l79" href="#l79">79</a>       signal: AbortSignal.timeout(timeoutMs),
+<a id="l80" href="#l80">80</a>     });
+<a id="l81" href="#l81">81</a>   } catch (e) {
+<a id="l82" href="#l82">82</a>     const why = e.name === &#x27;TimeoutError&#x27; ? `no answer in ${timeoutMs / 1000} s` : e.cause?.code || e.cause?.message || e.message;
+<a id="l83" href="#l83">83</a>     throw new EmbedError(`cannot reach ${endpoint} (${why})`);
+<a id="l84" href="#l84">84</a>   }
+<a id="l85" href="#l85">85</a>   const body = await res.text();
+<a id="l86" href="#l86">86</a>   if (!res.ok) {
+<a id="l87" href="#l87">87</a>     const err = new EmbedError(`${endpoint} answered ${res.status}: ${clip(body, 160)}`);
+<a id="l88" href="#l88">88</a>     err.tooLong = /too large|too long|context/i.test(body);
+<a id="l89" href="#l89">89</a>     throw err;
+<a id="l90" href="#l90">90</a>   }
+<a id="l91" href="#l91">91</a>   let data;
+<a id="l92" href="#l92">92</a>   try {
+<a id="l93" href="#l93">93</a>     data = JSON.parse(body).data;
+<a id="l94" href="#l94">94</a>   } catch {
+<a id="l95" href="#l95">95</a>     data = null;
+<a id="l96" href="#l96">96</a>   }
+<a id="l97" href="#l97">97</a>   if (!Array.isArray(data) || data.length !== texts.length) {
+<a id="l98" href="#l98">98</a>     throw new EmbedError(`${endpoint} did not return ${texts.length} embeddings: ${clip(body, 160)}`);
+<a id="l99" href="#l99">99</a>   }
+<a id="l100" href="#l100">100</a>   return [...data].sort((a, b) =&gt; a.index - b.index).map((d) =&gt; unit(d.embedding));
+<a id="l101" href="#l101">101</a> }
+<a id="l102" href="#l102">102</a> 
+<a id="l103" href="#l103">103</a> /**
+<a id="l104" href="#l104">104</a>  * Unit vectors for the texts, with the document or the query prefix. When the server says that a
+<a id="l105" href="#l105">105</a>  * text is too long, it embeds the texts one at a time and halves each text that is still too long.
+<a id="l106" href="#l106">106</a>  */
+<a id="l107" href="#l107">107</a> export async function embed(texts, { query = false, timeoutMs = 30000 } = {}) {
+<a id="l108" href="#l108">108</a>   const url = config.get(&#x27;embed_url&#x27;);
+<a id="l109" href="#l109">109</a>   const model = config.get(&#x27;embed_model&#x27;);
+<a id="l110" href="#l110">110</a>   const wrap = (t) =&gt; (query ? queryText(model, t) : documentText(model, t));
+<a id="l111" href="#l111">111</a>   const first = texts.map((t) =&gt; cut(String(t), MAX_CHARS));
+<a id="l112" href="#l112">112</a>   try {
+<a id="l113" href="#l113">113</a>     return await post(first.map(wrap), { url, model, timeoutMs });
+<a id="l114" href="#l114">114</a>   } catch (e) {
+<a id="l115" href="#l115">115</a>     if (!e.tooLong) throw e;
+<a id="l116" href="#l116">116</a>   }
+<a id="l117" href="#l117">117</a>   const out = [];
+<a id="l118" href="#l118">118</a>   for (let text of first) {
+<a id="l119" href="#l119">119</a>     for (;;) {
+<a id="l120" href="#l120">120</a>       try {
+<a id="l121" href="#l121">121</a>         out.push((await post([wrap(text)], { url, model, timeoutMs }))[0]);
+<a id="l122" href="#l122">122</a>         break;
+<a id="l123" href="#l123">123</a>       } catch (e) {
+<a id="l124" href="#l124">124</a>         if (!e.tooLong || text.length &lt;= MIN_CHARS) throw e;
+<a id="l125" href="#l125">125</a>         text = cut(text, Math.floor([...text].length / 2));
+<a id="l126" href="#l126">126</a>       }
+<a id="l127" href="#l127">127</a>     }
+<a id="l128" href="#l128">128</a>   }
+<a id="l129" href="#l129">129</a>   return out;
+<a id="l130" href="#l130">130</a> }
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a> const hashOf = (model, text) =&gt; crypto.createHash(&#x27;sha256&#x27;).update(`${model}\n${text}`).digest(&#x27;hex&#x27;).slice(0, 16);
+<a id="l133" href="#l133">133</a> 
+<a id="l134" href="#l134">134</a> function readVectors(model) {
+<a id="l135" href="#l135">135</a>   try {
+<a id="l136" href="#l136">136</a>     const file = JSON.parse(fs.readFileSync(vectorsPath(), &#x27;utf8&#x27;));
+<a id="l137" href="#l137">137</a>     return file.model === model &amp;&amp; file.items ? file.items : {};
+<a id="l138" href="#l138">138</a>   } catch {
+<a id="l139" href="#l139">139</a>     return {};
+<a id="l140" href="#l140">140</a>   }
+<a id="l141" href="#l141">141</a> }
+<a id="l142" href="#l142">142</a> 
+<a id="l143" href="#l143">143</a> /** Add vectors to the cache. Vectors of deleted ideas go, so a deleted idea leaves nothing behind. */
+<a id="l144" href="#l144">144</a> function saveVectors(model, entries) {
+<a id="l145" href="#l145">145</a>   withLock(() =&gt; {
+<a id="l146" href="#l146">146</a>     const live = new Set(load().ideas.map((i) =&gt; String(i.id)));
+<a id="l147" href="#l147">147</a>     const items = Object.fromEntries(Object.entries(readVectors(model)).filter(([id]) =&gt; live.has(id)));
+<a id="l148" href="#l148">148</a>     for (const [id, item] of entries) if (live.has(String(id))) items[id] = item;
+<a id="l149" href="#l149">149</a>     writeAtomic(vectorsPath(), JSON.stringify({ model, items }) + &#x27;\n&#x27;);
+<a id="l150" href="#l150">150</a>   });
+<a id="l151" href="#l151">151</a> }
+<a id="l152" href="#l152">152</a> 
+<a id="l153" href="#l153">153</a> /** A vector for each idea. Only new and changed ideas go to the server; the others come from the cache. */
+<a id="l154" href="#l154">154</a> export async function vectorsFor(ideas, { timeoutMs } = {}) {
+<a id="l155" href="#l155">155</a>   const model = config.get(&#x27;embed_model&#x27;);
+<a id="l156" href="#l156">156</a>   const cached = readVectors(model);
+<a id="l157" href="#l157">157</a>   const vectors = new Map();
+<a id="l158" href="#l158">158</a>   const todo = [];
+<a id="l159" href="#l159">159</a>   for (const idea of ideas) {
+<a id="l160" href="#l160">160</a>     const text = ideaText(idea);
+<a id="l161" href="#l161">161</a>     const hash = hashOf(model, text);
+<a id="l162" href="#l162">162</a>     if (cached[idea.id]?.hash === hash) vectors.set(idea.id, decodeVec(cached[idea.id].vec));
+<a id="l163" href="#l163">163</a>     else todo.push({ id: idea.id, text, hash });
+<a id="l164" href="#l164">164</a>   }
+<a id="l165" href="#l165">165</a>   for (let i = 0; i &lt; todo.length; i += BATCH) {
+<a id="l166" href="#l166">166</a>     const part = todo.slice(i, i + BATCH);
+<a id="l167" href="#l167">167</a>     const vecs = await embed(part.map((t) =&gt; t.text), { timeoutMs });
+<a id="l168" href="#l168">168</a>     part.forEach((t, k) =&gt; vectors.set(t.id, vecs[k]));
+<a id="l169" href="#l169">169</a>     saveVectors(model, part.map((t, k) =&gt; [t.id, { hash: t.hash, vec: encodeVec(vecs[k]) }]));
+<a id="l170" href="#l170">170</a>   }
+<a id="l171" href="#l171">171</a>   return vectors;
+<a id="l172" href="#l172">172</a> }
+<a id="l173" href="#l173">173</a> 
+<a id="l174" href="#l174">174</a> /**
+<a id="l175" href="#l175">175</a>  * Groups of ideas that are close in meaning, by average-linkage clustering: two groups join while
+<a id="l176" href="#l176">176</a>  * the mean similarity of the pairs across them is at least `threshold`. The ids are sorted first,
+<a id="l177" href="#l177">177</a>  * so the order of the input does not change the result. Only groups of 2 or more ideas are returned.
+<a id="l178" href="#l178">178</a>  */
+<a id="l179" href="#l179">179</a> export function groupIds(ids, vectors, threshold) {
+<a id="l180" href="#l180">180</a>   const sorted = [...new Set(ids)].sort((a, b) =&gt; a - b);
+<a id="l181" href="#l181">181</a>   const n = sorted.length;
+<a id="l182" href="#l182">182</a>   // sum[i][j]: sum of the similarities of all pairs across clusters i and j.
+<a id="l183" href="#l183">183</a>   const sum = sorted.map((a) =&gt; sorted.map((b) =&gt; cosine(vectors.get(a), vectors.get(b))));
+<a id="l184" href="#l184">184</a>   const clusters = sorted.map((id) =&gt; [id]);
+<a id="l185" href="#l185">185</a>   const alive = new Array(n).fill(true);
+<a id="l186" href="#l186">186</a>   for (;;) {
+<a id="l187" href="#l187">187</a>     let best = -Infinity;
+<a id="l188" href="#l188">188</a>     let pair = null;
+<a id="l189" href="#l189">189</a>     for (let i = 0; i &lt; n; i++) {
+<a id="l190" href="#l190">190</a>       if (!alive[i]) continue;
+<a id="l191" href="#l191">191</a>       for (let j = i + 1; j &lt; n; j++) {
+<a id="l192" href="#l192">192</a>         if (!alive[j]) continue;
+<a id="l193" href="#l193">193</a>         const avg = sum[i][j] / (clusters[i].length * clusters[j].length);
+<a id="l194" href="#l194">194</a>         if (avg &gt; best) {
+<a id="l195" href="#l195">195</a>           best = avg;
+<a id="l196" href="#l196">196</a>           pair = [i, j];
+<a id="l197" href="#l197">197</a>         }
+<a id="l198" href="#l198">198</a>       }
+<a id="l199" href="#l199">199</a>     }
+<a id="l200" href="#l200">200</a>     if (!pair || best &lt; threshold) break;
+<a id="l201" href="#l201">201</a>     const [i, j] = pair;
+<a id="l202" href="#l202">202</a>     clusters[i] = [...clusters[i], ...clusters[j]].sort((a, b) =&gt; a - b);
+<a id="l203" href="#l203">203</a>     alive[j] = false;
+<a id="l204" href="#l204">204</a>     for (let k = 0; k &lt; n; k++) {
+<a id="l205" href="#l205">205</a>       sum[i][k] += sum[j][k];
+<a id="l206" href="#l206">206</a>       sum[k][i] = sum[i][k];
+<a id="l207" href="#l207">207</a>     }
+<a id="l208" href="#l208">208</a>   }
+<a id="l209" href="#l209">209</a>   return clusters.filter((c, i) =&gt; alive[i] &amp;&amp; c.length &gt; 1);
+<a id="l210" href="#l210">210</a> }
+<a id="l211" href="#l211">211</a> 
+<a id="l212" href="#l212">212</a> // Words that many ideas use and that say little about a group (&quot;Add full support for ...&quot;).
+<a id="l213" href="#l213">213</a> const LABEL_SKIP = new Set(
+<a id="l214" href="#l214">214</a>   &#x27;add added also app apps better build built fix full idea ideas made need new nicer now should support want work&#x27;.split(&#x27; &#x27;),
+<a id="l215" href="#l215">215</a> );
+<a id="l216" href="#l216">216</a> 
+<a id="l217" href="#l217">217</a> /** A few words that the ideas of a group share and other ideas do not, most distinctive first. */
+<a id="l218" href="#l218">218</a> export function groupLabel(members, all) {
+<a id="l219" href="#l219">219</a>   const words = (idea) =&gt; [...wordSet(`${idea.title} ${idea.text} ${(idea.tags || []).join(&#x27; &#x27;)}`)].filter((w) =&gt; !LABEL_SKIP.has(w));
+<a id="l220" href="#l220">220</a>   const count = (ideas) =&gt; {
+<a id="l221" href="#l221">221</a>     const df = new Map();
+<a id="l222" href="#l222">222</a>     for (const idea of ideas) for (const w of words(idea)) df.set(w, (df.get(w) || 0) + 1);
+<a id="l223" href="#l223">223</a>     return df;
+<a id="l224" href="#l224">224</a>   };
+<a id="l225" href="#l225">225</a>   const inside = count(members);
+<a id="l226" href="#l226">226</a>   const overall = count(all);
+<a id="l227" href="#l227">227</a>   const best = [...inside]
+<a id="l228" href="#l228">228</a>     .filter(([, n]) =&gt; n &gt;= 2)
+<a id="l229" href="#l229">229</a>     .map(([w, n]) =&gt; [w, (n / members.length) * Math.log((all.length + 1) / (overall.get(w) || 1))])
+<a id="l230" href="#l230">230</a>     .sort((a, b) =&gt; b[1] - a[1] || a[0].localeCompare(b[0]))
+<a id="l231" href="#l231">231</a>     .slice(0, 3)
+<a id="l232" href="#l232">232</a>     .map(([w]) =&gt; w);
+<a id="l233" href="#l233">233</a>   return best.length ? best.join(&#x27; · &#x27;) : clip(members[0].title, 40);
+<a id="l234" href="#l234">234</a> }
+<a id="l235" href="#l235">235</a> 
+<a id="l236" href="#l236">236</a> /** Groups for these ideas: [{ ids, label }], the biggest first. Throws EmbedError when the server does not answer. */
+<a id="l237" href="#l237">237</a> export async function groupIdeas(ideas, { threshold = config.get(&#x27;group_threshold&#x27;), vectors = null, timeoutMs } = {}) {
+<a id="l238" href="#l238">238</a>   vectors ||= await vectorsFor(ideas, { timeoutMs });
+<a id="l239" href="#l239">239</a>   const byId = new Map(ideas.map((i) =&gt; [i.id, i]));
+<a id="l240" href="#l240">240</a>   return groupIds(ideas.map((i) =&gt; i.id), vectors, threshold)
+<a id="l241" href="#l241">241</a>     .map((ids) =&gt; ({ ids, label: groupLabel(ids.map((id) =&gt; byId.get(id)), ideas) }))
+<a id="l242" href="#l242">242</a>     .sort((a, b) =&gt; b.ids.length - a.ids.length || a.ids[0] - b.ids[0]);
+<a id="l243" href="#l243">243</a> }
+<a id="l244" href="#l244">244</a> 
+<a id="l245" href="#l245">245</a> /** The `k` ideas closest to idea `id`, with a similarity of at least `threshold`. */
+<a id="l246" href="#l246">246</a> export function nearest(id, ids, vectors, { k = 3, threshold = 0 } = {}) {
+<a id="l247" href="#l247">247</a>   const own = vectors.get(id);
+<a id="l248" href="#l248">248</a>   if (!own) return [];
+<a id="l249" href="#l249">249</a>   return ids
+<a id="l250" href="#l250">250</a>     .filter((other) =&gt; other !== id &amp;&amp; vectors.has(other))
+<a id="l251" href="#l251">251</a>     .map((other) =&gt; ({ id: other, score: Math.round(cosine(own, vectors.get(other)) * 1000) / 1000 }))
+<a id="l252" href="#l252">252</a>     .filter((r) =&gt; r.score &gt;= threshold)
+<a id="l253" href="#l253">253</a>     .sort((a, b) =&gt; b.score - a.score || a.id - b.id)
+<a id="l254" href="#l254">254</a>     .slice(0, k);
+<a id="l255" href="#l255">255</a> }
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> /** Word search for when meaning search is not available: more query words found ranks higher. */
+<a id="l258" href="#l258">258</a> function byWords(ideas, query) {
+<a id="l259" href="#l259">259</a>   const words = [...wordSet(query)];
+<a id="l260" href="#l260">260</a>   if (!words.length) words.push(...String(query).toLowerCase().split(/\s+/).filter(Boolean));
+<a id="l261" href="#l261">261</a>   return ideas
+<a id="l262" href="#l262">262</a>     .map((idea) =&gt; {
+<a id="l263" href="#l263">263</a>       const hay = `${ideaText(idea)}\n${idea.triage?.brief || &#x27;&#x27;}`.toLowerCase();
+<a id="l264" href="#l264">264</a>       return { idea, score: words.filter((w) =&gt; hay.includes(w)).length / words.length };
+<a id="l265" href="#l265">265</a>     })
+<a id="l266" href="#l266">266</a>     .filter((r) =&gt; r.score &gt; 0)
+<a id="l267" href="#l267">267</a>     .sort((a, b) =&gt; b.score - a.score || b.idea.id - a.idea.id);
+<a id="l268" href="#l268">268</a> }
+<a id="l269" href="#l269">269</a> 
+<a id="l270" href="#l270">270</a> /**
+<a id="l271" href="#l271">271</a>  * Ideas like the query, best first: { mode: &#x27;meaning&#x27; | &#x27;words&#x27;, results: [{ idea, score }], note }.
+<a id="l272" href="#l272">272</a>  * When the embedding server does not answer, it falls back to word search and says why in `note`.
+<a id="l273" href="#l273">273</a>  */
+<a id="l274" href="#l274">274</a> export async function find(db, query, { filter = &#x27;all&#x27;, project = null, limit = 10, threshold, timeoutMs = 8000 } = {}) {
+<a id="l275" href="#l275">275</a>   const ideas = listIdeas(db, { filter, project });
+<a id="l276" href="#l276">276</a>   threshold ??= config.get(&#x27;search_threshold&#x27;);
+<a id="l277" href="#l277">277</a>   try {
+<a id="l278" href="#l278">278</a>     const vectors = await vectorsFor(ideas, { timeoutMs });
+<a id="l279" href="#l279">279</a>     const [q] = await embed([query], { query: true, timeoutMs });
+<a id="l280" href="#l280">280</a>     const results = ideas
+<a id="l281" href="#l281">281</a>       .map((idea) =&gt; ({ idea, score: cosine(q, vectors.get(idea.id)) }))
+<a id="l282" href="#l282">282</a>       .filter((r) =&gt; r.score &gt;= threshold)
+<a id="l283" href="#l283">283</a>       .sort((a, b) =&gt; b.score - a.score || a.idea.id - b.idea.id);
+<a id="l284" href="#l284">284</a>     return { mode: &#x27;meaning&#x27;, results: limit ? results.slice(0, limit) : results, note: &#x27;&#x27; };
+<a id="l285" href="#l285">285</a>   } catch (e) {
+<a id="l286" href="#l286">286</a>     if (!(e instanceof EmbedError)) throw e;
+<a id="l287" href="#l287">287</a>     const results = byWords(ideas, query);
+<a id="l288" href="#l288">288</a>     return { mode: &#x27;words&#x27;, results: limit ? results.slice(0, limit) : results, note: e.message };
+<a id="l289" href="#l289">289</a>   }
+<a id="l290" href="#l290">290</a> }
+<a id="l291" href="#l291">291</a> 
+<a id="l292" href="#l292">292</a> /** Percentile `p` (0 to 1) of sorted numbers. */
+<a id="l293" href="#l293">293</a> const percentile = (sorted, p) =&gt; sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+<a id="l294" href="#l294">294</a> 
+<a id="l295" href="#l295">295</a> /**
+<a id="l296" href="#l296">296</a>  * Embed every idea that has no current vector, then describe the set, like memstate&#x27;s `embed
+<a id="l297" href="#l297">297</a>  * status`: coverage, the nearest-neighbour similarity of each idea, and how many ideas the
+<a id="l298" href="#l298">298</a>  * thresholds keep. Use it to set group_threshold and search_threshold for a new model.
+<a id="l299" href="#l299">299</a>  */
+<a id="l300" href="#l300">300</a> export async function status(db, { timeoutMs } = {}) {
+<a id="l301" href="#l301">301</a>   const url = config.get(&#x27;embed_url&#x27;);
+<a id="l302" href="#l302">302</a>   const model = config.get(&#x27;embed_model&#x27;);
+<a id="l303" href="#l303">303</a>   const groupThreshold = config.get(&#x27;group_threshold&#x27;);
+<a id="l304" href="#l304">304</a>   const lines = [`model ${model} at ${url}`];
+<a id="l305" href="#l305">305</a>   const vectors = await vectorsFor(db.ideas, { timeoutMs });
+<a id="l306" href="#l306">306</a>   const ids = db.ideas.map((i) =&gt; i.id);
+<a id="l307" href="#l307">307</a>   const dim = vectors.size ? vectors.values().next().value.length : 0;
+<a id="l308" href="#l308">308</a>   lines.push(`vectors ${vectors.size}/${ids.length}${dim ? `, ${dim} dimensions` : &#x27;&#x27;} · ${vectorsPath()}`);
+<a id="l309" href="#l309">309</a>   if (ids.length &gt; 1) {
+<a id="l310" href="#l310">310</a>     const nn = ids.map((id) =&gt; nearest(id, ids, vectors, { k: 1 })[0]?.score ?? 0).sort((a, b) =&gt; a - b);
+<a id="l311" href="#l311">311</a>     const p = (x) =&gt; percentile(nn, x).toFixed(2);
+<a id="l312" href="#l312">312</a>     lines.push(`nearest neighbour similarity: p10 ${p(0.1)} · p50 ${p(0.5)} · p90 ${p(0.9)} · max ${nn[nn.length - 1].toFixed(2)}`);
+<a id="l313" href="#l313">313</a>     const groups = groupIds(ids, vectors, groupThreshold);
+<a id="l314" href="#l314">314</a>     const grouped = groups.reduce((n, g) =&gt; n + g.length, 0);
+<a id="l315" href="#l315">315</a>     lines.push(`group_threshold ${groupThreshold}: ${groups.length} groups hold ${grouped} of ${ids.length} ideas`);
+<a id="l316" href="#l316">316</a>   }
+<a id="l317" href="#l317">317</a>   return lines.join(&#x27;\n&#x27;);
+<a id="l318" href="#l318">318</a> }</pre>
+</div></body></html>

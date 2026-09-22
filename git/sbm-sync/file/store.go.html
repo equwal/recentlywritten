@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync/store.go - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>store.go (9840 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package main
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import (
+<a id="l4" href="#l4">4</a> 	&quot;crypto/rand&quot;
+<a id="l5" href="#l5">5</a> 	&quot;crypto/sha256&quot;
+<a id="l6" href="#l6">6</a> 	&quot;encoding/hex&quot;
+<a id="l7" href="#l7">7</a> 	&quot;encoding/json&quot;
+<a id="l8" href="#l8">8</a> 	&quot;errors&quot;
+<a id="l9" href="#l9">9</a> 	&quot;io/fs&quot;
+<a id="l10" href="#l10">10</a> 	&quot;net/mail&quot;
+<a id="l11" href="#l11">11</a> 	&quot;os&quot;
+<a id="l12" href="#l12">12</a> 	&quot;path/filepath&quot;
+<a id="l13" href="#l13">13</a> 	&quot;regexp&quot;
+<a id="l14" href="#l14">14</a> 	&quot;sort&quot;
+<a id="l15" href="#l15">15</a> 	&quot;strings&quot;
+<a id="l16" href="#l16">16</a> 	&quot;sync&quot;
+<a id="l17" href="#l17">17</a> 	&quot;time&quot;
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> 	&quot;golang.org/x/crypto/bcrypt&quot;
+<a id="l20" href="#l20">20</a> )
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> const (
+<a id="l23" href="#l23">23</a> 	maxTokens   = 20 // sign-ins kept per account; the oldest goes first
+<a id="l24" href="#l24">24</a> 	maxVersions = 50 // versions of the bookmark file kept per account
+<a id="l25" href="#l25">25</a> )
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> var (
+<a id="l28" href="#l28">28</a> 	errTaken    = errors.New(&quot;an account with this email exists already&quot;)
+<a id="l29" href="#l29">29</a> 	errEmail    = errors.New(&quot;this is not an email address&quot;)
+<a id="l30" href="#l30">30</a> 	errPassword = errors.New(&quot;the password must have 8 to 72 characters&quot;)
+<a id="l31" href="#l31">31</a> 	errWrong    = errors.New(&quot;wrong email or password&quot;)
+<a id="l32" href="#l32">32</a> 	errGone     = errors.New(&quot;the account does not exist&quot;)
+<a id="l33" href="#l33">33</a> 	hashName    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+<a id="l34" href="#l34">34</a> )
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> // Account is one user. The file of the user is in files/&lt;ID&gt;.
+<a id="l37" href="#l37">37</a> type Account struct {
+<a id="l38" href="#l38">38</a> 	ID       string    `json:&quot;id&quot;`
+<a id="l39" href="#l39">39</a> 	Email    string    `json:&quot;email&quot;`
+<a id="l40" href="#l40">40</a> 	Hash     string    `json:&quot;hash&quot;` // bcrypt hash of the password
+<a id="l41" href="#l41">41</a> 	Created  time.Time `json:&quot;created&quot;`
+<a id="l42" href="#l42">42</a> 	Tokens   []string  `json:&quot;tokens&quot;` // SHA-256 of each sign-in token
+<a id="l43" href="#l43">43</a> 	Customer string    `json:&quot;customer,omitempty&quot;`
+<a id="l44" href="#l44">44</a> 	Status   string    `json:&quot;status,omitempty&quot;`    // of the Stripe subscription
+<a id="l45" href="#l45">45</a> 	StatusAt int64     `json:&quot;status_at,omitempty&quot;` // time of the Stripe event that set Status
+<a id="l46" href="#l46">46</a> }
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> // Store keeps the accounts in one JSON file, accounts.json, and the versions
+<a id="l49" href="#l49">49</a> // of each bookmark file in files/&lt;account ID&gt;/&lt;SHA-256 of the text&gt;. The file
+<a id="l50" href="#l50">50</a> // HEAD beside the versions names the current one.
+<a id="l51" href="#l51">51</a> type Store struct {
+<a id="l52" href="#l52">52</a> 	dir      string
+<a id="l53" href="#l53">53</a> 	mu       sync.Mutex // for the maps, the accounts and accounts.json
+<a id="l54" href="#l54">54</a> 	accounts map[string]*Account
+<a id="l55" href="#l55">55</a> 	byEmail  map[string]*Account
+<a id="l56" href="#l56">56</a> 	byToken  map[string]*Account
+<a id="l57" href="#l57">57</a> 	locks    map[string]*sync.Mutex // one for the files of each account
+<a id="l58" href="#l58">58</a> }
+<a id="l59" href="#l59">59</a> 
+<a id="l60" href="#l60">60</a> func openStore(dir string) (*Store, error) {
+<a id="l61" href="#l61">61</a> 	if err := os.MkdirAll(filepath.Join(dir, &quot;files&quot;), 0o700); err != nil {
+<a id="l62" href="#l62">62</a> 		return nil, err
+<a id="l63" href="#l63">63</a> 	}
+<a id="l64" href="#l64">64</a> 	s := &amp;Store{
+<a id="l65" href="#l65">65</a> 		dir:      dir,
+<a id="l66" href="#l66">66</a> 		accounts: map[string]*Account{},
+<a id="l67" href="#l67">67</a> 		byEmail:  map[string]*Account{},
+<a id="l68" href="#l68">68</a> 		byToken:  map[string]*Account{},
+<a id="l69" href="#l69">69</a> 		locks:    map[string]*sync.Mutex{},
+<a id="l70" href="#l70">70</a> 	}
+<a id="l71" href="#l71">71</a> 	b, err := os.ReadFile(filepath.Join(dir, &quot;accounts.json&quot;))
+<a id="l72" href="#l72">72</a> 	if errors.Is(err, fs.ErrNotExist) {
+<a id="l73" href="#l73">73</a> 		return s, nil
+<a id="l74" href="#l74">74</a> 	} else if err != nil {
+<a id="l75" href="#l75">75</a> 		return nil, err
+<a id="l76" href="#l76">76</a> 	}
+<a id="l77" href="#l77">77</a> 	var list []*Account
+<a id="l78" href="#l78">78</a> 	if err := json.Unmarshal(b, &amp;list); err != nil {
+<a id="l79" href="#l79">79</a> 		return nil, err
+<a id="l80" href="#l80">80</a> 	}
+<a id="l81" href="#l81">81</a> 	for _, a := range list {
+<a id="l82" href="#l82">82</a> 		s.index(a)
+<a id="l83" href="#l83">83</a> 	}
+<a id="l84" href="#l84">84</a> 	return s, nil
+<a id="l85" href="#l85">85</a> }
+<a id="l86" href="#l86">86</a> 
+<a id="l87" href="#l87">87</a> func (s *Store) index(a *Account) {
+<a id="l88" href="#l88">88</a> 	s.accounts[a.ID] = a
+<a id="l89" href="#l89">89</a> 	s.byEmail[a.Email] = a
+<a id="l90" href="#l90">90</a> 	for _, t := range a.Tokens {
+<a id="l91" href="#l91">91</a> 		s.byToken[t] = a
+<a id="l92" href="#l92">92</a> 	}
+<a id="l93" href="#l93">93</a> }
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a> // save writes accounts.json. The caller holds s.mu.
+<a id="l96" href="#l96">96</a> func (s *Store) save() error {
+<a id="l97" href="#l97">97</a> 	list := make([]*Account, 0, len(s.accounts))
+<a id="l98" href="#l98">98</a> 	for _, a := range s.accounts {
+<a id="l99" href="#l99">99</a> 		list = append(list, a)
+<a id="l100" href="#l100">100</a> 	}
+<a id="l101" href="#l101">101</a> 	sort.Slice(list, func(i, j int) bool { return list[i].Created.Before(list[j].Created) })
+<a id="l102" href="#l102">102</a> 	b, err := json.MarshalIndent(list, &quot;&quot;, &quot;\t&quot;)
+<a id="l103" href="#l103">103</a> 	if err != nil {
+<a id="l104" href="#l104">104</a> 		return err
+<a id="l105" href="#l105">105</a> 	}
+<a id="l106" href="#l106">106</a> 	return writeFile(filepath.Join(s.dir, &quot;accounts.json&quot;), b)
+<a id="l107" href="#l107">107</a> }
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a> // writeFile replaces a file in one step: a crash leaves the old file or the
+<a id="l110" href="#l110">110</a> // new one, never a part of one.
+<a id="l111" href="#l111">111</a> func writeFile(name string, data []byte) error {
+<a id="l112" href="#l112">112</a> 	tmp := name + &quot;.tmp&quot;
+<a id="l113" href="#l113">113</a> 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+<a id="l114" href="#l114">114</a> 	if err != nil {
+<a id="l115" href="#l115">115</a> 		return err
+<a id="l116" href="#l116">116</a> 	}
+<a id="l117" href="#l117">117</a> 	_, err = f.Write(data)
+<a id="l118" href="#l118">118</a> 	if err == nil {
+<a id="l119" href="#l119">119</a> 		err = f.Sync()
+<a id="l120" href="#l120">120</a> 	}
+<a id="l121" href="#l121">121</a> 	if cerr := f.Close(); err == nil {
+<a id="l122" href="#l122">122</a> 		err = cerr
+<a id="l123" href="#l123">123</a> 	}
+<a id="l124" href="#l124">124</a> 	if err != nil {
+<a id="l125" href="#l125">125</a> 		os.Remove(tmp)
+<a id="l126" href="#l126">126</a> 		return err
+<a id="l127" href="#l127">127</a> 	}
+<a id="l128" href="#l128">128</a> 	return os.Rename(tmp, name)
+<a id="l129" href="#l129">129</a> }
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a> func random(n int) string {
+<a id="l132" href="#l132">132</a> 	b := make([]byte, n)
+<a id="l133" href="#l133">133</a> 	if _, err := rand.Read(b); err != nil {
+<a id="l134" href="#l134">134</a> 		panic(err) // crypto/rand does not fail on supported systems
+<a id="l135" href="#l135">135</a> 	}
+<a id="l136" href="#l136">136</a> 	return hex.EncodeToString(b)
+<a id="l137" href="#l137">137</a> }
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a> func digest(s string) string {
+<a id="l140" href="#l140">140</a> 	sum := sha256.Sum256([]byte(s))
+<a id="l141" href="#l141">141</a> 	return hex.EncodeToString(sum[:])
+<a id="l142" href="#l142">142</a> }
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> // cleanEmail gives the email address in the form that the store keeps.
+<a id="l145" href="#l145">145</a> func cleanEmail(email string) (string, error) {
+<a id="l146" href="#l146">146</a> 	email = strings.ToLower(strings.TrimSpace(email))
+<a id="l147" href="#l147">147</a> 	a, err := mail.ParseAddress(email)
+<a id="l148" href="#l148">148</a> 	if err != nil || a.Name != &quot;&quot; || a.Address != email || len(email) &gt; 254 {
+<a id="l149" href="#l149">149</a> 		return &quot;&quot;, errEmail
+<a id="l150" href="#l150">150</a> 	}
+<a id="l151" href="#l151">151</a> 	return email, nil
+<a id="l152" href="#l152">152</a> }
+<a id="l153" href="#l153">153</a> 
+<a id="l154" href="#l154">154</a> func (s *Store) signup(email, password string) (*Account, error) {
+<a id="l155" href="#l155">155</a> 	email, err := cleanEmail(email)
+<a id="l156" href="#l156">156</a> 	if err != nil {
+<a id="l157" href="#l157">157</a> 		return nil, err
+<a id="l158" href="#l158">158</a> 	}
+<a id="l159" href="#l159">159</a> 	if len(password) &lt; 8 || len(password) &gt; 72 {
+<a id="l160" href="#l160">160</a> 		return nil, errPassword
+<a id="l161" href="#l161">161</a> 	}
+<a id="l162" href="#l162">162</a> 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+<a id="l163" href="#l163">163</a> 	if err != nil {
+<a id="l164" href="#l164">164</a> 		return nil, err
+<a id="l165" href="#l165">165</a> 	}
+<a id="l166" href="#l166">166</a> 	s.mu.Lock()
+<a id="l167" href="#l167">167</a> 	defer s.mu.Unlock()
+<a id="l168" href="#l168">168</a> 	if s.byEmail[email] != nil {
+<a id="l169" href="#l169">169</a> 		return nil, errTaken
+<a id="l170" href="#l170">170</a> 	}
+<a id="l171" href="#l171">171</a> 	a := &amp;Account{ID: random(16), Email: email, Hash: string(hash), Created: time.Now().UTC()}
+<a id="l172" href="#l172">172</a> 	s.index(a)
+<a id="l173" href="#l173">173</a> 	if err := s.save(); err != nil {
+<a id="l174" href="#l174">174</a> 		delete(s.accounts, a.ID)
+<a id="l175" href="#l175">175</a> 		delete(s.byEmail, a.Email)
+<a id="l176" href="#l176">176</a> 		return nil, err
+<a id="l177" href="#l177">177</a> 	}
+<a id="l178" href="#l178">178</a> 	return a, nil
+<a id="l179" href="#l179">179</a> }
+<a id="l180" href="#l180">180</a> 
+<a id="l181" href="#l181">181</a> // dummy is compared when the email is unknown, so that a wrong email takes
+<a id="l182" href="#l182">182</a> // as long as a wrong password.
+<a id="l183" href="#l183">183</a> var dummy, _ = bcrypt.GenerateFromPassword([]byte(&quot;sbm-sync dummy password&quot;), bcrypt.DefaultCost)
+<a id="l184" href="#l184">184</a> 
+<a id="l185" href="#l185">185</a> func (s *Store) check(email, password string) (*Account, error) {
+<a id="l186" href="#l186">186</a> 	email = strings.ToLower(strings.TrimSpace(email))
+<a id="l187" href="#l187">187</a> 	s.mu.Lock()
+<a id="l188" href="#l188">188</a> 	a := s.byEmail[email]
+<a id="l189" href="#l189">189</a> 	hash := dummy
+<a id="l190" href="#l190">190</a> 	if a != nil {
+<a id="l191" href="#l191">191</a> 		hash = []byte(a.Hash)
+<a id="l192" href="#l192">192</a> 	}
+<a id="l193" href="#l193">193</a> 	s.mu.Unlock()
+<a id="l194" href="#l194">194</a> 	if bcrypt.CompareHashAndPassword(hash, []byte(password)) != nil || a == nil {
+<a id="l195" href="#l195">195</a> 		return nil, errWrong
+<a id="l196" href="#l196">196</a> 	}
+<a id="l197" href="#l197">197</a> 	return a, nil
+<a id="l198" href="#l198">198</a> }
+<a id="l199" href="#l199">199</a> 
+<a id="l200" href="#l200">200</a> // signIn gives a new token for the account. Only its hash is kept.
+<a id="l201" href="#l201">201</a> func (s *Store) signIn(a *Account) (string, error) {
+<a id="l202" href="#l202">202</a> 	token := random(32)
+<a id="l203" href="#l203">203</a> 	s.mu.Lock()
+<a id="l204" href="#l204">204</a> 	defer s.mu.Unlock()
+<a id="l205" href="#l205">205</a> 	if s.accounts[a.ID] == nil {
+<a id="l206" href="#l206">206</a> 		return &quot;&quot;, errGone
+<a id="l207" href="#l207">207</a> 	}
+<a id="l208" href="#l208">208</a> 	a.Tokens = append(a.Tokens, digest(token))
+<a id="l209" href="#l209">209</a> 	s.byToken[digest(token)] = a
+<a id="l210" href="#l210">210</a> 	for len(a.Tokens) &gt; maxTokens {
+<a id="l211" href="#l211">211</a> 		delete(s.byToken, a.Tokens[0])
+<a id="l212" href="#l212">212</a> 		a.Tokens = a.Tokens[1:]
+<a id="l213" href="#l213">213</a> 	}
+<a id="l214" href="#l214">214</a> 	return token, s.save()
+<a id="l215" href="#l215">215</a> }
+<a id="l216" href="#l216">216</a> 
+<a id="l217" href="#l217">217</a> func (s *Store) signOut(token string) error {
+<a id="l218" href="#l218">218</a> 	h := digest(token)
+<a id="l219" href="#l219">219</a> 	s.mu.Lock()
+<a id="l220" href="#l220">220</a> 	defer s.mu.Unlock()
+<a id="l221" href="#l221">221</a> 	a := s.byToken[h]
+<a id="l222" href="#l222">222</a> 	if a == nil {
+<a id="l223" href="#l223">223</a> 		return nil
+<a id="l224" href="#l224">224</a> 	}
+<a id="l225" href="#l225">225</a> 	delete(s.byToken, h)
+<a id="l226" href="#l226">226</a> 	for i, t := range a.Tokens {
+<a id="l227" href="#l227">227</a> 		if t == h {
+<a id="l228" href="#l228">228</a> 			a.Tokens = append(a.Tokens[:i], a.Tokens[i+1:]...)
+<a id="l229" href="#l229">229</a> 			break
+<a id="l230" href="#l230">230</a> 		}
+<a id="l231" href="#l231">231</a> 	}
+<a id="l232" href="#l232">232</a> 	return s.save()
+<a id="l233" href="#l233">233</a> }
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> func (s *Store) byTok(token string) *Account {
+<a id="l236" href="#l236">236</a> 	if token == &quot;&quot; {
+<a id="l237" href="#l237">237</a> 		return nil
+<a id="l238" href="#l238">238</a> 	}
+<a id="l239" href="#l239">239</a> 	s.mu.Lock()
+<a id="l240" href="#l240">240</a> 	defer s.mu.Unlock()
+<a id="l241" href="#l241">241</a> 	return s.byToken[digest(token)]
+<a id="l242" href="#l242">242</a> }
+<a id="l243" href="#l243">243</a> 
+<a id="l244" href="#l244">244</a> func (s *Store) byID(id string) *Account {
+<a id="l245" href="#l245">245</a> 	s.mu.Lock()
+<a id="l246" href="#l246">246</a> 	defer s.mu.Unlock()
+<a id="l247" href="#l247">247</a> 	return s.accounts[id]
+<a id="l248" href="#l248">248</a> }
+<a id="l249" href="#l249">249</a> 
+<a id="l250" href="#l250">250</a> func (s *Store) byCustomer(customer string) *Account {
+<a id="l251" href="#l251">251</a> 	if customer == &quot;&quot; {
+<a id="l252" href="#l252">252</a> 		return nil
+<a id="l253" href="#l253">253</a> 	}
+<a id="l254" href="#l254">254</a> 	s.mu.Lock()
+<a id="l255" href="#l255">255</a> 	defer s.mu.Unlock()
+<a id="l256" href="#l256">256</a> 	for _, a := range s.accounts {
+<a id="l257" href="#l257">257</a> 		if a.Customer == customer {
+<a id="l258" href="#l258">258</a> 			return a
+<a id="l259" href="#l259">259</a> 		}
+<a id="l260" href="#l260">260</a> 	}
+<a id="l261" href="#l261">261</a> 	return nil
+<a id="l262" href="#l262">262</a> }
+<a id="l263" href="#l263">263</a> 
+<a id="l264" href="#l264">264</a> // view gives a copy of the account, safe to read without the lock.
+<a id="l265" href="#l265">265</a> func (s *Store) view(a *Account) Account {
+<a id="l266" href="#l266">266</a> 	s.mu.Lock()
+<a id="l267" href="#l267">267</a> 	defer s.mu.Unlock()
+<a id="l268" href="#l268">268</a> 	c := *a
+<a id="l269" href="#l269">269</a> 	c.Tokens = nil
+<a id="l270" href="#l270">270</a> 	return c
+<a id="l271" href="#l271">271</a> }
+<a id="l272" href="#l272">272</a> 
+<a id="l273" href="#l273">273</a> func (s *Store) setCustomer(a *Account, customer string) error {
+<a id="l274" href="#l274">274</a> 	s.mu.Lock()
+<a id="l275" href="#l275">275</a> 	defer s.mu.Unlock()
+<a id="l276" href="#l276">276</a> 	a.Customer = customer
+<a id="l277" href="#l277">277</a> 	return s.save()
+<a id="l278" href="#l278">278</a> }
+<a id="l279" href="#l279">279</a> 
+<a id="l280" href="#l280">280</a> // setStatus records the state of the subscription, unless the store has a
+<a id="l281" href="#l281">281</a> // newer event already: Stripe does not send events in order.
+<a id="l282" href="#l282">282</a> func (s *Store) setStatus(a *Account, status string, at int64) error {
+<a id="l283" href="#l283">283</a> 	s.mu.Lock()
+<a id="l284" href="#l284">284</a> 	defer s.mu.Unlock()
+<a id="l285" href="#l285">285</a> 	if at &lt; a.StatusAt {
+<a id="l286" href="#l286">286</a> 		return nil
+<a id="l287" href="#l287">287</a> 	}
+<a id="l288" href="#l288">288</a> 	a.Status, a.StatusAt = status, at
+<a id="l289" href="#l289">289</a> 	return s.save()
+<a id="l290" href="#l290">290</a> }
+<a id="l291" href="#l291">291</a> 
+<a id="l292" href="#l292">292</a> func (s *Store) lock(id string) *sync.Mutex {
+<a id="l293" href="#l293">293</a> 	s.mu.Lock()
+<a id="l294" href="#l294">294</a> 	defer s.mu.Unlock()
+<a id="l295" href="#l295">295</a> 	m := s.locks[id]
+<a id="l296" href="#l296">296</a> 	if m == nil {
+<a id="l297" href="#l297">297</a> 		m = &amp;sync.Mutex{}
+<a id="l298" href="#l298">298</a> 		s.locks[id] = m
+<a id="l299" href="#l299">299</a> 	}
+<a id="l300" href="#l300">300</a> 	return m
+<a id="l301" href="#l301">301</a> }
+<a id="l302" href="#l302">302</a> 
+<a id="l303" href="#l303">303</a> // remove deletes the account and all versions of its file.
+<a id="l304" href="#l304">304</a> func (s *Store) remove(a *Account) error {
+<a id="l305" href="#l305">305</a> 	m := s.lock(a.ID)
+<a id="l306" href="#l306">306</a> 	m.Lock()
+<a id="l307" href="#l307">307</a> 	defer m.Unlock()
+<a id="l308" href="#l308">308</a> 	s.mu.Lock()
+<a id="l309" href="#l309">309</a> 	delete(s.accounts, a.ID)
+<a id="l310" href="#l310">310</a> 	delete(s.byEmail, a.Email)
+<a id="l311" href="#l311">311</a> 	for _, t := range a.Tokens {
+<a id="l312" href="#l312">312</a> 		delete(s.byToken, t)
+<a id="l313" href="#l313">313</a> 	}
+<a id="l314" href="#l314">314</a> 	err := s.save()
+<a id="l315" href="#l315">315</a> 	s.mu.Unlock()
+<a id="l316" href="#l316">316</a> 	if err != nil {
+<a id="l317" href="#l317">317</a> 		return err
+<a id="l318" href="#l318">318</a> 	}
+<a id="l319" href="#l319">319</a> 	return os.RemoveAll(filepath.Join(s.dir, &quot;files&quot;, a.ID))
+<a id="l320" href="#l320">320</a> }
+<a id="l321" href="#l321">321</a> 
+<a id="l322" href="#l322">322</a> // sync merges the file that a device sends into the current version, keeps
+<a id="l323" href="#l323">323</a> // the result as the new current version and gives it with its name. base
+<a id="l324" href="#l324">324</a> // names the version that the device got last time, or is &quot;&quot; for none.
+<a id="l325" href="#l325">325</a> func (s *Store) sync(a *Account, base, local string) (string, string, error) {
+<a id="l326" href="#l326">326</a> 	m := s.lock(a.ID)
+<a id="l327" href="#l327">327</a> 	m.Lock()
+<a id="l328" href="#l328">328</a> 	defer m.Unlock()
+<a id="l329" href="#l329">329</a> 	if s.byID(a.ID) == nil {
+<a id="l330" href="#l330">330</a> 		return &quot;&quot;, &quot;&quot;, errGone
+<a id="l331" href="#l331">331</a> 	}
+<a id="l332" href="#l332">332</a> 	dir := filepath.Join(s.dir, &quot;files&quot;, a.ID)
+<a id="l333" href="#l333">333</a> 	if err := os.MkdirAll(dir, 0o700); err != nil {
+<a id="l334" href="#l334">334</a> 		return &quot;&quot;, &quot;&quot;, err
+<a id="l335" href="#l335">335</a> 	}
+<a id="l336" href="#l336">336</a> 	remote := &quot;&quot;
+<a id="l337" href="#l337">337</a> 	head, err := os.ReadFile(filepath.Join(dir, &quot;HEAD&quot;))
+<a id="l338" href="#l338">338</a> 	if err == nil {
+<a id="l339" href="#l339">339</a> 		b, err := os.ReadFile(filepath.Join(dir, strings.TrimSpace(string(head))))
+<a id="l340" href="#l340">340</a> 		if err != nil {
+<a id="l341" href="#l341">341</a> 			return &quot;&quot;, &quot;&quot;, err
+<a id="l342" href="#l342">342</a> 		}
+<a id="l343" href="#l343">343</a> 		remote = string(b)
+<a id="l344" href="#l344">344</a> 	} else if !errors.Is(err, fs.ErrNotExist) {
+<a id="l345" href="#l345">345</a> 		return &quot;&quot;, &quot;&quot;, err
+<a id="l346" href="#l346">346</a> 	}
+<a id="l347" href="#l347">347</a> 	old := &quot;&quot;
+<a id="l348" href="#l348">348</a> 	if hashName.MatchString(base) {
+<a id="l349" href="#l349">349</a> 		if b, err := os.ReadFile(filepath.Join(dir, base)); err == nil {
+<a id="l350" href="#l350">350</a> 			old = string(b)
+<a id="l351" href="#l351">351</a> 		}
+<a id="l352" href="#l352">352</a> 	}
+<a id="l353" href="#l353">353</a> 	merged := merge(old, local, remote)
+<a id="l354" href="#l354">354</a> 	name := digest(merged)
+<a id="l355" href="#l355">355</a> 	path := filepath.Join(dir, name)
+<a id="l356" href="#l356">356</a> 	if _, err := os.Stat(path); err == nil {
+<a id="l357" href="#l357">357</a> 		now := time.Now()
+<a id="l358" href="#l358">358</a> 		err = os.Chtimes(path, now, now) // the newest versions are kept
+<a id="l359" href="#l359">359</a> 		if err != nil {
+<a id="l360" href="#l360">360</a> 			return &quot;&quot;, &quot;&quot;, err
+<a id="l361" href="#l361">361</a> 		}
+<a id="l362" href="#l362">362</a> 	} else if err := writeFile(path, []byte(merged)); err != nil {
+<a id="l363" href="#l363">363</a> 		return &quot;&quot;, &quot;&quot;, err
+<a id="l364" href="#l364">364</a> 	}
+<a id="l365" href="#l365">365</a> 	if err := writeFile(filepath.Join(dir, &quot;HEAD&quot;), []byte(name+&quot;\n&quot;)); err != nil {
+<a id="l366" href="#l366">366</a> 		return &quot;&quot;, &quot;&quot;, err
+<a id="l367" href="#l367">367</a> 	}
+<a id="l368" href="#l368">368</a> 	return merged, name, prune(dir, name)
+<a id="l369" href="#l369">369</a> }
+<a id="l370" href="#l370">370</a> 
+<a id="l371" href="#l371">371</a> // prune deletes all but the newest versions in dir, and never keep.
+<a id="l372" href="#l372">372</a> func prune(dir, keep string) error {
+<a id="l373" href="#l373">373</a> 	entries, err := os.ReadDir(dir)
+<a id="l374" href="#l374">374</a> 	if err != nil {
+<a id="l375" href="#l375">375</a> 		return err
+<a id="l376" href="#l376">376</a> 	}
+<a id="l377" href="#l377">377</a> 	type version struct {
+<a id="l378" href="#l378">378</a> 		name string
+<a id="l379" href="#l379">379</a> 		time time.Time
+<a id="l380" href="#l380">380</a> 	}
+<a id="l381" href="#l381">381</a> 	var vs []version
+<a id="l382" href="#l382">382</a> 	for _, e := range entries {
+<a id="l383" href="#l383">383</a> 		if !hashName.MatchString(e.Name()) || e.Name() == keep {
+<a id="l384" href="#l384">384</a> 			continue
+<a id="l385" href="#l385">385</a> 		}
+<a id="l386" href="#l386">386</a> 		info, err := e.Info()
+<a id="l387" href="#l387">387</a> 		if err != nil {
+<a id="l388" href="#l388">388</a> 			return err
+<a id="l389" href="#l389">389</a> 		}
+<a id="l390" href="#l390">390</a> 		vs = append(vs, version{e.Name(), info.ModTime()})
+<a id="l391" href="#l391">391</a> 	}
+<a id="l392" href="#l392">392</a> 	sort.Slice(vs, func(i, j int) bool { return vs[i].time.After(vs[j].time) })
+<a id="l393" href="#l393">393</a> 	for i := maxVersions - 1; i &lt; len(vs); i++ {
+<a id="l394" href="#l394">394</a> 		if err := os.Remove(filepath.Join(dir, vs[i].name)); err != nil {
+<a id="l395" href="#l395">395</a> 			return err
+<a id="l396" href="#l396">396</a> 		}
+<a id="l397" href="#l397">397</a> 	}
+<a id="l398" href="#l398">398</a> 	return nil
+<a id="l399" href="#l399">399</a> }</pre>
+</div></body></html>

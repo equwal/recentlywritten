@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/render.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/render.py (9971 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Render a YouTube-ready MP4: cover image, the audio, and a soft subtitle track.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> The subtitles are a selectable track rather than burned into the picture, so the
+<a id="l4" href="#l4">4</a> file stays small, the encode stays fast, and the viewer can turn captions off.
+<a id="l5" href="#l5">5</a> YouTube reads the track on upload; the .srt is also offered on its own for
+<a id="l6" href="#l6">6</a> people who would rather attach it there.
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> The encode is cheap by construction: one still frame per second over a canvas
+<a id="l9" href="#l9">9</a> that is scaled once up front, so ffmpeg never recomputes the scale per frame.
+<a id="l10" href="#l10">10</a> &quot;&quot;&quot;
+<a id="l11" href="#l11">11</a> 
+<a id="l12" href="#l12">12</a> from __future__ import annotations
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> import logging
+<a id="l15" href="#l15">15</a> import subprocess
+<a id="l16" href="#l16">16</a> import zipfile
+<a id="l17" href="#l17">17</a> from functools import lru_cache
+<a id="l18" href="#l18">18</a> from pathlib import Path
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> from .settings import settings
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> log = logging.getLogger(__name__)
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> # Cover art we are willing to pull out of an epub.
+<a id="l25" href="#l25">25</a> _IMAGE_SUFFIXES = {&quot;.jpg&quot;, &quot;.jpeg&quot;, &quot;.png&quot;, &quot;.webp&quot;}
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> # H.264 encoders in order of preference. ffmpeg builds vary wildly in what they
+<a id="l28" href="#l28">28</a> # include - libx264 is the usual default but is absent from plenty of builds,
+<a id="l29" href="#l29">29</a> # so pick from what is actually compiled in rather than assuming.
+<a id="l30" href="#l30">30</a> _H264_PREFERENCE = [
+<a id="l31" href="#l31">31</a>     &quot;libx264&quot;,      # best quality per bit, most common
+<a id="l32" href="#l32">32</a>     &quot;h264_nvenc&quot;,   # NVIDIA
+<a id="l33" href="#l33">33</a>     &quot;h264_qsv&quot;,     # Intel Quick Sync
+<a id="l34" href="#l34">34</a>     &quot;h264_amf&quot;,     # AMD
+<a id="l35" href="#l35">35</a>     &quot;libopenh264&quot;,  # software fallback, always safe
+<a id="l36" href="#l36">36</a>     &quot;h264_mf&quot;,      # Windows Media Foundation
+<a id="l37" href="#l37">37</a> ]
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a> # Encoder-specific quality flags. A libx264 -crf/-preset means nothing to the
+<a id="l40" href="#l40">40</a> # others and makes ffmpeg fail outright.
+<a id="l41" href="#l41">41</a> _ENCODER_FLAGS: dict[str, list[str]] = {
+<a id="l42" href="#l42">42</a>     &quot;libx264&quot;: [&quot;-preset&quot;, &quot;veryfast&quot;, &quot;-tune&quot;, &quot;stillimage&quot;],
+<a id="l43" href="#l43">43</a>     &quot;libopenh264&quot;: [&quot;-b:v&quot;, &quot;1M&quot;],
+<a id="l44" href="#l44">44</a>     &quot;h264_nvenc&quot;: [&quot;-preset&quot;, &quot;p4&quot;, &quot;-tune&quot;, &quot;ll&quot;],
+<a id="l45" href="#l45">45</a>     &quot;h264_qsv&quot;: [&quot;-preset&quot;, &quot;veryfast&quot;],
+<a id="l46" href="#l46">46</a>     &quot;h264_amf&quot;: [&quot;-quality&quot;, &quot;speed&quot;, &quot;-rc&quot;, &quot;cqp&quot;],
+<a id="l47" href="#l47">47</a>     &quot;h264_mf&quot;: [],
+<a id="l48" href="#l48">48</a> }
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a> class RenderError(RuntimeError):
+<a id="l52" href="#l52">52</a>     pass
+<a id="l53" href="#l53">53</a> 
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> @lru_cache(maxsize=1)
+<a id="l56" href="#l56">56</a> def available_encoders() -&gt; set[str]:
+<a id="l57" href="#l57">57</a>     try:
+<a id="l58" href="#l58">58</a>         out = subprocess.run(
+<a id="l59" href="#l59">59</a>             [&quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-encoders&quot;],
+<a id="l60" href="#l60">60</a>             capture_output=True, timeout=60,
+<a id="l61" href="#l61">61</a>         ).stdout.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+<a id="l62" href="#l62">62</a>     except (subprocess.SubprocessError, OSError):
+<a id="l63" href="#l63">63</a>         return set()
+<a id="l64" href="#l64">64</a>     names = set()
+<a id="l65" href="#l65">65</a>     for line in out.splitlines():
+<a id="l66" href="#l66">66</a>         parts = line.split()
+<a id="l67" href="#l67">67</a>         # Rows look like &quot; V....D libopenh264  OpenH264 ...&quot; - the name is [1].
+<a id="l68" href="#l68">68</a>         if len(parts) &gt;= 2 and parts[0].startswith(&quot;V&quot;):
+<a id="l69" href="#l69">69</a>             names.add(parts[1])
+<a id="l70" href="#l70">70</a>     return names
+<a id="l71" href="#l71">71</a> 
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a> def encoder_works(name: str) -&gt; bool:
+<a id="l74" href="#l74">74</a>     &quot;&quot;&quot;Actually encode one frame with `name`.
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a>     Being listed by `ffmpeg -encoders` only means it was compiled in. The
+<a id="l77" href="#l77">77</a>     hardware encoders are listed on machines with no such hardware and fail at
+<a id="l78" href="#l78">78</a>     runtime, so the only trustworthy check is to run one.
+<a id="l79" href="#l79">79</a>     &quot;&quot;&quot;
+<a id="l80" href="#l80">80</a>     cmd = [
+<a id="l81" href="#l81">81</a>         &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;,
+<a id="l82" href="#l82">82</a>         &quot;-f&quot;, &quot;lavfi&quot;, &quot;-i&quot;, &quot;color=c=black:s=320x240:d=0.1&quot;,
+<a id="l83" href="#l83">83</a>         &quot;-frames:v&quot;, &quot;1&quot;, &quot;-c:v&quot;, name,
+<a id="l84" href="#l84">84</a>         *_ENCODER_FLAGS.get(name, []),
+<a id="l85" href="#l85">85</a>         &quot;-pix_fmt&quot;, &quot;yuv420p&quot;, &quot;-f&quot;, &quot;null&quot;, &quot;-&quot;,
+<a id="l86" href="#l86">86</a>     ]
+<a id="l87" href="#l87">87</a>     try:
+<a id="l88" href="#l88">88</a>         return subprocess.run(cmd, capture_output=True, timeout=60).returncode == 0
+<a id="l89" href="#l89">89</a>     except (subprocess.SubprocessError, OSError):
+<a id="l90" href="#l90">90</a>         return False
+<a id="l91" href="#l91">91</a> 
+<a id="l92" href="#l92">92</a> 
+<a id="l93" href="#l93">93</a> @lru_cache(maxsize=1)
+<a id="l94" href="#l94">94</a> def resolve_encoder() -&gt; str:
+<a id="l95" href="#l95">95</a>     &quot;&quot;&quot;The H.264 encoder to use, honouring an explicit setting if it works.&quot;&quot;&quot;
+<a id="l96" href="#l96">96</a>     have = available_encoders()
+<a id="l97" href="#l97">97</a>     configured = settings.video_encoder
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a>     if configured and configured != &quot;auto&quot;:
+<a id="l100" href="#l100">100</a>         if encoder_works(configured):
+<a id="l101" href="#l101">101</a>             return configured
+<a id="l102" href="#l102">102</a>         log.warning(
+<a id="l103" href="#l103">103</a>             &quot;video_encoder=%r does not work on this machine; falling back&quot;,
+<a id="l104" href="#l104">104</a>             configured,
+<a id="l105" href="#l105">105</a>         )
+<a id="l106" href="#l106">106</a> 
+<a id="l107" href="#l107">107</a>     for name in _H264_PREFERENCE:
+<a id="l108" href="#l108">108</a>         if name in have and encoder_works(name):
+<a id="l109" href="#l109">109</a>             log.info(&quot;using video encoder %s&quot;, name)
+<a id="l110" href="#l110">110</a>             return name
+<a id="l111" href="#l111">111</a> 
+<a id="l112" href="#l112">112</a>     raise RenderError(
+<a id="l113" href="#l113">113</a>         &quot;No working H.264 encoder found (tried &quot;
+<a id="l114" href="#l114">114</a>         + &quot;, &quot;.join(n for n in _H264_PREFERENCE if n in have)
+<a id="l115" href="#l115">115</a>         + &quot;). Install an ffmpeg with libx264 or libopenh264, or set &quot;
+<a id="l116" href="#l116">116</a>         &quot;SUBPLZ_WEB_RENDER_VIDEO=false.&quot;
+<a id="l117" href="#l117">117</a>     )
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a> 
+<a id="l120" href="#l120">120</a> def extract_cover(book: Path, dest_dir: Path) -&gt; Path | None:
+<a id="l121" href="#l121">121</a>     &quot;&quot;&quot;Pull the largest image out of an epub, as a stand-in for cover art.
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a>     &quot;Largest&quot; beats parsing the OPF metadata for this purpose: the cover is
+<a id="l124" href="#l124">124</a>     almost always the biggest image, and this still works on the malformed
+<a id="l125" href="#l125">125</a>     epubs that converted books often are.
+<a id="l126" href="#l126">126</a>     &quot;&quot;&quot;
+<a id="l127" href="#l127">127</a>     if book.suffix.lower() != &quot;.epub&quot;:
+<a id="l128" href="#l128">128</a>         return None
+<a id="l129" href="#l129">129</a>     try:
+<a id="l130" href="#l130">130</a>         with zipfile.ZipFile(book) as zf:
+<a id="l131" href="#l131">131</a>             images = [
+<a id="l132" href="#l132">132</a>                 info for info in zf.infolist()
+<a id="l133" href="#l133">133</a>                 if Path(info.filename).suffix.lower() in _IMAGE_SUFFIXES
+<a id="l134" href="#l134">134</a>             ]
+<a id="l135" href="#l135">135</a>             if not images:
+<a id="l136" href="#l136">136</a>                 return None
+<a id="l137" href="#l137">137</a>             best = max(images, key=lambda i: i.file_size)
+<a id="l138" href="#l138">138</a>             if best.file_size &lt; 1024:  # a bullet or a rule, not a cover
+<a id="l139" href="#l139">139</a>                 return None
+<a id="l140" href="#l140">140</a>             dest = dest_dir / f&quot;cover{Path(best.filename).suffix.lower()}&quot;
+<a id="l141" href="#l141">141</a>             dest.parent.mkdir(parents=True, exist_ok=True)
+<a id="l142" href="#l142">142</a>             dest.write_bytes(zf.read(best.filename))
+<a id="l143" href="#l143">143</a>             return dest
+<a id="l144" href="#l144">144</a>     except (zipfile.BadZipFile, OSError, KeyError):
+<a id="l145" href="#l145">145</a>         return None
+<a id="l146" href="#l146">146</a> 
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a> def build_canvas(cover: Path | None, dest: Path) -&gt; Path:
+<a id="l149" href="#l149">149</a>     &quot;&quot;&quot;Scale the cover onto a fixed canvas once, ahead of the encode.&quot;&quot;&quot;
+<a id="l150" href="#l150">150</a>     w, h = settings.video_width, settings.video_height
+<a id="l151" href="#l151">151</a>     dest.parent.mkdir(parents=True, exist_ok=True)
+<a id="l152" href="#l152">152</a> 
+<a id="l153" href="#l153">153</a>     if cover is not None and cover.exists():
+<a id="l154" href="#l154">154</a>         cmd = [
+<a id="l155" href="#l155">155</a>             &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;,
+<a id="l156" href="#l156">156</a>             &quot;-i&quot;, str(cover),
+<a id="l157" href="#l157">157</a>             &quot;-vf&quot;,
+<a id="l158" href="#l158">158</a>             f&quot;scale={w}:{h}:force_original_aspect_ratio=decrease,&quot;
+<a id="l159" href="#l159">159</a>             f&quot;pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black&quot;,
+<a id="l160" href="#l160">160</a>             &quot;-frames:v&quot;, &quot;1&quot;,
+<a id="l161" href="#l161">161</a>             str(dest),
+<a id="l162" href="#l162">162</a>         ]
+<a id="l163" href="#l163">163</a>     else:
+<a id="l164" href="#l164">164</a>         # No cover: a plain dark card still gives YouTube a valid video stream.
+<a id="l165" href="#l165">165</a>         cmd = [
+<a id="l166" href="#l166">166</a>             &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;,
+<a id="l167" href="#l167">167</a>             &quot;-f&quot;, &quot;lavfi&quot;, &quot;-i&quot;, f&quot;color=c=0x16161a:s={w}x{h}&quot;,
+<a id="l168" href="#l168">168</a>             &quot;-frames:v&quot;, &quot;1&quot;,
+<a id="l169" href="#l169">169</a>             str(dest),
+<a id="l170" href="#l170">170</a>         ]
+<a id="l171" href="#l171">171</a> 
+<a id="l172" href="#l172">172</a>     proc = subprocess.run(cmd, capture_output=True, timeout=300)
+<a id="l173" href="#l173">173</a>     if proc.returncode != 0 or not dest.exists():
+<a id="l174" href="#l174">174</a>         err = proc.stderr.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;).strip().splitlines()
+<a id="l175" href="#l175">175</a>         raise RenderError(
+<a id="l176" href="#l176">176</a>             &quot;could not prepare the cover image: &quot;
+<a id="l177" href="#l177">177</a>             + (&quot; | &quot;.join(err[-2:]) if err else &quot;no output&quot;)
+<a id="l178" href="#l178">178</a>         )
+<a id="l179" href="#l179">179</a>     return dest
+<a id="l180" href="#l180">180</a> 
+<a id="l181" href="#l181">181</a> 
+<a id="l182" href="#l182">182</a> def render_video(
+<a id="l183" href="#l183">183</a>     audio: Path,
+<a id="l184" href="#l184">184</a>     canvas: Path,
+<a id="l185" href="#l185">185</a>     dest: Path,
+<a id="l186" href="#l186">186</a>     duration: float | None = None,
+<a id="l187" href="#l187">187</a> ) -&gt; Path:
+<a id="l188" href="#l188">188</a>     &quot;&quot;&quot;Cover image + audio into a clean MP4, carrying no subtitle track.
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a>     Subtitle-free on purpose. This is the file for YouTube, where captions are
+<a id="l191" href="#l191">191</a>     attached separately as an .srt: YouTube&#x27;s handling of an embedded mov_text
+<a id="l192" href="#l192">192</a>     track is unreliable, and uploading the .srt is the supported route.
+<a id="l193" href="#l193">193</a> 
+<a id="l194" href="#l194">194</a>     This is the expensive step - `mux_subtitles` reuses its output instead of
+<a id="l195" href="#l195">195</a>     encoding a second time.
+<a id="l196" href="#l196">196</a>     &quot;&quot;&quot;
+<a id="l197" href="#l197">197</a>     dest.parent.mkdir(parents=True, exist_ok=True)
+<a id="l198" href="#l198">198</a> 
+<a id="l199" href="#l199">199</a>     cmd = [
+<a id="l200" href="#l200">200</a>         &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;,
+<a id="l201" href="#l201">201</a>         &quot;-loop&quot;, &quot;1&quot;, &quot;-r&quot;, str(settings.video_fps), &quot;-i&quot;, str(canvas),
+<a id="l202" href="#l202">202</a>         &quot;-i&quot;, str(audio),
+<a id="l203" href="#l203">203</a>     ]
+<a id="l204" href="#l204">204</a>     if duration:
+<a id="l205" href="#l205">205</a>         cmd += [&quot;-t&quot;, f&quot;{duration:.3f}&quot;]
+<a id="l206" href="#l206">206</a>     else:
+<a id="l207" href="#l207">207</a>         cmd += [&quot;-shortest&quot;]
+<a id="l208" href="#l208">208</a> 
+<a id="l209" href="#l209">209</a>     encoder = resolve_encoder()
+<a id="l210" href="#l210">210</a>     cmd += [
+<a id="l211" href="#l211">211</a>         &quot;-map&quot;, &quot;0:v&quot;, &quot;-map&quot;, &quot;1:a&quot;,
+<a id="l212" href="#l212">212</a>         # Carry chapter marks through; harmless where they are ignored.
+<a id="l213" href="#l213">213</a>         &quot;-map_chapters&quot;, &quot;1&quot;,
+<a id="l214" href="#l214">214</a>         &quot;-c:v&quot;, encoder,
+<a id="l215" href="#l215">215</a>         &quot;-pix_fmt&quot;, &quot;yuv420p&quot;,
+<a id="l216" href="#l216">216</a>         &quot;-c:a&quot;, &quot;aac&quot;, &quot;-b:a&quot;, &quot;128k&quot;,
+<a id="l217" href="#l217">217</a>         # Lets a player start without reading the whole file first.
+<a id="l218" href="#l218">218</a>         &quot;-movflags&quot;, &quot;+faststart&quot;,
+<a id="l219" href="#l219">219</a>     ]
+<a id="l220" href="#l220">220</a>     cmd += _ENCODER_FLAGS.get(encoder, [])
+<a id="l221" href="#l221">221</a>     # -crf is a libx264/libx265 concept; the others have their own rate control.
+<a id="l222" href="#l222">222</a>     if encoder == &quot;libx264&quot;:
+<a id="l223" href="#l223">223</a>         cmd += [&quot;-crf&quot;, str(settings.video_crf)]
+<a id="l224" href="#l224">224</a> 
+<a id="l225" href="#l225">225</a>     cmd.append(str(dest))
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a>     proc = subprocess.run(
+<a id="l228" href="#l228">228</a>         cmd, capture_output=True, timeout=settings.job_timeout_seconds
+<a id="l229" href="#l229">229</a>     )
+<a id="l230" href="#l230">230</a>     if proc.returncode != 0 or not dest.exists():
+<a id="l231" href="#l231">231</a>         err = proc.stderr.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;).strip().splitlines()
+<a id="l232" href="#l232">232</a>         tail = &quot; | &quot;.join(err[-3:]) if err else &quot;no output&quot;
+<a id="l233" href="#l233">233</a>         raise RenderError(f&quot;ffmpeg could not build the video: {tail}&quot;)
+<a id="l234" href="#l234">234</a>     return dest
+<a id="l235" href="#l235">235</a> 
+<a id="l236" href="#l236">236</a> 
+<a id="l237" href="#l237">237</a> def mux_subtitles(video: Path, subtitles: Path, dest: Path) -&gt; Path:
+<a id="l238" href="#l238">238</a>     &quot;&quot;&quot;Copy `video` into an MKV carrying `subtitles` as a selectable track.
+<a id="l239" href="#l239">239</a> 
+<a id="l240" href="#l240">240</a>     For local playback - MPV, VLC, Jellyfin - where one self-contained file
+<a id="l241" href="#l241">241</a>     beats juggling a video and a sidecar .srt.
+<a id="l242" href="#l242">242</a> 
+<a id="l243" href="#l243">243</a>     MKV rather than MP4 because MKV stores SRT natively, keeping the cue text
+<a id="l244" href="#l244">244</a>     intact; MP4 must convert to mov_text, which is a lossy reduction. Nothing
+<a id="l245" href="#l245">245</a>     is re-encoded here: the streams are copied, so this costs seconds however
+<a id="l246" href="#l246">246</a>     long the book is.
+<a id="l247" href="#l247">247</a>     &quot;&quot;&quot;
+<a id="l248" href="#l248">248</a>     dest.parent.mkdir(parents=True, exist_ok=True)
+<a id="l249" href="#l249">249</a>     cmd = [
+<a id="l250" href="#l250">250</a>         &quot;ffmpeg&quot;, &quot;-hide_banner&quot;, &quot;-v&quot;, &quot;error&quot;, &quot;-y&quot;,
+<a id="l251" href="#l251">251</a>         &quot;-i&quot;, str(video),
+<a id="l252" href="#l252">252</a>         # Declare the format; ffmpeg does not always sniff an srt correctly.
+<a id="l253" href="#l253">253</a>         &quot;-f&quot;, &quot;srt&quot;, &quot;-i&quot;, str(subtitles),
+<a id="l254" href="#l254">254</a>         # Map video and audio explicitly rather than &quot;-map 0&quot;: an MP4 carries
+<a id="l255" href="#l255">255</a>         # its chapters as a bin_data track, and Matroska accepts only audio,
+<a id="l256" href="#l256">256</a>         # video and subtitle streams - it refuses the file outright otherwise.
+<a id="l257" href="#l257">257</a>         # Chapters still survive via -map_chapters, being container metadata.
+<a id="l258" href="#l258">258</a>         &quot;-map&quot;, &quot;0:v&quot;, &quot;-map&quot;, &quot;0:a&quot;, &quot;-map&quot;, &quot;1:s&quot;,
+<a id="l259" href="#l259">259</a>         &quot;-map_chapters&quot;, &quot;0&quot;,
+<a id="l260" href="#l260">260</a>         &quot;-c&quot;, &quot;copy&quot;, &quot;-c:s&quot;, &quot;srt&quot;,
+<a id="l261" href="#l261">261</a>         # Players pick this up automatically instead of needing it turned on.
+<a id="l262" href="#l262">262</a>         &quot;-disposition:s:0&quot;, &quot;default&quot;,
+<a id="l263" href="#l263">263</a>         &quot;-metadata:s:s:0&quot;, &quot;title=Aligned subtitles&quot;,
+<a id="l264" href="#l264">264</a>         str(dest),
+<a id="l265" href="#l265">265</a>     ]
+<a id="l266" href="#l266">266</a>     proc = subprocess.run(cmd, capture_output=True, timeout=1800)
+<a id="l267" href="#l267">267</a>     if proc.returncode != 0 or not dest.exists():
+<a id="l268" href="#l268">268</a>         err = proc.stderr.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;).strip().splitlines()
+<a id="l269" href="#l269">269</a>         tail = &quot; | &quot;.join(err[-3:]) if err else &quot;no output&quot;
+<a id="l270" href="#l270">270</a>         raise RenderError(f&quot;ffmpeg could not embed the subtitles: {tail}&quot;)
+<a id="l271" href="#l271">271</a>     return dest</pre>
+</div></body></html>

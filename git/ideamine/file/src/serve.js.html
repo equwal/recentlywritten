@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/src/serve.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/serve.js (22751 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // The dashboard with buttons. `ideamine serve` runs a web server that serves the page of `ideamine
+<a id="l2" href="#l2">2</a> // publish`, a live data.json, and an API for the slash commands: add, delete, done, reopen, start,
+<a id="l3" href="#l3">3</a> // drop, note, model, triage, build, ask, and the watcher. It has two roles:
+<a id="l4" href="#l4">4</a> //
+<a id="l5" href="#l5">5</a> // - On a PC, it runs the commands there, where the Claude Code login is. When sync is on, the
+<a id="l6" href="#l6">6</a> //   archive that it changes is on the ideamine server, and the Prompts and Memory tabs come from
+<a id="l7" href="#l7">7</a> //   there too.
+<a id="l8" href="#l8">8</a> // - On a server (sync off), it holds the archive for every machine: the machines sync with /api/db
+<a id="l9" href="#l9">9</a> //   and /api/ops, and send their prompts to /api/prompts. With memstate_url, the Memory tab shows
+<a id="l10" href="#l10">10</a> //   the memories of a memstated daemon. nginx in front of it names the server in serve_hosts.
+<a id="l11" href="#l11">11</a> //
+<a id="l12" href="#l12">12</a> // The server listens on 127.0.0.1 only, and it takes commands only from its own page.
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> import { spawn } from &#x27;node:child_process&#x27;;
+<a id="l15" href="#l15">15</a> import fs from &#x27;node:fs&#x27;;
+<a id="l16" href="#l16">16</a> import http from &#x27;node:http&#x27;;
+<a id="l17" href="#l17">17</a> import os from &#x27;node:os&#x27;;
+<a id="l18" href="#l18">18</a> import path from &#x27;node:path&#x27;;
+<a id="l19" href="#l19">19</a> import { fileURLToPath } from &#x27;node:url&#x27;;
+<a id="l20" href="#l20">20</a> import * as archive from &#x27;./archive.js&#x27;;
+<a id="l21" href="#l21">21</a> import * as config from &#x27;./config.js&#x27;;
+<a id="l22" href="#l22">22</a> import * as publish from &#x27;./publish.js&#x27;;
+<a id="l23" href="#l23">23</a> import { renderAdded, stamp } from &#x27;./render.js&#x27;;
+<a id="l24" href="#l24">24</a> import * as store from &#x27;./store.js&#x27;;
+<a id="l25" href="#l25">25</a> import * as sync from &#x27;./sync.js&#x27;;
+<a id="l26" href="#l26">26</a> import { clip, splitIdeas } from &#x27;./text.js&#x27;;
+<a id="l27" href="#l27">27</a> import * as watch from &#x27;./watch.js&#x27;;
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> const PAGE = new URL(&#x27;../dashboard/index.html&#x27;, import.meta.url);
+<a id="l30" href="#l30">30</a> const BIN = fileURLToPath(new URL(&#x27;../bin/ideamine.js&#x27;, import.meta.url));
+<a id="l31" href="#l31">31</a> const MAX_BODY = 1024 * 1024;
+<a id="l32" href="#l32">32</a> const EMBED_TIMEOUT_MS = 5000; // data.json must not wait long for an embedding server that is away
+<a id="l33" href="#l33">33</a> const HEADERS = { &#x27;cache-control&#x27;: &#x27;no-store&#x27;, &#x27;x-content-type-options&#x27;: &#x27;nosniff&#x27; };
+<a id="l34" href="#l34">34</a> const DAY = 86400000;
+<a id="l35" href="#l35">35</a> const APPLIED_KEPT = 1000; // results of recent changes, so that a change that comes twice applies once
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a> const logPath = () =&gt; path.join(store.home(), &#x27;serve.log&#x27;);
+<a id="l38" href="#l38">38</a> const promptsPath = () =&gt; path.join(store.home(), &#x27;prompts.jsonl&#x27;);
+<a id="l39" href="#l39">39</a> const appliedPath = () =&gt; path.join(store.home(), &#x27;applied.json&#x27;);
+<a id="l40" href="#l40">40</a> const sleep = (ms) =&gt; new Promise((resolve) =&gt; setTimeout(resolve, ms));
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> /** The port from the setting serve_port. */
+<a id="l43" href="#l43">43</a> export function port() {
+<a id="l44" href="#l44">44</a>   const value = config.get(&#x27;serve_port&#x27;);
+<a id="l45" href="#l45">45</a>   const n = Number(value);
+<a id="l46" href="#l46">46</a>   if (!Number.isInteger(n) || n &lt; 1 || n &gt; 65535) throw new Error(`serve_port must be a whole number from 1 to 65535, not &quot;${value}&quot;`);
+<a id="l47" href="#l47">47</a>   return n;
+<a id="l48" href="#l48">48</a> }
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a> export const address = (p = port()) =&gt; `http://127.0.0.1:${p}/`;
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> /** The Host names from the setting serve_hosts, for example the address that nginx answers on. */
+<a id="l53" href="#l53">53</a> const extraHosts = () =&gt; config.get(&#x27;serve_hosts&#x27;).split(&#x27;,&#x27;).map((h) =&gt; h.trim().toLowerCase()).filter(Boolean);
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> /**
+<a id="l56" href="#l56">56</a>  * True when the server may answer a request. The Host header must name this server, which stops a
+<a id="l57" href="#l57">57</a>  * DNS rebinding page. A POST must send JSON, and its Origin, if any, must be this server. A page of
+<a id="l58" href="#l58">58</a>  * another site cannot send JSON here without a CORS preflight, and this server allows none.
+<a id="l59" href="#l59">59</a>  */
+<a id="l60" href="#l60">60</a> export function allowed({ method, host, origin, type }, port, hosts = []) {
+<a id="l61" href="#l61">61</a>   const h = String(host ?? &#x27;&#x27;).toLowerCase();
+<a id="l62" href="#l62">62</a>   if (h !== `127.0.0.1:${port}` &amp;&amp; h !== `localhost:${port}` &amp;&amp; !hosts.includes(h)) return false;
+<a id="l63" href="#l63">63</a>   if (method === &#x27;GET&#x27; || method === &#x27;HEAD&#x27;) return true;
+<a id="l64" href="#l64">64</a>   if (method !== &#x27;POST&#x27; || !/^application\/json\s*(;|$)/i.test(String(type ?? &#x27;&#x27;).trim())) return false;
+<a id="l65" href="#l65">65</a>   return origin == null || origin === `http://${h}`;
+<a id="l66" href="#l66">66</a> }
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> /**
+<a id="l69" href="#l69">69</a>  * Run `node &lt;args&gt;` in a new console window, so that Claude Code gets a terminal. Windows only.
+<a id="l70" href="#l70">70</a>  * `start` opens the window. A Windows path cannot hold a quote, so quotes around each argument
+<a id="l71" href="#l71">71</a>  * keep cmd.exe from reading a &amp; or | in a path. IDEAMINE_WINDOW keeps the window open after an error.
+<a id="l72" href="#l72">72</a>  */
+<a id="l73" href="#l73">73</a> export function openWindow(args, cwd) {
+<a id="l74" href="#l74">74</a>   if (process.platform !== &#x27;win32&#x27;) {
+<a id="l75" href="#l75">75</a>     return Promise.reject(new Error(`the page can open a terminal only on Windows. Run in a terminal: ideamine ${args.slice(1).join(&#x27; &#x27;)}`));
+<a id="l76" href="#l76">76</a>   }
+<a id="l77" href="#l77">77</a>   const line = [&#x27;start&#x27;, &#x27;&quot;&quot;&#x27;, ...[process.execPath, ...args].map((a) =&gt; `&quot;${a}&quot;`)].join(&#x27; &#x27;);
+<a id="l78" href="#l78">78</a>   return new Promise((resolve, reject) =&gt; {
+<a id="l79" href="#l79">79</a>     const child = spawn(process.env.ComSpec || &#x27;cmd.exe&#x27;, [&#x27;/d&#x27;, &#x27;/c&#x27;, line], {
+<a id="l80" href="#l80">80</a>       cwd,
+<a id="l81" href="#l81">81</a>       env: { ...process.env, IDEAMINE_WINDOW: &#x27;1&#x27; },
+<a id="l82" href="#l82">82</a>       detached: true,
+<a id="l83" href="#l83">83</a>       stdio: &#x27;ignore&#x27;,
+<a id="l84" href="#l84">84</a>       windowsVerbatimArguments: true,
+<a id="l85" href="#l85">85</a>     });
+<a id="l86" href="#l86">86</a>     child.on(&#x27;error&#x27;, reject);
+<a id="l87" href="#l87">87</a>     child.on(&#x27;spawn&#x27;, () =&gt; {
+<a id="l88" href="#l88">88</a>       child.unref();
+<a id="l89" href="#l89">89</a>       resolve();
+<a id="l90" href="#l90">90</a>     });
+<a id="l91" href="#l91">91</a>   });
+<a id="l92" href="#l92">92</a> }
+<a id="l93" href="#l93">93</a> 
+<a id="l94" href="#l94">94</a> function send(res, status, json, headers = {}) {
+<a id="l95" href="#l95">95</a>   res.writeHead(status, { ...HEADERS, &#x27;content-type&#x27;: &#x27;application/json; charset=utf-8&#x27;, ...headers });
+<a id="l96" href="#l96">96</a>   res.end(JSON.stringify(json));
+<a id="l97" href="#l97">97</a> }
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a> function sendPage(res) {
+<a id="l100" href="#l100">100</a>   res.writeHead(200, {
+<a id="l101" href="#l101">101</a>     ...HEADERS,
+<a id="l102" href="#l102">102</a>     &#x27;content-type&#x27;: &#x27;text/html; charset=utf-8&#x27;,
+<a id="l103" href="#l103">103</a>     &#x27;content-security-policy&#x27;: &quot;frame-ancestors &#x27;none&#x27;&quot;, // no other page can frame the buttons
+<a id="l104" href="#l104">104</a>   });
+<a id="l105" href="#l105">105</a>   res.end(fs.readFileSync(PAGE));
+<a id="l106" href="#l106">106</a> }
+<a id="l107" href="#l107">107</a> 
+<a id="l108" href="#l108">108</a> function readBody(req) {
+<a id="l109" href="#l109">109</a>   return new Promise((resolve, reject) =&gt; {
+<a id="l110" href="#l110">110</a>     const chunks = [];
+<a id="l111" href="#l111">111</a>     let size = 0;
+<a id="l112" href="#l112">112</a>     req.on(&#x27;data&#x27;, (chunk) =&gt; {
+<a id="l113" href="#l113">113</a>       size += chunk.length;
+<a id="l114" href="#l114">114</a>       if (size &gt; MAX_BODY) {
+<a id="l115" href="#l115">115</a>         reject(new Error(&#x27;the request is too big&#x27;));
+<a id="l116" href="#l116">116</a>         req.destroy();
+<a id="l117" href="#l117">117</a>       } else chunks.push(chunk);
+<a id="l118" href="#l118">118</a>     });
+<a id="l119" href="#l119">119</a>     req.on(&#x27;end&#x27;, () =&gt; resolve(Buffer.concat(chunks)));
+<a id="l120" href="#l120">120</a>     req.on(&#x27;error&#x27;, reject);
+<a id="l121" href="#l121">121</a>   });
+<a id="l122" href="#l122">122</a> }
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a> async function readJson(req) {
+<a id="l125" href="#l125">125</a>   const raw = (await readBody(req)).toString(&#x27;utf8&#x27;);
+<a id="l126" href="#l126">126</a>   let body;
+<a id="l127" href="#l127">127</a>   try {
+<a id="l128" href="#l128">128</a>     body = raw.trim() ? JSON.parse(raw) : {};
+<a id="l129" href="#l129">129</a>   } catch {
+<a id="l130" href="#l130">130</a>     throw new Error(&#x27;the request is not valid JSON&#x27;);
+<a id="l131" href="#l131">131</a>   }
+<a id="l132" href="#l132">132</a>   if (!body || typeof body !== &#x27;object&#x27; || Array.isArray(body)) throw new Error(&#x27;the request must be a JSON object&#x27;);
+<a id="l133" href="#l133">133</a>   return body;
+<a id="l134" href="#l134">134</a> }
+<a id="l135" href="#l135">135</a> 
+<a id="l136" href="#l136">136</a> /** The snapshot of `ideamine publish`, and `live`: what only this server can tell the page. */
+<a id="l137" href="#l137">137</a> async function liveData() {
+<a id="l138" href="#l138">138</a>   const db = await archive.fresh();
+<a id="l139" href="#l139">139</a>   const { data, note } = await publish.build(db, { timeoutMs: EMBED_TIMEOUT_MS });
+<a id="l140" href="#l140">140</a>   const { hasClaude } = await import(&#x27;./claude.js&#x27;);
+<a id="l141" href="#l141">141</a>   const w = watch.readState();
+<a id="l142" href="#l142">142</a>   const synced = sync.enabled();
+<a id="l143" href="#l143">143</a>   return {
+<a id="l144" href="#l144">144</a>     ...data,
+<a id="l145" href="#l145">145</a>     live: {
+<a id="l146" href="#l146">146</a>       note,
+<a id="l147" href="#l147">147</a>       window: process.platform === &#x27;win32&#x27;,
+<a id="l148" href="#l148">148</a>       claude: hasClaude(),
+<a id="l149" href="#l149">149</a>       watch: { on: !!w.on, status: watch.status() },
+<a id="l150" href="#l150">150</a>       sync: synced ? { url: sync.serverUrl(), offline: archive.offlineReason(), waiting: sync.waiting() } : null,
+<a id="l151" href="#l151">151</a>       prompts: synced || fs.existsSync(promptsPath()),
+<a id="l152" href="#l152">152</a>       memory: synced || !!config.get(&#x27;memstate_url&#x27;),
+<a id="l153" href="#l153">153</a>     },
+<a id="l154" href="#l154">154</a>   };
+<a id="l155" href="#l155">155</a> }
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a> /** Search by meaning on the page: the page sends its query to the embedding server through here. */
+<a id="l158" href="#l158">158</a> async function proxyEmbeddings(req, res) {
+<a id="l159" href="#l159">159</a>   const endpoint = `${config.get(&#x27;embed_url&#x27;).replace(/\/+$/, &#x27;&#x27;)}/embeddings`;
+<a id="l160" href="#l160">160</a>   let upstream;
+<a id="l161" href="#l161">161</a>   try {
+<a id="l162" href="#l162">162</a>     upstream = await fetch(endpoint, {
+<a id="l163" href="#l163">163</a>       method: &#x27;POST&#x27;,
+<a id="l164" href="#l164">164</a>       headers: { &#x27;content-type&#x27;: &#x27;application/json&#x27; },
+<a id="l165" href="#l165">165</a>       body: await readBody(req),
+<a id="l166" href="#l166">166</a>       signal: AbortSignal.timeout(8000),
+<a id="l167" href="#l167">167</a>     });
+<a id="l168" href="#l168">168</a>   } catch {
+<a id="l169" href="#l169">169</a>     return send(res, 502, { ok: false, error: `cannot reach ${endpoint}` });
+<a id="l170" href="#l170">170</a>   }
+<a id="l171" href="#l171">171</a>   res.writeHead(upstream.status, { ...HEADERS, &#x27;content-type&#x27;: upstream.headers.get(&#x27;content-type&#x27;) || &#x27;application/json&#x27; });
+<a id="l172" href="#l172">172</a>   res.end(Buffer.from(await upstream.arrayBuffer()));
+<a id="l173" href="#l173">173</a> }
+<a id="l174" href="#l174">174</a> 
+<a id="l175" href="#l175">175</a> /** A read of the Prompts or Memory tab on a PC with sync on: the ideamine server answers it. */
+<a id="l176" href="#l176">176</a> async function forward(res, route) {
+<a id="l177" href="#l177">177</a>   const target = new URL(route, sync.serverUrl());
+<a id="l178" href="#l178">178</a>   let upstream;
+<a id="l179" href="#l179">179</a>   try {
+<a id="l180" href="#l180">180</a>     upstream = await fetch(target, { signal: AbortSignal.timeout(15000) });
+<a id="l181" href="#l181">181</a>   } catch {
+<a id="l182" href="#l182">182</a>     return send(res, 502, { ok: false, error: `cannot reach ${target.origin}` });
+<a id="l183" href="#l183">183</a>   }
+<a id="l184" href="#l184">184</a>   res.writeHead(upstream.status, { ...HEADERS, &#x27;content-type&#x27;: upstream.headers.get(&#x27;content-type&#x27;) || &#x27;application/json&#x27; });
+<a id="l185" href="#l185">185</a>   res.end(Buffer.from(await upstream.arrayBuffer()));
+<a id="l186" href="#l186">186</a> }
+<a id="l187" href="#l187">187</a> 
+<a id="l188" href="#l188">188</a> // ---------------------------------------------------------------------------------------------
+<a id="l189" href="#l189">189</a> // The server role: the archive for every machine, the prompt log, and the memories.
+<a id="l190" href="#l190">190</a> 
+<a id="l191" href="#l191">191</a> // A change from a machine. Each result is small, because the machine reads the archive that comes
+<a id="l192" href="#l192">192</a> // with the answer.
+<a id="l193" href="#l193">193</a> const CHANGES = {
+<a id="l194" href="#l194">194</a>   add: (op) =&gt;
+<a id="l195" href="#l195">195</a>     store
+<a id="l196" href="#l196">196</a>       .addIdeas(op.texts, { source: op.source, project: op.project, session: op.session, tags: op.tags, host: op.host })
+<a id="l197" href="#l197">197</a>       .map(({ idea, similar }) =&gt; ({ id: idea.id, similar })),
+<a id="l198" href="#l198">198</a>   update: (op) =&gt; ({ id: store.updateIdea(op.id, op.patch || {}).id }),
+<a id="l199" href="#l199">199</a>   remove: (op) =&gt; store.removeIdeas(op.ids || []),
+<a id="l200" href="#l200">200</a>   triage: (op) =&gt; store.applyTriage(op.verdicts, { by: op.by, projects: op.projects }),
+<a id="l201" href="#l201">201</a> };
+<a id="l202" href="#l202">202</a> 
+<a id="l203" href="#l203">203</a> function readApplied() {
+<a id="l204" href="#l204">204</a>   try {
+<a id="l205" href="#l205">205</a>     return JSON.parse(fs.readFileSync(appliedPath(), &#x27;utf8&#x27;));
+<a id="l206" href="#l206">206</a>   } catch {
+<a id="l207" href="#l207">207</a>     return {};
+<a id="l208" href="#l208">208</a>   }
+<a id="l209" href="#l209">209</a> }
+<a id="l210" href="#l210">210</a> 
+<a id="l211" href="#l211">211</a> /**
+<a id="l212" href="#l212">212</a>  * Apply changes in order. A change that came before (the same oid) is not applied again: its first
+<a id="l213" href="#l213">213</a>  * result comes back. A machine sends a change again when an answer got lost on the way.
+<a id="l214" href="#l214">214</a>  */
+<a id="l215" href="#l215">215</a> function applyChanges(ops) {
+<a id="l216" href="#l216">216</a>   if (!Array.isArray(ops)) throw new Error(&#x27;ops must be a list&#x27;);
+<a id="l217" href="#l217">217</a>   const applied = readApplied();
+<a id="l218" href="#l218">218</a>   const results = ops.map((op) =&gt; {
+<a id="l219" href="#l219">219</a>     if (op?.oid &amp;&amp; applied[op.oid]) return applied[op.oid];
+<a id="l220" href="#l220">220</a>     let result;
+<a id="l221" href="#l221">221</a>     try {
+<a id="l222" href="#l222">222</a>       if (!op || !Object.hasOwn(CHANGES, op.op)) throw new Error(`unknown change &quot;${op?.op}&quot;`);
+<a id="l223" href="#l223">223</a>       result = { ok: true, value: CHANGES[op.op](op) };
+<a id="l224" href="#l224">224</a>     } catch (e) {
+<a id="l225" href="#l225">225</a>       result = { ok: false, error: e.message };
+<a id="l226" href="#l226">226</a>     }
+<a id="l227" href="#l227">227</a>     if (op?.oid) applied[op.oid] = result;
+<a id="l228" href="#l228">228</a>     return result;
+<a id="l229" href="#l229">229</a>   });
+<a id="l230" href="#l230">230</a>   const kept = Object.entries(applied).slice(-APPLIED_KEPT);
+<a id="l231" href="#l231">231</a>   store.withLock(() =&gt; store.writeAtomic(appliedPath(), JSON.stringify(Object.fromEntries(kept))));
+<a id="l232" href="#l232">232</a>   return results;
+<a id="l233" href="#l233">233</a> }
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> let promptCache = null;
+<a id="l236" href="#l236">236</a> 
+<a id="l237" href="#l237">237</a> /** The prompt log: one JSON line for each prompt. The copy in memory is kept until the file changes. */
+<a id="l238" href="#l238">238</a> function loadPrompts() {
+<a id="l239" href="#l239">239</a>   const st = fs.statSync(promptsPath(), { throwIfNoEntry: false });
+<a id="l240" href="#l240">240</a>   if (!st) return { prompts: [], ids: new Set() };
+<a id="l241" href="#l241">241</a>   if (promptCache?.mtime === st.mtimeMs &amp;&amp; promptCache.size === st.size) return promptCache;
+<a id="l242" href="#l242">242</a>   const prompts = [];
+<a id="l243" href="#l243">243</a>   for (const line of fs.readFileSync(promptsPath(), &#x27;utf8&#x27;).split(&#x27;\n&#x27;)) {
+<a id="l244" href="#l244">244</a>     if (!line.trim()) continue;
+<a id="l245" href="#l245">245</a>     try {
+<a id="l246" href="#l246">246</a>       prompts.push(JSON.parse(line));
+<a id="l247" href="#l247">247</a>     } catch {
+<a id="l248" href="#l248">248</a>       // A line that a crash cut in half.
+<a id="l249" href="#l249">249</a>     }
+<a id="l250" href="#l250">250</a>   }
+<a id="l251" href="#l251">251</a>   promptCache = { mtime: st.mtimeMs, size: st.size, prompts, ids: new Set(prompts.map((p) =&gt; p.id)) };
+<a id="l252" href="#l252">252</a>   return promptCache;
+<a id="l253" href="#l253">253</a> }
+<a id="l254" href="#l254">254</a> 
+<a id="l255" href="#l255">255</a> const field = (v, max = 300) =&gt; (v == null ? null : String(v).slice(0, max));
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> /** Add prompts that the log does not have yet. A prompt without an id, a time, or a text is skipped. */
+<a id="l258" href="#l258">258</a> function addPrompts(list) {
+<a id="l259" href="#l259">259</a>   if (!Array.isArray(list)) throw new Error(&#x27;prompts must be a list&#x27;);
+<a id="l260" href="#l260">260</a>   const { ids } = loadPrompts();
+<a id="l261" href="#l261">261</a>   const add = [];
+<a id="l262" href="#l262">262</a>   let skipped = 0;
+<a id="l263" href="#l263">263</a>   for (const p of list) {
+<a id="l264" href="#l264">264</a>     const bad = !p || typeof p.id !== &#x27;string&#x27; || !p.id || typeof p.prompt !== &#x27;string&#x27; || Number.isNaN(Date.parse(p.at));
+<a id="l265" href="#l265">265</a>     if (bad) skipped++;
+<a id="l266" href="#l266">266</a>     if (bad || ids.has(p.id)) continue;
+<a id="l267" href="#l267">267</a>     ids.add(p.id);
+<a id="l268" href="#l268">268</a>     add.push({ id: p.id.slice(0, 64), at: new Date(p.at).toISOString(), host: field(p.host, 100), session: field(p.session, 100), cwd: field(p.cwd), prompt: p.prompt });
+<a id="l269" href="#l269">269</a>   }
+<a id="l270" href="#l270">270</a>   if (add.length) store.withLock(() =&gt; fs.appendFileSync(promptsPath(), add.map((p) =&gt; `${JSON.stringify(p)}\n`).join(&#x27;&#x27;)));
+<a id="l271" href="#l271">271</a>   return { added: add.length, skipped };
+<a id="l272" href="#l272">272</a> }
+<a id="l273" href="#l273">273</a> 
+<a id="l274" href="#l274">274</a> /** The prompts of the last `days` days (all prompts for 0), oldest first. */
+<a id="l275" href="#l275">275</a> function listPrompts(days) {
+<a id="l276" href="#l276">276</a>   const since = days &gt; 0 ? Date.now() - days * DAY : 0;
+<a id="l277" href="#l277">277</a>   return loadPrompts().prompts.filter((p) =&gt; Date.parse(p.at) &gt;= since).sort((a, b) =&gt; a.at.localeCompare(b.at));
+<a id="l278" href="#l278">278</a> }
+<a id="l279" href="#l279">279</a> 
+<a id="l280" href="#l280">280</a> /** A read from the memstated daemon at memstate_url. */
+<a id="l281" href="#l281">281</a> async function memstate(route, body) {
+<a id="l282" href="#l282">282</a>   const base = config.get(&#x27;memstate_url&#x27;);
+<a id="l283" href="#l283">283</a>   if (!base) throw new Error(&#x27;this server shows no memories. Set memstate_url, for example: ideamine config memstate_url http://127.0.0.1:8765&#x27;);
+<a id="l284" href="#l284">284</a>   const url = `${base.replace(/\/+$/, &#x27;&#x27;)}${route}`;
+<a id="l285" href="#l285">285</a>   const init = { signal: AbortSignal.timeout(8000) };
+<a id="l286" href="#l286">286</a>   if (body) Object.assign(init, { method: &#x27;POST&#x27;, headers: { &#x27;content-type&#x27;: &#x27;application/json&#x27; }, body: JSON.stringify(body) });
+<a id="l287" href="#l287">287</a>   let res;
+<a id="l288" href="#l288">288</a>   try {
+<a id="l289" href="#l289">289</a>     res = await fetch(url, init);
+<a id="l290" href="#l290">290</a>   } catch {
+<a id="l291" href="#l291">291</a>     throw new Error(`cannot reach memstated at ${base}`);
+<a id="l292" href="#l292">292</a>   }
+<a id="l293" href="#l293">293</a>   const json = await res.json().catch(() =&gt; null);
+<a id="l294" href="#l294">294</a>   if (!res.ok) throw new Error(`memstated answered ${res.status}: ${json?.error || &#x27;no reason&#x27;}`);
+<a id="l295" href="#l295">295</a>   return json;
+<a id="l296" href="#l296">296</a> }
+<a id="l297" href="#l297">297</a> 
+<a id="l298" href="#l298">298</a> // The Memory tab reads memstated. It never writes there.
+<a id="l299" href="#l299">299</a> const MEMORY = {
+<a id="l300" href="#l300">300</a>   /** Every project, and every current memory without its text, for the list and the timeline. */
+<a id="l301" href="#l301">301</a>   async overview() {
+<a id="l302" href="#l302">302</a>     const { projects } = await memstate(&#x27;/api/v1/projects&#x27;);
+<a id="l303" href="#l303">303</a>     const memories = [];
+<a id="l304" href="#l304">304</a>     for (const p of projects) {
+<a id="l305" href="#l305">305</a>       const { memories: list } = await memstate(&#x27;/api/v1/keypaths&#x27;, { project_id: p.id });
+<a id="l306" href="#l306">306</a>       for (const m of list) memories.push({ id: m.id, project_id: p.id, keypath: m.keypath, category: m.category || null, version: m.version, created_at: m.created_at });
+<a id="l307" href="#l307">307</a>     }
+<a id="l308" href="#l308">308</a>     return { projects, memories };
+<a id="l309" href="#l309">309</a>   },
+<a id="l310" href="#l310">310</a>   /** The current memories of one project, with their text. */
+<a id="l311" href="#l311">311</a>   async project(query) {
+<a id="l312" href="#l312">312</a>     const { memories } = await memstate(&#x27;/api/v1/keypaths&#x27;, { project_id: query.get(&#x27;id&#x27;) || &#x27;&#x27;, include_content: true });
+<a id="l313" href="#l313">313</a>     return { memories };
+<a id="l314" href="#l314">314</a>   },
+<a id="l315" href="#l315">315</a>   /** Every version of one memory, oldest first. */
+<a id="l316" href="#l316">316</a>   async history(query) {
+<a id="l317" href="#l317">317</a>     const { versions } = await memstate(&#x27;/api/v1/memories/history&#x27;, { project_id: query.get(&#x27;project&#x27;) || &#x27;&#x27;, keypath: query.get(&#x27;keypath&#x27;) || &#x27;&#x27; });
+<a id="l318" href="#l318">318</a>     return { versions };
+<a id="l319" href="#l319">319</a>   },
+<a id="l320" href="#l320">320</a> };
+<a id="l321" href="#l321">321</a> 
+<a id="l322" href="#l322">322</a> // ---------------------------------------------------------------------------------------------
+<a id="l323" href="#l323">323</a> // The slash commands. Each one takes the JSON body and returns the text to show on the page.
+<a id="l324" href="#l324">324</a> 
+<a id="l325" href="#l325">325</a> const ACTIONS = {
+<a id="l326" href="#l326">326</a>   /** /idea. A bulleted list adds one idea per bullet. */
+<a id="l327" href="#l327">327</a>   async add({ text }) {
+<a id="l328" href="#l328">328</a>     const results = await archive.add(splitIdeas(String(text ?? &#x27;&#x27;)), { source: &#x27;web&#x27; });
+<a id="l329" href="#l329">329</a>     return results.queued ? archive.queuedText(results) : renderAdded(results, store.load());
+<a id="l330" href="#l330">330</a>   },
+<a id="l331" href="#l331">331</a> 
+<a id="l332" href="#l332">332</a>   /** /ideas-rm. An unknown id deletes nothing. */
+<a id="l333" href="#l333">333</a>   async rm({ ids }) {
+<a id="l334" href="#l334">334</a>     if (!Array.isArray(ids) || !ids.length) throw new Error(&#x27;name the ideas to delete&#x27;);
+<a id="l335" href="#l335">335</a>     const gone = await archive.remove(ids);
+<a id="l336" href="#l336">336</a>     return gone.queued ? archive.queuedText(gone) : gone.map((i) =&gt; `Removed #${i.id} · ${clip(i.title, 60)}`).join(&#x27;\n&#x27;);
+<a id="l337" href="#l337">337</a>   },
+<a id="l338" href="#l338">338</a> 
+<a id="l339" href="#l339">339</a>   /** /ideas-done, /ideas-reopen, and the verbs start, drop, note, and model of the CLI. */
+<a id="l340" href="#l340">340</a>   async update({ id, status, note, model }) {
+<a id="l341" href="#l341">341</a>     if (!status &amp;&amp; !note &amp;&amp; !model) throw new Error(&#x27;nothing to change&#x27;);
+<a id="l342" href="#l342">342</a>     const idea = await archive.update(id, { status, note, model });
+<a id="l343" href="#l343">343</a>     if (idea.queued) return archive.queuedText(idea);
+<a id="l344" href="#l344">344</a>     const bits = [`#${idea.id} ${clip(idea.title, 60)} → ${store.lane(idea)}`];
+<a id="l345" href="#l345">345</a>     if (model) bits.push(`model ${idea.triage.model}`);
+<a id="l346" href="#l346">346</a>     if (note) bits.push(&#x27;note added&#x27;);
+<a id="l347" href="#l347">347</a>     return `✓ ${bits.join(&#x27; · &#x27;)}`;
+<a id="l348" href="#l348">348</a>   },
+<a id="l349" href="#l349">349</a> 
+<a id="l350" href="#l350">350</a>   /** /ideas-sort */
+<a id="l351" href="#l351">351</a>   async sort() {
+<a id="l352" href="#l352">352</a>     const { headlessTriage } = await import(&#x27;./claude.js&#x27;);
+<a id="l353" href="#l353">353</a>     const { headlessSummary } = await import(&#x27;./mcp.js&#x27;);
+<a id="l354" href="#l354">354</a>     return headlessSummary(await headlessTriage());
+<a id="l355" href="#l355">355</a>   },
+<a id="l356" href="#l356">356</a> 
+<a id="l357" href="#l357">357</a>   /**
+<a id="l358" href="#l358">358</a>    * /ideas-go [N]. New ideas are triaged first. Then a new window runs `ideamine go N`: Claude Code
+<a id="l359" href="#l359">359</a>    * on the recommended model, in the project of the idea.
+<a id="l360" href="#l360">360</a>    */
+<a id="l361" href="#l361">361</a>   async go({ id }, { open }) {
+<a id="l362" href="#l362">362</a>     const { goPlan, triageFirst } = await import(&#x27;./claude.js&#x27;);
+<a id="l363" href="#l363">363</a>     const { headlessSummary } = await import(&#x27;./mcp.js&#x27;);
+<a id="l364" href="#l364">364</a>     const lines = [];
+<a id="l365" href="#l365">365</a>     try {
+<a id="l366" href="#l366">366</a>       const triaged = await triageFirst({ id: id ?? null });
+<a id="l367" href="#l367">367</a>       if (triaged) lines.push(headlessSummary(triaged));
+<a id="l368" href="#l368">368</a>     } catch (e) {
+<a id="l369" href="#l369">369</a>       lines.push(`Triage failed: ${e.message}`);
+<a id="l370" href="#l370">370</a>     }
+<a id="l371" href="#l371">371</a>     const db = await archive.fresh();
+<a id="l372" href="#l372">372</a>     const idea = id != null ? store.findIdea(db, id) : store.pickNext(db);
+<a id="l373" href="#l373">373</a>     if (!idea) throw new Error(id != null ? `no idea #${id}` : &#x27;Nothing is ready to build. Triage the inbox first.&#x27;);
+<a id="l374" href="#l374">374</a>     const { model, dir } = goPlan(idea, os.homedir());
+<a id="l375" href="#l375">375</a>     await open([BIN, &#x27;go&#x27;, String(idea.id)], dir);
+<a id="l376" href="#l376">376</a>     await archive.update(idea.id, { status: &#x27;doing&#x27; });
+<a id="l377" href="#l377">377</a>     lines.push(`Opened Claude Code (${model}) in ${dir} for #${idea.id} · ${clip(idea.title, 60)}`);
+<a id="l378" href="#l378">378</a>     return lines.join(&#x27;\n\n&#x27;);
+<a id="l379" href="#l379">379</a>   },
+<a id="l380" href="#l380">380</a> 
+<a id="l381" href="#l381">381</a>   /** /ideas &lt;question&gt; */
+<a id="l382" href="#l382">382</a>   async ask({ question }) {
+<a id="l383" href="#l383">383</a>     const q = String(question ?? &#x27;&#x27;).trim();
+<a id="l384" href="#l384">384</a>     if (!q) throw new Error(&#x27;ask a question&#x27;);
+<a id="l385" href="#l385">385</a>     const { askAboutIdeas } = await import(&#x27;./claude.js&#x27;);
+<a id="l386" href="#l386">386</a>     return (await askAboutIdeas(q)).answer || &#x27;Claude gave no answer.&#x27;;
+<a id="l387" href="#l387">387</a>   },
+<a id="l388" href="#l388">388</a> 
+<a id="l389" href="#l389">389</a>   /** /ideas-watch [off] */
+<a id="l390" href="#l390">390</a>   watch({ on }) {
+<a id="l391" href="#l391">391</a>     if (on) {
+<a id="l392" href="#l392">392</a>       watch.turnOn();
+<a id="l393" href="#l393">393</a>       watch.kick();
+<a id="l394" href="#l394">394</a>     } else watch.turnOff();
+<a id="l395" href="#l395">395</a>     return watch.status();
+<a id="l396" href="#l396">396</a>   },
+<a id="l397" href="#l397">397</a> };
+<a id="l398" href="#l398">398</a> 
+<a id="l399" href="#l399">399</a> // These actions do not change the archive, so the dashboard server needs no new upload.
+<a id="l400" href="#l400">400</a> const READ_ONLY = new Set([&#x27;ask&#x27;, &#x27;watch&#x27;]);
+<a id="l401" href="#l401">401</a> 
+<a id="l402" href="#l402">402</a> /** The reads and changes of the server role. Resolves to false for a route that it does not have. */
+<a id="l403" href="#l403">403</a> async function serverRoute(req, res, route, query) {
+<a id="l404" href="#l404">404</a>   if (route === &#x27;GET /api/db&#x27;) return send(res, 200, { ok: true, db: store.load() });
+<a id="l405" href="#l405">405</a>   if (route === &#x27;POST /api/ops&#x27;) {
+<a id="l406" href="#l406">406</a>     const { ops } = await readJson(req);
+<a id="l407" href="#l407">407</a>     return send(res, 200, { ok: true, results: applyChanges(ops), db: store.load() });
+<a id="l408" href="#l408">408</a>   }
+<a id="l409" href="#l409">409</a>   if (route === &#x27;POST /api/prompts&#x27;) {
+<a id="l410" href="#l410">410</a>     const { prompts } = await readJson(req);
+<a id="l411" href="#l411">411</a>     return send(res, 200, { ok: true, ...addPrompts(prompts) });
+<a id="l412" href="#l412">412</a>   }
+<a id="l413" href="#l413">413</a>   if (route === &#x27;GET /api/prompts&#x27;) return send(res, 200, { ok: true, prompts: listPrompts(Number(query.get(&#x27;days&#x27;)) || 0) });
+<a id="l414" href="#l414">414</a>   const memory = route.startsWith(&#x27;GET /api/memory/&#x27;) &amp;&amp; route.slice(&#x27;GET /api/memory/&#x27;.length);
+<a id="l415" href="#l415">415</a>   if (memory &amp;&amp; Object.hasOwn(MEMORY, memory)) return send(res, 200, { ok: true, ...(await MEMORY[memory](query)) });
+<a id="l416" href="#l416">416</a>   return false;
+<a id="l417" href="#l417">417</a> }
+<a id="l418" href="#l418">418</a> 
+<a id="l419" href="#l419">419</a> async function handle(req, res, ctx) {
+<a id="l420" href="#l420">420</a>   const request = { method: req.method, host: req.headers.host, origin: req.headers.origin, type: req.headers[&#x27;content-type&#x27;] };
+<a id="l421" href="#l421">421</a>   if (!allowed(request, ctx.port, extraHosts())) return send(res, 403, { ok: false, error: &#x27;forbidden&#x27; });
+<a id="l422" href="#l422">422</a>   const { pathname, search, searchParams } = new URL(req.url, &#x27;http://127.0.0.1&#x27;);
+<a id="l423" href="#l423">423</a>   const route = `${req.method === &#x27;HEAD&#x27; ? &#x27;GET&#x27; : req.method} ${pathname}`;
+<a id="l424" href="#l424">424</a>   if (route === &#x27;GET /&#x27; || route === &#x27;GET /index.html&#x27;) return sendPage(res);
+<a id="l425" href="#l425">425</a>   if (route === &#x27;GET /data.json&#x27;) return send(res, 200, await liveData());
+<a id="l426" href="#l426">426</a>   // A ping gets a new connection each time, so it never reaches a server that stops on an old one.
+<a id="l427" href="#l427">427</a>   if (route === &#x27;GET /api/ping&#x27;) return send(res, 200, { ok: true, app: &#x27;ideamine&#x27; }, { connection: &#x27;close&#x27; });
+<a id="l428" href="#l428">428</a>   if (route === &#x27;POST /v1/embeddings&#x27;) return proxyEmbeddings(req, res);
+<a id="l429" href="#l429">429</a>   if (route === &#x27;POST /api/stop&#x27;) {
+<a id="l430" href="#l430">430</a>     // After &quot;stopped&quot;, no kept-alive connection may answer a request.
+<a id="l431" href="#l431">431</a>     res.on(&#x27;finish&#x27;, () =&gt; ctx.server.closeAllConnections?.());
+<a id="l432" href="#l432">432</a>     send(res, 200, { ok: true, message: &#x27;stopped&#x27; }, { connection: &#x27;close&#x27; });
+<a id="l433" href="#l433">433</a>     ctx.server.close();
+<a id="l434" href="#l434">434</a>     return;
+<a id="l435" href="#l435">435</a>   }
+<a id="l436" href="#l436">436</a>   if (sync.enabled()) {
+<a id="l437" href="#l437">437</a>     if (route === &#x27;GET /api/prompts&#x27; || route.startsWith(&#x27;GET /api/memory/&#x27;)) return forward(res, `${pathname.slice(1)}${search}`);
+<a id="l438" href="#l438">438</a>   } else {
+<a id="l439" href="#l439">439</a>     try {
+<a id="l440" href="#l440">440</a>       if ((await serverRoute(req, res, route, searchParams)) !== false) return;
+<a id="l441" href="#l441">441</a>     } catch (e) {
+<a id="l442" href="#l442">442</a>       return send(res, 400, { ok: false, error: e.message });
+<a id="l443" href="#l443">443</a>     }
+<a id="l444" href="#l444">444</a>   }
+<a id="l445" href="#l445">445</a>   const action = route.startsWith(&#x27;POST /api/&#x27;) ? route.slice(&#x27;POST /api/&#x27;.length) : &#x27;&#x27;;
+<a id="l446" href="#l446">446</a>   if (!Object.hasOwn(ACTIONS, action)) return send(res, 404, { ok: false, error: &#x27;not found&#x27; });
+<a id="l447" href="#l447">447</a>   try {
+<a id="l448" href="#l448">448</a>     const message = await ACTIONS[action](await readJson(req), ctx);
+<a id="l449" href="#l449">449</a>     ctx.log(`${action}: ok`);
+<a id="l450" href="#l450">450</a>     if (!READ_ONLY.has(action)) {
+<a id="l451" href="#l451">451</a>       try {
+<a id="l452" href="#l452">452</a>         ctx.afterChange();
+<a id="l453" href="#l453">453</a>       } catch {
+<a id="l454" href="#l454">454</a>         // The upload to the dashboard server must never fail a command.
+<a id="l455" href="#l455">455</a>       }
+<a id="l456" href="#l456">456</a>     }
+<a id="l457" href="#l457">457</a>     return send(res, 200, { ok: true, message });
+<a id="l458" href="#l458">458</a>   } catch (e) {
+<a id="l459" href="#l459">459</a>     ctx.log(`${action}: ${e.message}`);
+<a id="l460" href="#l460">460</a>     return send(res, 400, { ok: false, error: e.message });
+<a id="l461" href="#l461">461</a>   }
+<a id="l462" href="#l462">462</a> }
+<a id="l463" href="#l463">463</a> 
+<a id="l464" href="#l464">464</a> /**
+<a id="l465" href="#l465">465</a>  * The server, not listening yet. `open` opens the window for a build, `afterChange` runs after a
+<a id="l466" href="#l466">466</a>  * command changes the archive (by default it uploads the dashboard again), and `log` gets a line
+<a id="l467" href="#l467">467</a>  * for each command.
+<a id="l468" href="#l468">468</a>  */
+<a id="l469" href="#l469">469</a> export function createServer({ open = openWindow, afterChange = publish.kick, log = () =&gt; {} } = {}) {
+<a id="l470" href="#l470">470</a>   const ctx = { open, afterChange, log, port: null };
+<a id="l471" href="#l471">471</a>   ctx.server = http.createServer((req, res) =&gt; {
+<a id="l472" href="#l472">472</a>     handle(req, res, ctx).catch((e) =&gt; {
+<a id="l473" href="#l473">473</a>       if (!res.headersSent) send(res, 500, { ok: false, error: e.message });
+<a id="l474" href="#l474">474</a>     });
+<a id="l475" href="#l475">475</a>   });
+<a id="l476" href="#l476">476</a>   ctx.server.on(&#x27;listening&#x27;, () =&gt; (ctx.port = ctx.server.address().port));
+<a id="l477" href="#l477">477</a>   return ctx.server;
+<a id="l478" href="#l478">478</a> }
+<a id="l479" href="#l479">479</a> 
+<a id="l480" href="#l480">480</a> /** Listen on 127.0.0.1. Resolves to { server, url }. */
+<a id="l481" href="#l481">481</a> export function start({ port: p = port(), ...options } = {}) {
+<a id="l482" href="#l482">482</a>   const server = createServer(options);
+<a id="l483" href="#l483">483</a>   return new Promise((resolve, reject) =&gt; {
+<a id="l484" href="#l484">484</a>     server.once(&#x27;error&#x27;, reject);
+<a id="l485" href="#l485">485</a>     server.listen(p, &#x27;127.0.0.1&#x27;, () =&gt; resolve({ server, url: address(server.address().port) }));
+<a id="l486" href="#l486">486</a>   });
+<a id="l487" href="#l487">487</a> }
+<a id="l488" href="#l488">488</a> 
+<a id="l489" href="#l489">489</a> /** True when an ideamine server answers at `url`. */
+<a id="l490" href="#l490">490</a> async function ping(url) {
+<a id="l491" href="#l491">491</a>   try {
+<a id="l492" href="#l492">492</a>     const res = await fetch(new URL(&#x27;api/ping&#x27;, url), { signal: AbortSignal.timeout(1000) });
+<a id="l493" href="#l493">493</a>     return res.ok &amp;&amp; (await res.json()).app === &#x27;ideamine&#x27;;
+<a id="l494" href="#l494">494</a>   } catch {
+<a id="l495" href="#l495">495</a>     return false;
+<a id="l496" href="#l496">496</a>   }
+<a id="l497" href="#l497">497</a> }
+<a id="l498" href="#l498">498</a> 
+<a id="l499" href="#l499">499</a> /** Start `ideamine serve` in the background. Its output goes to serve.log, and so does a failed start. */
+<a id="l500" href="#l500">500</a> function startProcess() {
+<a id="l501" href="#l501">501</a>   fs.mkdirSync(store.home(), { recursive: true });
+<a id="l502" href="#l502">502</a>   const log = fs.openSync(logPath(), &#x27;a&#x27;);
+<a id="l503" href="#l503">503</a>   try {
+<a id="l504" href="#l504">504</a>     const child = spawn(process.execPath, [BIN, &#x27;serve&#x27;], { cwd: store.home(), detached: true, stdio: [&#x27;ignore&#x27;, log, log], windowsHide: true });
+<a id="l505" href="#l505">505</a>     child.on(&#x27;error&#x27;, (e) =&gt; fs.appendFileSync(logPath(), `${logLine(`cannot start: ${e.message}`)}\n`));
+<a id="l506" href="#l506">506</a>     child.unref();
+<a id="l507" href="#l507">507</a>   } finally {
+<a id="l508" href="#l508">508</a>     fs.closeSync(log);
+<a id="l509" href="#l509">509</a>   }
+<a id="l510" href="#l510">510</a> }
+<a id="l511" href="#l511">511</a> 
+<a id="l512" href="#l512">512</a> /** /ideas-web: start the server when it does not run. Resolves to the text for the user. */
+<a id="l513" href="#l513">513</a> export async function ensureRunning({ startServer = startProcess, waitMs = 5000 } = {}) {
+<a id="l514" href="#l514">514</a>   const url = address();
+<a id="l515" href="#l515">515</a>   if (await ping(url)) return `ideamine web: ${url}`;
+<a id="l516" href="#l516">516</a>   startServer();
+<a id="l517" href="#l517">517</a>   for (const deadline = Date.now() + waitMs; Date.now() &lt; deadline; ) {
+<a id="l518" href="#l518">518</a>     await sleep(150);
+<a id="l519" href="#l519">519</a>     if (await ping(url)) return `ideamine web: ${url} (started)`;
+<a id="l520" href="#l520">520</a>   }
+<a id="l521" href="#l521">521</a>   return `ideamine web did not start at ${url}. The reason is in ${logPath()}.`;
+<a id="l522" href="#l522">522</a> }
+<a id="l523" href="#l523">523</a> 
+<a id="l524" href="#l524">524</a> /** /ideas-web off */
+<a id="l525" href="#l525">525</a> export async function stopRunning() {
+<a id="l526" href="#l526">526</a>   const url = address();
+<a id="l527" href="#l527">527</a>   if (!(await ping(url))) return &#x27;ideamine web: not running.&#x27;;
+<a id="l528" href="#l528">528</a>   try {
+<a id="l529" href="#l529">529</a>     await fetch(new URL(&#x27;api/stop&#x27;, url), { method: &#x27;POST&#x27;, headers: { &#x27;content-type&#x27;: &#x27;application/json&#x27; }, body: &#x27;{}&#x27; });
+<a id="l530" href="#l530">530</a>   } catch {
+<a id="l531" href="#l531">531</a>     // The server can close the connection before its answer arrives. The ping below tells the result.
+<a id="l532" href="#l532">532</a>   }
+<a id="l533" href="#l533">533</a>   return (await ping(url)) ? `ideamine web: still running at ${url}` : &#x27;ideamine web: stopped.&#x27;;
+<a id="l534" href="#l534">534</a> }
+<a id="l535" href="#l535">535</a> 
+<a id="l536" href="#l536">536</a> /** A line for serve.log: the time and the text. */
+<a id="l537" href="#l537">537</a> export const logLine = (text) =&gt; `${stamp(new Date().toISOString())}  ${text}`;</pre>
+</div></body></html>

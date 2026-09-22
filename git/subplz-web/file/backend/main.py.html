@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/main.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/main.py (5518 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Application entrypoint.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a>     python -m uvicorn backend.main:app --host 127.0.0.1 --port 8420
+<a id="l4" href="#l4">4</a> 
+<a id="l5" href="#l5">5</a> Serves the API and the static frontend from one origin, so localhost needs no
+<a id="l6" href="#l6">6</a> CORS config and no second server.
+<a id="l7" href="#l7">7</a> &quot;&quot;&quot;
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> from __future__ import annotations
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> import asyncio
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> import logging
+<a id="l14" href="#l14">14</a> import mimetypes
+<a id="l15" href="#l15">15</a> import subprocess
+<a id="l16" href="#l16">16</a> from contextlib import asynccontextmanager
+<a id="l17" href="#l17">17</a> 
+<a id="l18" href="#l18">18</a> from fastapi import FastAPI
+<a id="l19" href="#l19">19</a> from fastapi.responses import FileResponse
+<a id="l20" href="#l20">20</a> from fastapi.staticfiles import StaticFiles
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> from .api import router
+<a id="l23" href="#l23">23</a> from .db import Job, JobStatus, SessionLocal, init_db
+<a id="l24" href="#l24">24</a> from .languages import all_languages
+<a id="l25" href="#l25">25</a> from .queue import queue
+<a id="l26" href="#l26">26</a> from .settings import ROOT, settings
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> logging.basicConfig(
+<a id="l29" href="#l29">29</a>     level=logging.INFO,
+<a id="l30" href="#l30">30</a>     format=&quot;%(asctime)s %(levelname)-7s %(name)s: %(message)s&quot;,
+<a id="l31" href="#l31">31</a> )
+<a id="l32" href="#l32">32</a> log = logging.getLogger(&quot;subplz.web&quot;)
+<a id="l33" href="#l33">33</a> 
+<a id="l34" href="#l34">34</a> FRONTEND = ROOT / &quot;frontend&quot;
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a> def _version() -&gt; str:
+<a id="l38" href="#l38">38</a>     &quot;&quot;&quot;The release this checkout is: the nearest git tag, e.g. v2.0.0 or
+<a id="l39" href="#l39">39</a>     v2.0.0-3-gabc1234 when it is ahead of one. Answers &quot;what is deployed?&quot;.&quot;&quot;&quot;
+<a id="l40" href="#l40">40</a>     try:
+<a id="l41" href="#l41">41</a>         return subprocess.run(
+<a id="l42" href="#l42">42</a>             [&quot;git&quot;, &quot;-c&quot;, f&quot;safe.directory={ROOT.as_posix()}&quot;, &quot;describe&quot;, &quot;--tags&quot;, &quot;--always&quot;, &quot;--dirty&quot;],
+<a id="l43" href="#l43">43</a>             cwd=ROOT, capture_output=True, text=True, timeout=10, check=True,
+<a id="l44" href="#l44">44</a>         ).stdout.strip() or &quot;unknown&quot;
+<a id="l45" href="#l45">45</a>     except (subprocess.SubprocessError, OSError):
+<a id="l46" href="#l46">46</a>         return &quot;unknown&quot;
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a> VERSION = _version()
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a> # Python takes these from the OS, and Windows gets both wrong. A module served
+<a id="l52" href="#l52">52</a> # as text/plain is refused outright, and WebAssembly will not stream-compile.
+<a id="l53" href="#l53">53</a> mimetypes.add_type(&quot;text/javascript&quot;, &quot;.js&quot;)
+<a id="l54" href="#l54">54</a> mimetypes.add_type(&quot;text/javascript&quot;, &quot;.mjs&quot;)
+<a id="l55" href="#l55">55</a> mimetypes.add_type(&quot;application/wasm&quot;, &quot;.wasm&quot;)
+<a id="l56" href="#l56">56</a> 
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a> def _requeue_interrupted() -&gt; None:
+<a id="l59" href="#l59">59</a>     &quot;&quot;&quot;Recover jobs that were mid-flight when the server last stopped.
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a>     An in-process queue dies with the process, so anything left `running` is
+<a id="l62" href="#l62">62</a>     orphaned. Put it back in the queue rather than leaving a stuck progress bar.
+<a id="l63" href="#l63">63</a>     &quot;&quot;&quot;
+<a id="l64" href="#l64">64</a>     with SessionLocal() as s:
+<a id="l65" href="#l65">65</a>         stale = (
+<a id="l66" href="#l66">66</a>             s.query(Job)
+<a id="l67" href="#l67">67</a>             .filter(Job.status.in_([JobStatus.running, JobStatus.queued]), Job.local == 0)
+<a id="l68" href="#l68">68</a>             .all()
+<a id="l69" href="#l69">69</a>         )
+<a id="l70" href="#l70">70</a>         for job in stale:
+<a id="l71" href="#l71">71</a>             job.status = JobStatus.queued
+<a id="l72" href="#l72">72</a>             job.stage = &quot;Queued (resumed after restart)&quot;
+<a id="l73" href="#l73">73</a>             job.progress = 0.0
+<a id="l74" href="#l74">74</a>         s.commit()
+<a id="l75" href="#l75">75</a>         ids = [j.id for j in stale]
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a>     for job_id in ids:
+<a id="l78" href="#l78">78</a>         queue.enqueue(job_id)
+<a id="l79" href="#l79">79</a>     if ids:
+<a id="l80" href="#l80">80</a>         log.info(&quot;re-queued %d interrupted job(s)&quot;, len(ids))
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> 
+<a id="l83" href="#l83">83</a> @asynccontextmanager
+<a id="l84" href="#l84">84</a> async def lifespan(_: FastAPI):
+<a id="l85" href="#l85">85</a>     init_db()
+<a id="l86" href="#l86">86</a>     log.info(
+<a id="l87" href="#l87">87</a>         &quot;subplz-web ready | %d languages | model=%s device=%s | &quot;
+<a id="l88" href="#l88">88</a>         &quot;queue=%s storage=%s | billing=%s&quot;,
+<a id="l89" href="#l89">89</a>         len(all_languages()), settings.model, settings.device,
+<a id="l90" href="#l90">90</a>         settings.queue_backend, settings.storage_backend,
+<a id="l91" href="#l91">91</a>         &quot;on&quot; if settings.billing_enabled else &quot;off&quot;,
+<a id="l92" href="#l92">92</a>     )
+<a id="l93" href="#l93">93</a>     _requeue_interrupted()
+<a id="l94" href="#l94">94</a>     sweeper = asyncio.create_task(_housekeeping())
+<a id="l95" href="#l95">95</a>     yield
+<a id="l96" href="#l96">96</a>     sweeper.cancel()
+<a id="l97" href="#l97">97</a>     queue.shutdown()
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> async def _housekeeping() -&gt; None:
+<a id="l101" href="#l101">101</a>     &quot;&quot;&quot;Once an hour: let go of abandoned browser jobs, and delete files past their time.&quot;&quot;&quot;
+<a id="l102" href="#l102">102</a>     from . import retention
+<a id="l103" href="#l103">103</a>     from .api import expire_stale_local_jobs
+<a id="l104" href="#l104">104</a> 
+<a id="l105" href="#l105">105</a>     while True:
+<a id="l106" href="#l106">106</a>         def once() -&gt; None:
+<a id="l107" href="#l107">107</a>             with SessionLocal() as s:
+<a id="l108" href="#l108">108</a>                 expire_stale_local_jobs(s)
+<a id="l109" href="#l109">109</a>                 retention.sweep(s)
+<a id="l110" href="#l110">110</a> 
+<a id="l111" href="#l111">111</a>         try:
+<a id="l112" href="#l112">112</a>             await asyncio.to_thread(once)       # deleting a book&#x27;s files is slow; do not hold the site up
+<a id="l113" href="#l113">113</a>         except Exception:  # noqa: BLE001 - housekeeping must not take the site down
+<a id="l114" href="#l114">114</a>             log.exception(&quot;housekeeping failed&quot;)
+<a id="l115" href="#l115">115</a>         await asyncio.sleep(3600)
+<a id="l116" href="#l116">116</a> 
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a> app = FastAPI(
+<a id="l119" href="#l119">119</a>     title=&quot;SubPlz Web&quot;,
+<a id="l120" href="#l120">120</a>     summary=&quot;Drag an audiobook and an epub in; get split-timed SRT subtitles out.&quot;,
+<a id="l121" href="#l121">121</a>     version=&quot;1.0.0&quot;,
+<a id="l122" href="#l122">122</a>     lifespan=lifespan,
+<a id="l123" href="#l123">123</a> )
+<a id="l124" href="#l124">124</a> app.include_router(router)
+<a id="l125" href="#l125">125</a> 
+<a id="l126" href="#l126">126</a> 
+<a id="l127" href="#l127">127</a> @app.middleware(&quot;http&quot;)
+<a id="l128" href="#l128">128</a> async def cross_origin_isolation(request, call_next):
+<a id="l129" href="#l129">129</a>     &quot;&quot;&quot;Let the page use threads.
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a>     The speech model runs in the browser on WebAssembly threads, which need
+<a id="l132" href="#l132">132</a>     SharedArrayBuffer, which browsers only hand to a cross-origin-isolated
+<a id="l133" href="#l133">133</a>     page. Every file the page loads, the model weights included, comes from
+<a id="l134" href="#l134">134</a>     this origin. &quot;credentialless&quot; rather than &quot;require-corp&quot; so that a
+<a id="l135" href="#l135">135</a>     cross-origin image or link a visitor adds later does not break the page.
+<a id="l136" href="#l136">136</a>     &quot;&quot;&quot;
+<a id="l137" href="#l137">137</a>     response = await call_next(request)
+<a id="l138" href="#l138">138</a>     response.headers[&quot;Cross-Origin-Opener-Policy&quot;] = &quot;same-origin&quot;
+<a id="l139" href="#l139">139</a>     response.headers[&quot;Cross-Origin-Embedder-Policy&quot;] = &quot;credentialless&quot;
+<a id="l140" href="#l140">140</a>     # The engine&#x27;s modules import each other by bare path, so a browser that
+<a id="l141" href="#l141">141</a>     # kept an old engine/asr.js would run it with a new app.js. Make each of
+<a id="l142" href="#l142">142</a>     # them ask the server first (an ETag answers in one round trip); the
+<a id="l143" href="#l143">143</a>     # pinned libraries and weights under /vendor/ may stay a day.
+<a id="l144" href="#l144">144</a>     if request.url.path.startswith(&quot;/vendor/&quot;):
+<a id="l145" href="#l145">145</a>         response.headers[&quot;Cache-Control&quot;] = &quot;public, max-age=86400&quot;
+<a id="l146" href="#l146">146</a>     elif response.headers.get(&quot;content-type&quot;, &quot;&quot;).startswith((&quot;text/javascript&quot;, &quot;text/html&quot;)):
+<a id="l147" href="#l147">147</a>         response.headers[&quot;Cache-Control&quot;] = &quot;no-cache&quot;
+<a id="l148" href="#l148">148</a>     return response
+<a id="l149" href="#l149">149</a> 
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a> @app.get(&quot;/healthz&quot;)
+<a id="l152" href="#l152">152</a> def healthz():
+<a id="l153" href="#l153">153</a>     return {
+<a id="l154" href="#l154">154</a>         &quot;ok&quot;: True,
+<a id="l155" href="#l155">155</a>         &quot;version&quot;: VERSION,
+<a id="l156" href="#l156">156</a>         &quot;languages&quot;: len(all_languages()),
+<a id="l157" href="#l157">157</a>         &quot;queue_backend&quot;: settings.queue_backend,
+<a id="l158" href="#l158">158</a>         &quot;queue_depth&quot;: queue.depth(),
+<a id="l159" href="#l159">159</a>         &quot;storage_backend&quot;: settings.storage_backend,
+<a id="l160" href="#l160">160</a>     }
+<a id="l161" href="#l161">161</a> 
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a> @app.get(&quot;/&quot;)
+<a id="l164" href="#l164">164</a> def index():
+<a id="l165" href="#l165">165</a>     return FileResponse(FRONTEND / &quot;index.html&quot;)
+<a id="l166" href="#l166">166</a> 
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a> app.mount(&quot;/&quot;, StaticFiles(directory=FRONTEND), name=&quot;static&quot;)</pre>
+</div></body></html>

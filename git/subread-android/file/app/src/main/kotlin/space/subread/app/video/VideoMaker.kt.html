@@ -1,0 +1,489 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-android/app/src/main/kotlin/space/subread/app/video/VideoMaker.kt - Recently Written</title>
+<link rel="stylesheet" href="../../../../../../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../../../../../../index.html">git</a></div>
+<h1>subread-android</h1><span class="desc">SubRead for Android: times an audiobook against its ebook on the device</span><p class="url">git clone https://github.com/equwal/subread-android</p><p><a href="../../../../../../../../../../subread-android/index.html">Log</a> | <a href="../../../../../../../../../../subread-android/files.html">Files</a> | <a href="../../../../../../../../../../subread-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>app/src/main/kotlin/space/subread/app/video/VideoMaker.kt (22717 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package space.subread.app.video
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import android.content.Context
+<a id="l4" href="#l4">4</a> import android.graphics.Bitmap
+<a id="l5" href="#l5">5</a> import android.graphics.BitmapFactory
+<a id="l6" href="#l6">6</a> import android.graphics.Color
+<a id="l7" href="#l7">7</a> import android.graphics.Paint
+<a id="l8" href="#l8">8</a> import android.graphics.RectF
+<a id="l9" href="#l9">9</a> import android.media.MediaCodec
+<a id="l10" href="#l10">10</a> import android.media.MediaCodecInfo
+<a id="l11" href="#l11">11</a> import android.media.MediaCodecList
+<a id="l12" href="#l12">12</a> import android.media.MediaExtractor
+<a id="l13" href="#l13">13</a> import android.media.MediaFormat
+<a id="l14" href="#l14">14</a> import android.media.MediaMuxer
+<a id="l15" href="#l15">15</a> import android.net.Uri
+<a id="l16" href="#l16">16</a> import android.util.Log
+<a id="l17" href="#l17">17</a> import androidx.core.graphics.createBitmap
+<a id="l18" href="#l18">18</a> import space.subread.core.H264Still
+<a id="l19" href="#l19">19</a> import java.nio.ByteBuffer
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> /**
+<a id="l22" href="#l22">22</a>  * A video of the book: a still picture over the audiobook&#x27;s own audio, as an
+<a id="l23" href="#l23">23</a>  * MP4 that any player opens and YouTube accepts. The subtitles go beside it as
+<a id="l24" href="#l24">24</a>  * an .srt with the same name, which players load by themselves.
+<a id="l25" href="#l25">25</a>  *
+<a id="l26" href="#l26">26</a>  * A still picture is cheap if nothing is encoded twice. The encoder makes one
+<a id="l27" href="#l27">27</a>  * key frame. The frames after it say &quot;no change&quot; in about ten bytes each; they
+<a id="l28" href="#l28">28</a>  * are written by hand (see H264Still), because an encoder spends kilobytes on
+<a id="l29" href="#l29">29</a>  * the same frame. That minute is written again and again with new time stamps.
+<a id="l30" href="#l30">30</a>  * So the frame rate costs almost nothing, and the picture size costs only in
+<a id="l31" href="#l31">31</a>  * the one key frame of each minute.
+<a id="l32" href="#l32">32</a>  * AAC audio is copied as it is; other audio is encoded to AAC once, which the
+<a id="l33" href="#l33">33</a>  * MP4 container needs.
+<a id="l34" href="#l34">34</a>  */
+<a id="l35" href="#l35">35</a> class VideoSize(val width: Int, val height: Int) {
+<a id="l36" href="#l36">36</a>     val label: String get() = &quot;${height}p&quot;
+<a id="l37" href="#l37">37</a> }
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a> object VideoMaker {
+<a id="l40" href="#l40">40</a>     private const val TAG = &quot;SubRead&quot;
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a>     /** Sizes to offer. A device makes only those for which it has an encoder: see [sizes]. */
+<a id="l43" href="#l43">43</a>     private val SIZES = listOf(VideoSize(1280, 720), VideoSize(1920, 1080), VideoSize(2560, 1440),
+<a id="l44" href="#l44">44</a>         VideoSize(3840, 2160), VideoSize(7680, 4320))
+<a id="l45" href="#l45">45</a>     val FRAME_RATES = listOf(1, 24, 30, 60)
+<a id="l46" href="#l46">46</a>     private const val GOP_SECONDS = 60
+<a id="l47" href="#l47">47</a>     private const val KEY_FRAME_QP = 26
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a>     private class Frame(val bytes: ByteArray, val key: Boolean)
+<a id="l50" href="#l50">50</a>     private class Sample(val bytes: ByteArray, val ptsUs: Long)
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a>     /** The sizes this device can make, smallest first. The first one is the default. */
+<a id="l53" href="#l53">53</a>     fun sizes(): List&lt;VideoSize&gt; = SIZES.filter { encoderFor(it) != null }.ifEmpty { SIZES.take(1) }
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a>     /**
+<a id="l56" href="#l56">56</a>      * @param cover image bytes, or null for a plain card
+<a id="l57" href="#l57">57</a>      * @param size one of [sizes]
+<a id="l58" href="#l58">58</a>      * @param fps frames in a second, 1 to 60
+<a id="l59" href="#l59">59</a>      */
+<a id="l60" href="#l60">60</a>     fun make(
+<a id="l61" href="#l61">61</a>         context: Context, audio: Uri, cover: ByteArray?, dest: Uri,
+<a id="l62" href="#l62">62</a>         size: VideoSize = SIZES[0], fps: Int = 1, onProgress: (Float) -&gt; Unit,
+<a id="l63" href="#l63">63</a>     ) {
+<a id="l64" href="#l64">64</a>         require(fps in 1..60) { &quot;fps $fps&quot; }
+<a id="l65" href="#l65">65</a>         val yuv = Yuv(picture(cover, size), size)
+<a id="l66" href="#l66">66</a>         var rate = fps
+<a id="l67" href="#l67">67</a>         var (videoFormat, gop) = encodeStill(yuv, size, 1)
+<a id="l68" href="#l68">68</a>         try {
+<a id="l69" href="#l69">69</a>             val skips = H264Still.skipFrames(bytes(videoFormat, &quot;csd-0&quot;), bytes(videoFormat, &quot;csd-1&quot;), GOP_SECONDS * fps - 1)
+<a id="l70" href="#l70">70</a>             gop = gop + skips.map { Frame(it, false) }
+<a id="l71" href="#l71">71</a>         } catch (e: H264Still.Unsupported) {
+<a id="l72" href="#l72">72</a>             // Bigger and at one frame a second, but correct: the encoder&#x27;s own frames.
+<a id="l73" href="#l73">73</a>             Log.w(TAG, &quot;still: no hand-made frames for this stream (${e.message})&quot;)
+<a id="l74" href="#l74">74</a>             rate = 1
+<a id="l75" href="#l75">75</a>             encodeStill(yuv, size, GOP_SECONDS).let { videoFormat = it.first; gop = it.second }
+<a id="l76" href="#l76">76</a>         }
+<a id="l77" href="#l77">77</a>         val level = H264Still.level(size.width, size.height, rate)
+<a id="l78" href="#l78">78</a>         videoFormat.setByteBuffer(&quot;csd-0&quot;, ByteBuffer.wrap(H264Still.withLevel(bytes(videoFormat, &quot;csd-0&quot;), level)))
+<a id="l79" href="#l79">79</a>         Log.i(TAG, &quot;still: ${size.width}x${size.height} at $rate fps, level $level, ${gop.size} frames, &quot; +
+<a id="l80" href="#l80">80</a>             &quot;key ${gop[0].bytes.size} B, the rest ${gop.drop(1).sumOf { it.bytes.size }} B&quot;)
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a>         val extractor = MediaExtractor()
+<a id="l83" href="#l83">83</a>         extractor.setDataSource(context, audio, null)
+<a id="l84" href="#l84">84</a>         val track = (0 until extractor.trackCount).firstOrNull {
+<a id="l85" href="#l85">85</a>             extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME).orEmpty().startsWith(&quot;audio/&quot;)
+<a id="l86" href="#l86">86</a>         } ?: throw IllegalArgumentException(&quot;No audio track in this file.&quot;)
+<a id="l87" href="#l87">87</a>         extractor.selectTrack(track)
+<a id="l88" href="#l88">88</a>         val source = extractor.getTrackFormat(track)
+<a id="l89" href="#l89">89</a>         val durationUs = if (source.containsKey(MediaFormat.KEY_DURATION)) source.getLong(MediaFormat.KEY_DURATION) else 0L
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a>         val sound: AudioSource =
+<a id="l92" href="#l92">92</a>             if (source.getString(MediaFormat.KEY_MIME) == MediaFormat.MIMETYPE_AUDIO_AAC) Copy(extractor, source)
+<a id="l93" href="#l93">93</a>             else Transcode(extractor, source)
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a>         context.contentResolver.openFileDescriptor(dest, &quot;rw&quot;)!!.use { pfd -&gt;
+<a id="l96" href="#l96">96</a>             val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+<a id="l97" href="#l97">97</a>             try {
+<a id="l98" href="#l98">98</a>                 val v = muxer.addTrack(videoFormat)
+<a id="l99" href="#l99">99</a>                 val a = muxer.addTrack(sound.format())
+<a id="l100" href="#l100">100</a>                 muxer.start()
+<a id="l101" href="#l101">101</a> 
+<a id="l102" href="#l102">102</a>                 val info = MediaCodec.BufferInfo()
+<a id="l103" href="#l103">103</a>                 var frame = 0L
+<a id="l104" href="#l104">104</a>                 var frameUs = 0L
+<a id="l105" href="#l105">105</a>                 fun picture() {
+<a id="l106" href="#l106">106</a>                     val f = gop[(frame % gop.size).toInt()]
+<a id="l107" href="#l107">107</a>                     info.set(0, f.bytes.size, frameUs, if (f.key) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0)
+<a id="l108" href="#l108">108</a>                     muxer.writeSampleData(v, ByteBuffer.wrap(f.bytes), info)
+<a id="l109" href="#l109">109</a>                     frame++
+<a id="l110" href="#l110">110</a>                     frameUs = frame * 1_000_000 / rate
+<a id="l111" href="#l111">111</a>                 }
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a>                 var lastUs = 0L
+<a id="l114" href="#l114">114</a>                 while (true) {
+<a id="l115" href="#l115">115</a>                     val s = sound.next() ?: break
+<a id="l116" href="#l116">116</a>                     // Keep the two tracks side by side in the file, so a player
+<a id="l117" href="#l117">117</a>                     // does not have to jump about to find the next of either.
+<a id="l118" href="#l118">118</a>                     while (frameUs &lt;= s.ptsUs) picture()
+<a id="l119" href="#l119">119</a>                     info.set(0, s.bytes.size, s.ptsUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+<a id="l120" href="#l120">120</a>                     muxer.writeSampleData(a, ByteBuffer.wrap(s.bytes), info)
+<a id="l121" href="#l121">121</a>                     lastUs = s.ptsUs
+<a id="l122" href="#l122">122</a>                     if (durationUs &gt; 0) onProgress((s.ptsUs.toFloat() / durationUs).coerceIn(0f, 1f))
+<a id="l123" href="#l123">123</a>                 }
+<a id="l124" href="#l124">124</a>                 while (frameUs &lt;= lastUs) picture()
+<a id="l125" href="#l125">125</a>                 muxer.stop()
+<a id="l126" href="#l126">126</a>             } finally {
+<a id="l127" href="#l127">127</a>                 runCatching { muxer.release() }
+<a id="l128" href="#l128">128</a>                 sound.close()
+<a id="l129" href="#l129">129</a>                 extractor.release()
+<a id="l130" href="#l130">130</a>             }
+<a id="l131" href="#l131">131</a>         }
+<a id="l132" href="#l132">132</a>     }
+<a id="l133" href="#l133">133</a> 
+<a id="l134" href="#l134">134</a>     private val AVC_LEVELS = mapOf(
+<a id="l135" href="#l135">135</a>         31 to MediaCodecInfo.CodecProfileLevel.AVCLevel31, 32 to MediaCodecInfo.CodecProfileLevel.AVCLevel32,
+<a id="l136" href="#l136">136</a>         40 to MediaCodecInfo.CodecProfileLevel.AVCLevel4, 42 to MediaCodecInfo.CodecProfileLevel.AVCLevel42,
+<a id="l137" href="#l137">137</a>         50 to MediaCodecInfo.CodecProfileLevel.AVCLevel5, 51 to MediaCodecInfo.CodecProfileLevel.AVCLevel51,
+<a id="l138" href="#l138">138</a>         52 to MediaCodecInfo.CodecProfileLevel.AVCLevel52,
+<a id="l139" href="#l139">139</a>         // AVCLevel6, AVCLevel61 and AVCLevel62. The names are in API 29 and later; the values are the same on each version.
+<a id="l140" href="#l140">140</a>         60 to 0x20000, 61 to 0x40000, 62 to 0x80000,
+<a id="l141" href="#l141">141</a>     )
+<a id="l142" href="#l142">142</a> 
+<a id="l143" href="#l143">143</a>     private fun bytes(format: MediaFormat, key: String): ByteArray {
+<a id="l144" href="#l144">144</a>         val buffer = format.getByteBuffer(key) ?: throw H264Still.Unsupported(&quot;no $key&quot;)
+<a id="l145" href="#l145">145</a>         return ByteArray(buffer.remaining()).also { buffer.duplicate().get(it) }
+<a id="l146" href="#l146">146</a>     }
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a>     // ------------------------------------------------------------------ audio
+<a id="l149" href="#l149">149</a> 
+<a id="l150" href="#l150">150</a>     private interface AudioSource {
+<a id="l151" href="#l151">151</a>         fun format(): MediaFormat
+<a id="l152" href="#l152">152</a>         fun next(): Sample?
+<a id="l153" href="#l153">153</a>         fun close() {}
+<a id="l154" href="#l154">154</a>     }
+<a id="l155" href="#l155">155</a> 
+<a id="l156" href="#l156">156</a>     /** AAC goes into the MP4 untouched. */
+<a id="l157" href="#l157">157</a>     private class Copy(val extractor: MediaExtractor, val source: MediaFormat) : AudioSource {
+<a id="l158" href="#l158">158</a>         private val buffer = ByteBuffer.allocate(1 shl 18)
+<a id="l159" href="#l159">159</a>         override fun format() = source
+<a id="l160" href="#l160">160</a>         override fun next(): Sample? {
+<a id="l161" href="#l161">161</a>             val n = extractor.readSampleData(buffer, 0)
+<a id="l162" href="#l162">162</a>             if (n &lt; 0) return null
+<a id="l163" href="#l163">163</a>             val bytes = ByteArray(n)
+<a id="l164" href="#l164">164</a>             buffer.position(0)
+<a id="l165" href="#l165">165</a>             buffer.get(bytes, 0, n)
+<a id="l166" href="#l166">166</a>             val s = Sample(bytes, extractor.sampleTime)
+<a id="l167" href="#l167">167</a>             extractor.advance()
+<a id="l168" href="#l168">168</a>             return s
+<a id="l169" href="#l169">169</a>         }
+<a id="l170" href="#l170">170</a>     }
+<a id="l171" href="#l171">171</a> 
+<a id="l172" href="#l172">172</a>     /**
+<a id="l173" href="#l173">173</a>      * MP3, Opus and the rest: decoded and encoded to AAC, once.
+<a id="l174" href="#l174">174</a>      *
+<a id="l175" href="#l175">175</a>      * Each call into a codec costs about a millisecond on a slow device, and
+<a id="l176" href="#l176">176</a>      * that cost, not the arithmetic, sets the speed. So the decoder has its own
+<a id="l177" href="#l177">177</a>      * thread and works while the encoder works, and the encoder gets the sound
+<a id="l178" href="#l178">178</a>      * in large pieces: one call for many frames.
+<a id="l179" href="#l179">179</a>      */
+<a id="l180" href="#l180">180</a>     private class Transcode(val extractor: MediaExtractor, source: MediaFormat) : AudioSource {
+<a id="l181" href="#l181">181</a>         private val decoder = MediaCodec.createDecoderByType(source.getString(MediaFormat.KEY_MIME)!!).apply {
+<a id="l182" href="#l182">182</a>             configure(source, null, null, 0); start()
+<a id="l183" href="#l183">183</a>         }
+<a id="l184" href="#l184">184</a>         @Volatile private var rate = source.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+<a id="l185" href="#l185">185</a>         @Volatile private var channels = source.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+<a id="l186" href="#l186">186</a>         @Volatile private var failure: Throwable? = null
+<a id="l187" href="#l187">187</a>         @Volatile private var closed = false
+<a id="l188" href="#l188">188</a>         private val pieces = java.util.concurrent.ArrayBlockingQueue&lt;ByteArray&gt;(8)
+<a id="l189" href="#l189">189</a>         private val decoding = kotlin.concurrent.thread(name = &quot;subread-audio-decode&quot;) {
+<a id="l190" href="#l190">190</a>             try { decode() } catch (e: Throwable) { if (!closed) failure = e }
+<a id="l191" href="#l191">191</a>             runCatching { pieces.put(END) }
+<a id="l192" href="#l192">192</a>         }
+<a id="l193" href="#l193">193</a> 
+<a id="l194" href="#l194">194</a>         private var encoder: MediaCodec? = null
+<a id="l195" href="#l195">195</a>         private var outFormat: MediaFormat? = null
+<a id="l196" href="#l196">196</a>         private val info = MediaCodec.BufferInfo()
+<a id="l197" href="#l197">197</a>         private var piece: ByteArray? = null
+<a id="l198" href="#l198">198</a>         private var pieceAt = 0
+<a id="l199" href="#l199">199</a>         private var pcmEnded = false
+<a id="l200" href="#l200">200</a>         private var encoderEnded = false
+<a id="l201" href="#l201">201</a>         private var framesIn = 0L
+<a id="l202" href="#l202">202</a>         private val ready = ArrayDeque&lt;Sample&gt;()
+<a id="l203" href="#l203">203</a>         private var finished = false
+<a id="l204" href="#l204">204</a> 
+<a id="l205" href="#l205">205</a>         override fun format(): MediaFormat {
+<a id="l206" href="#l206">206</a>             while (outFormat == null &amp;&amp; !finished) pump()
+<a id="l207" href="#l207">207</a>             return outFormat ?: throw IllegalStateException(&quot;The audio could not be encoded.&quot;)
+<a id="l208" href="#l208">208</a>         }
+<a id="l209" href="#l209">209</a> 
+<a id="l210" href="#l210">210</a>         override fun next(): Sample? {
+<a id="l211" href="#l211">211</a>             while (ready.isEmpty() &amp;&amp; !finished) pump()
+<a id="l212" href="#l212">212</a>             return ready.removeFirstOrNull()
+<a id="l213" href="#l213">213</a>         }
+<a id="l214" href="#l214">214</a> 
+<a id="l215" href="#l215">215</a>         /** The decoder&#x27;s thread: compressed audio in, PCM out in pieces of about [PIECE] bytes. */
+<a id="l216" href="#l216">216</a>         private fun decode() {
+<a id="l217" href="#l217">217</a>             val info = MediaCodec.BufferInfo()
+<a id="l218" href="#l218">218</a>             val pcm = java.io.ByteArrayOutputStream(PIECE + (1 shl 14))
+<a id="l219" href="#l219">219</a>             var extractorDone = false
+<a id="l220" href="#l220">220</a>             while (!closed) {
+<a id="l221" href="#l221">221</a>                 // Each free input buffer gets a frame, so the decoder never waits for this loop.
+<a id="l222" href="#l222">222</a>                 while (!extractorDone) {
+<a id="l223" href="#l223">223</a>                     val i = decoder.dequeueInputBuffer(0)
+<a id="l224" href="#l224">224</a>                     if (i &lt; 0) break
+<a id="l225" href="#l225">225</a>                     val n = extractor.readSampleData(decoder.getInputBuffer(i)!!, 0)
+<a id="l226" href="#l226">226</a>                     if (n &lt; 0) {
+<a id="l227" href="#l227">227</a>                         decoder.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+<a id="l228" href="#l228">228</a>                         extractorDone = true
+<a id="l229" href="#l229">229</a>                     } else {
+<a id="l230" href="#l230">230</a>                         decoder.queueInputBuffer(i, 0, n, 0, 0)
+<a id="l231" href="#l231">231</a>                         extractor.advance()
+<a id="l232" href="#l232">232</a>                     }
+<a id="l233" href="#l233">233</a>                 }
+<a id="l234" href="#l234">234</a>                 val o = decoder.dequeueOutputBuffer(info, 10_000)
+<a id="l235" href="#l235">235</a>                 if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+<a id="l236" href="#l236">236</a>                     // The container can be wrong about these; the decoder is not.
+<a id="l237" href="#l237">237</a>                     rate = decoder.outputFormat.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+<a id="l238" href="#l238">238</a>                     channels = decoder.outputFormat.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+<a id="l239" href="#l239">239</a>                 }
+<a id="l240" href="#l240">240</a>                 if (o &lt; 0) continue
+<a id="l241" href="#l241">241</a>                 if (info.size &gt; 0) {
+<a id="l242" href="#l242">242</a>                     val bytes = ByteArray(info.size)
+<a id="l243" href="#l243">243</a>                     decoder.getOutputBuffer(o)!!.apply { position(info.offset); get(bytes) }
+<a id="l244" href="#l244">244</a>                     pcm.write(bytes)
+<a id="l245" href="#l245">245</a>                 }
+<a id="l246" href="#l246">246</a>                 val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+<a id="l247" href="#l247">247</a>                 decoder.releaseOutputBuffer(o, false)
+<a id="l248" href="#l248">248</a>                 if (pcm.size() &gt;= PIECE || (end &amp;&amp; pcm.size() &gt; 0)) {
+<a id="l249" href="#l249">249</a>                     pieces.put(pcm.toByteArray())
+<a id="l250" href="#l250">250</a>                     pcm.reset()
+<a id="l251" href="#l251">251</a>                 }
+<a id="l252" href="#l252">252</a>                 if (end) return
+<a id="l253" href="#l253">253</a>             }
+<a id="l254" href="#l254">254</a>         }
+<a id="l255" href="#l255">255</a> 
+<a id="l256" href="#l256">256</a>         private fun startEncoder(): MediaCodec {
+<a id="l257" href="#l257">257</a>             val f = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, rate, channels).apply {
+<a id="l258" href="#l258">258</a>                 setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+<a id="l259" href="#l259">259</a>                 setInteger(MediaFormat.KEY_BIT_RATE, if (channels == 1) 80_000 else 128_000)
+<a id="l260" href="#l260">260</a>                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, PIECE)
+<a id="l261" href="#l261">261</a>             }
+<a id="l262" href="#l262">262</a>             return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+<a id="l263" href="#l263">263</a>                 configure(f, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE); start()
+<a id="l264" href="#l264">264</a>             }.also { encoder = it }
+<a id="l265" href="#l265">265</a>         }
+<a id="l266" href="#l266">266</a> 
+<a id="l267" href="#l267">267</a>         /** One step of the encoder&#x27;s side: take encoded audio out, or put PCM in. */
+<a id="l268" href="#l268">268</a>         private fun pump() {
+<a id="l269" href="#l269">269</a>             encoder?.let { enc -&gt;
+<a id="l270" href="#l270">270</a>                 // Wait only when there is nothing to put in.
+<a id="l271" href="#l271">271</a>                 val o = enc.dequeueOutputBuffer(info, if (piece != null || pieces.isNotEmpty()) 0 else 10_000)
+<a id="l272" href="#l272">272</a>                 if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) outFormat = enc.outputFormat
+<a id="l273" href="#l273">273</a>                 else if (o &gt;= 0) {
+<a id="l274" href="#l274">274</a>                     if (info.size &gt; 0 &amp;&amp; info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+<a id="l275" href="#l275">275</a>                         val bytes = ByteArray(info.size)
+<a id="l276" href="#l276">276</a>                         enc.getOutputBuffer(o)!!.apply { position(info.offset); get(bytes) }
+<a id="l277" href="#l277">277</a>                         ready += Sample(bytes, info.presentationTimeUs)
+<a id="l278" href="#l278">278</a>                     }
+<a id="l279" href="#l279">279</a>                     val end = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+<a id="l280" href="#l280">280</a>                     enc.releaseOutputBuffer(o, false)
+<a id="l281" href="#l281">281</a>                     if (end) finished = true
+<a id="l282" href="#l282">282</a>                     return
+<a id="l283" href="#l283">283</a>                 }
+<a id="l284" href="#l284">284</a>             }
+<a id="l285" href="#l285">285</a> 
+<a id="l286" href="#l286">286</a>             if (piece == null &amp;&amp; !pcmEnded) {
+<a id="l287" href="#l287">287</a>                 val next = pieces.poll(10, java.util.concurrent.TimeUnit.MILLISECONDS) ?: return
+<a id="l288" href="#l288">288</a>                 if (next === END) {
+<a id="l289" href="#l289">289</a>                     pcmEnded = true
+<a id="l290" href="#l290">290</a>                     failure?.let { throw it }
+<a id="l291" href="#l291">291</a>                 } else {
+<a id="l292" href="#l292">292</a>                     piece = next
+<a id="l293" href="#l293">293</a>                     pieceAt = 0
+<a id="l294" href="#l294">294</a>                 }
+<a id="l295" href="#l295">295</a>             }
+<a id="l296" href="#l296">296</a>             if (encoderEnded) return
+<a id="l297" href="#l297">297</a> 
+<a id="l298" href="#l298">298</a>             val enc = encoder ?: startEncoder()
+<a id="l299" href="#l299">299</a>             val i = enc.dequeueInputBuffer(10_000)
+<a id="l300" href="#l300">300</a>             if (i &lt; 0) return
+<a id="l301" href="#l301">301</a>             val ptsUs = framesIn * 1_000_000 / rate
+<a id="l302" href="#l302">302</a>             val pcm = piece
+<a id="l303" href="#l303">303</a>             if (pcm != null) {
+<a id="l304" href="#l304">304</a>                 val buf = enc.getInputBuffer(i)!!
+<a id="l305" href="#l305">305</a>                 val frame = 2 * channels
+<a id="l306" href="#l306">306</a>                 val n = minOf(buf.capacity() / frame * frame, pcm.size - pieceAt)
+<a id="l307" href="#l307">307</a>                 buf.clear()
+<a id="l308" href="#l308">308</a>                 buf.put(pcm, pieceAt, n)
+<a id="l309" href="#l309">309</a>                 enc.queueInputBuffer(i, 0, n, ptsUs, 0)
+<a id="l310" href="#l310">310</a>                 pieceAt += n
+<a id="l311" href="#l311">311</a>                 framesIn += n / frame
+<a id="l312" href="#l312">312</a>                 if (pieceAt &gt;= pcm.size) piece = null
+<a id="l313" href="#l313">313</a>             } else {
+<a id="l314" href="#l314">314</a>                 enc.queueInputBuffer(i, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+<a id="l315" href="#l315">315</a>                 encoderEnded = true
+<a id="l316" href="#l316">316</a>             }
+<a id="l317" href="#l317">317</a>         }
+<a id="l318" href="#l318">318</a> 
+<a id="l319" href="#l319">319</a>         override fun close() {
+<a id="l320" href="#l320">320</a>             closed = true
+<a id="l321" href="#l321">321</a>             pieces.clear()              // so a decoder that waits to put a piece can go on, and stop
+<a id="l322" href="#l322">322</a>             decoding.join(2_000)
+<a id="l323" href="#l323">323</a>             runCatching { decoder.stop() }; decoder.release()
+<a id="l324" href="#l324">324</a>             encoder?.let { runCatching { it.stop() }; it.release() }
+<a id="l325" href="#l325">325</a>         }
+<a id="l326" href="#l326">326</a> 
+<a id="l327" href="#l327">327</a>         private companion object {
+<a id="l328" href="#l328">328</a>             /** About a third of a second of stereo sound. */
+<a id="l329" href="#l329">329</a>             const val PIECE = 1 shl 16
+<a id="l330" href="#l330">330</a>             val END = ByteArray(0)
+<a id="l331" href="#l331">331</a>         }
+<a id="l332" href="#l332">332</a>     }
+<a id="l333" href="#l333">333</a> 
+<a id="l334" href="#l334">334</a>     // ---------------------------------------------------------------- picture
+<a id="l335" href="#l335">335</a> 
+<a id="l336" href="#l336">336</a>     /** The cover, letterboxed on a black card; a plain dark card when there is none. */
+<a id="l337" href="#l337">337</a>     internal fun picture(cover: ByteArray?, size: VideoSize): Bitmap {
+<a id="l338" href="#l338">338</a>         val width = size.width
+<a id="l339" href="#l339">339</a>         val height = size.height
+<a id="l340" href="#l340">340</a>         val card = createBitmap(width, height)
+<a id="l341" href="#l341">341</a>         val canvas = android.graphics.Canvas(card)
+<a id="l342" href="#l342">342</a>         canvas.drawColor(Color.rgb(0x16, 0x16, 0x1a))
+<a id="l343" href="#l343">343</a>         val image = cover?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size) }.getOrNull() }
+<a id="l344" href="#l344">344</a>         if (image != null) {
+<a id="l345" href="#l345">345</a>             canvas.drawColor(Color.BLACK)
+<a id="l346" href="#l346">346</a>             val scale = minOf(width.toFloat() / image.width, height.toFloat() / image.height)
+<a id="l347" href="#l347">347</a>             val w = image.width * scale
+<a id="l348" href="#l348">348</a>             val h = image.height * scale
+<a id="l349" href="#l349">349</a>             canvas.drawBitmap(image, null, RectF((width - w) / 2, (height - h) / 2, (width + w) / 2, (height + h) / 2),
+<a id="l350" href="#l350">350</a>                 Paint(Paint.FILTER_BITMAP_FLAG))
+<a id="l351" href="#l351">351</a>         }
+<a id="l352" href="#l352">352</a>         return card
+<a id="l353" href="#l353">353</a>     }
+<a id="l354" href="#l354">354</a> 
+<a id="l355" href="#l355">355</a>     /**
+<a id="l356" href="#l356">356</a>      * The encoder for a picture of this size. The software encoder is first:
+<a id="l357" href="#l357">357</a>      * it is the same on each device. A hardware encoder makes the larger sizes.
+<a id="l358" href="#l358">358</a>      */
+<a id="l359" href="#l359">359</a>     private fun encoderFor(size: VideoSize): String? =
+<a id="l360" href="#l360">360</a>         MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos
+<a id="l361" href="#l361">361</a>             .filter { c -&gt; c.isEncoder &amp;&amp; c.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_VIDEO_AVC, true) } }
+<a id="l362" href="#l362">362</a>             .filter { c -&gt;
+<a id="l363" href="#l363">363</a>                 runCatching {
+<a id="l364" href="#l364">364</a>                     c.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC).videoCapabilities.isSizeSupported(size.width, size.height)
+<a id="l365" href="#l365">365</a>                 }.getOrDefault(false)
+<a id="l366" href="#l366">366</a>             }
+<a id="l367" href="#l367">367</a>             .sortedBy { c -&gt; if (c.name.startsWith(&quot;c2.android.&quot;) || c.name.startsWith(&quot;OMX.google.&quot;)) 0 else 1 }
+<a id="l368" href="#l368">368</a>             .firstOrNull()?.name
+<a id="l369" href="#l369">369</a> 
+<a id="l370" href="#l370">370</a>     /**
+<a id="l371" href="#l371">371</a>      * The first [count] seconds of the picture at one frame a second. The
+<a id="l372" href="#l372">372</a>      * frames go in as YUV buffers: that is the input each encoder accepts
+<a id="l373" href="#l373">373</a>      * (the MediaTek encoder fails on frames drawn with a Canvas).
+<a id="l374" href="#l374">374</a>      */
+<a id="l375" href="#l375">375</a>     private fun encodeStill(yuv: Yuv, size: VideoSize, count: Int): Pair&lt;MediaFormat, List&lt;Frame&gt;&gt; {
+<a id="l376" href="#l376">376</a>         val width = size.width
+<a id="l377" href="#l377">377</a>         val height = size.height
+<a id="l378" href="#l378">378</a>         val name = encoderFor(size) ?: throw IllegalStateException(&quot;This device has no H.264 encoder for ${size.label} video.&quot;)
+<a id="l379" href="#l379">379</a> 
+<a id="l380" href="#l380">380</a>         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+<a id="l381" href="#l381">381</a>             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+<a id="l382" href="#l382">382</a>             setInteger(MediaFormat.KEY_BIT_RATE, 600_000)
+<a id="l383" href="#l383">383</a>             setInteger(MediaFormat.KEY_FRAME_RATE, 1)
+<a id="l384" href="#l384">384</a>             setInteger(&quot;video-qp-i-min&quot;, KEY_FRAME_QP)
+<a id="l385" href="#l385">385</a>             setInteger(&quot;video-qp-i-max&quot;, KEY_FRAME_QP)
+<a id="l386" href="#l386">386</a>             // Far longer than the clip: only the first frame is a key frame.
+<a id="l387" href="#l387">387</a>             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3600)
+<a id="l388" href="#l388">388</a>             // Baseline: each player decodes it, and H264Still can write frames for it.
+<a id="l389" href="#l389">389</a>             setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+<a id="l390" href="#l390">390</a>             // The level for one frame a second. make() writes the true level afterwards.
+<a id="l391" href="#l391">391</a>             setInteger(MediaFormat.KEY_LEVEL, AVC_LEVELS.getValue(H264Still.level(width, height, 1)))
+<a id="l392" href="#l392">392</a>         }
+<a id="l393" href="#l393">393</a>         val codec = MediaCodec.createByCodecName(name)
+<a id="l394" href="#l394">394</a>         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+<a id="l395" href="#l395">395</a>         codec.start()
+<a id="l396" href="#l396">396</a>         val info = MediaCodec.BufferInfo()
+<a id="l397" href="#l397">397</a>         val frames = ArrayList&lt;Frame&gt;()
+<a id="l398" href="#l398">398</a>         var outFormat: MediaFormat? = null
+<a id="l399" href="#l399">399</a>         var queued = 0
+<a id="l400" href="#l400">400</a>         var ended = false
+<a id="l401" href="#l401">401</a>         try {
+<a id="l402" href="#l402">402</a>             while (!ended) {
+<a id="l403" href="#l403">403</a>                 if (queued &lt;= count) {
+<a id="l404" href="#l404">404</a>                     val i = codec.dequeueInputBuffer(10_000)
+<a id="l405" href="#l405">405</a>                     if (i &gt;= 0) {
+<a id="l406" href="#l406">406</a>                         if (queued == count) {
+<a id="l407" href="#l407">407</a>                             codec.queueInputBuffer(i, 0, 0, queued * 1_000_000L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+<a id="l408" href="#l408">408</a>                         } else {
+<a id="l409" href="#l409">409</a>                             yuv.fill(codec.getInputImage(i)!!)
+<a id="l410" href="#l410">410</a>                             codec.queueInputBuffer(i, 0, width * height * 3 / 2, queued * 1_000_000L, 0)
+<a id="l411" href="#l411">411</a>                         }
+<a id="l412" href="#l412">412</a>                         queued++
+<a id="l413" href="#l413">413</a>                     }
+<a id="l414" href="#l414">414</a>                 }
+<a id="l415" href="#l415">415</a>                 val o = codec.dequeueOutputBuffer(info, 10_000)
+<a id="l416" href="#l416">416</a>                 if (o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) outFormat = codec.outputFormat
+<a id="l417" href="#l417">417</a>                 if (o &lt; 0) continue
+<a id="l418" href="#l418">418</a>                 if (info.size &gt; 0 &amp;&amp; info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+<a id="l419" href="#l419">419</a>                     val bytes = ByteArray(info.size)
+<a id="l420" href="#l420">420</a>                     codec.getOutputBuffer(o)!!.apply { position(info.offset); get(bytes) }
+<a id="l421" href="#l421">421</a>                     frames += Frame(bytes, info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0)
+<a id="l422" href="#l422">422</a>                 }
+<a id="l423" href="#l423">423</a>                 ended = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+<a id="l424" href="#l424">424</a>                 codec.releaseOutputBuffer(o, false)
+<a id="l425" href="#l425">425</a>             }
+<a id="l426" href="#l426">426</a>         } finally {
+<a id="l427" href="#l427">427</a>             runCatching { codec.stop() }
+<a id="l428" href="#l428">428</a>             codec.release()
+<a id="l429" href="#l429">429</a>         }
+<a id="l430" href="#l430">430</a>         check(frames.size == count &amp;&amp; frames[0].key) { &quot;The video encoder made ${frames.size} of $count frames.&quot; }
+<a id="l431" href="#l431">431</a>         check(frames.drop(1).none { it.key }) { &quot;The video encoder made more than one key frame.&quot; }
+<a id="l432" href="#l432">432</a>         return (outFormat ?: throw IllegalStateException(&quot;The video encoder gave no format.&quot;)) to frames
+<a id="l433" href="#l433">433</a>     }
+<a id="l434" href="#l434">434</a> 
+<a id="l435" href="#l435">435</a>     /** The picture as Y, U and V planes (BT.601, video range), made once and copied into each frame. */
+<a id="l436" href="#l436">436</a>     internal class Yuv(picture: Bitmap, size: VideoSize) {
+<a id="l437" href="#l437">437</a>         private val width = size.width
+<a id="l438" href="#l438">438</a>         private val height = size.height
+<a id="l439" href="#l439">439</a>         val y = ByteArray(width * height)
+<a id="l440" href="#l440">440</a>         private val u = ByteArray(width * height / 4)
+<a id="l441" href="#l441">441</a>         private val v = ByteArray(width * height / 4)
+<a id="l442" href="#l442">442</a> 
+<a id="l443" href="#l443">443</a>         init {
+<a id="l444" href="#l444">444</a>             val argb = IntArray(width * height)
+<a id="l445" href="#l445">445</a>             picture.getPixels(argb, 0, width, 0, 0, width, height)
+<a id="l446" href="#l446">446</a>             for (row in 0 until height) for (col in 0 until width) {
+<a id="l447" href="#l447">447</a>                 val c = argb[row * width + col]
+<a id="l448" href="#l448">448</a>                 val r = (c shr 16) and 0xff
+<a id="l449" href="#l449">449</a>                 val g = (c shr 8) and 0xff
+<a id="l450" href="#l450">450</a>                 val b = c and 0xff
+<a id="l451" href="#l451">451</a>                 y[row * width + col] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16).toByte()
+<a id="l452" href="#l452">452</a>                 if (row % 2 == 0 &amp;&amp; col % 2 == 0) {
+<a id="l453" href="#l453">453</a>                     val k = (row / 2) * (width / 2) + col / 2
+<a id="l454" href="#l454">454</a>                     u[k] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128).toByte()
+<a id="l455" href="#l455">455</a>                     v[k] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128).toByte()
+<a id="l456" href="#l456">456</a>                 }
+<a id="l457" href="#l457">457</a>             }
+<a id="l458" href="#l458">458</a>         }
+<a id="l459" href="#l459">459</a> 
+<a id="l460" href="#l460">460</a>         /** Planar or semi-planar, padded or not: the Image says, and this follows. */
+<a id="l461" href="#l461">461</a>         fun fill(image: android.media.Image) {
+<a id="l462" href="#l462">462</a>             copy(y, width, height, image.planes[0])
+<a id="l463" href="#l463">463</a>             copy(u, width / 2, height / 2, image.planes[1])
+<a id="l464" href="#l464">464</a>             copy(v, width / 2, height / 2, image.planes[2])
+<a id="l465" href="#l465">465</a>         }
+<a id="l466" href="#l466">466</a> 
+<a id="l467" href="#l467">467</a>         private fun copy(src: ByteArray, w: Int, h: Int, plane: android.media.Image.Plane) {
+<a id="l468" href="#l468">468</a>             val buffer = plane.buffer
+<a id="l469" href="#l469">469</a>             if (plane.pixelStride == 1 &amp;&amp; plane.rowStride == w) {
+<a id="l470" href="#l470">470</a>                 buffer.position(0)
+<a id="l471" href="#l471">471</a>                 buffer.put(src, 0, w * h)
+<a id="l472" href="#l472">472</a>                 return
+<a id="l473" href="#l473">473</a>             }
+<a id="l474" href="#l474">474</a>             for (row in 0 until h) for (col in 0 until w) {
+<a id="l475" href="#l475">475</a>                 buffer.put(row * plane.rowStride + col * plane.pixelStride, src[row * w + col])
+<a id="l476" href="#l476">476</a>             }
+<a id="l477" href="#l477">477</a>         }
+<a id="l478" href="#l478">478</a>     }
+<a id="l479" href="#l479">479</a> }</pre>
+</div></body></html>
