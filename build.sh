@@ -44,7 +44,8 @@ cat > "$TEMPLATE" << 'TMPL'
   <meta property="og:site_name" content="Recently Written" />
   <meta property="og:title" content="$title$" />
   <meta property="og:url" content="$url$" />
-  <meta name="twitter:card" content="summary" />
+  <meta property="og:image" content="https://recentlywritten.com/static/og.png" />
+  <meta name="twitter:card" content="summary_large_image" />
   <link rel="stylesheet" href="style.css" />
   <link rel="alternate" type="application/rss+xml" title="Recently Written" href="rss.xml" />
 </head>
