@@ -63,6 +63,7 @@ cat > "$TEMPLATE" << 'TMPL'
       <a href="esperanto.html">esperanto</a>
       <a href="call.html">contact</a>
       <a href="rss.xml">rss</a>
+      <a href="account/">subscribe</a>
     </nav>
   </div>
 
@@ -218,6 +219,19 @@ absolute() {
     done
     printf '</channel>\n</rss>\n'
 } > "$SITE_DIR/rss.xml"
+
+# ── post data for the accounts service ──────────────────────
+# accounts/ reads these files to send email about new posts and to make
+# the private feed of each user. index.tsv has one line for each post,
+# newest first: date, slug, tags, title. postdata/<slug>.html has the body
+# of the post, with absolute links.
+mkdir -p "$SITE_DIR/postdata"
+while IFS="$TAB" read -r order date slug title; do
+    [ -z "$slug" ] && continue
+    printf '%s\t%s\t%s\t%s\n' "$date" "$slug" "$(meta "$POSTS_DIR/$slug.md" tags)" "$title"
+    pandoc --from markdown --to html5 "$POSTS_DIR/$slug.md" < /dev/null |
+        absolute > "$SITE_DIR/postdata/$slug.html"
+done < "$WORK/sorted.tsv" > "$SITE_DIR/postdata/index.tsv"
 
 echo "Built $(ls "$SITE_DIR"/*.html | wc -l | tr -d ' ') pages → $SITE_DIR/"
 echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WORK/pages.tsv" | tr -d ' ')   feed: $(grep -c '<item>' "$SITE_DIR/rss.xml") items"
