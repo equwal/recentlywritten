@@ -12,7 +12,7 @@ Support the work at [ko-fi.com/truex](https://ko-fi.com/truex).
 
 * [subread.space](https://subread.space) - Line up an audiobook with its ebook. Get read-along subtitles, EPUB 3 read-along books, and subtitled video. Free in the browser.
 * [honjimaku.com](https://honjimaku.com) - A library of Japanese subtitles for audiobooks, and Subrep live captions by share link.
-* [sbm.subread.space](https://sbm.subread.space) - sbm Sync: one plain bookmark file, the same on every device. Free, AGPL.
+* [sbmsync.com](https://sbmsync.com) - sbm Sync: one plain bookmark file, the same on every device. Free, AGPL.
 * [hentaibun.online](https://hentaibun.online) - Reading lists and tools to learn kanbun and kobun.
 * [recentlywritten.com](https://recentlywritten.com) - Writing on Unix, Lisp, Nix, Esperanto, and language learning. ([equwal.com](https://equwal.com) goes here.)
 * [ko-fi.com/truex](https://ko-fi.com/truex) - Support.
