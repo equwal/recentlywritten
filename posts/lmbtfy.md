@@ -16,8 +16,6 @@ Like let me google that for you, but for books! READ A BOOK for Gen Z.
 
 Claude Fable 5.1 MAX made it, I don't know how it works.
 
-## Credits
-
 ## Support
 
 Support the AI bill at [ko-fi.com/truex](https://ko-fi.com/truex).
