@@ -1,5 +1,7 @@
 ---
-title: sbm
+title: sbm Sync
+date: 2026-09-22
+tags: projects
 ---
 
 Suckless Bookmark Manager (now sbm Sync)

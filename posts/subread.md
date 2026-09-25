@@ -1,10 +1,12 @@
 ---
 title: SubRead
+date: 2026-09-22
+tags: projects
 ---
 
 SubRead makes it possible to read books with synced subtitles that keep your place. This is very nice for language learning.
 
-Subread is a suite of tools that port forced alignment to a variety of platforms. It is 100% free when used locally, although it is possible to do conversions with my cloud for a fee. It is 100% self-hostable free software. BUY NOW!
+Subread is a suite of tools that port forced alignment to a variety of platforms. It is 100% free when used locally, although it is possible to do conversions with my cloud for a fee. It is 100% self-hostable free software. [BUY NOW!](https://subread.space)
 
 ## Promo Video
 
@@ -18,6 +20,7 @@ Subread is a suite of tools that port forced alignment to a variety of platforms
 
 ## Projects
 
+* [subread.space](https://github.com/equwal/subread.space): Read an `.srt` one line at a time with the space bar. Works with Yomitan, furigana, and pitch accent markup.
 * [subplz-web](https://github.com/equwal/subplz-web): subread.space source
 * [subread-android](https://github.com/equwal/subread-android): subread.space android app (local and cloud conversions are possible)
 * [subread-extension](https://github.com/equwal/subread-extension): Extension to use subread on youtube for audiobooks published there.
@@ -28,6 +31,9 @@ Subread is a suite of tools that port forced alignment to a variety of platforms
 * [desktop-subtitle-replay](https://github.com/equwal/desktop-subtitle-replay): Whisper on your computer, and broadcast them to your friends. Useful for online language classrooms or bilingual exchanges.
 * [honjimaku](https://github.com/equwal/honjimaku): Book subtitles database for japanese
 * [Hoshi-Reader-Android](https://github.com/equwal/Hoshi-Reader-Android): Fork of hoshi reader that can do the conversion inside hoshi reader. Hopefully gets merged.
+* [chimahon](https://github.com/equwal/chimahon): Fork with a `readalong` branch for the Mihon immersion reader.
+* [dickt.store](https://github.com/equwal/dickt.store): Bring-your-own-key Yomitan dictionary converter.
+* [vibeslop-dickt](https://github.com/equwal/vibeslop-dickt): Make your own Yomitan dictionary in a few minutes.
 
 ## Why
 
