@@ -60,6 +60,7 @@ cat > "$TEMPLATE" << 'TMPL'
       <a href="about.html">about</a>
       <a href="lair.html">code</a>
       <a href="git/index.html">git</a>
+      <a href="links.html">links</a>
       <a href="youtube.html">youtube</a>
       <a href="esperanto.html">esperanto</a>
       <a href="call.html">contact</a>
