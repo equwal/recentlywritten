@@ -49,6 +49,9 @@ cat > "$TEMPLATE" << 'TMPL'
   <meta name="twitter:card" content="summary_large_image" />
   <link rel="stylesheet" href="style.css" />
   <link rel="alternate" type="application/rss+xml" title="Recently Written" href="rss.xml" />
+$if(feed)$
+  <link rel="alternate" type="application/atom+xml" title="$title$" href="$feed$" />
+$endif$
 </head>
 <body>
 <div id="container">
