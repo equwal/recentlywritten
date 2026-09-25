@@ -12,6 +12,7 @@ SITE_URL="https://recentlywritten.com"
 DEPLOY_HOST="root@recentlywritten.com"
 DEPLOY_PATH="/var/www/recentlywritten/"
 FEED_SIZE=10
+DICKT_FEED="https://dickt.store/rss.xml"
 
 DEPLOY=yes
 [ "$1" = "--no-deploy" ] && DEPLOY=no
@@ -217,6 +218,14 @@ absolute() {
         printf ']]></description>\n'
         printf '  </item>\n'
     done
+    # Releases on dickt.store go in the same feed. The build copies each
+    # item from the live dickt.store feed. If the fetch fails, the build
+    # continues without these items, because the posts are more important.
+    if curl -fsS -o "$WORK/dickt.xml" "$DICKT_FEED"; then
+        awk '/<item>/,/<\/item>/' "$WORK/dickt.xml"
+    else
+        echo "warning: no items from $DICKT_FEED" >&2
+    fi
     printf '</channel>\n</rss>\n'
 } > "$SITE_DIR/rss.xml"
 
