@@ -5,7 +5,7 @@ order: 023
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
 links:
-- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
+- '[AJATT (All Japanese All The Time Mirror) at alljapanesealltheti.me](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
 - '[New podcast about polyglot language learning (LISTEN NOW!)](New-podcast-about-polyglot-language-learning-LISTEN-NOW.html)'
 - '[youtube.com/\@therealtruex](https://www.youtube.com/@therealtruex)'
 - '[Turn an android into 24/7 portable polyglot radio](Turn-an-android-into-247-portable-polyglot-radio.html)'

@@ -8,7 +8,7 @@ links:
 - '[Install Anki](Install-Anki.html)'
 - '[3000 Vocab Flashcards (3k Final Solution)](3000-Vocab-Flashcards-3k-Final-Solution.html)'
 - '[kakijun.jp](https://kakijun.jp)'
-- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
+- '[AJATT (All Japanese All The Time Mirror) at alljapanesealltheti.me](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
 - '[roshiajin.jp](https://roshiajin.jp)'
 ---
 

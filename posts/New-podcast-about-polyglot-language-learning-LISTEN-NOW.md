@@ -7,7 +7,7 @@ source: "therealtruex.com (recovered from web.archive.org; date approximate, fir
 links:
 - '[Polyglot Podcast Now Goes on The YouTube.com Website](Polyglot-Podcast-Now-Goes-on-The-YouTubecom-Website.html)'
 - '[New book coming soon about language learning (for multiple languages)! PREORDER NOW!](New-book-coming-soon-about-language-learning-for-multiple-languages-PREORDER-NOW.html)'
-- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
+- '[AJATT (All Japanese All The Time Mirror) at alljapanesealltheti.me](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
 - '[SubRead](subread.html)'
 - '[youtube.com/\@therealtruex](https://www.youtube.com/@therealtruex)'
 - '[Polyglot Radio is Dead: Long Live The Queue (Antennapod shill post)](Polyglot-Radio-is-Dead-Long-Live-The-Queue-Antennapod-shill-post.html)'

@@ -1,5 +1,5 @@
 ---
-title: AJATT (All Japanese All The Time Mirror) at xm0.co
+title: AJATT (All Japanese All The Time Mirror) at alljapanesealltheti.me
 date: 2024-05-21
 order: 021
 tags: articles
