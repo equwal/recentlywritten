@@ -289,6 +289,12 @@ youtube_url() {
     printf '  <language>en-us</language>\n'
     printf '  <atom:link href="%s/podcast.xml" rel="self" type="application/rss+xml" />\n' "$SITE_URL"
     printf '  <itunes:author>Spenser Truex</itunes:author>\n'
+    # Podcast directories such as Spotify send the code that proves
+    # ownership of the feed to this email address.
+    printf '  <itunes:owner>\n'
+    printf '    <itunes:name>Spenser Truex</itunes:name>\n'
+    printf '    <itunes:email>truex@equwal.com</itunes:email>\n'
+    printf '  </itunes:owner>\n'
     printf '  <itunes:image href="%s/static/podcast.png" />\n' "$SITE_URL"
     printf '  <itunes:category text="Education">\n'
     printf '    <itunes:category text="Language Learning" />\n'

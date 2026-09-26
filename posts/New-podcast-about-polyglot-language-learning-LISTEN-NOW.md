@@ -37,3 +37,6 @@ Right now it isn't syndicated anywhere, but you can download them directly from 
 - [16 BUY NOW (book announcement)](static/language-podcast/buy-now.m4a)
 - [17 How to Use the Internet Library Only](static/language-podcast/how-to-use-the-internet-library-only.m4a)
 - [18 Quixotic Self-Awareness](static/language-podcast/quixotic-self-awareness.m4a)
+- [19 Our "AI" is totally fine according to Bostrom's Superintelligence, 2014](static/language-podcast/our-ai-is-totally-fine.m4a)
+- [20 Secret way to test your FREAKING VIBE CODE or it will never work ever](static/language-podcast/test-your-vibe-code.m4a)
+- [21 We're all going to die by AI unless this one thing happens: stop AI with this one weird trick](static/language-podcast/stop-ai-with-this-one-weird-trick.m4a)
