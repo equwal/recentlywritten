@@ -54,6 +54,9 @@ func TestNotifySendsNewPostOneTime(t *testing.T) {
 	if m.Unsubscribe != wantUnsub || !strings.Contains(m.Body, wantUnsub) {
 		t.Errorf("unsubscribe link missing: header %q, body:\n%s", m.Unsubscribe, m.Body)
 	}
+	if !strings.Contains(m.Body, "https://subread.space/\n") {
+		t.Errorf("body has no link to SubRead:\n%s", m.Body)
+	}
 }
 
 func TestNotifyRetriesAfterSendFailure(t *testing.T) {

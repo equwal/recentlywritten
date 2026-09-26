@@ -17,7 +17,11 @@ Support the work at [ko-fi.com/truex](https://ko-fi.com/truex).
 * [subread.space](https://subread.space) - Line up an audiobook with its ebook. Get read-along subtitles, EPUB 3 read-along books, and subtitled video. Free in the browser.
 * [honjimaku.com](https://honjimaku.com) - A library of Japanese subtitles for audiobooks, and Subrep live captions by share link.
 * [sbmsync.com](https://sbmsync.com) - sbm Sync: one plain bookmark file, the same on every device. Free, AGPL.
+* [booksimulator.com](https://booksimulator.com) - Book Simulator: a reading room by the sea. Read Aozora Bunko and Project Gutenberg books, keep a reading diary, and follow the narration of an audiobook line by line.
+* [dickt.store](https://dickt.store) - Language-learning tools, flashcards, stories, and small web toys.
 * [hentaibun.online](https://hentaibun.online) - Reading lists and tools to learn kanbun and kobun.
+* [mowimypopol.online](https://mowimypopol.online) - Archival study materials for learning Polish.
+* [alljapanesealltheti.me](https://alljapanesealltheti.me) - A mirror of AJATT, All Japanese All The Time.
 * [recentlywritten.com](https://recentlywritten.com) - Writing on Unix, Lisp, Nix, Esperanto, and language learning. ([equwal.com](https://equwal.com) goes here.)
 * [ko-fi.com/truex](https://ko-fi.com/truex) - Support.
 
@@ -31,6 +35,7 @@ Read along with audiobooks, and mine the words.
 * [subread-extension](https://github.com/equwal/subread-extension) - Show your own `.srt` over a YouTube video, in time. Chrome and Firefox.
 * [subread-overlay](https://github.com/equwal/subread-overlay) - Show `.srt` lines over any Android media player. Tap a word to look it up.
 * [subread-dictionary](https://github.com/equwal/subread-dictionary) - Pop-up dictionary for Android. Reads Yomitan dictionaries, with local audio.
+* [subread-anki](https://github.com/equwal/subread-anki) - One tap makes an Anki card on Android: word, definition, sentence, screenshot, and audio. Works with any app.
 * [subread.koplugin](https://github.com/equwal/subread.koplugin) - KOReader plugin. The book follows the narration, from an `.srt` made by subread.space.
 * [subrep-android](https://github.com/equwal/subrep-android) - Live captions of the phone's sound, made on the phone by Whisper, shared by link.
 * [desktop-subtitle-replay](https://github.com/equwal/desktop-subtitle-replay) - Live subtitles for anything on your screen. Replay a sentence and mine it into Anki.
@@ -60,6 +65,7 @@ Fuzzy search thousands of bookmarks, on every device.
 * [sbm-android](https://github.com/equwal/sbm-android) - sbm on Android. Share to add.
 * [sbm-extension](https://github.com/equwal/sbm-extension) - sbm for Firefox and Chrome.
 * [sbm-sync](https://github.com/equwal/sbm-sync) - Sync server. One small Go program, plain files, AGPL.
+* [sbm-webpublish](https://github.com/equwal/sbm-webpublish) - Publish an sbm bookmark file as a list of links on a web site.
 * [sbm-suckless](https://github.com/equwal/sbm-suckless) - sbm before the rewrite. Suckless style.
 
 ## Tools for AI agents

@@ -144,6 +144,7 @@ func (a *app) digest(u user, posts []Post) message {
 	}
 	fmt.Fprintf(&b, "-- \nChange your settings: %s/account/\nStop these emails: %s\n",
 		a.cfg.BaseURL, a.unsubscribeURL(u))
+	b.WriteString("\nAlso from the author: SubRead, read along with an audiobook: https://subread.space/\n")
 	return message{To: u.Email, Subject: subject, Body: b.String(), Unsubscribe: a.unsubscribeURL(u)}
 }
 
