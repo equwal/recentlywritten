@@ -6,6 +6,6 @@ tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
 ---
 
-Table of contents: <https://xm0.co/all-japanese-all-the-time-ajatt-how-to-learn-japanese-on-your-own-having-fun-and-to-fluency.html>
+Table of contents: <https://alljapanesealltheti.me/blog/all-japanese-all-the-time-ajatt-how-to-learn-japanese-on-your-own-having-fun-and-to-fluency/>
 
 Enjoy.

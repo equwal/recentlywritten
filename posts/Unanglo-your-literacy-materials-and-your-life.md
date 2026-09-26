@@ -55,6 +55,6 @@ It's important to still read in English in order to retain a high level of liter
 
 ### Further Reading
 
-Check out the AJATT website for a method to truly deanglo: [xm0.co mirror](https://xm0.co/)
+Check out the AJATT website for a method to truly deanglo: [alljapanesealltheti.me mirror](https://alljapanesealltheti.me/)
 
 The re-homed anglo is in a unique position to have a deep enough understanding of his native language to translate important materials from his new language into the anglo, thus making a small dent in de-angloing the anglo. This is recommended.

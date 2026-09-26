@@ -11,7 +11,7 @@ source: "therealtruex.com (recovered from web.archive.org; date approximate, fir
 <figcaption>Some automation done with a proprietary bloatware app.</figcaption>
 </figure>
 
-It's easier to do this on a proper linux machine, but the benefits of having this on your phone are pretty obvious (to me). For anyone desiring to speak more than two languages, it can become difficult to make sure to actually contact all of the languages frequently enough to make progress. While "All Japanese All The Time" ([visit the mirrored site](https://xm0.co)) might work for someone only studying Japanese, it hardly works for someone studying more languages than that. Even "Khatzumoto", who invented this religious cult, seems to have fallen flat in his attempts to learn other East Asian languages with his approach.
+It's easier to do this on a proper linux machine, but the benefits of having this on your phone are pretty obvious (to me). For anyone desiring to speak more than two languages, it can become difficult to make sure to actually contact all of the languages frequently enough to make progress. While "All Japanese All The Time" ([visit the mirrored site](https://alljapanesealltheti.me)) might work for someone only studying Japanese, it hardly works for someone studying more languages than that. Even "Khatzumoto", who invented this religious cult, seems to have fallen flat in his attempts to learn other East Asian languages with his approach.
 
 Alexandre Arguilles knows a large number of languages, which he did by ruthlessly categorizing his time in 15 minute segments and reading for many hours a day, in many languages, for many years.
 

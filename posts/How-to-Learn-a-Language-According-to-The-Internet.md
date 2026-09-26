@@ -8,7 +8,7 @@ source: "therealtruex.com (recovered from web.archive.org; date approximate, fir
 
 ## Informational Websites
 
-- This website! [https://recentlywritten.com](index.html) xm0.co mirror of the AJATT website (down) <https://xm0.co>
+- This website! [https://recentlywritten.com](index.html) alljapanesealltheti.me mirror of the AJATT website (down) <https://alljapanesealltheti.me>
 
 - Steven Krashen's website <http://www.sdkrashen.com/>
 
