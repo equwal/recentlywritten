@@ -23,7 +23,7 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - intervjuoj-de-aejk.html
 - noveloj-de-la-ondo.html
 
-## Attachments referenced by the posts and pages (123)
+## Attachments referenced by the posts and pages (109)
 
 - 25-noveloj/25-noveloj.epub  — used by 25-noveloj.html
 - 25-noveloj/25-noveloj.mobi  — used by 25-noveloj.html
@@ -106,23 +106,9 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - static/kanji-radicals.apkg  — used by Learn-Kanji-in-a-Fortnight.html
 - static/kern-punkto-walnut.png  — used by esperantaj-audoj.html
 - static/language-podcast/1 ALATT Path And C1 Polyglot To C2.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/10-what-is-a-good-language-learning-method.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/11-you-need-to-know-how-they-learn-japanese.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/12-why-do-we-learn-languages.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/13-so-you-want-to-learn-latin.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/14-learn-how-to-learn-how-to-learn-languages.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
 - static/language-podcast/2 LR is Mandatory For Literate Polyglots.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
 - static/language-podcast/3 Six Part Learner Model.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
 - static/language-podcast/4 There Are Higher Levels To Aquisition.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/5-so-you-want-to-learn-some-languages-what-do-you-do.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/6-need-to-listen-to-conversations-to-speak.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/7-listening-reading.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/8-how-to-get-and-consume-media-climbing-a-mountain.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/9-learn-five-languages-from-zero.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/Audacity Shadowing Without Shadowing.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/BUYNOW.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/How to Use the Internet Library Only.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
-- static/language-podcast/Quixotic Self-Awareness.opus  — used by New-podcast-about-polyglot-language-learning-LISTEN-NOW.html
 - static/norda-naturo/norda-naturo.epub  — used by norda-naturo.html
 - static/norda-naturo/norda-naturo.mobi  — used by norda-naturo.html
 - static/norda-naturo/norda-naturo.txt  — used by norda-naturo.html

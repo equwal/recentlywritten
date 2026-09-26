@@ -191,9 +191,10 @@ awk -v postfile="$WORK/post-items.html" -v pagefile="$WORK/page-items.html" '
 
 # RFC 822, as RSS requires. The C locale matters: without it the day and
 # month names come out in the system language. `date -d` is GNU; where it is
-# missing the item simply goes out without a pubDate.
+# missing the item simply goes out without a pubDate. A post has only a
+# date, so its time is midnight; a podcast episode has an exact time.
 feed_date() {
-    LC_ALL=C date -u -d "$1" '+%a, %d %b %Y 00:00:00 +0000' 2>/dev/null
+    LC_ALL=C date -u -d "$1" '+%a, %d %b %Y %H:%M:%S +0000' 2>/dev/null
 }
 
 # A feed reader shows the HTML away from the site, so links relative to it
@@ -237,6 +238,84 @@ absolute() {
     printf '</channel>\n</rss>\n'
 } > "$SITE_DIR/rss.xml"
 
+# ── podcast ──────────────────────────────────────────────────
+# podcast.tsv lists the podcast episodes, newest first, one on each line:
+#   date <TAB> file <TAB> bytes <TAB> seconds <TAB> youtube <TAB> title
+# date is the UTC time of the upload in ISO 8601. file is the name of the
+# audio in static/language-podcast/. The audio stays out of git (see
+# .gitignore), so its size and length, which the feed must give, are kept
+# here. youtube is the ID of the same episode on YouTube, or "-" if none.
+# Every field needs a value, because read merges empty tab-separated fields.
+PODCAST_PAGE="polyglot-podcast.html"
+AUDIO_DIR="static/language-podcast"
+
+youtube_url() {
+    printf 'https://www.youtube.com/watch?v=%s' "$1"
+}
+
+{
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+    printf '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"'
+    printf ' xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"'
+    printf ' xmlns:podcast="https://podcastindex.org/namespace/1.0">\n<channel>\n'
+    printf '  <title>Polyglot Podcast</title>\n'
+    printf '  <link>%s/%s</link>\n' "$SITE_URL" "$PODCAST_PAGE"
+    printf '  <description>Spenser Truex talks about how to learn languages, and about AI.</description>\n'
+    printf '  <language>en-us</language>\n'
+    printf '  <atom:link href="%s/podcast.xml" rel="self" type="application/rss+xml" />\n' "$SITE_URL"
+    printf '  <itunes:author>Spenser Truex</itunes:author>\n'
+    printf '  <itunes:image href="%s/static/podcast.png" />\n' "$SITE_URL"
+    printf '  <itunes:category text="Education">\n'
+    printf '    <itunes:category text="Language Learning" />\n'
+    printf '  </itunes:category>\n'
+    printf '  <itunes:explicit>false</itunes:explicit>\n'
+    printf '  <podcast:funding url="https://ko-fi.com/truex">Support the podcast</podcast:funding>\n'
+    while IFS="$TAB" read -r date file bytes seconds youtube title; do
+        [ -z "$date" ] && continue
+        case $file in
+            *.m4a) type=audio/x-m4a ;;
+            *.mp3) type=audio/mpeg ;;
+            *) echo "podcast.tsv: no MIME type for $file" >&2; exit 1 ;;
+        esac
+        url="$SITE_URL/$AUDIO_DIR/$file"
+        printf '  <item>\n'
+        printf '    <title>%s</title>\n' "$(printf '%s' "$title" | esc)"
+        printf '    <enclosure url="%s" length="%s" type="%s" />\n' "$url" "$bytes" "$type"
+        printf '    <guid isPermaLink="false">%s</guid>\n' "$url"
+        pub=$(feed_date "$date") && [ -n "$pub" ] &&
+            printf '    <pubDate>%s</pubDate>\n' "$pub"
+        printf '    <itunes:duration>%s</itunes:duration>\n' "$seconds"
+        if [ "$youtube" != - ]; then
+            printf '    <link>%s</link>\n' "$(youtube_url "$youtube")"
+            printf '    <description>Video: %s</description>\n' "$(youtube_url "$youtube")"
+        fi
+        printf '  </item>\n'
+    done < podcast.tsv
+    printf '</channel>\n</rss>\n'
+} > "$SITE_DIR/podcast.xml"
+
+# The podcast page lists the same episodes. The list goes in place of the
+# comment <!-- EPISODE_LIST --> in pages/polyglot-podcast.md.
+while IFS="$TAB" read -r date file bytes seconds youtube title; do
+    [ -z "$date" ] && continue
+    printf '<li><a href="%s/%s">%s</a>' "$AUDIO_DIR" "$file" \
+        "$(printf '%s' "$title" | esc)"
+    [ "$youtube" = - ] ||
+        printf ' (<a href="%s">video</a>)' "$(youtube_url "$youtube")"
+    printf '</li>\n'
+done < podcast.tsv > "$WORK/episode-items.html"
+awk -v listfile="$WORK/episode-items.html" '
+    /<!-- EPISODE_LIST -->/ {
+        print "<ul>"
+        while ((getline line < listfile) > 0) print line
+        close(listfile)
+        print "</ul>"
+        next
+    }
+    { print }
+' "$SITE_DIR/$PODCAST_PAGE" > "$WORK/podcast-page.html"
+cp "$WORK/podcast-page.html" "$SITE_DIR/$PODCAST_PAGE"
+
 # ── post data for the accounts service ──────────────────────
 # accounts/ reads these files to send email about new posts and to make
 # the private feed of each user. index.tsv has one line for each post,
@@ -251,7 +330,7 @@ while IFS="$TAB" read -r order date slug title; do
 done < "$WORK/sorted.tsv" > "$SITE_DIR/postdata/index.tsv"
 
 echo "Built $(ls "$SITE_DIR"/*.html | wc -l | tr -d ' ') pages → $SITE_DIR/"
-echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WORK/pages.tsv" | tr -d ' ')   feed: $(grep -c '<item>' "$SITE_DIR/rss.xml") items"
+echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WORK/pages.tsv" | tr -d ' ')   feed: $(grep -c '<item>' "$SITE_DIR/rss.xml") items   podcast: $(grep -c '<item>' "$SITE_DIR/podcast.xml") episodes"
 
 # ── deploy ───────────────────────────────────────────────────
 # git/ and git.html share this web root but are published by deploy-git.sh,
@@ -259,9 +338,13 @@ echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WOR
 # rsync never deletes an excluded path on the receiving side.
 # static/book/ holds book files that stay out of the repo (see .gitignore).
 # They exist only on the server, so the same rule protects them.
+# static/language-podcast/ holds the podcast audio, which also stays out of
+# the repo. The P (protect) rule stops --delete from removing the server
+# copy when the working tree has no audio, but the audio that the working
+# tree has still uploads.
 if [ "$DEPLOY" = yes ]; then
     rsync -avzP --delete --exclude=/git/ --exclude=/git.html \
-        --exclude=/static/book/ \
+        --exclude=/static/book/ --filter='P /static/language-podcast/***' \
         "$SITE_DIR/" "$DEPLOY_HOST:$DEPLOY_PATH"
     ssh "$DEPLOY_HOST" "chmod -R a+rX $DEPLOY_PATH"
 fi
