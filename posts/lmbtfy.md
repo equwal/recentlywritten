@@ -2,6 +2,9 @@
 title: Let Me Book That For You
 date: 2026-09-25
 tags: projects
+links:
+- '[BookSimulator.com](booksimulator.html)'
+- '[dickt.store](https://dickt.store)'
 ---
 
 Like let me google that for you, but for books! READ A BOOK for Gen Z.

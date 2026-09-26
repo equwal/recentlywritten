@@ -4,6 +4,14 @@ date: 2025-09-06
 order: 023
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
+- '[New podcast about polyglot language learning (LISTEN NOW!)](New-podcast-about-polyglot-language-learning-LISTEN-NOW.html)'
+- '[youtube.com/\@therealtruex](https://www.youtube.com/@therealtruex)'
+- '[Turn an android into 24/7 portable polyglot radio](Turn-an-android-into-247-portable-polyglot-radio.html)'
+- '[3000 Vocab Flashcards (3k Final Solution)](3000-Vocab-Flashcards-3k-Final-Solution.html)'
+- '[Unanglo your literacy materials (and your life)](Unanglo-your-literacy-materials-and-your-life.html)'
+- '[ling.towson.edu](https://ling.towson.edu/)'
 ---
 
 ## Informational Websites

@@ -4,6 +4,10 @@ date: 2025-11-13
 order: 030
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Git extra worktrees ROCK](Git-extra-worktrees-ROCK.html)'
+- '[github.com/equwal/coleslaw](https://github.com/equwal/coleslaw)'
+- '[gendocs](https://github.com/equwal/gendocs)'
 ---
 
 ## S(S/C)Gs (Static (Site/Content) Generators) don't have to be bloat

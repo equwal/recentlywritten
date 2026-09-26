@@ -4,6 +4,11 @@ date: 2024-05-21
 order: 010
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[epub.moe](https://epub.moe)'
+- '[readmore.me](https://readmore.me)'
+- '[How to manage 100,000 digital books in 15 languages](How-to-manage-100000-digital-books-in-15-languages.html)'
+- '[Unanglo your literacy materials (and your life)](Unanglo-your-literacy-materials-and-your-life.html)'
 ---
 
 PD

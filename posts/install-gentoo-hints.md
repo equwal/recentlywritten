@@ -4,6 +4,10 @@ date: 2024-05-21
 order: 019
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[Install Nix on Gentoo](Install-Nix-on-Gentoo.html)'
+- '[Nixtoo Genux™ released](Nixtoo-Genux-released.html)'
+- '[sacc-ebuild](https://github.com/equwal/sacc-ebuild)'
 ---
 
 To install gentoo, we must RTFM. Here is the FM: <https://wiki.gentoo.org/wiki/Handbook:AMD64>

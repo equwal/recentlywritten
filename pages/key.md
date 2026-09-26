@@ -2,6 +2,9 @@
 title: Mail Encryption
 tags: articles
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Hackermen neomutt config](Hackermen-neomutt-config.html)'
+- '[github.com/HACKERMEN-ORG/neomutt-config](https://github.com/HACKERMEN-ORG/neomutt-config)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

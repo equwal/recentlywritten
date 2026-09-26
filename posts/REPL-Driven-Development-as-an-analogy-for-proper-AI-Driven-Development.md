@@ -4,6 +4,12 @@ date: 2025-09-08
 order: 048
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[Minimal nvim config optional AI slop (enjoy!)](Minimal-nvim-config-optional-AI-slop-enjoy.html)'
+- '[aintitinit: Claude INITIALIZER](aintitinit-Claude-INITIALIZER.html)'
+- '[SLY](https://github.com/joaotavora/sly)'
+- '[vlime](https://github.com/vlime/vlime)'
+- '[Lisp Rant](lisprant.html)'
 ---
 
 I recently "discovered" using an LLM to code with, and was looking forward to doing some "REPL Driven Development" on it. Unfortunately, I discovered that all of the vibe-coded vim plugins just use vim as a (terrible) multiplexer for the Claude Code CLI program. The Emacs plugin <a href="https://github.com/manzaltu/claude-code-ide.el" class="external-link">claude-code-ide.el</a> does it right by having text selection and other send-to-repl-like actions like a proper Lisp IDE does.

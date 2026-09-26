@@ -1,6 +1,11 @@
 ---
 title: irc relay
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[ii/lchat setup (too easy)](iilchat-setup-too-easy.html)'
+- '[Using an init system for many instances of simple programs](Using-an-init-system-for-many-instances-of-simple-programs.html)'
+- '[ii-lchat-metapackage](https://github.com/equwal/ii-lchat-metapackage)'
+- '[tiny-runlevels](https://github.com/equwal/tiny-runlevels)'
 ---
 
 oftc over tor

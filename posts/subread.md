@@ -2,6 +2,12 @@
 title: SubRead
 date: 2026-09-22
 tags: projects
+links:
+- '[BookSimulator.com](booksimulator.html)'
+- '[github.com/equwal/kikiyomi](https://github.com/equwal/kikiyomi)'
+- '[3000 Vocab Flashcards (3k Final Solution)](3000-Vocab-Flashcards-3k-Final-Solution.html)'
+- '[readmore.me](https://readmore.me)'
+- '[whisperweb.net](https://whisperweb.net)'
 ---
 
 SubRead makes it possible to read books with synced subtitles that keep your place. This is very nice for language learning.

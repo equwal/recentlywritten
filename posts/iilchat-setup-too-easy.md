@@ -4,6 +4,11 @@ date: 2025-08-30
 order: 029
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, from the announced repo's creation)"
+links:
+- '[Using an init system for many instances of simple programs](Using-an-init-system-for-many-instances-of-simple-programs.html)'
+- '[irc relay](irc-relay.html)'
+- '[suckless](https://suckless.org)'
+- '[sic](https://tools.suckless.org/sic/)'
 ---
 
 Look at how beautiful IRC can be(?)

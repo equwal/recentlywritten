@@ -2,6 +2,8 @@
 title: "Je L'Esperantid 2.0"
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Three Steps to Esperanto Mastery](esperanto-three-steps.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

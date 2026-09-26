@@ -2,6 +2,11 @@
 title: eo artikoloj
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Three Steps to Esperanto Mastery](esperanto-three-steps.html)'
+- '[Je L\''Esperantid 2.0](lesperant2.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[vortaroj](esperantaj-vortaroj.html)'
 ---
 
 Artikolar'

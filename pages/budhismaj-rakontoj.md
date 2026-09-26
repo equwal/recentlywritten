@@ -2,6 +2,10 @@
 title: budhismaj rakontoj
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[audo](esperantaj-audoj.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[la sankta biblio](biblio.html)'
 ---
 
 Budhismo

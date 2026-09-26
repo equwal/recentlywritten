@@ -4,6 +4,10 @@ date: 2025-09-05
 order: 042
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[Minimal nvim config optional AI slop (enjoy!)](Minimal-nvim-config-optional-AI-slop-enjoy.html)'
+- '[Why/How to host a bunch of crap locally](WhyHow-to-host-a-bunch-of-crap-locally.html)'
+- '[tmpl: insanely simple templates](tmpl-insanely-simple-templates.html)'
 ---
 
 <a href="https://github.com/equwal/tag-gen" class="external-link">git hub website link here</a>

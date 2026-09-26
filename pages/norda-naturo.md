@@ -2,6 +2,8 @@
 title: norda naturo
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[eo libroj](esperantaj-libroj.html)'
 ---
 
 Norda Naturo

@@ -2,6 +2,12 @@
 title: ligilo
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[github.com/equwal/esperanto](https://github.com/equwal/esperanto)'
+- '[Noveloj de Sten Johansson](sten-johansson.html)'
+- '[La Faraono](la-faraono.html)'
+- '[rut](rut.html)'
+- '[La Cervido](cervido.html)'
 ---
 
 ligilo

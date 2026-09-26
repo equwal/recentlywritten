@@ -4,6 +4,10 @@ date: 2024-05-21
 order: 014
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[Why/How to host a bunch of crap locally](WhyHow-to-host-a-bunch-of-crap-locally.html)'
+- '[Using an init system for many instances of simple programs](Using-an-init-system-for-many-instances-of-simple-programs.html)'
+- '[install gentoo hints](install-gentoo-hints.html)'
 ---
 
 My most recent posts are about how to setup a few services locally, which I think *would* be interesting to the consumers of the idea of "self-hosting".

@@ -1,6 +1,9 @@
 ---
 title: matrix homeserver
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[irc relay](irc-relay.html)'
+- '[ii/lchat setup (too easy)](iilchat-setup-too-easy.html)'
 ---
 
 Matrix server

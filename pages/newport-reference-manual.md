@@ -1,6 +1,12 @@
 ---
 title: Newport Reference Manual
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Newport](Newport.html)'
+- '[github.com/equwal/Newport](https://github.com/equwal/Newport)'
+- '[POSIX pipes for Lisp](POSIX-pipes-for-Lisp.html)'
+- '[posix-pipes](https://github.com/equwal/posix-pipes)'
+- '[Toplevel Macros in Alexandria: Code Revival Project](Toplevel-Macros-in-Alexandria-Code-Revival-Project.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

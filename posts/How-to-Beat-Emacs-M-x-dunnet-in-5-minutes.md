@@ -4,6 +4,8 @@ date: 2018-12-29
 order: 003
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[Forthe](Forthe.html)'
 ---
 
 ## What?

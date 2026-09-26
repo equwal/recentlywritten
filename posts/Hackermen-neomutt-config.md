@@ -4,6 +4,13 @@ date: 2025-09-08
 order: 049
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[Mail Encryption](key.html)'
+- '[Start emailing your patches GUIDE](Start-emailing-your-patches-GUIDE.html)'
+- '[Get on mailing lists like it is 1989](Get-on-mailing-lists-like-it-is-1989.html)'
+- '[dpatchmail](https://github.com/equwal/dpatchmail)'
+- '[prompt-mail](https://github.com/equwal/prompt-mail)'
+- '[\"Mailing list\" in one line](Mailing-list-in-one-line.html)'
 ---
 
 <a href="https://github.com/HACKERMEN-ORG/neomutt-config" class="external-link">link to git hub website repository</a>

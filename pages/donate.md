@@ -1,6 +1,8 @@
 ---
 title: Donate
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[ko-fi.com/truex](https://ko-fi.com/truex)'
 ---
 
 Donate

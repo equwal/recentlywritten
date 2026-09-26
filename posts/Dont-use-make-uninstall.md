@@ -4,6 +4,15 @@ date: 2025-09-06
 order: 044
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[Nixtoo Genux™ released](Nixtoo-Genux-released.html)'
+- '[Install Nix on Gentoo](Install-Nix-on-Gentoo.html)'
+- '[moreutils](https://github.com/pgdr/moreutils)'
+- '[termbox](https://github.com/termbox/termbox)'
+- '[f3](https://github.com/AltraMayor/f3)'
+- '[gita](https://github.com/nosarthur/gita)'
+- '[Trofi\''s nix-guix-gentoo overlay](https://github.com/trofi/nix-guix-gentoo)'
+- '[Why YOU need NixOS on your desktop and servers](Why-YOU-need-NixOS-on-your-desktop-and-servers.html)'
 ---
 
 Much like "sending a file over the internet", "installing software" has not been solved generally. There's more than one way to do it. A mixed system that uses both declarative and traditional package managers in unison is the way to go for now. It would be ideal to package a non-specific declarative package install definition together with the source of programs, and make unnecessary the concept of a "package maintainer" for each package manager. The existence of two declarative package managers already suggests the need for an arbitrary standard which can transformed into a definition for any declarative system.

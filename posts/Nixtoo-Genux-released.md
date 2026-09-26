@@ -4,6 +4,13 @@ date: 2025-09-04
 order: 041
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, from the announced repo's creation)"
+links:
+- '[Install Nix on Gentoo](Install-Nix-on-Gentoo.html)'
+- '[Why YOU need NixOS on your desktop and servers](Why-YOU-need-NixOS-on-your-desktop-and-servers.html)'
+- '[nix on gentoo howto by trofi](https://trofi.github.io/posts/196-nix-on-gentoo-howto.html)'
+- '[Don\''t use make (un)install](Dont-use-make-uninstall.html)'
+- '[github.com/NixOS/nix](https://github.com/NixOS/nix)'
+- '[install gentoo hints](install-gentoo-hints.html)'
 ---
 
 <a href="https://github.com/equwal/nixtoo-genux" class="external-link">git hub website link here</a>

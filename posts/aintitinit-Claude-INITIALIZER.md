@@ -4,6 +4,12 @@ date: 2025-09-09
 order: 051
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[REPL Driven Development as an analogy for proper AI Driven Development](REPL-Driven-Development-as-an-analogy-for-proper-AI-Driven-Development.html)'
+- '[Minimal nvim config optional AI slop (enjoy!)](Minimal-nvim-config-optional-AI-slop-enjoy.html)'
+- '[memstate](https://github.com/equwal/memstate)'
+- '[ideamine](https://github.com/equwal/ideamine)'
+- '[deploy-handoff](https://github.com/equwal/deploy-handoff)'
 ---
 
 <a href="https://github.com/HACKERMEN-ORG/aintitinit" class="external-link">git hub website repo</a>

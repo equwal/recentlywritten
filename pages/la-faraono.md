@@ -1,6 +1,9 @@
 ---
 title: La Faraono
 source: equwal.com (recovered from web.archive.org)
+links:
+- '[eo libroj](esperantaj-libroj.html)'
+- '[Serpentoj En La Puto](serpentoj-en-la-puto.html)'
 ---
 
 ###### Bolesław Prus

@@ -1,5 +1,8 @@
 ---
 title: YouTube
+links:
+- '[New podcast about polyglot language learning (LISTEN NOW!)](New-podcast-about-polyglot-language-learning-LISTEN-NOW.html)'
+- '[Polyglot Podcast Now Goes on The YouTube.com Website](Polyglot-Podcast-Now-Goes-on-The-YouTubecom-Website.html)'
 ---
 
 Two channels.

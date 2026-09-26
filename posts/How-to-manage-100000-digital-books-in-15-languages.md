@@ -4,6 +4,11 @@ date: 2024-05-21
 order: 011
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[How Japanese Aquire Books](How-Japanese-Aquire-Books.html)'
+- '[How to take notes: not self-help advice](How-to-take-notes-not-self-help-advice.html)'
+- '[sbm](sbm.html)'
+- '[karl-voit.at/2022/01/29/How-to-Use-Tags](https://karl-voit.at/2022/01/29/How-to-Use-Tags/)'
 ---
 
 ## Calibre - the library management program

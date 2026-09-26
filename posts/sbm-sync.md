@@ -2,6 +2,10 @@
 title: sbm Sync
 date: 2026-09-22
 tags: projects
+links:
+- '[sbm](sbm.html)'
+- '[sbm-webpublish](https://github.com/equwal/sbm-webpublish)'
+- '[dmenu scripts repo released](dmenu-scripts-repo-released.html)'
 ---
 
 Suckless Bookmark Manager (now sbm Sync)

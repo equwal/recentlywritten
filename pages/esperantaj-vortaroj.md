@@ -2,6 +2,10 @@
 title: vortaroj
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Three Steps to Esperanto Mastery](esperanto-three-steps.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[eo artikoloj](esperantaj-artikoloj.html)'
 ---
 
 Esperantaj Vortaroj

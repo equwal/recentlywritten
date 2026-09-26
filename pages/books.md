@@ -1,6 +1,11 @@
 ---
 title: books
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[la sankta biblio](biblio.html)'
+- '[Unanglo your literacy materials (and your life)](Unanglo-your-literacy-materials-and-your-life.html)'
+- '[Lisp Rant](lisprant.html)'
+- '[How to manage 100,000 digital books in 15 languages](How-to-manage-100000-digital-books-in-15-languages.html)'
 ---
 
 Chad Books

@@ -4,6 +4,11 @@ date: 2025-09-11
 order: 033
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Nixtoo Genux™ released](Nixtoo-Genux-released.html)'
+- '[Install Nix on Gentoo](Install-Nix-on-Gentoo.html)'
+- '[Don\''t use make (un)install](Dont-use-make-uninstall.html)'
+- '[install gentoo hints](install-gentoo-hints.html)'
 ---
 
 ## Why?

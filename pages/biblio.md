@@ -2,6 +2,11 @@
 title: la sankta biblio
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[audo](esperantaj-audoj.html)'
+- '[books](books.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[budhismaj rakontoj](budhismaj-rakontoj.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

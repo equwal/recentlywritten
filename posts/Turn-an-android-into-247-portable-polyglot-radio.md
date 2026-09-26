@@ -4,6 +4,11 @@ date: 2024-05-21
 order: 016
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[Polyglot Radio is Dead: Long Live The Queue (Antennapod shill post)](Polyglot-Radio-is-Dead-Long-Live-The-Queue-Antennapod-shill-post.html)'
+- '[youtube.com/\@ProfASAr](https://www.youtube.com/@ProfASAr)'
+- '[New podcast about polyglot language learning (LISTEN NOW!)](New-podcast-about-polyglot-language-learning-LISTEN-NOW.html)'
+- '[How to Learn a Language According to The Internet](How-to-Learn-a-Language-According-to-The-Internet.html)'
 ---
 
 <figure>

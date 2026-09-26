@@ -4,6 +4,12 @@ date: 2019-04-28
 order: 008
 tags: projects
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[POSIX pipes for Lisp](POSIX-pipes-for-Lisp.html)'
+- '[CLOCC\''s port module](https://clocc.sourceforge.net/dist/port.html)'
+- '[github.com/Sharp-CLOCC/Newport](https://github.com/Sharp-CLOCC/Newport)'
+- '[Toplevel Macros in Alexandria: Code Revival Project](Toplevel-Macros-in-Alexandria-Code-Revival-Project.html)'
+- '[posix-pipes](https://github.com/equwal/posix-pipes)'
 ---
 
 ##### Portable shell and system access for Common Lisp.

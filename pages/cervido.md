@@ -2,6 +2,10 @@
 title: La Cervido
 tags: esperanto
 source: equwal.com (recovered from web.archive.org)
+links:
+- '[audo](esperantaj-audoj.html)'
+- '[rut](rut.html)'
+- '[meti limon](meti-limon.html)'
 ---
 
 ## La Cervido

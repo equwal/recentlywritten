@@ -4,6 +4,13 @@ date: 2025-09-11
 order: 031
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Hackermen neomutt config](Hackermen-neomutt-config.html)'
+- '[Get on mailing lists like it is 1989](Get-on-mailing-lists-like-it-is-1989.html)'
+- '[dmenu scripts repo released](dmenu-scripts-repo-released.html)'
+- '[dpatchmail](https://github.com/equwal/dpatchmail)'
+- '[prompt-mail](https://github.com/equwal/prompt-mail)'
+- '[suckless](https://suckless.org)'
 ---
 
 ## Why we need this

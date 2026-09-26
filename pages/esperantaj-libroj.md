@@ -2,6 +2,14 @@
 title: eo libroj
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Noveloj de Sten Johansson](sten-johansson.html)'
+- '[noveloj](esperantaj-noveloj.html)'
+- '[steloj.de/esperanto/verkoj.html](http://www.steloj.de/esperanto/verkoj.html)'
+- '[literaturo.esperanto.net](http://literaturo.esperanto.net/)'
+- '[vortaroj](esperantaj-vortaroj.html)'
+- '[audo](esperantaj-audoj.html)'
+- '[books](books.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

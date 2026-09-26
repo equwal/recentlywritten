@@ -1,6 +1,11 @@
 ---
 title: Three Steps to Esperanto Mastery
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[Je L\''Esperantid 2.0](lesperant2.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[audo](esperantaj-audoj.html)'
+- '[vortaroj](esperantaj-vortaroj.html)'
 ---
 
 Three Steps Esperanto

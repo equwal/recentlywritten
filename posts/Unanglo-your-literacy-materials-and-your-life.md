@@ -4,6 +4,11 @@ date: 2024-05-21
 order: 015
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[books](books.html)'
+- '[How Japanese Aquire Books](How-Japanese-Aquire-Books.html)'
+- '[How to manage 100,000 digital books in 15 languages](How-to-manage-100000-digital-books-in-15-languages.html)'
+- '[How to Learn a Language According to The Internet](How-to-Learn-a-Language-According-to-The-Internet.html)'
 ---
 
 <figure>

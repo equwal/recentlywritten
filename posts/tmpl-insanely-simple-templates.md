@@ -4,6 +4,11 @@ date: 2025-09-06
 order: 043
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[Minimal nvim config optional AI slop (enjoy!)](Minimal-nvim-config-optional-AI-slop-enjoy.html)'
+- '[dmenu scripts repo released](dmenu-scripts-repo-released.html)'
+- '[tag-gen](tag-gen.html)'
+- '[quickproject](https://github.com/xach/quickproject)'
 ---
 
 <a href="https://github.com/equwal/tmpl" class="external-link">git repo here</a>

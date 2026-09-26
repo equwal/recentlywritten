@@ -4,6 +4,11 @@ date: 2024-05-21
 order: 013
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[Don\''t Self-Host: Self-Locally](Dont-Self-Host-Self-Locally.html)'
+- '[Using an init system for many instances of simple programs](Using-an-init-system-for-many-instances-of-simple-programs.html)'
+- '[tag-gen](tag-gen.html)'
+- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
 ---
 
 ## Why/How to host a bunch of crap locally

@@ -4,6 +4,8 @@ date: 2019-01-07
 order: 004
 tags: projects
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[asdf-registration](https://github.com/equwal/asdf-registration)'
 ---
 
 Defines a Common Lisp reader to read in CSV:

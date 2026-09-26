@@ -1,6 +1,9 @@
 ---
 title: Noveloj de Sten Johansson
 source: equwal.com (recovered from web.archive.org)
+links:
+- '[noveloj](esperantaj-noveloj.html)'
+- '[25 Noveloj](25-noveloj.html)'
 ---
 
 [txt](sten-johansson/sten-johansson.txt)    [mobi](sten-johansson/sten-johansson.mobi)    [epub](sten-johansson/sten-johansson.epub)    [pdf](sten-johansson/sten-johansson.pdf)

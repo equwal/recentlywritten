@@ -76,6 +76,10 @@ $endif$
 
   $body$
 
+$if(links)$
+  <p class="links">$for(links)$$links$$sep$ · $endfor$</p>
+
+$endif$
   <div id="footer">
     <a href="index.html">← Home</a> ·
     <a href="https://github.com/equwal">Github</a>

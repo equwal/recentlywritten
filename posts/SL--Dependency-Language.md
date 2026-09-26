@@ -4,6 +4,9 @@ date: 2019-07-02
 order: 007
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[defsl](https://github.com/equwal/defsl)'
+- '[Newport](Newport.html)'
 ---
 
 \[image /static/bnf-sl.png\]

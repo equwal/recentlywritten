@@ -2,6 +2,11 @@
 title: noveloj
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[literaturo.esperanto.net](http://literaturo.esperanto.net/)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[budhismaj rakontoj](budhismaj-rakontoj.html)'
+- '[audo](esperantaj-audoj.html)'
 ---
 
 Novelar'

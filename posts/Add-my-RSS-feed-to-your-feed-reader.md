@@ -4,6 +4,9 @@ date: 2025-09-11
 order: 038
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[\"Mailing list\" in one line](Mailing-list-in-one-line.html)'
+- '[dmenu scripts repo released](dmenu-scripts-repo-released.html)'
 ---
 
 Here is the link: [https://recentlywritten.com/rss.xml](rss.xml)

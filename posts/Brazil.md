@@ -4,6 +4,8 @@ date: 2018-11-26
 order: 001
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[Three Steps to Esperanto Mastery](esperanto-three-steps.html)'
 ---
 
 I've spend a total of 13 months in Brazil in my adult life.

@@ -4,6 +4,9 @@ date: 2025-09-03
 order: 039
 tags: projects
 source: "therealtruex.com (recovered from web.archive.org; date approximate, from the announced repo's creation)"
+links:
+- '[Newport](Newport.html)'
+- '[Newport Reference Manual](newport-reference-manual.html)'
 ---
 
 ## <a href="https://github.com/equwal/posix-pipes" class="external-link">posix-pipes</a>

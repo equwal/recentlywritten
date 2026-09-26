@@ -4,6 +4,13 @@ date: 2023-09-22
 order: 009
 tags: projects
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[sbm Sync](sbm-sync.html)'
+- '[sbm-suckless](https://github.com/equwal/sbm-suckless)'
+- '[sbmsync.com](https://sbmsync.com)'
+- '[dmenu](https://tools.suckless.org/dmenu/)'
+- '[sbm-webpublish](https://github.com/equwal/sbm-webpublish)'
+- '[dmenu scripts repo released](dmenu-scripts-repo-released.html)'
 ---
 
 How to keep track of thousands of bookmarks with a simple tool and your own tags.

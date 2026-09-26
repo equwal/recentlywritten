@@ -2,6 +2,10 @@
 title: 25 Noveloj
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[noveloj](esperantaj-noveloj.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[Noveloj de Sten Johansson](sten-johansson.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

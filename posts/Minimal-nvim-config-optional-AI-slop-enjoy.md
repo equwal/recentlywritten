@@ -4,6 +4,13 @@ date: 2025-09-07
 order: 047
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[REPL Driven Development as an analogy for proper AI Driven Development](REPL-Driven-Development-as-an-analogy-for-proper-AI-Driven-Development.html)'
+- '[Hackermen neomutt config](Hackermen-neomutt-config.html)'
+- '[tnot](https://github.com/equwal/tnot)'
+- '[mtm](https://github.com/deadpixi/mtm)'
+- '[abduco](https://www.brain-dump.org/projects/abduco/)'
+- '[shellcheck](https://shellcheck.net)'
 ---
 
 <a href="https://github.com/HACKERMEN-ORG/hackermen-neovim-config-file" class="external-link">code on the git hub website</a>

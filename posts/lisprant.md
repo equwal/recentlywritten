@@ -1,6 +1,10 @@
 ---
 title: Lisp Rant
 date: 2026-05-12
+links:
+- '[flownet.com/gat/jpl-lisp.html](http://www.flownet.com/gat/jpl-lisp.html)'
+- '[Paul Graham\''s essays](https://paulgraham.com/articles.html)'
+- '[REPL Driven Development as an analogy for proper AI Driven Development](REPL-Driven-Development-as-an-analogy-for-proper-AI-Driven-Development.html)'
 ---
 
 Read doug hoyte then come back and tell me static typing is better

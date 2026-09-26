@@ -2,6 +2,12 @@
 title: rut
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[audo](esperantaj-audoj.html)'
+- '[esperantobiblio.org](http://esperantobiblio.org/)'
+- '[La Cervido](cervido.html)'
+- '[meti limon](meti-limon.html)'
+- '[eo libroj](esperantaj-libroj.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

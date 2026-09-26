@@ -4,6 +4,15 @@ date: 2025-09-11
 order: 026
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Polyglot Podcast Now Goes on The YouTube.com Website](Polyglot-Podcast-Now-Goes-on-The-YouTubecom-Website.html)'
+- '[New book coming soon about language learning (for multiple languages)! PREORDER NOW!](New-book-coming-soon-about-language-learning-for-multiple-languages-PREORDER-NOW.html)'
+- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
+- '[SubRead](subread.html)'
+- '[youtube.com/\@therealtruex](https://www.youtube.com/@therealtruex)'
+- '[Polyglot Radio is Dead: Long Live The Queue (Antennapod shill post)](Polyglot-Radio-is-Dead-Long-Live-The-Queue-Antennapod-shill-post.html)'
+- '[Turn an android into 24/7 portable polyglot radio](Turn-an-android-into-247-portable-polyglot-radio.html)'
+- '[How to Learn a Language According to The Internet](How-to-Learn-a-Language-According-to-The-Internet.html)'
 ---
 
 Right now it isn't syndicated anywhere, but you can download them directly from these links:

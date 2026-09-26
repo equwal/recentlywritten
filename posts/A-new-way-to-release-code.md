@@ -4,6 +4,9 @@ date: 2025-09-11
 order: 035
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Start emailing your patches GUIDE](Start-emailing-your-patches-GUIDE.html)'
+- '[ii/lchat setup (too easy)](iilchat-setup-too-easy.html)'
 ---
 
 Recently clobbered this together to send over IRC really quick. The power of pipes! Best for April fools.

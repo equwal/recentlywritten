@@ -4,6 +4,12 @@ date: 2025-09-06
 order: 045
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[Hackermen neomutt config](Hackermen-neomutt-config.html)'
+- '[Add my RSS feed to your feed reader](Add-my-RSS-feed-to-your-feed-reader.html)'
+- '[Get on mailing lists like it is 1989](Get-on-mailing-lists-like-it-is-1989.html)'
+- '[Start emailing your patches GUIDE](Start-emailing-your-patches-GUIDE.html)'
+- '[github.com/HACKERMEN-ORG/neomutt-config](https://github.com/HACKERMEN-ORG/neomutt-config)'
 ---
 
 # ==> list-of-emails.txt <==

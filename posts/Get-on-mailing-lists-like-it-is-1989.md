@@ -4,6 +4,11 @@ date: 2025-09-11
 order: 028
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Start emailing your patches GUIDE](Start-emailing-your-patches-GUIDE.html)'
+- '[Hackermen neomutt config](Hackermen-neomutt-config.html)'
+- '[dpatchmail](https://github.com/equwal/dpatchmail)'
+- '[\"Mailing list\" in one line](Mailing-list-in-one-line.html)'
 ---
 
 ## More folders than INBOX and SPAM

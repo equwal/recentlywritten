@@ -4,6 +4,11 @@ date: 2019-04-29
 order: 005
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[Newport](Newport.html)'
+- '[github.com/Sharp-CLOCC/Newport](https://github.com/Sharp-CLOCC/Newport)'
+- '[POSIX pipes for Lisp](POSIX-pipes-for-Lisp.html)'
+- '[Newport Reference Manual](newport-reference-manual.html)'
 ---
 
 \[image /static/lisp-alu-blue.gif, class logo, alt "ALU lisp logo, CC attributed" \]

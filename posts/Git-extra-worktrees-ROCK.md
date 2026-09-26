@@ -4,6 +4,10 @@ date: 2025-09-11
 order: 032
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Coleslaw](https://github.com/coleslaw-org/coleslaw)'
+- '[Generate your OWN internet web site easily](Generate-your-OWN-internet-web-site-easily.html)'
+- '[Start emailing your patches GUIDE](Start-emailing-your-patches-GUIDE.html)'
 ---
 
 A friend informed me that now git has explicit support for extra worktrees (rather than just blindly copying stuff). I was pretty incredulous about it at first – why would you need that? I figured it out pretty quick.

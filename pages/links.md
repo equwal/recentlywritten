@@ -1,6 +1,9 @@
 ---
 title: Links
 feed: links/atom.xml
+links:
+- '[sbm Sync](sbm-sync.html)'
+- '[sbm](sbm.html)'
 ---
 
 Pages that I keep, under their tags. The newest are first. The list comes

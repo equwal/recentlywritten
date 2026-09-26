@@ -4,6 +4,12 @@ date: 2025-08-09
 order: 022
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[How to take notes: not self-help advice](How-to-take-notes-not-self-help-advice.html)'
+- '[SubRead](subread.html)'
+- '[desktop-subtitle-replay](https://github.com/equwal/desktop-subtitle-replay)'
+- '[Install Anki](Install-Anki.html)'
+- '[Learn Kanji in a Fortnight](Learn-Kanji-in-a-Fortnight.html)'
 ---
 
 ## Why make 3,000 vocabulary flashcards?

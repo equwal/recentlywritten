@@ -4,6 +4,12 @@ date: 2025-09-07
 order: 046
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the therealtruex.com feed)"
+links:
+- '[ii/lchat setup (too easy)](iilchat-setup-too-easy.html)'
+- '[Why/How to host a bunch of crap locally](WhyHow-to-host-a-bunch-of-crap-locally.html)'
+- '[irc relay](irc-relay.html)'
+- '[dmenu scripts repo released](dmenu-scripts-repo-released.html)'
+- '[Don\''t Self-Host: Self-Locally](Dont-Self-Host-Self-Locally.html)'
 ---
 
 <a href="https://github.com/equwal/tiny-runlevels" class="external-link">mirrored on github for convenience here</a>

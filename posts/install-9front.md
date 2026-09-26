@@ -4,6 +4,10 @@ date: 2025-09-11
 order: 036
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[9front.org](http://9front.org)'
+- '[cat-v.org](http://cat-v.org)'
+- '[Hey kids, want to learn the unix way](Hey-kids-want-to-learn-the-unix-way.html)'
 ---
 
 <a href="https://9fans.github.io/plan9port/" class="external-link">Plan9port</a> is nice for running commands like \`9 ls\` which gives a coherent interface for scripting. But we can go deeper. Let's install plan9.

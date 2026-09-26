@@ -1,5 +1,9 @@
 ---
 title: Projects
+links:
+- '[SubRead](subread.html)'
+- '[Rebind](rebind.html)'
+- '[sbm Sync](sbm-sync.html)'
 ---
 
 Spenser Truex. Free tarballs.

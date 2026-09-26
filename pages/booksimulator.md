@@ -1,5 +1,9 @@
 ---
 title: BookSimulator.com
+links:
+- '[Let Me Book That For You](lmbtfy.html)'
+- '[SubRead](subread.html)'
+- '[subread.space](https://subread.space)'
 ---
 
 Read a book in a book simulator. Comes with full dictionary lookup, audiobook whispersync with Subread, VR support, Android, iOS, and Steam editions, and a web edition.

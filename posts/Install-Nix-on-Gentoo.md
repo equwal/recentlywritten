@@ -4,6 +4,12 @@ date: 2025-11-13
 order: 040
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on therealtruex.com)"
+links:
+- '[Nixtoo Genux™ released](Nixtoo-Genux-released.html)'
+- '[nixtoo-genux](https://github.com/equwal/nixtoo-genux)'
+- '[install gentoo hints](install-gentoo-hints.html)'
+- '[Don\''t use make (un)install](Dont-use-make-uninstall.html)'
+- '[nixos.org/download](https://nixos.org/download/)'
 ---
 
 Code:  

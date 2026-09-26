@@ -4,6 +4,10 @@ date: 2024-05-21
 order: 012
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[How to manage 100,000 digital books in 15 languages](How-to-manage-100000-digital-books-in-15-languages.html)'
+- '[calibre-ebook.com](https://calibre-ebook.com/)'
+- '[3000 Vocab Flashcards (3k Final Solution)](3000-Vocab-Flashcards-3k-Final-Solution.html)'
 ---
 
 I think I have a unique take on note taking.

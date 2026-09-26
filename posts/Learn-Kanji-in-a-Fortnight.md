@@ -4,6 +4,12 @@ date: 2024-05-21
 order: 017
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, first archive crawl on equwal.com)"
+links:
+- '[Install Anki](Install-Anki.html)'
+- '[3000 Vocab Flashcards (3k Final Solution)](3000-Vocab-Flashcards-3k-Final-Solution.html)'
+- '[kakijun.jp](https://kakijun.jp)'
+- '[AJATT (All Japanese All The Time Mirror) at xm0.co](AJATT-All-Japanese-All-The-Time-Mirror-at-xm0co.html)'
+- '[roshiajin.jp](https://roshiajin.jp)'
 ---
 
 ### The first deck

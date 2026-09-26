@@ -4,6 +4,13 @@ date: 2025-09-01
 order: 037
 tags: articles
 source: "therealtruex.com (recovered from web.archive.org; date approximate, from the announced repo's creation)"
+links:
+- '[sbm](sbm.html)'
+- '[tmpl: insanely simple templates](tmpl-insanely-simple-templates.html)'
+- '[git.2f30.org/sad](https://git.2f30.org/sad/)'
+- '[pass-simple](https://github.com/equwal/pass-simple)'
+- '[Using an init system for many instances of simple programs](Using-an-init-system-for-many-instances-of-simple-programs.html)'
+- '[sbm Sync](sbm-sync.html)'
 ---
 
 ## My dmenu scripts <a href="https://github.com/equwal/dmenu-scripts" class="external-link">(click here for the git repo)</a>

@@ -2,6 +2,10 @@
 title: Serpentoj En La Puto
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[eo libroj](esperantaj-libroj.html)'
+- '[La Faraono](la-faraono.html)'
+- '[norda naturo](norda-naturo.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

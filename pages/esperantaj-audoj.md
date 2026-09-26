@@ -2,6 +2,11 @@
 title: audo
 tags: esperanto
 source: therealtruex.com (recovered from web.archive.org)
+links:
+- '[rut](rut.html)'
+- '[La Cervido](cervido.html)'
+- '[eo libroj](esperantaj-libroj.html)'
+- '[noveloj](esperantaj-noveloj.html)'
 ---
 
 <span class="relative-nav"> <span class="fishdown"> </span> <span class="centercomp"> </span></span>

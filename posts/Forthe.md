@@ -3,6 +3,10 @@ title: Forthe
 date: 2019-06-22
 order: 006
 source: "therealtruex.com (recovered from web.archive.org; date exact, from the original .post file in equwal/truex.eu)"
+links:
+- '[Nameless](https://github.com/Malabarba/Nameless)'
+- '[SL-\-Dependency Language](SL--Dependency-Language.html)'
+- '[LispBrain](https://github.com/equwal/LispBrain)'
 ---
 
 &gt; Go Forth\[e\] and ye shall find.
