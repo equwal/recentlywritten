@@ -40,3 +40,5 @@ Right now it isn't syndicated anywhere, but you can download them directly from 
 - [19 Our "AI" is totally fine according to Bostrom's Superintelligence, 2014](static/language-podcast/our-ai-is-totally-fine.m4a)
 - [20 Secret way to test your FREAKING VIBE CODE or it will never work ever](static/language-podcast/test-your-vibe-code.m4a)
 - [21 We're all going to die by AI unless this one thing happens: stop AI with this one weird trick](static/language-podcast/stop-ai-with-this-one-weird-trick.m4a)
+- [22 Why your languages STOPPED improving: conversation and literacy are two different skills](static/language-podcast/22-conversation-and-literacy-are-two-skills.m4a)
+- [23 Atomic Habits won't teach you a language: big problems need BIG solutions](static/language-podcast/23-big-problems-need-big-solutions.m4a)
