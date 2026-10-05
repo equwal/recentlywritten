@@ -80,6 +80,7 @@ Fuzzy search thousands of bookmarks, on every device.
 
 * [tmpl](https://github.com/equwal/tmpl) - Insanely simple templates.
 * [dmenu-scripts](https://github.com/equwal/dmenu-scripts) - Ask for things with dmenu.
+* [sh](https://github.com/equwal/sh) - Small shell and Python scripts: PDF recompression, man page search, a pomodoro timer, phone uploads.
 * [dsad](https://github.com/equwal/dsad) - dmenu interface for sad, the simple audio daemon.
 * [dpatchmail](https://github.com/equwal/dpatchmail) - Patch programs from mail with dmenu.
 * [prompt-mail](https://github.com/equwal/prompt-mail) - Mail questions and mail files with dmenu.
