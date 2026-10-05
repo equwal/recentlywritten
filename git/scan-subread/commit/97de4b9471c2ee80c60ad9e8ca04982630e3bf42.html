@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 97de4b94 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 97de4b9471c2ee80c60ad9e8ca04982630e3bf42
+truex &lt;truex@equwal.com&gt;
+2026-09-26 13:49:52 -0700
+
+Make a card in SubRead Anki from the plugin
+
+The new plugin method ankiAdd starts space.subread.anki.action.ADD for
+a result. It sends the word, the reading, the sentence, the text and
+the source as string extras, and show as a boolean extra, only when the
+caller gives them. SubRead Anki needs a word or a text, so the call
+rejects without both.
+
+RESULT_OK resolves added true with the note id. A cancel resolves added
+false. ReturnWatch decides when SubRead Anki is closed, the same as for
+a lookup. Without SubRead Anki, and on the web, the call resolves the
+error not_installed. The manifest now queries the SubRead Anki package.
+
+</pre><pre> android/app/src/main/AndroidManifest.xml           |  1 +
+ .../java/com/equwal/scansubread/SubReadPlugin.java | 61 +++++++++++++++++++++-
+ src/subread.ts                                     | 42 ++++++++++++++-
+ test/subread.test.ts                               |  6 +++
+ 4 files changed, 107 insertions(+), 3 deletions(-)
+</pre><pre>diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 016c045..079262f 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+<span class="h">@@ -42,6 +42,7 @@</span>
+         &lt;package android:name=&quot;space.subread.overlay&quot; /&gt;
+         &lt;package android:name=&quot;space.subread.overlay.debug&quot; /&gt;
+         &lt;package android:name=&quot;space.subread.dictionary&quot; /&gt;
+<span class="a">+        &lt;package android:name=&quot;space.subread.anki&quot; /&gt;</span>
+         &lt;!-- The player provider of SubRead Overlay: the release build and the debug build. --&gt;
+         &lt;provider android:authorities=&quot;space.subread.overlay.player;space.subread.overlay.debug.player&quot; /&gt;
+         &lt;!-- The dictionary apps: each app in the text selection menu. --&gt;
+diff --git a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+index 0fbe0a6..b7f9f8f 100644
+--- a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
++++ b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+<span class="h">@@ -45,6 +45,8 @@ import java.util.List;</span>
+  *   menu. The lookup resolves when the dictionary closes.
+  * - The subtitle maker, through the intent API of the SubRead app
+  *   (`space.subread.app.action.ALIGN`).
+<span class="a">+ * - SubRead Anki, through `space.subread.anki.action.ADD`: a card for a</span>
+<span class="a">+ *   word and its sentence.</span>
+  * - The screen, which stays on during read-along.
+  */
+ @CapacitorPlugin(name = &quot;SubRead&quot;)
+<span class="h">@@ -72,10 +74,20 @@ public class SubReadPlugin extends Plugin {</span>
+ 
+     private static final String SHARE_DIR = &quot;share&quot;;
+ 
+<span class="a">+    private static final String ANKI_PACKAGE = &quot;space.subread.anki&quot;;</span>
+<span class="a">+    private static final String ACTION_ANKI_ADD = &quot;space.subread.anki.action.ADD&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_WORD = &quot;space.subread.anki.extra.WORD&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_READING = &quot;space.subread.anki.extra.READING&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_SENTENCE = &quot;space.subread.anki.extra.SENTENCE&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_TEXT = &quot;space.subread.anki.extra.TEXT&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_SOURCE = &quot;space.subread.anki.extra.SOURCE&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_SHOW = &quot;space.subread.anki.extra.SHOW&quot;;</span>
+<span class="a">+    private static final String EXTRA_ANKI_NOTE_ID = &quot;space.subread.anki.extra.NOTE_ID&quot;;</span>
+<span class="a">+</span>
+     /** The authority that answered last. It is tried first. */
+     private String authority;
+ 
+<span class="d">-    /** Tells when the dictionary is closed. */</span>
+<span class="a">+    /** Tells when the dictionary or SubRead Anki is closed. */</span>
+     private final ReturnWatch returns = new ReturnWatch();
+ 
+     @Override
+<span class="h">@@ -273,6 +285,53 @@ public class SubReadPlugin extends Plugin {</span>
+         call.resolve();
+     }
+ 
+<span class="a">+    // --- The card maker, through SubRead Anki ---</span>
+<span class="a">+</span>
+<span class="a">+    /** Puts the text option `name` in the extra `extra`, when the caller gave it. */</span>
+<span class="a">+    private static void putText(Intent intent, PluginCall call, String name, String extra) {</span>
+<span class="a">+        String value = call.getString(name);</span>
+<span class="a">+        if (value != null &amp;&amp; !value.isEmpty()) intent.putExtra(extra, value);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Asks SubRead Anki to make a card. SubRead Anki needs a word or a text. */</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void ankiAdd(PluginCall call) {</span>
+<span class="a">+        Intent add = new Intent(ACTION_ANKI_ADD).setPackage(ANKI_PACKAGE);</span>
+<span class="a">+        putText(add, call, &quot;word&quot;, EXTRA_ANKI_WORD);</span>
+<span class="a">+        putText(add, call, &quot;reading&quot;, EXTRA_ANKI_READING);</span>
+<span class="a">+        putText(add, call, &quot;sentence&quot;, EXTRA_ANKI_SENTENCE);</span>
+<span class="a">+        putText(add, call, &quot;text&quot;, EXTRA_ANKI_TEXT);</span>
+<span class="a">+        putText(add, call, &quot;source&quot;, EXTRA_ANKI_SOURCE);</span>
+<span class="a">+        if (!add.hasExtra(EXTRA_ANKI_WORD) &amp;&amp; !add.hasExtra(EXTRA_ANKI_TEXT)) {</span>
+<span class="a">+            call.reject(&quot;word or text is required.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        Boolean show = call.getBoolean(&quot;show&quot;);</span>
+<span class="a">+        if (show != null) add.putExtra(EXTRA_ANKI_SHOW, show.booleanValue());</span>
+<span class="a">+        if (add.resolveActivity(getContext().getPackageManager()) == null) {</span>
+<span class="a">+            call.resolve(errorObject(&quot;not_installed&quot;));</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        returns.launched();</span>
+<span class="a">+        startActivityForResult(call, add, &quot;ankiResult&quot;);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** SubRead Anki gave its result: the note is in Anki, or the user closed the card. */</span>
+<span class="a">+    @ActivityCallback</span>
+<span class="a">+    private void ankiResult(PluginCall call, ActivityResult result) {</span>
+<span class="a">+        if (call == null) return;</span>
+<span class="a">+        returns.result(() -&gt; {</span>
+<span class="a">+            JSObject ret = new JSObject();</span>
+<span class="a">+            Intent data = result.getData();</span>
+<span class="a">+            boolean added = result.getResultCode() == Activity.RESULT_OK;</span>
+<span class="a">+            ret.put(&quot;added&quot;, added);</span>
+<span class="a">+            if (added &amp;&amp; data != null &amp;&amp; data.hasExtra(EXTRA_ANKI_NOTE_ID)) {</span>
+<span class="a">+                ret.put(&quot;noteId&quot;, data.getLongExtra(EXTRA_ANKI_NOTE_ID, 0));</span>
+<span class="a">+            }</span>
+<span class="a">+            call.resolve(ret);</span>
+<span class="a">+        });</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     // --- The subtitle maker, through the SubRead app ---
+ 
+     /** Writes `text` to cacheDir/share/&lt;name&gt; and returns its FileProvider Uri. */
+diff --git a/src/subread.ts b/src/subread.ts
+index 89e7884..4a3bc20 100644
+--- a/src/subread.ts
++++ b/src/subread.ts
+<span class="h">@@ -1,8 +1,8 @@</span>
+ // The bridge to the SubRead suite: the typed side of SubReadPlugin.java.
+ //
+ // On the web there is no suite. The fallback reports no overlay, copies a
+<span class="d">-// lookup to the clipboard, and cannot make subtitles. It keeps the screen on</span>
+<span class="d">-// with the Screen Wake Lock API when the browser has it.</span>
+<span class="a">+// lookup to the clipboard, and cannot make subtitles or cards. It keeps the</span>
+<span class="a">+// screen on with the Screen Wake Lock API when the browser has it.</span>
+ 
+ import { Capacitor, registerPlugin } from &#x27;@capacitor/core&#x27;;
+ 
+<span class="h">@@ -28,6 +28,31 @@ export interface SubtitlesResult {</span>
+   error?: string;
+ }
+ 
+<span class="a">+/** A card for SubRead Anki. Give `word` or `text`. */</span>
+<span class="a">+export interface AnkiCard {</span>
+<span class="a">+  /** The word, in its dictionary form when the caller knows it. */</span>
+<span class="a">+  word?: string;</span>
+<span class="a">+  /** The reading of the word, in kana. */</span>
+<span class="a">+  reading?: string;</span>
+<span class="a">+  /** The sentence that holds the word, as plain text: see `sentenceAround`. */</span>
+<span class="a">+  sentence?: string;</span>
+<span class="a">+  /** A text with no word chosen: the user taps the word on the card. */</span>
+<span class="a">+  text?: string;</span>
+<span class="a">+  /** Where the sentence is from, for example the title of the book. */</span>
+<span class="a">+  source?: string;</span>
+<span class="a">+  /** True: show the card before it goes to Anki. */</span>
+<span class="a">+  show?: boolean;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface AnkiResult {</span>
+<span class="a">+  /** True when the note is in Anki. False when the user closed the card. */</span>
+<span class="a">+  added?: boolean;</span>
+<span class="a">+  /** The id of the new note in Anki, when `added` is true. */</span>
+<span class="a">+  noteId?: number;</span>
+<span class="a">+  /** SubRead Anki is not on the device. */</span>
+<span class="a">+  error?: &#x27;not_installed&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ export interface SubReadPlugin {
+   playerState(): Promise&lt;StateLine&gt;;
+   play(): Promise&lt;StateLine&gt;;
+<span class="h">@@ -49,6 +74,16 @@ export interface SubReadPlugin {</span>
+   dictionaries(): Promise&lt;{ apps: DictionaryApp[]; chosen: string }&gt;;
+   /** An empty component means: ask each time. */
+   setDictionary(options: { component: string }): Promise&lt;void&gt;;
+<span class="a">+  /**</span>
+<span class="a">+   * Makes a card in SubRead Anki (`space.subread.anki.action.ADD`). Only the</span>
+<span class="a">+   * fields that are given and not empty go to SubRead Anki; without `word`</span>
+<span class="a">+   * and `text` the call rejects. Resolves when SubRead Anki closes, the same</span>
+<span class="a">+   * as `lookup`: `{ added: true, noteId }` when the note is in Anki,</span>
+<span class="a">+   * `{ added: false }` when the user closed the card, and</span>
+<span class="a">+   * `{ error: &#x27;not_installed&#x27; }` without SubRead Anki. On the web:</span>
+<span class="a">+   * `{ error: &#x27;not_installed&#x27; }`.</span>
+<span class="a">+   */</span>
+<span class="a">+  ankiAdd(options: AnkiCard): Promise&lt;AnkiResult&gt;;</span>
+   makeSubtitles(options: {
+     audio: string;
+     bookText: string;
+<span class="h">@@ -104,6 +139,9 @@ class SubReadWeb implements SubReadPlugin {</span>
+   setDictionary(): Promise&lt;void&gt; {
+     return Promise.resolve();
+   }
+<span class="a">+  ankiAdd(): Promise&lt;AnkiResult&gt; {</span>
+<span class="a">+    return Promise.resolve({ error: &#x27;not_installed&#x27; });</span>
+<span class="a">+  }</span>
+   makeSubtitles(): Promise&lt;SubtitlesResult&gt; {
+     return Promise.resolve({ error: &#x27;not_installed&#x27; });
+   }
+diff --git a/test/subread.test.ts b/test/subread.test.ts
+index 1bac26e..4e6b8f2 100644
+--- a/test/subread.test.ts
++++ b/test/subread.test.ts
+<span class="h">@@ -47,6 +47,12 @@ describe(&#x27;the web fallback of the plugin&#x27;, () =&gt; {</span>
+     expect(locks[1]!.released).toBe(true);
+   });
+ 
+<span class="a">+  it(&#x27;has no SubRead Anki&#x27;, async () =&gt; {</span>
+<span class="a">+    await expect(SubRead.ankiAdd({ word: &#x27;猫&#x27;, sentence: &#x27;吾輩は猫である。&#x27; })).resolves.toEqual({</span>
+<span class="a">+      error: &#x27;not_installed&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;ignores a browser with no wake lock, and a refused request&#x27;, async () =&gt; {
+     vi.stubGlobal(&#x27;navigator&#x27;, {});
+     await expect(SubRead.keepAwake({ on: true })).resolves.toBeUndefined();</pre>
+</div></body></html>

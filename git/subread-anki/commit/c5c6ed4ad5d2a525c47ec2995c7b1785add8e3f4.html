@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-anki c5c6ed4a - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-anki</h1><span class="desc">One tap makes an Anki card on Android: word, definition, sentence, screenshot, audio. Works with any app, with SubRead Dictionary and SubRead Overlay.</span><p class="url">git clone https://github.com/equwal/subread-anki</p><p><a href="../../subread-anki/index.html">Log</a> | <a href="../../subread-anki/files.html">Files</a> | <a href="../../subread-anki/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c5c6ed4ad5d2a525c47ec2995c7b1785add8e3f4
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-09-26 14:28:00 -0700
+
+Talk to AnkiDroid without the JitPack library, and turn on R8
+
+F-Droid builds from Maven Central and source only, and the AnkiDroid API library is on JitPack only. AnkiClient now uses the content provider of AnkiDroid (the FlashCardsContract) directly, with the same calls as the library, and keeps its own methods, so the callers do not change. A duplicate check is an Anki search on the first field. R8 removes unused code; F-Droid asks for it.
+
+</pre><pre> app/build.gradle.kts                               |  11 +-
+ .../main/kotlin/space/subread/anki/AnkiClient.kt   | 176 +++++++++++++++++----
+ .../main/kotlin/space/subread/anki/MainActivity.kt |   6 +-
+ gradle/libs.versions.toml                          |   3 -
+ settings.gradle.kts                                |   5 -
+ 5 files changed, 148 insertions(+), 53 deletions(-)
+</pre><pre>diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 604a4d6..df62df3 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+<span class="h">@@ -47,7 +47,10 @@ android {</span>
+     buildTypes {
+         debug { applicationIdSuffix = &quot;.debug&quot; }
+         release {
+<span class="d">-            isMinifyEnabled = false</span>
+<span class="a">+            // R8 removes unused code and resources. F-Droid asks for it.</span>
+<span class="a">+            isMinifyEnabled = true</span>
+<span class="a">+            isShrinkResources = true</span>
+<span class="a">+            proguardFiles(getDefaultProguardFile(&quot;proguard-android-optimize.txt&quot;))</span>
+             if (signingReady) signingConfig = signingConfigs.getByName(&quot;release&quot;)
+         }
+     }
+<span class="h">@@ -58,17 +61,11 @@ android {</span>
+     }
+     buildFeatures { buildConfig = true }
+ 
+<span class="d">-    lint {</span>
+<span class="d">-        // The AnkiDroid API library ships the lint rules of the AnkiDroid app itself. This one</span>
+<span class="d">-        // wants the clock of the Anki collection; this app has no collection.</span>
+<span class="d">-        disable += &quot;DirectSystemCurrentTimeMillisUsage&quot;</span>
+<span class="d">-    }</span>
+ }
+ 
+ dependencies {
+     implementation(project(&quot;:core&quot;))
+     implementation(libs.androidx.core.ktx)
+<span class="d">-    implementation(libs.ankidroid.api)</span>
+ 
+     androidTestImplementation(libs.junit)
+     androidTestImplementation(libs.androidx.test.runner)
+diff --git a/app/src/main/kotlin/space/subread/anki/AnkiClient.kt b/app/src/main/kotlin/space/subread/anki/AnkiClient.kt
+index 5315d56..7c72751 100644
+--- a/app/src/main/kotlin/space/subread/anki/AnkiClient.kt
++++ b/app/src/main/kotlin/space/subread/anki/AnkiClient.kt
+<span class="h">@@ -1,29 +1,58 @@</span>
+ package space.subread.anki
+ 
+<span class="a">+import android.content.ContentValues</span>
+ import android.content.Context
+ import android.content.Intent
+ import android.content.pm.PackageManager
+<span class="d">-import com.ichi2.anki.api.AddContentApi</span>
+<span class="d">-import com.ichi2.anki.api.NoteInfo</span>
+<span class="a">+import android.net.Uri</span>
+<span class="a">+import android.os.Build</span>
+ import space.subread.anki.core.Fields
+ import space.subread.anki.core.NoteType
+ import space.subread.anki.core.Source
+ import java.io.File
+ 
+<span class="d">-/** The AnkiDroid API: the deck, the note type, the media files and the notes. */</span>
+<span class="a">+/**</span>
+<span class="a">+ * AnkiDroid, through its content provider: the deck, the note type, the media files and the</span>
+<span class="a">+ * notes. The authority, the paths and the columns are the FlashCardsContract of AnkiDroid. The</span>
+<span class="a">+ * API library of AnkiDroid is not used: it comes from JitPack alone, and F-Droid builds from</span>
+<span class="a">+ * Maven Central and source alone.</span>
+<span class="a">+ */</span>
+ class AnkiClient(private val context: Context) {
+ 
+<span class="d">-    private val api = AddContentApi(context)</span>
+<span class="a">+    /** A note of the collection: its id, its fields in order, and its tags. */</span>
+<span class="a">+    class Note(val id: Long, val fields: Array&lt;String&gt;, val tags: Set&lt;String&gt;)</span>
+<span class="a">+</span>
+<span class="a">+    private val resolver get() = context.contentResolver</span>
+     private val store = Store(context)
+ 
+     /** The decks of the collection, by id. Empty when AnkiDroid does not answer. */
+<span class="d">-    fun decks(): Map&lt;Long, String&gt; = runCatching { api.deckList }.getOrNull().orEmpty()</span>
+<span class="a">+    fun decks(): Map&lt;Long, String&gt; = runCatching {</span>
+<span class="a">+        resolver.query(DECKS, arrayOf(&quot;deck_id&quot;, &quot;deck_name&quot;), null, null, null)?.use { c -&gt;</span>
+<span class="a">+            buildMap {</span>
+<span class="a">+                while (c.moveToNext()) put(c.getLong(0), c.getString(1))</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }.getOrNull().orEmpty()</span>
+ 
+     /** The note types of the collection, by id. */
+<span class="d">-    fun models(): Map&lt;Long, String&gt; = runCatching { api.modelList }.getOrNull().orEmpty()</span>
+<span class="a">+    fun models(): Map&lt;Long, String&gt; = runCatching {</span>
+<span class="a">+        resolver.query(MODELS, arrayOf(&quot;_id&quot;, &quot;name&quot;), null, null, null)?.use { c -&gt;</span>
+<span class="a">+            buildMap {</span>
+<span class="a">+                while (c.moveToNext()) put(c.getLong(0), c.getString(1))</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }.getOrNull().orEmpty()</span>
+ 
+     /** The fields of a note type, in order. Empty when the note type is gone. */
+<span class="d">-    fun fields(modelId: Long): List&lt;String&gt; = runCatching { api.getFieldList(modelId) }.getOrNull()?.toList().orEmpty()</span>
+<span class="a">+    fun fields(modelId: Long): List&lt;String&gt; = runCatching {</span>
+<span class="a">+        resolver.query(Uri.withAppendedPath(MODELS, modelId.toString()), arrayOf(&quot;field_names&quot;), null, null, null)?.use { c -&gt;</span>
+<span class="a">+            if (c.moveToFirst()) c.getString(0).split(SEPARATOR) else null</span>
+<span class="a">+        }</span>
+<span class="a">+    }.getOrNull().orEmpty()</span>
+<span class="a">+</span>
+<span class="a">+    /** Makes a deck with this name. Returns its id, or null when AnkiDroid refused. */</span>
+<span class="a">+    fun addDeck(name: String): Long? =</span>
+<span class="a">+        resolver.insert(DECKS, ContentValues().apply { put(&quot;deck_name&quot;, name) })?.lastPathSegment?.toLongOrNull()</span>
+ 
+     /** The deck the cards go to. The chosen one, else &quot;SubRead&quot;, made when it is not there. */
+     fun ensureDeck(): Long {
+<span class="h">@@ -31,7 +60,7 @@ class AnkiClient(private val context: Context) {</span>
+         val chosen = store.deckId
+         if (chosen != Store.NONE &amp;&amp; decks.containsKey(chosen)) return chosen
+         val id = decks.entries.firstOrNull { it.value == DECK_NAME }?.key
+<span class="d">-            ?: api.addNewDeck(DECK_NAME)</span>
+<span class="a">+            ?: addDeck(DECK_NAME)</span>
+             ?: throw IllegalStateException(&quot;AnkiDroid did not make the deck&quot;)
+         store.deckId = id
+         return id
+<span class="h">@@ -43,22 +72,39 @@ class AnkiClient(private val context: Context) {</span>
+         val chosen = store.modelId
+         if (chosen != Store.NONE &amp;&amp; models.containsKey(chosen)) return chosen
+         val id = models.entries.firstOrNull { it.value == NoteType.NAME }?.key
+<span class="d">-            ?: api.addNewCustomModel(</span>
+<span class="d">-                NoteType.NAME,</span>
+<span class="d">-                NoteType.FIELDS.toTypedArray(),</span>
+<span class="d">-                NoteType.CARD_NAMES.toTypedArray(),</span>
+<span class="d">-                NoteType.QUESTION_FORMATS.toTypedArray(),</span>
+<span class="d">-                NoteType.ANSWER_FORMATS.toTypedArray(),</span>
+<span class="d">-                NoteType.CSS,</span>
+<span class="d">-                deckId,</span>
+<span class="d">-                0,</span>
+<span class="d">-            )</span>
+<span class="a">+            ?: addModel(deckId)</span>
+             ?: throw IllegalStateException(&quot;AnkiDroid did not make the note type&quot;)
+         store.modelId = id
+         store.mapping = NoteType.MAPPING
+         return id
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Makes the note type of the app: first the note type with its fields, then the template</span>
+<span class="a">+     * of each card. Returns its id, or null when AnkiDroid refused.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun addModel(deckId: Long): Long? {</span>
+<span class="a">+        val values = ContentValues().apply {</span>
+<span class="a">+            put(&quot;name&quot;, NoteType.NAME)</span>
+<span class="a">+            put(&quot;field_names&quot;, NoteType.FIELDS.joinToString(SEPARATOR))</span>
+<span class="a">+            put(&quot;num_cards&quot;, NoteType.CARD_NAMES.size)</span>
+<span class="a">+            put(&quot;css&quot;, NoteType.CSS)</span>
+<span class="a">+            put(&quot;deck_id&quot;, deckId)</span>
+<span class="a">+            put(&quot;sort_field_index&quot;, 0)</span>
+<span class="a">+        }</span>
+<span class="a">+        val model = resolver.insert(MODELS, values) ?: return null</span>
+<span class="a">+        val templates = Uri.withAppendedPath(model, &quot;templates&quot;)</span>
+<span class="a">+        NoteType.CARD_NAMES.forEachIndexed { i, card -&gt;</span>
+<span class="a">+            val template = ContentValues().apply {</span>
+<span class="a">+                put(&quot;card_template_name&quot;, card)</span>
+<span class="a">+                put(&quot;question_format&quot;, NoteType.QUESTION_FORMATS[i])</span>
+<span class="a">+                put(&quot;answer_format&quot;, NoteType.ANSWER_FORMATS[i])</span>
+<span class="a">+            }</span>
+<span class="a">+            resolver.update(Uri.withAppendedPath(templates, i.toString()), template, null, null)</span>
+<span class="a">+        }</span>
+<span class="a">+        return model.lastPathSegment?.toLongOrNull()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     /** The note type of the cards when it exists already, or null. Makes nothing: for a look before the first card. */
+     fun existingModel(): Long? {
+         val models = models()
+<span class="h">@@ -89,41 +135,105 @@ class AnkiClient(private val context: Context) {</span>
+ 
+     /**
+      * Copies a file into the media folder of AnkiDroid and returns its name there. [kind] is
+<span class="d">-     * `audio` or `image`. AnkiDroid reads the file through [MediaProvider], so the read is</span>
+<span class="d">-     * granted to it for the copy.</span>
+<span class="a">+     * `audio` or `image`; AnkiDroid takes the kind from the file. AnkiDroid reads the file</span>
+<span class="a">+     * through [MediaProvider], so the read is granted to it for the copy.</span>
+      */
+<span class="a">+    @Suppress(&quot;UNUSED_PARAMETER&quot;)</span>
+     fun addMedia(file: File, kind: String): String? {
+         val uri = Media.uriFor(context, file)
+         val anki = packageName(context) ?: return null
+         context.grantUriPermission(anki, uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+         try {
+<span class="d">-            val stem = file.nameWithoutExtension</span>
+<span class="d">-            val formatted = api.addMediaFromUri(uri, stem, kind) ?: return null</span>
+<span class="d">-            // The API answers with the field text, `[sound:name]` or `&lt;img src=&quot;name&quot; /&gt;`: take the name.</span>
+<span class="d">-            return Regex(&quot;\\[sound:(.+)]|src=\&quot;([^\&quot;]+)\&quot;&quot;).find(formatted)?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }</span>
+<span class="a">+            val values = ContentValues().apply {</span>
+<span class="a">+                put(&quot;file_uri&quot;, uri.toString())</span>
+<span class="a">+                put(&quot;preferred_name&quot;, file.nameWithoutExtension.replace(&#x27; &#x27;, &#x27;_&#x27;))</span>
+<span class="a">+            }</span>
+<span class="a">+            val stored = runCatching { resolver.insert(MEDIA, values) }.getOrNull() ?: return null</span>
+<span class="a">+            // The path of the answer is the name of the file in the media folder, after a slash.</span>
+<span class="a">+            return stored.path?.trimStart(&#x27;/&#x27;)?.takeIf { it.isNotEmpty() }</span>
+         } finally {
+             context.revokeUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+         }
+     }
+ 
+     /** True when a note of [modelId] has [key] as its first field. */
+<span class="d">-    fun isDuplicate(modelId: Long, key: String): Boolean =</span>
+<span class="d">-        key.isNotEmpty() &amp;&amp; runCatching { api.findDuplicateNotes(modelId, key) }.getOrNull().orEmpty().isNotEmpty()</span>
+<span class="a">+    fun isDuplicate(modelId: Long, key: String): Boolean {</span>
+<span class="a">+        if (key.isBlank()) return false</span>
+<span class="a">+        return runCatching {</span>
+<span class="a">+            val model = models()[modelId] ?: return@runCatching false</span>
+<span class="a">+            val first = fields(modelId).firstOrNull() ?: return@runCatching false</span>
+<span class="a">+            // The selection of the notes path is an Anki search. The quotes make one term of</span>
+<span class="a">+            // &quot;field:text&quot;, and the escapes stop Anki from reading _ and * as wildcards.</span>
+<span class="a">+            val search = &quot;\&quot;${escape(first)}:${escape(key)}\&quot; \&quot;note:${escape(model)}\&quot;&quot;</span>
+<span class="a">+            resolver.query(NOTES, arrayOf(&quot;_id&quot;), search, null, null)?.use { it.count &gt; 0 } ?: false</span>
+<span class="a">+        }.getOrDefault(false)</span>
+<span class="a">+    }</span>
+ 
+<span class="d">-    /** Adds a note. Null when AnkiDroid refused it. */</span>
+<span class="d">-    fun addNote(modelId: Long, deckId: Long, fields: Array&lt;String&gt;, tags: Set&lt;String&gt;): Long? =</span>
+<span class="d">-        api.addNote(modelId, deckId, fields, tags)</span>
+<span class="a">+    /** Adds a note and puts its cards in the deck. Null when AnkiDroid refused it. */</span>
+<span class="a">+    fun addNote(modelId: Long, deckId: Long, fields: Array&lt;String&gt;, tags: Set&lt;String&gt;): Long? {</span>
+<span class="a">+        val values = ContentValues().apply {</span>
+<span class="a">+            put(&quot;mid&quot;, modelId)</span>
+<span class="a">+            put(&quot;flds&quot;, fields.joinToString(SEPARATOR))</span>
+<span class="a">+            put(&quot;tags&quot;, tags.joinToString(&quot; &quot;) { it.replace(&#x27; &#x27;, &#x27;_&#x27;) })</span>
+<span class="a">+        }</span>
+<span class="a">+        val note = resolver.insert(NOTES, values) ?: return null</span>
+<span class="a">+        val cards = Uri.withAppendedPath(note, &quot;cards&quot;)</span>
+<span class="a">+        resolver.query(cards, arrayOf(&quot;ord&quot;), null, null, null)?.use { c -&gt;</span>
+<span class="a">+            while (c.moveToNext()) {</span>
+<span class="a">+                val deck = ContentValues().apply { put(&quot;deck_id&quot;, deckId) }</span>
+<span class="a">+                resolver.update(Uri.withAppendedPath(cards, c.getString(0)), deck, null, null)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        return note.lastPathSegment?.toLongOrNull()</span>
+<span class="a">+    }</span>
+ 
+<span class="d">-    fun note(noteId: Long): NoteInfo? = runCatching { api.getNote(noteId) }.getOrNull()</span>
+<span class="a">+    fun note(noteId: Long): Note? = runCatching {</span>
+<span class="a">+        resolver.query(Uri.withAppendedPath(NOTES, noteId.toString()), arrayOf(&quot;_id&quot;, &quot;flds&quot;, &quot;tags&quot;), null, null, null)?.use { c -&gt;</span>
+<span class="a">+            if (!c.moveToFirst()) {</span>
+<span class="a">+                null</span>
+<span class="a">+            } else {</span>
+<span class="a">+                Note(</span>
+<span class="a">+                    c.getLong(0),</span>
+<span class="a">+                    c.getString(1).split(SEPARATOR).toTypedArray(),</span>
+<span class="a">+                    c.getString(2).orEmpty().split(&#x27; &#x27;).filter { it.isNotBlank() }.toSet(),</span>
+<span class="a">+                )</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }.getOrNull()</span>
+ 
+<span class="d">-    fun updateFields(noteId: Long, fields: Array&lt;String&gt;): Boolean = runCatching { api.updateNoteFields(noteId, fields) }.getOrDefault(false)</span>
+<span class="a">+    fun updateFields(noteId: Long, fields: Array&lt;String&gt;): Boolean = runCatching {</span>
+<span class="a">+        val values = ContentValues().apply { put(&quot;flds&quot;, fields.joinToString(SEPARATOR)) }</span>
+<span class="a">+        resolver.update(Uri.withAppendedPath(NOTES, noteId.toString()), values, null, null) &gt; 0</span>
+<span class="a">+    }.getOrDefault(false)</span>
+ 
+     companion object {
+         const val DECK_NAME = &quot;SubRead&quot;
+<span class="d">-        const val PERMISSION = AddContentApi.READ_WRITE_PERMISSION</span>
+<span class="a">+        const val PERMISSION = &quot;com.ichi2.anki.permission.READ_WRITE_DATABASE&quot;</span>
+<span class="a">+</span>
+<span class="a">+        private const val AUTHORITY = &quot;com.ichi2.anki.flashcards&quot;</span>
+<span class="a">+        private val ROOT: Uri = Uri.parse(&quot;content://$AUTHORITY&quot;)</span>
+<span class="a">+        private val NOTES: Uri = Uri.withAppendedPath(ROOT, &quot;notes&quot;)</span>
+<span class="a">+        private val MODELS: Uri = Uri.withAppendedPath(ROOT, &quot;models&quot;)</span>
+<span class="a">+        private val DECKS: Uri = Uri.withAppendedPath(ROOT, &quot;decks&quot;)</span>
+<span class="a">+        private val MEDIA: Uri = Uri.withAppendedPath(ROOT, &quot;media&quot;)</span>
+<span class="a">+</span>
+<span class="a">+        /** Anki keeps the fields of a note in one string, with this character between them. */</span>
+<span class="a">+        private const val SEPARATOR = &quot;\u001f&quot;</span>
+<span class="a">+</span>
+<span class="a">+        /** A text for an Anki search between quotes: \, &quot;, _ and * get a backslash. */</span>
+<span class="a">+        private fun escape(text: String): String =</span>
+<span class="a">+            text.replace(&quot;\\&quot;, &quot;\\\\&quot;).replace(&quot;\&quot;&quot;, &quot;\\\&quot;&quot;).replace(&quot;_&quot;, &quot;\\_&quot;).replace(&quot;*&quot;, &quot;\\*&quot;)</span>
+ 
+         /** The package of AnkiDroid, or null when it is not installed. */
+<span class="d">-        fun packageName(context: Context): String? = AddContentApi.getAnkiDroidPackageName(context)</span>
+<span class="a">+        fun packageName(context: Context): String? {</span>
+<span class="a">+            val info = if (Build.VERSION.SDK_INT &gt;= Build.VERSION_CODES.TIRAMISU) {</span>
+<span class="a">+                context.packageManager.resolveContentProvider(AUTHORITY, PackageManager.ComponentInfoFlags.of(0))</span>
+<span class="a">+            } else {</span>
+<span class="a">+                @Suppress(&quot;DEPRECATION&quot;)</span>
+<span class="a">+                context.packageManager.resolveContentProvider(AUTHORITY, 0)</span>
+<span class="a">+            }</span>
+<span class="a">+            return info?.packageName</span>
+<span class="a">+        }</span>
+ 
+         fun hasPermission(context: Context): Boolean =
+             context.checkSelfPermission(PERMISSION) == PackageManager.PERMISSION_GRANTED
+diff --git a/app/src/main/kotlin/space/subread/anki/MainActivity.kt b/app/src/main/kotlin/space/subread/anki/MainActivity.kt
+index 0147eae..8362ae5 100644
+--- a/app/src/main/kotlin/space/subread/anki/MainActivity.kt
++++ b/app/src/main/kotlin/space/subread/anki/MainActivity.kt
+<span class="h">@@ -170,7 +170,7 @@ class MainActivity : Activity() {</span>
+             val name = field.text.toString().trim()
+             if (name.isEmpty()) return@setPositiveButton
+             thread {
+<span class="d">-                val id = runCatching { AnkiClient(this).run { decks().entries.firstOrNull { it.value == name }?.key ?: addNewDeckOrNull(name) } }.getOrNull()</span>
+<span class="a">+                val id = runCatching { AnkiClient(this).run { decks().entries.firstOrNull { it.value == name }?.key ?: addDeck(name) } }.getOrNull()</span>
+                 runOnUiThread {
+                     if (id != null) store.deckId = id else toast(getString(R.string.failed, name))
+                     draw()
+<span class="h">@@ -179,10 +179,6 @@ class MainActivity : Activity() {</span>
+         }.setNegativeButton(R.string.cancel, null).show()
+     }
+ 
+<span class="d">-    private fun AnkiClient.addNewDeckOrNull(name: String): Long? = runCatching {</span>
+<span class="d">-        com.ichi2.anki.api.AddContentApi(this@MainActivity).addNewDeck(name)</span>
+<span class="d">-    }.getOrNull()</span>
+<span class="d">-</span>
+     private fun chooseModel() {
+         thread {
+             val models = AnkiClient(this).models().entries.sortedBy { it.value }
+diff --git a/gradle/libs.versions.toml b/gradle/libs.versions.toml
+index aa5aae8..0cec3c2 100644
+--- a/gradle/libs.versions.toml
++++ b/gradle/libs.versions.toml
+<span class="h">@@ -3,7 +3,6 @@ agp = &quot;9.2.0&quot;</span>
+ kotlin = &quot;2.3.21&quot;
+ coreKtx = &quot;1.16.0&quot;
+ kotlinxCoroutines = &quot;1.10.2&quot;
+<span class="d">-ankidroidApi = &quot;api-v1.1.0&quot;</span>
+ kotestProperty = &quot;5.9.1&quot;
+ junit = &quot;4.13.2&quot;
+ androidxTestRunner = &quot;1.7.0&quot;
+<span class="h">@@ -14,8 +13,6 @@ androidxTestCore = &quot;1.7.0&quot;</span>
+ androidx-core-ktx = { group = &quot;androidx.core&quot;, name = &quot;core-ktx&quot;, version.ref = &quot;coreKtx&quot; }
+ kotlinx-coroutines-core = { group = &quot;org.jetbrains.kotlinx&quot;, name = &quot;kotlinx-coroutines-core&quot;, version.ref = &quot;kotlinxCoroutines&quot; }
+ kotlinx-coroutines-android = { group = &quot;org.jetbrains.kotlinx&quot;, name = &quot;kotlinx-coroutines-android&quot;, version.ref = &quot;kotlinxCoroutines&quot; }
+<span class="d">-# The AnkiDroid API: a thin client of the AnkiDroid content provider, from the AnkiDroid project itself.</span>
+<span class="d">-ankidroid-api = { group = &quot;com.github.ankidroid&quot;, name = &quot;Anki-Android&quot;, version.ref = &quot;ankidroidApi&quot; }</span>
+ kotest-property = { group = &quot;io.kotest&quot;, name = &quot;kotest-property&quot;, version.ref = &quot;kotestProperty&quot; }
+ junit = { group = &quot;junit&quot;, name = &quot;junit&quot;, version.ref = &quot;junit&quot; }
+ androidx-test-runner = { group = &quot;androidx.test&quot;, name = &quot;runner&quot;, version.ref = &quot;androidxTestRunner&quot; }
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index 8edf401..c9431bd 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+<span class="h">@@ -16,11 +16,6 @@ dependencyResolutionManagement {</span>
+     repositories {
+         google()
+         mavenCentral()
+<span class="d">-        // The AnkiDroid API library is published on JitPack only.</span>
+<span class="d">-        maven {</span>
+<span class="d">-            url = uri(&quot;https://jitpack.io&quot;)</span>
+<span class="d">-            content { includeGroup(&quot;com.github.ankidroid&quot;) }</span>
+<span class="d">-        }</span>
+     }
+ }
+ </pre>
+</div></body></html>

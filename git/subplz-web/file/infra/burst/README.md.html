@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/infra/burst/README.md - Recently Written</title>
+<link rel="stylesheet" href="../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../../subplz-web/index.html">Log</a> | <a href="../../../../subplz-web/files.html">Files</a> | <a href="../../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>infra/burst/README.md (13365 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> # Burst mode: more workers, on the cheapest cloud, when paid jobs wait
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> Burst mode is **off**. Nothing here runs, and nothing here costs money, until
+<a id="l4" href="#l4">4</a> the owner turns it on with the procedure below.
+<a id="l5" href="#l5">5</a> 
+<a id="l6" href="#l6">6</a> ## What it does
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> Today the web server does each server job itself, one at a time. When many
+<a id="l9" href="#l9">9</a> paid jobs wait (a 500-book pack, an unlimited plan), buyers wait for hours.
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> In burst mode:
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> - The web server keeps the data: Postgres and Redis on its own 127.0.0.1, and
+<a id="l14" href="#l14">14</a>   its own worker, which takes paid jobs first and then free ones.
+<a id="l15" href="#l15">15</a> - The files go to a Cloudflare R2 bucket. R2 charges no transfer fee, to any
+<a id="l16" href="#l16">16</a>   cloud or to a customer who downloads a result.
+<a id="l17" href="#l17">17</a> - Once a minute the burst controller (`python -m tools.burst`) reads the paid
+<a id="l18" href="#l18">18</a>   queue. When paid jobs wait, it reads the live offers of each cloud that has
+<a id="l19" href="#l19">19</a>   keys: the newest AWS spot prices, and the Hetzner prices of the server types
+<a id="l20" href="#l20">20</a>   that are in stock. A new worker goes to the offer with the lowest cost per
+<a id="l21" href="#l21">21</a>   book, inside the spend cap.
+<a id="l22" href="#l22">22</a> - A worker reaches Postgres and Redis through an SSH tunnel to the web server.
+<a id="l23" href="#l23">23</a>   The tunnel user can forward those two ports and do nothing else. A worker
+<a id="l24" href="#l24">24</a>   takes no inbound connection.
+<a id="l25" href="#l25">25</a> - A worker with no job for 10 minutes stops after its job, and Terraform
+<a id="l26" href="#l26">26</a>   destroys its machine. A scale-in never kills a job. When a cloud takes a spot
+<a id="l27" href="#l27">27</a>   machine back during a job, the job runs once more on another worker.
+<a id="l28" href="#l28">28</a> - Free credits never start a machine: burst workers take paid jobs only.
+<a id="l29" href="#l29">29</a> 
+<a id="l30" href="#l30">30</a> ```
+<a id="l31" href="#l31">31</a>                   web server (RackNerd, US west)
+<a id="l32" href="#l32">32</a>           Postgres + Redis on 127.0.0.1, own worker, controller
+<a id="l33" href="#l33">33</a>                  ^                                  |
+<a id="l34" href="#l34">34</a>      SSH tunnel  |                                  | terraform apply
+<a id="l35" href="#l35">35</a>      (2 ports)   |                                  v
+<a id="l36" href="#l36">36</a>         burst workers on AWS spot (us-west-2) or Hetzner, 0..N
+<a id="l37" href="#l37">37</a>                  |
+<a id="l38" href="#l38">38</a>                  v
+<a id="l39" href="#l39">39</a>         Cloudflare R2 bucket (inputs, results, app releases, backups)
+<a id="l40" href="#l40">40</a> ```
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> ## Money
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> **Spend cap.** The controller keeps the cost of the burst machines of the last
+<a id="l45" href="#l45">45</a> 30 days under a cap:
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a>     cap = min($100, max($5, 30% of the net server revenue of the last 30 days))
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a> The net revenue counts each pack for 30 days after its purchase, and each
+<a id="l50" href="#l50">50</a> active subscription, after the Stripe fee (2.9% + 30 cents, and 0.7% more for
+<a id="l51" href="#l51">51</a> a subscription). Free credits count for nothing. The $5 floor lets the first
+<a id="l52" href="#l52">52</a> buyer have a burst worker. The controller also keeps 2.5 hours of each running
+<a id="l53" href="#l53">53</a> worker in reserve. At the cap it starts no new machine, and running jobs
+<a id="l54" href="#l54">54</a> finish. Change the numbers with `SUBPLZ_BURST_CAP_SHARE`,
+<a id="l55" href="#l55">55</a> `SUBPLZ_BURST_CAP_FLOOR_USD` and `SUBPLZ_BURST_CAP_CEILING_USD`.
+<a id="l56" href="#l56">56</a> 
+<a id="l57" href="#l57">57</a> **Other limits.** `SUBPLZ_BURST_MAX_WORKERS` (default 1). The AWS spot price
+<a id="l58" href="#l58">58</a> limit (`max_price`, $0.0625 an hour). The AWS spot limit of a new account (5
+<a id="l59" href="#l59">59</a> vCPU: one worker). The Hetzner server limit. A machine powers itself off after
+<a id="l60" href="#l60">60</a> 90 idle minutes, if the controller is gone.
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> **Prices** (financial advocate, 2026-09-22; the controller reads the live ones):
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> | Offer | Per hour | Compute per 10-hour book | Note |
+<a id="l65" href="#l65">65</a> |---|---|---|---|
+<a id="l66" href="#l66">66</a> | AWS spot, 4-vCPU x86 (c6a, c7a, m6a) | about $0.06, + $0.007 IPv4 and disk | about $0.14 | billed per second |
+<a id="l67" href="#l67">67</a> | AWS spot, 4-vCPU Graviton (c7g) | $0.041-0.056 | $0.10-0.14 | off until one test book: add to `SUBPLZ_BURST_AWS_TYPES` |
+<a id="l68" href="#l68">68</a> | Hetzner EU cx33 | about $0.016 | about $0.05 | often sold out; billed per started hour |
+<a id="l69" href="#l69">69</a> | Hetzner EU cpx32 | about $0.065 | $0.14-0.20 | 155 ms from the web server |
+<a id="l70" href="#l70">70</a> | Hetzner US cpx31 | about $0.115 | $0.25-0.35 | |
+<a id="l71" href="#l71">71</a> | R2 bucket | $0.015 per GB-month | | no transfer fee; 10 GB free |
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a> While burst mode is on and idle, only the R2 storage costs money. AWS charges
+<a id="l74" href="#l74">74</a> $0.09/GB for the results that its workers send to R2, above 100 GB a month:
+<a id="l75" href="#l75">75</a> when you pass that, set `SUBPLZ_BURST_AWS_EGRESS_USD_PER_BOOK` (about 0.09 x
+<a id="l76" href="#l76">76</a> the GB of a result), so that the price comparison includes it.
+<a id="l77" href="#l77">77</a> 
+<a id="l78" href="#l78">78</a> ## Parts
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> | Path | What |
+<a id="l81" href="#l81">81</a> |---|---|
+<a id="l82" href="#l82">82</a> | `state/` | The web server&#x27;s Postgres, Redis and tunnel user (`setup-web-server.sh`), the R2 bucket and its token. Apply once, on the web server. |
+<a id="l83" href="#l83">83</a> | `workers/aws/` | One spot instance for each AWS worker. Only the controller applies it. `iam-policy.json` is the policy of the controller&#x27;s AWS key. |
+<a id="l84" href="#l84">84</a> | `workers/hetzner/` | One server for each Hetzner worker. Only the controller applies it. |
+<a id="l85" href="#l85">85</a> | `cloud-init.yaml.tftpl` | What a new machine does at first boot, on either cloud. |
+<a id="l86" href="#l86">86</a> | `worker-constraints.txt` | The package versions of the web server, so that a worker computes the same result. |
+<a id="l87" href="#l87">87</a> | `systemd/` | Units for the web server: the controller timer and the web server&#x27;s own worker. |
+<a id="l88" href="#l88">88</a> | `../../tools/burst/` | The controller: `core.py` decides, `offers.py` reads the prices, `revenue.py` reads the revenue. |
+<a id="l89" href="#l89">89</a> | `../../tools/copy_database.py` | Copies SQLite to Postgres (once, when burst mode goes on) and back. |
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a> ## Accounts (owner steps, once)
+<a id="l92" href="#l92">92</a> 
+<a id="l93" href="#l93">93</a> Only the owner does these steps. Claude never types a key.
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a> 1. **Cloudflare**: an account with R2 turned on (done on 2026-09-22). At
+<a id="l96" href="#l96">96</a>    activation, make an API token for Terraform (My Profile, API Tokens, Create
+<a id="l97" href="#l97">97</a>    Custom Token) with two permissions: Account, Workers R2 Storage, Edit; and
+<a id="l98" href="#l98">98</a>    User, API Tokens, Edit. Write down the account ID (R2 page, right side).
+<a id="l99" href="#l99">99</a> 2. **AWS**, for spot workers: an account on the Paid plan (the Free plan blocks
+<a id="l100" href="#l100">100</a>    xlarge machines), with MFA on the root user. Make an IAM user
+<a id="l101" href="#l101">101</a>    `subplz-burst` with the policy in `workers/aws/iam-policy.json`, and an
+<a id="l102" href="#l102">102</a>    access key for it. Sign up: [AWS sign-up](https://portal.aws.amazon.com/billing/signup).
+<a id="l103" href="#l103">103</a> 3. **Hetzner**, for Hetzner workers: an account, a project `subplz-burst` with
+<a id="l104" href="#l104">104</a>    nothing else in it, and an API token (Read &amp; Write) in that project. Check
+<a id="l105" href="#l105">105</a>    the server limit of the project (Limits). Sign up:
+<a id="l106" href="#l106">106</a>    [Hetzner sign-up](https://accounts.hetzner.com/signUp).
+<a id="l107" href="#l107">107</a> 
+<a id="l108" href="#l108">108</a> The controller uses each cloud that has keys. One cloud is enough; two let it
+<a id="l109" href="#l109">109</a> switch to the cheaper one.
+<a id="l110" href="#l110">110</a> 
+<a id="l111" href="#l111">111</a> ## Turn burst mode on
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a> Do these steps as root on the web server. The site is down from step 8 to
+<a id="l114" href="#l114">114</a> step 12, about 10 minutes.
+<a id="l115" href="#l115">115</a> 
+<a id="l116" href="#l116">116</a> 1. Install Terraform:
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a>    ```bash
+<a id="l119" href="#l119">119</a>    wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+<a id="l120" href="#l120">120</a>    echo &quot;deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com bookworm main&quot; &gt; /etc/apt/sources.list.d/hashicorp.list
+<a id="l121" href="#l121">121</a>    apt-get update &amp;&amp; apt-get install -y terraform
+<a id="l122" href="#l122">122</a>    ```
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a> 2. Put the keys in `/etc/subplz-burst.env`. Each command asks for the value
+<a id="l125" href="#l125">125</a>    with the input hidden. Leave out the lines of a cloud that you do not use:
+<a id="l126" href="#l126">126</a> 
+<a id="l127" href="#l127">127</a>    ```bash
+<a id="l128" href="#l128">128</a>    cd /opt/subplz-web
+<a id="l129" href="#l129">129</a>    tools/set-secret.sh CLOUDFLARE_API_TOKEN /etc/subplz-burst.env
+<a id="l130" href="#l130">130</a>    tools/set-secret.sh SUBPLZ_BURST_AWS_ACCESS_KEY_ID /etc/subplz-burst.env
+<a id="l131" href="#l131">131</a>    tools/set-secret.sh SUBPLZ_BURST_AWS_SECRET_ACCESS_KEY /etc/subplz-burst.env
+<a id="l132" href="#l132">132</a>    tools/set-secret.sh HCLOUD_TOKEN /etc/subplz-burst.env
+<a id="l133" href="#l133">133</a>    echo &quot;SUBPLZ_BURST_MAX_WORKERS=1&quot; &gt;&gt; /etc/subplz-burst.env
+<a id="l134" href="#l134">134</a>    ```
+<a id="l135" href="#l135">135</a> 
+<a id="l136" href="#l136">136</a> 3. Install the queue, storage and Postgres clients into the app, and make the
+<a id="l137" href="#l137">137</a>    folder of the Terraform state (it holds passwords):
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a>    ```bash
+<a id="l140" href="#l140">140</a>    .venv/bin/pip install -c infra/burst/worker-constraints.txt redis rq boto3 &quot;psycopg[binary]&quot;
+<a id="l141" href="#l141">141</a>    install -d -m 700 /var/lib/subplz-burst
+<a id="l142" href="#l142">142</a>    ```
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> 4. Make the shared state. This installs Postgres, Redis and the tunnel user on
+<a id="l145" href="#l145">145</a>    this machine, and makes the bucket and its token. Read the plan before you
+<a id="l146" href="#l146">146</a>    type `yes`:
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a>    ```bash
+<a id="l149" href="#l149">149</a>    set -a; . /etc/subplz-burst.env; set +a
+<a id="l150" href="#l150">150</a>    S=/opt/subplz-web/infra/burst/state
+<a id="l151" href="#l151">151</a>    terraform -chdir=$S init -backend-config=path=/var/lib/subplz-burst/state.tfstate
+<a id="l152" href="#l152">152</a>    terraform -chdir=$S apply -var cloudflare_account_id=YOUR_ACCOUNT_ID
+<a id="l153" href="#l153">153</a>    ```
+<a id="l154" href="#l154">154</a> 
+<a id="l155" href="#l155">155</a> 5. Write the storage keys and the backup settings:
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a>    ```bash
+<a id="l158" href="#l158">158</a>    (umask 077
+<a id="l159" href="#l159">159</a>     terraform -chdir=$S output -raw storage_env &gt; /etc/subplz-storage.env
+<a id="l160" href="#l160">160</a>     terraform -chdir=$S output -raw rclone_env &gt; /etc/subplz-rclone.env
+<a id="l161" href="#l161">161</a>     echo &quot;BUCKET=$(terraform -chdir=$S output -raw bucket)&quot; &gt; /etc/subplz-backup.env)
+<a id="l162" href="#l162">162</a>    ```
+<a id="l163" href="#l163">163</a> 
+<a id="l164" href="#l164">164</a> 6. Make the backups:
+<a id="l165" href="#l165">165</a> 
+<a id="l166" href="#l166">166</a>    ```bash
+<a id="l167" href="#l167">167</a>    cp .env .env.bak-before-burst
+<a id="l168" href="#l168">168</a>    cp data/subplz.db data/subplz.db.bak-before-burst
+<a id="l169" href="#l169">169</a>    ```
+<a id="l170" href="#l170">170</a> 
+<a id="l171" href="#l171">171</a> 7. Read the new database address:
+<a id="l172" href="#l172">172</a> 
+<a id="l173" href="#l173">173</a>    ```bash
+<a id="l174" href="#l174">174</a>    DB=$(terraform -chdir=$S output -raw web_env | sed -n &#x27;s/^SUBPLZ_WEB_DATABASE_URL=//p&#x27;)
+<a id="l175" href="#l175">175</a>    ```
+<a id="l176" href="#l176">176</a> 
+<a id="l177" href="#l177">177</a> 8. Stop the site:
+<a id="l178" href="#l178">178</a> 
+<a id="l179" href="#l179">179</a>    ```bash
+<a id="l180" href="#l180">180</a>    systemctl stop subplz-web
+<a id="l181" href="#l181">181</a>    ```
+<a id="l182" href="#l182">182</a> 
+<a id="l183" href="#l183">183</a> 9. Copy the database to Postgres, and the files to the bucket:
+<a id="l184" href="#l184">184</a> 
+<a id="l185" href="#l185">185</a>    ```bash
+<a id="l186" href="#l186">186</a>    .venv/bin/python -m tools.copy_database sqlite:////opt/subplz-web/data/subplz.db &quot;$DB&quot;
+<a id="l187" href="#l187">187</a>    env $(cat /etc/subplz-rclone.env) rclone copy --progress data/artifacts &quot;r2:$(terraform -chdir=$S output -raw bucket)/jobs&quot;
+<a id="l188" href="#l188">188</a>    ```
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a> 10. Tell the app to use the queue, Postgres and the bucket:
+<a id="l191" href="#l191">191</a> 
+<a id="l192" href="#l192">192</a>     ```bash
+<a id="l193" href="#l193">193</a>     terraform -chdir=$S output -raw web_env &gt;&gt; .env
+<a id="l194" href="#l194">194</a>     install -d /etc/systemd/system/subplz-web.service.d
+<a id="l195" href="#l195">195</a>     printf &#x27;[Service]\nEnvironmentFile=/etc/subplz-storage.env\n&#x27; &gt; /etc/systemd/system/subplz-web.service.d/storage.conf
+<a id="l196" href="#l196">196</a>     cp infra/burst/systemd/subplz-worker.service infra/burst/systemd/subplz-burst.* /etc/systemd/system/
+<a id="l197" href="#l197">197</a>     systemctl daemon-reload
+<a id="l198" href="#l198">198</a>     ```
+<a id="l199" href="#l199">199</a> 
+<a id="l200" href="#l200">200</a> 11. Start the site, the web server&#x27;s own worker, and the nightly backup:
+<a id="l201" href="#l201">201</a> 
+<a id="l202" href="#l202">202</a>     ```bash
+<a id="l203" href="#l203">203</a>     systemctl start subplz-web
+<a id="l204" href="#l204">204</a>     systemctl enable --now subplz-worker subplz-pgdump.timer
+<a id="l205" href="#l205">205</a>     ```
+<a id="l206" href="#l206">206</a> 
+<a id="l207" href="#l207">207</a> 12. Do a test job on the site with &quot;Convert in this browser&quot; off. Make sure
+<a id="l208" href="#l208">208</a>     that it succeeds and that its files download. If it fails, turn burst mode
+<a id="l209" href="#l209">209</a>     off (below) before you look for the cause.
+<a id="l210" href="#l210">210</a> 
+<a id="l211" href="#l211">211</a> 13. Prepare the worker modules of each cloud that has keys:
+<a id="l212" href="#l212">212</a> 
+<a id="l213" href="#l213">213</a>     ```bash
+<a id="l214" href="#l214">214</a>     for c in aws hetzner; do
+<a id="l215" href="#l215">215</a>       terraform -chdir=infra/burst/workers/$c init -backend-config=path=/var/lib/subplz-burst/workers-$c.tfstate
+<a id="l216" href="#l216">216</a>     done
+<a id="l217" href="#l217">217</a>     ```
+<a id="l218" href="#l218">218</a> 
+<a id="l219" href="#l219">219</a> 14. Start the controller. Do a dry run first: it logs its decision, the offers
+<a id="l220" href="#l220">220</a>     and the spend cap, and changes nothing:
+<a id="l221" href="#l221">221</a> 
+<a id="l222" href="#l222">222</a>     ```bash
+<a id="l223" href="#l223">223</a>     set -a; . ./.env; . /etc/subplz-storage.env; . /etc/subplz-burst.env; set +a
+<a id="l224" href="#l224">224</a>     .venv/bin/python -m tools.burst --dry-run
+<a id="l225" href="#l225">225</a>     systemctl enable --now subplz-burst.timer
+<a id="l226" href="#l226">226</a>     ```
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a> 15. Watch it: `journalctl -u subplz-burst -f`. A new worker needs about 10
+<a id="l229" href="#l229">229</a>     minutes to install before it takes a job.
+<a id="l230" href="#l230">230</a> 
+<a id="l231" href="#l231">231</a> 16. Measure one book on each cloud that the controller used. If a 10-hour book
+<a id="l232" href="#l232">232</a>     takes much more or less than 2 hours on 4 vCPU, the price comparison is
+<a id="l233" href="#l233">233</a>     off: tell Claude the times.
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> ## While burst mode is on
+<a id="l236" href="#l236">236</a> 
+<a id="l237" href="#l237">237</a> - **Deploy**: after `git pull`, restart `subplz-web` and `subplz-worker`. The
+<a id="l238" href="#l238">238</a>   controller sees the new commit. It stops the workers of the old commit after
+<a id="l239" href="#l239">239</a>   their jobs and starts new ones. You do nothing else.
+<a id="l240" href="#l240">240</a> - **Workers**: change `SUBPLZ_BURST_MAX_WORKERS` in `/etc/subplz-burst.env`.
+<a id="l241" href="#l241">241</a>   The next run uses it. With `0`, each burst worker stops after its job and its
+<a id="l242" href="#l242">242</a>   machine goes.
+<a id="l243" href="#l243">243</a> - **AWS spot limit**: when paid jobs often wait for more than an hour, ask AWS
+<a id="l244" href="#l244">244</a>   for more spot vCPU (Service Quotas, &quot;All Standard Spot Instance Requests&quot;),
+<a id="l245" href="#l245">245</a>   then raise `SUBPLZ_BURST_AWS_VCPU_LIMIT` and `SUBPLZ_BURST_MAX_WORKERS`.
+<a id="l246" href="#l246">246</a> - **Keys**: do not change the passwords, the tunnel key or the bucket token
+<a id="l247" href="#l247">247</a>   while a worker runs. Set the workers to 0 first, and wait until
+<a id="l248" href="#l248">248</a>   `terraform -chdir=infra/burst/workers/&lt;cloud&gt; state list` shows nothing.
+<a id="l249" href="#l249">249</a> - **State**: `/var/lib/subplz-burst` is the only record of what Terraform made.
+<a id="l250" href="#l250">250</a>   If it is lost, the machines still run and cost money: find them in the AWS
+<a id="l251" href="#l251">251</a>   and Hetzner consoles (tag or label `subplz-burst-worker`) and delete them.
+<a id="l252" href="#l252">252</a> - **Storage**: nothing deletes files. R2 costs $0.015 per GB-month; watch the
+<a id="l253" href="#l253">253</a>   bucket size in the Cloudflare dashboard.
+<a id="l254" href="#l254">254</a> 
+<a id="l255" href="#l255">255</a> ## Turn burst mode off
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> 1. Set `SUBPLZ_BURST_MAX_WORKERS=0`. Wait until the `state list` of each worker
+<a id="l258" href="#l258">258</a>    module shows nothing. Then:
+<a id="l259" href="#l259">259</a>    `systemctl disable --now subplz-burst.timer subplz-worker subplz-pgdump.timer`.
+<a id="l260" href="#l260">260</a> 2. Stop the site. Copy Postgres to a new SQLite file, and the bucket to the
+<a id="l261" href="#l261">261</a>    disk:
+<a id="l262" href="#l262">262</a> 
+<a id="l263" href="#l263">263</a>    ```bash
+<a id="l264" href="#l264">264</a>    systemctl stop subplz-web
+<a id="l265" href="#l265">265</a>    .venv/bin/python -m tools.copy_database &quot;$DB&quot; sqlite:////opt/subplz-web/data/subplz-from-postgres.db
+<a id="l266" href="#l266">266</a>    env $(cat /etc/subplz-rclone.env) rclone copy --progress &quot;r2:$(terraform -chdir=$S output -raw bucket)/jobs&quot; data/artifacts
+<a id="l267" href="#l267">267</a>    mv data/subplz.db data/subplz.db.bak-burst &amp;&amp; mv data/subplz-from-postgres.db data/subplz.db
+<a id="l268" href="#l268">268</a>    ```
+<a id="l269" href="#l269">269</a> 
+<a id="l270" href="#l270">270</a> 3. Remove the burst lines from `.env` (the six lines that step 10 added), and
+<a id="l271" href="#l271">271</a>    remove `/etc/systemd/system/subplz-web.service.d/storage.conf`. Then
+<a id="l272" href="#l272">272</a>    `systemctl daemon-reload &amp;&amp; systemctl start subplz-web`, and do a test job.
+<a id="l273" href="#l273">273</a> 4. Only after the test job succeeds: remove the bucket and its token with
+<a id="l274" href="#l274">274</a>    `terraform -chdir=$S destroy`. It deletes the bucket with its files.
+<a id="l275" href="#l275">275</a>    Postgres and Redis stay installed on the web server, unused.
+<a id="l276" href="#l276">276</a> 
+<a id="l277" href="#l277">277</a> ## Security
+<a id="l278" href="#l278">278</a> 
+<a id="l279" href="#l279">279</a> - Postgres and Redis listen on 127.0.0.1 only. A worker reaches them through
+<a id="l280" href="#l280">280</a>   an SSH tunnel as `subplz-tunnel`, a user with no shell whose key can forward
+<a id="l281" href="#l281">281</a>   those two ports and nothing else. The worker checks the web server&#x27;s host key.
+<a id="l282" href="#l282">282</a> - A worker accepts no inbound connection (AWS security group and Hetzner
+<a id="l283" href="#l283">283</a>   firewall without inbound rules).
+<a id="l284" href="#l284">284</a> - The bucket token can read and write that one bucket only. The AWS key can end
+<a id="l285" href="#l285">285</a>   only instances tagged `subplz-burst-worker`.
+<a id="l286" href="#l286">286</a> - The state files and `/etc/subplz-*.env` hold secrets: root only, mode 0600.
+<a id="l287" href="#l287">287</a>   A machine&#x27;s user data holds the tunnel key and the database passwords; only
+<a id="l288" href="#l288">288</a>   the cloud account and the machine itself can read it.</pre>
+</div></body></html>

@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web c94214d9 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c94214d9de0e27ea6099e68500ed54a0accb9540
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 15:23:42 -0700
+
+Keep every upload and result on the server
+
+The owner debugs conversions from their files and deletes the files by
+hand. So the server now deletes no file by itself:
+
+- A server job keeps its audio, its book and its subtitles together in
+  data/work/&lt;job id&gt;/ after it succeeds or is cancelled.
+- The hourly housekeeping no longer deletes old uploads, drafts or
+  results. It only lets go of abandoned browser jobs. backend/retention.py
+  and its two settings are gone.
+- A refused upload keeps what arrived.
+- DELETE /api/jobs/{id} takes the job off the visitor&#x27;s list and keeps
+  its files.
+
+The terms and the note for server conversions now say that the server
+keeps the files, that we look at them only to find faults, and that we
+delete them on request.
+
+</pre><pre> .env.example             |   3 --
+ README.md                |  17 ++++----
+ backend/api.py           |  12 ++----
+ backend/main.py          |  22 +++++-----
+ backend/retention.py     |  84 --------------------------------------
+ backend/runner.py        |  19 +--------
+ backend/settings.py      |   4 --
+ frontend/app.js          |   3 +-
+ frontend/terms.html      |  17 +++-----
+ tests/test_keep_files.py | 102 +++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_retention.py  |  80 -------------------------------------
+ 11 files changed, 138 insertions(+), 225 deletions(-)
+</pre><pre>diff --git a/.env.example b/.env.example
+index ab3b5d2..28fd5f1 100644
+--- a/.env.example
++++ b/.env.example
+<span class="h">@@ -62,9 +62,6 @@ SUBPLZ_WEB_FREE_CREDITS_ANONYMOUS=1</span>
+ SUBPLZ_WEB_FREE_CREDITS_SIGNED_IN=10
+ # Where customers write to. Shown on /terms.html.
+ SUBPLZ_WEB_CONTACT_EMAIL=
+<span class="d">-# How long the server keeps a visitor&#x27;s files (see backend/retention.py).</span>
+<span class="d">-SUBPLZ_WEB_INPUT_RETENTION_HOURS=24</span>
+<span class="d">-SUBPLZ_WEB_ARTIFACT_RETENTION_DAYS=7</span>
+ 
+ # --- accounts &amp; payments ---------------------------------------------------
+ # The origin users reach this on. Sign-in links and Stripe return URLs use it.
+diff --git a/README.md b/README.md
+index 77c19c7..a4b60b9 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -263,8 +263,10 @@ m4a/m4b, which are the types an EPUB 3 reader must play. `tests/engine/epub.test</span>
+ follows each overlay as a reader does, and gives the result to the W3C
+ `epubcheck` when `EPUBCHECK` points to its jar.
+ 
+<span class="d">-Uploaded media is deleted once a job succeeds. A **failed** job keeps its inputs</span>
+<span class="d">-so you can fix the language and retry without re-uploading.</span>
+<span class="a">+The server keeps the files of each job together in `data/work/&lt;job id&gt;/`: the</span>
+<span class="a">+audio and the book in `input/`, the subtitles in `out/`, and the run log. Nothing</span>
+<span class="a">+deletes them: the operator deletes them by hand. A **failed** job can thus be</span>
+<span class="a">+retried without a new upload.</span>
+ 
+ ---
+ 
+<span class="h">@@ -354,11 +356,9 @@ Off: the files are uploaded, the job runs on the server, and the result waits</span>
+ in the list of conversions, so the visitor can close the tab. The page asks
+ for the credit before the upload, not after it.
+ 
+<span class="d">-The server does not keep a visitor&#x27;s files past their use</span>
+<span class="d">-(`backend/retention.py`, once an hour): uploads go when the job succeeds, or</span>
+<span class="d">-after 24 hours when it did not; results go after 7 days. `/terms.html` says the</span>
+<span class="d">-same to the visitor, with the numbers read from the server, and shows</span>
+<span class="d">-`SUBPLZ_WEB_CONTACT_EMAIL`.</span>
+<span class="a">+The server keeps each upload and each result, for debugging. Nothing deletes</span>
+<span class="a">+them automatically: the operator deletes them by hand, and on request.</span>
+<span class="a">+`/terms.html` says so to the visitor, and shows `SUBPLZ_WEB_CONTACT_EMAIL`.</span>
+ 
+ `SUBPLZ_WEB_CLOUD_ENABLED` says that fast conversion is on offer. While it is
+ false the page shows no way to buy credits, whatever `SUBPLZ_WEB_BILLING_ENABLED`
+<span class="h">@@ -440,7 +440,8 @@ shared filesystem.</span>
+ 
+ - Set the Stripe keys, the webhook and SMTP (see *Turning payments on*).
+ - Put a reverse proxy in front for TLS and upload limits.
+<span class="d">-- Add a retention job — audiobooks are large and artifacts are kept forever.</span>
+<span class="a">+- Watch the disk. The server keeps each upload and result until the operator</span>
+<span class="a">+  deletes it.</span>
+ - Run workers on hardware that can take it. Alignment needs roughly 2–3 GB of
+   RAM; a 1 GB VPS will OOM. A 4h40m Russian audiobook took ~45 minutes on
+   `tiny`/CPU with 15 threads here, and would take many hours on one vCPU.
+diff --git a/backend/api.py b/backend/api.py
+index 8d31b72..f5f1871 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -13,7 +13,6 @@ checkout, its return trip and its webhook).</span>
+ 
+ from __future__ import annotations
+ 
+<span class="d">-import shutil</span>
+ from pathlib import Path
+ from typing import Annotated, Literal
+ 
+<span class="h">@@ -324,8 +323,6 @@ def get_pricing():</span>
+         &quot;payments_available&quot;: settings.payments_configured,
+         &quot;tiers&quot;: pricing.TIER_OUTPUTS,
+         &quot;contact_email&quot;: settings.contact_email,
+<span class="d">-        &quot;input_retention_hours&quot;: settings.input_retention_hours,</span>
+<span class="d">-        &quot;artifact_retention_days&quot;: settings.artifact_retention_days,</span>
+         &quot;plans&quot;: pricing.as_dicts(),
+     }
+ 
+<span class="h">@@ -573,14 +570,13 @@ async def create_upload(</span>
+         session.add(job)
+         session.commit()
+ 
+<span class="a">+    # A refused upload keeps what arrived, for debugging. The operator deletes</span>
+<span class="a">+    # it by hand.</span>
+     except HTTPException:
+<span class="d">-        shutil.rmtree(paths.root, ignore_errors=True)</span>
+         raise
+     except detect.DetectionError as exc:
+<span class="d">-        shutil.rmtree(paths.root, ignore_errors=True)</span>
+         raise HTTPException(400, str(exc)) from exc
+     except Exception as exc:  # noqa: BLE001
+<span class="d">-        shutil.rmtree(paths.root, ignore_errors=True)</span>
+         raise HTTPException(500, f&quot;Upload failed: {exc}&quot;) from exc
+ 
+     return UploadOut(
+<span class="h">@@ -857,11 +853,11 @@ def delete_job(</span>
+     account: Annotated[Account, Depends(get_account)],
+     session: Annotated[Session, Depends(get_session)],
+ ):
+<span class="a">+    &quot;&quot;&quot;Take the job off the visitor&#x27;s list. Its files stay on the server for</span>
+<span class="a">+    debugging, and the operator deletes them by hand.&quot;&quot;&quot;</span>
+     job = _load(session, account, job_id)
+     if job.status in (JobStatus.queued, JobStatus.running):
+         raise HTTPException(409, &quot;Cancel the job before deleting it.&quot;)
+<span class="d">-    storage.delete_prefix(job.id)</span>
+<span class="d">-    shutil.rmtree(Paths.for_job(job.id).root, ignore_errors=True)</span>
+     session.delete(job)
+     session.commit()
+     return {&quot;deleted&quot;: job_id}
+diff --git a/backend/main.py b/backend/main.py
+index a6ee76e..c08cf4b 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -97,19 +97,23 @@ async def lifespan(_: FastAPI):</span>
+     queue.shutdown()
+ 
+ 
+<span class="d">-async def _housekeeping() -&gt; None:</span>
+<span class="d">-    &quot;&quot;&quot;Once an hour: let go of abandoned browser jobs, and delete files past their time.&quot;&quot;&quot;</span>
+<span class="d">-    from . import retention</span>
+<span class="a">+def housekeeping() -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;One pass of the hourly housekeeping: let go of abandoned browser jobs.</span>
+<span class="a">+</span>
+<span class="a">+    It deletes no file. The server keeps each upload and each result for</span>
+<span class="a">+    debugging, and the operator deletes them by hand.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+     from .api import expire_stale_local_jobs
+ 
+<span class="d">-    while True:</span>
+<span class="d">-        def once() -&gt; None:</span>
+<span class="d">-            with SessionLocal() as s:</span>
+<span class="d">-                expire_stale_local_jobs(s)</span>
+<span class="d">-                retention.sweep(s)</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        expire_stale_local_jobs(s)</span>
+<span class="a">+</span>
+ 
+<span class="a">+async def _housekeeping() -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Run `housekeeping` once an hour.&quot;&quot;&quot;</span>
+<span class="a">+    while True:</span>
+         try:
+<span class="d">-            await asyncio.to_thread(once)       # deleting a book&#x27;s files is slow; do not hold the site up</span>
+<span class="a">+            await asyncio.to_thread(housekeeping)</span>
+         except Exception:  # noqa: BLE001 - housekeeping must not take the site down
+             log.exception(&quot;housekeeping failed&quot;)
+         await asyncio.sleep(3600)
+diff --git a/backend/retention.py b/backend/retention.py
+deleted file mode 100644
+index e2296dc..0000000
+--- a/backend/retention.py
++++ /dev/null
+<span class="h">@@ -1,84 +0,0 @@</span>
+<span class="d">-&quot;&quot;&quot;What the server keeps, and for how long.</span>
+<span class="d">-</span>
+<span class="d">-A server job brings an audiobook and a book onto this machine. They are the</span>
+<span class="d">-visitor&#x27;s files, often bought ones, and the disk is small. So nothing stays</span>
+<span class="d">-longer than it is of use:</span>
+<span class="d">-</span>
+<span class="d">-  uploaded files   deleted when the job succeeds (runner.py). A job that was</span>
+<span class="d">-                   never started, failed or was cancelled keeps them for</span>
+<span class="d">-                   `input_retention_hours`, so the visitor can fix the language</span>
+<span class="d">-                   and try again; then they go too.</span>
+<span class="d">-  results          subtitles and videos stay for `artifact_retention_days`,</span>
+<span class="d">-                   then they are deleted. The row of the job stays, so the list</span>
+<span class="d">-                   still says what was converted.</span>
+<span class="d">-</span>
+<span class="d">-Jobs that ran in the visitor&#x27;s browser have no files here, only the subtitles</span>
+<span class="d">-the browser sent back; those follow the rule for results.</span>
+<span class="d">-&quot;&quot;&quot;</span>
+<span class="d">-</span>
+<span class="d">-from __future__ import annotations</span>
+<span class="d">-</span>
+<span class="d">-import logging</span>
+<span class="d">-import shutil</span>
+<span class="d">-from datetime import timedelta</span>
+<span class="d">-</span>
+<span class="d">-from sqlalchemy.orm import Session</span>
+<span class="d">-</span>
+<span class="d">-from .db import Artifact, Job, JobStatus, utcnow</span>
+<span class="d">-from .runner import Paths</span>
+<span class="d">-from .settings import settings</span>
+<span class="d">-from .storage import storage</span>
+<span class="d">-</span>
+<span class="d">-log = logging.getLogger(&quot;subplz-web.retention&quot;)</span>
+<span class="d">-</span>
+<span class="d">-_IDLE = [JobStatus.draft, JobStatus.failed, JobStatus.canceled]</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def sweep(session: Session) -&gt; dict[str, int]:</span>
+<span class="d">-    &quot;&quot;&quot;Delete what is past its time. Safe to run at any moment, and again.&quot;&quot;&quot;</span>
+<span class="d">-    now = utcnow()</span>
+<span class="d">-    done = {&quot;inputs&quot;: 0, &quot;drafts&quot;: 0, &quot;results&quot;: 0}</span>
+<span class="d">-</span>
+<span class="d">-    old_idle = (</span>
+<span class="d">-        session.query(Job)</span>
+<span class="d">-        .filter(Job.local == 0, Job.status.in_(_IDLE),</span>
+<span class="d">-                Job.created_at &lt; now - timedelta(hours=settings.input_retention_hours))</span>
+<span class="d">-        .all()</span>
+<span class="d">-    )</span>
+<span class="d">-    for job in old_idle:</span>
+<span class="d">-        root = Paths.for_job(job.id).root</span>
+<span class="d">-        if root.exists():</span>
+<span class="d">-            shutil.rmtree(root, ignore_errors=True)</span>
+<span class="d">-            done[&quot;inputs&quot;] += 1</span>
+<span class="d">-        _delete_stored(job.id)</span>
+<span class="d">-        if job.status == JobStatus.draft:</span>
+<span class="d">-            # Never started: nothing to show for it.</span>
+<span class="d">-            session.delete(job)</span>
+<span class="d">-            done[&quot;drafts&quot;] += 1</span>
+<span class="d">-</span>
+<span class="d">-    old_results = (</span>
+<span class="d">-        session.query(Job)</span>
+<span class="d">-        .join(Artifact, Artifact.job_id == Job.id)</span>
+<span class="d">-        .filter(Job.status == JobStatus.succeeded,</span>
+<span class="d">-                Job.finished_at &lt; now - timedelta(days=settings.artifact_retention_days))</span>
+<span class="d">-        .distinct()</span>
+<span class="d">-        .all()</span>
+<span class="d">-    )</span>
+<span class="d">-    for job in old_results:</span>
+<span class="d">-        _delete_stored(job.id)</span>
+<span class="d">-        shutil.rmtree(Paths.for_job(job.id).root, ignore_errors=True)</span>
+<span class="d">-        session.query(Artifact).filter(Artifact.job_id == job.id).delete()</span>
+<span class="d">-        job.stage = f&quot;Files deleted after {settings.artifact_retention_days} days&quot;</span>
+<span class="d">-        done[&quot;results&quot;] += 1</span>
+<span class="d">-</span>
+<span class="d">-    session.commit()</span>
+<span class="d">-    if any(done.values()):</span>
+<span class="d">-        log.info(&quot;retention sweep: %s&quot;, done)</span>
+<span class="d">-    return done</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def _delete_stored(job_id: str) -&gt; None:</span>
+<span class="d">-    try:</span>
+<span class="d">-        storage.delete_prefix(job_id)</span>
+<span class="d">-    except Exception as exc:  # noqa: BLE001 - the next sweep tries again</span>
+<span class="d">-        log.warning(&quot;could not delete stored files of %s: %s&quot;, job_id, exc)</span>
+diff --git a/backend/runner.py b/backend/runner.py
+index 58430f6..327bae1 100644
+--- a/backend/runner.py
++++ b/backend/runner.py
+<span class="h">@@ -380,7 +380,6 @@ def run_job(job_id: str) -&gt; None:</span>
+         returncode = _stream_aligner(job_id, request, log_path)
+ 
+         if _is_canceled(job_id):
+<span class="d">-            _cleanup_inputs(paths)</span>
+             return
+ 
+         if returncode != 0:
+<span class="h">@@ -392,15 +391,13 @@ def run_job(job_id: str) -&gt; None:</span>
+         _set(job_id, stage=&quot;Collecting output&quot;, progress=0.92)
+         _collect_artifacts(job_id, paths, log_path, duration, request, audio_in)
+ 
+<span class="a">+        # The audio, the book and the subtitles stay in the folder of the job</span>
+<span class="a">+        # for debugging. The operator deletes them by hand.</span>
+         _set(job_id, status=JobStatus.succeeded, stage=&quot;Done&quot;, progress=1.0,
+              finished_at=utcnow())
+<span class="d">-        # Only on success: a failed job keeps its inputs so it can be retried</span>
+<span class="d">-        # without re-uploading hundreds of megabytes.</span>
+<span class="d">-        _cleanup_inputs(paths)</span>
+ 
+     except Exception as exc:  # noqa: BLE001 - surfaced to the user on the Job row
+         if _is_canceled(job_id):
+<span class="d">-            _cleanup_inputs(paths)</span>
+             return
+         # Keep the log even on failure: it is the only way to debug an alignment.
+         try:
+<span class="h">@@ -671,15 +668,3 @@ def _summarize_srt(path: Path) -&gt; tuple[int, float | None, float | None]:</span>
+     if not stamps:
+         return count, None, None
+     return count, to_seconds(stamps[0]), to_seconds(stamps[-1])
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def _cleanup_inputs(paths: Paths) -&gt; None:</span>
+<span class="d">-    &quot;&quot;&quot;Drop the uploaded media once the run is over; keep artifacts and the log.&quot;&quot;&quot;</span>
+<span class="d">-    shutil.rmtree(paths.inp, ignore_errors=True)</span>
+<span class="d">-    shutil.rmtree(paths.out, ignore_errors=True)</span>
+<span class="d">-    shutil.rmtree(paths.root / &quot;video&quot;, ignore_errors=True)</span>
+<span class="d">-    # Also drop the shared-storage copy made for external workers.</span>
+<span class="d">-    try:</span>
+<span class="d">-        storage.delete_prefix(f&quot;{paths.root.name}/input&quot;)</span>
+<span class="d">-    except Exception:</span>
+<span class="d">-        pass</span>
+diff --git a/backend/settings.py b/backend/settings.py
+index d41129f..9b5de23 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -54,10 +54,6 @@ class Settings(BaseSettings):</span>
+     # Presigned-URL lifetime for s3 downloads.
+     download_url_ttl_seconds: int = 3600
+ 
+<span class="d">-    # How long the server keeps a visitor&#x27;s files. See retention.py.</span>
+<span class="d">-    input_retention_hours: int = 24</span>
+<span class="d">-    artifact_retention_days: int = 7</span>
+<span class="d">-</span>
+     # SQLite locally; set to a postgresql+psycopg:// URL in production.
+     database_url: str = &quot;&quot;
+ 
+diff --git a/frontend/app.js b/frontend/app.js
+index 2a0c9ab..59bd27b 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+<span class="h">@@ -386,7 +386,8 @@ function renderMode() {</span>
+   el.start.textContent = &#x27;Upload and convert on our server&#x27;;
+   el.eta.textContent =
+     &#x27;The files are uploaded, the work is done on our server, and the result waits for you on this page, &#x27; +
+<span class="d">-    &#x27;so you can close this tab. The files are deleted after the job.&#x27; + serverPrice();</span>
+<span class="a">+    &#x27;so you can close this tab. We keep the files on our server to find faults, and delete them on request.&#x27; +</span>
+<span class="a">+    serverPrice();</span>
+ }
+ 
+ el.inBrowser.addEventListener(&#x27;change&#x27;, renderMode);
+diff --git a/frontend/terms.html b/frontend/terms.html
+index a6054f7..0f1874b 100644
+--- a/frontend/terms.html
++++ b/frontend/terms.html
+<span class="h">@@ -31,13 +31,11 @@</span>
+   &lt;h2&gt;Your files&lt;/h2&gt;
+   &lt;ul&gt;
+     &lt;li&gt;Use only files that you have the right to use. You keep all rights in them. We claim none.&lt;/li&gt;
+<span class="d">-    &lt;li&gt;Files uploaded for a server conversion are deleted when the job succeeds. If a job fails,</span>
+<span class="d">-      is cancelled, or is never started, they are kept for &lt;span class=&quot;input-hours&quot;&gt;24&lt;/span&gt; hours</span>
+<span class="d">-      so that you can try again, and then deleted.&lt;/li&gt;</span>
+<span class="d">-    &lt;li&gt;Results (subtitles, videos) are kept for &lt;span class=&quot;result-days&quot;&gt;7&lt;/span&gt; days and then</span>
+<span class="d">-      deleted. Download what you want to keep.&lt;/li&gt;</span>
+<span class="d">-    &lt;li&gt;Nobody looks at your files, they are not shared, and they are not used to train anything.</span>
+<span class="d">-      There is no public library of uploads.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;The server keeps the files that you upload for a server conversion (the audio and the</span>
+<span class="a">+      book), and the results of each conversion (subtitles, videos). Nothing deletes them</span>
+<span class="a">+      automatically: we delete them by hand. Write to us to have your files deleted.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;We look at your files only to find and fix faults in a conversion. They are not shared,</span>
+<span class="a">+      and they are not used to train anything. There is no public library of uploads.&lt;/li&gt;</span>
+   &lt;/ul&gt;
+ 
+   &lt;h2&gt;Payments and refunds&lt;/h2&gt;
+<span class="h">@@ -66,7 +64,7 @@</span>
+   &lt;/ul&gt;
+ 
+   &lt;h2&gt;Copyright complaints&lt;/h2&gt;
+<span class="d">-  &lt;p&gt;We do not publish or share what users upload, and uploads are deleted as said above. If you</span>
+<span class="a">+  &lt;p&gt;We do not publish or share what users upload. If you</span>
+     believe that material on this service infringes your copyright, write to the contact address
+     with: the work, where it is on this service, your contact details, a statement that you act in
+     good faith for the owner of the right, and your signature. We remove what the notice properly
+<span class="h">@@ -83,7 +81,6 @@</span>
+ &lt;/main&gt;
+ &lt;script type=&quot;module&quot;&gt;
+   const site = await (await fetch(&#x27;/api/pricing&#x27;)).json();
+<span class="d">-  const put = (cls, value) =&gt; document.querySelectorAll(&#x27;.&#x27; + cls).forEach((el) =&gt; { el.textContent = value; });</span>
+   if (site.contact_email) {
+     document.querySelectorAll(&#x27;.contact&#x27;).forEach((el) =&gt; {
+       const a = document.createElement(&#x27;a&#x27;);
+<span class="h">@@ -92,8 +89,6 @@</span>
+       el.replaceChildren(a);
+     });
+   }
+<span class="d">-  put(&#x27;input-hours&#x27;, site.input_retention_hours);</span>
+<span class="d">-  put(&#x27;result-days&#x27;, site.artifact_retention_days);</span>
+ &lt;/script&gt;
+ &lt;/body&gt;
+ &lt;/html&gt;
+diff --git a/tests/test_keep_files.py b/tests/test_keep_files.py
+new file mode 100644
+index 0000000..4f42d25
+--- /dev/null
++++ b/tests/test_keep_files.py
+<span class="h">@@ -0,0 +1,102 @@</span>
+<span class="a">+&quot;&quot;&quot;The server keeps each file of a job: the audio, the book and the subtitles,</span>
+<span class="a">+together in the folder of the job. Nothing deletes them automatically. The</span>
+<span class="a">+operator deletes them by hand.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+from datetime import timedelta</span>
+<span class="a">+</span>
+<span class="a">+from backend import main, runner</span>
+<span class="a">+from backend.db import Job, JobStatus, SessionLocal, utcnow</span>
+<span class="a">+from backend.runner import Paths</span>
+<span class="a">+from backend.settings import settings</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import get_job_row, make_job</span>
+<span class="a">+</span>
+<span class="a">+SRT = &quot;1\n00:00:00,000 --&gt; 00:00:01,000\nhello\n\n&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def stage_inputs(job_id: str) -&gt; tuple[Paths, list]:</span>
+<span class="a">+    &quot;&quot;&quot;Put an audio file and a book where an upload puts them.&quot;&quot;&quot;</span>
+<span class="a">+    paths = Paths.for_job(job_id)</span>
+<span class="a">+    paths.create()</span>
+<span class="a">+    audio = runner.staged_audio_path(job_id, &quot;book.m4b&quot;)</span>
+<span class="a">+    book = runner.staged_text_path(job_id, &quot;book.epub&quot;)</span>
+<span class="a">+    audio.write_bytes(b&quot;audio&quot;)</span>
+<span class="a">+    book.write_bytes(b&quot;book&quot;)</span>
+<span class="a">+    return paths, [audio, book]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def age(job_id: str, **delta) -&gt; None:</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        job = s.get(Job, job_id)</span>
+<span class="a">+        job.created_at = utcnow() - timedelta(**delta)</span>
+<span class="a">+        job.finished_at = utcnow() - timedelta(**delta)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_finished_server_job_keeps_audio_book_and_subtitles_together(client, monkeypatch):</span>
+<span class="a">+    job_id = make_job(client, JobStatus.queued)</span>
+<span class="a">+    paths, inputs = stage_inputs(job_id)</span>
+<span class="a">+    produced = paths.out / &quot;source.en.srt&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def fake_aligner(job_id, request, log_path):</span>
+<span class="a">+        # Bytes, not text: on Windows write_text writes CRLF line ends.</span>
+<span class="a">+        produced.write_bytes(SRT.encode(&quot;utf-8&quot;))</span>
+<span class="a">+        return 0</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(runner, &quot;probe_duration&quot;, lambda path: 1.0)</span>
+<span class="a">+    monkeypatch.setattr(runner, &quot;probe_chapters&quot;, lambda path: 0)</span>
+<span class="a">+    monkeypatch.setattr(runner, &quot;normalize_for_alignment&quot;, lambda job_id, source: source)</span>
+<span class="a">+    monkeypatch.setattr(runner, &quot;_stream_aligner&quot;, fake_aligner)</span>
+<span class="a">+    monkeypatch.setattr(runner.aligner, &quot;locate_output&quot;, lambda request: produced)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;render_video&quot;, False)</span>
+<span class="a">+</span>
+<span class="a">+    runner.run_job(job_id)</span>
+<span class="a">+</span>
+<span class="a">+    assert get_job_row(job_id).status == JobStatus.succeeded</span>
+<span class="a">+    for path in [*inputs, produced]:</span>
+<span class="a">+        assert path.exists(), path</span>
+<span class="a">+        assert paths.root in path.parents  # one folder for the job</span>
+<span class="a">+    assert client.get(f&quot;/api/jobs/{job_id}/files/srt&quot;).text == SRT</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_housekeeping_deletes_no_file_and_no_job(client):</span>
+<span class="a">+    failed = make_job(client, JobStatus.failed)</span>
+<span class="a">+    draft = make_job(client)</span>
+<span class="a">+    done = make_job(client, JobStatus.succeeded, with_files=True)</span>
+<span class="a">+    staged = {job_id: stage_inputs(job_id)[1] for job_id in (failed, draft, done)}</span>
+<span class="a">+    for job_id in staged:</span>
+<span class="a">+        age(job_id, days=400)</span>
+<span class="a">+</span>
+<span class="a">+    main.housekeeping()</span>
+<span class="a">+</span>
+<span class="a">+    for job_id, inputs in staged.items():</span>
+<span class="a">+        assert get_job_row(job_id) is not None</span>
+<span class="a">+        assert all(path.exists() for path in inputs), job_id</span>
+<span class="a">+    assert client.get(f&quot;/api/jobs/{done}/files/srt&quot;).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_deleting_a_job_keeps_its_files(client):</span>
+<span class="a">+    job_id = make_job(client)</span>
+<span class="a">+    _, inputs = stage_inputs(job_id)</span>
+<span class="a">+    assert client.delete(f&quot;/api/jobs/{job_id}&quot;).status_code == 200</span>
+<span class="a">+    assert get_job_row(job_id) is None</span>
+<span class="a">+    assert all(path.exists() for path in inputs)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_refused_upload_keeps_what_arrived(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;max_upload_bytes&quot;, 10)</span>
+<span class="a">+    work = settings.data_dir / &quot;work&quot;</span>
+<span class="a">+    before = set(work.iterdir()) if work.exists() else set()</span>
+<span class="a">+</span>
+<span class="a">+    r = client.post(&quot;/api/uploads&quot;, files=[</span>
+<span class="a">+        (&quot;files&quot;, (&quot;book.epub&quot;, b&quot;epub&quot;, &quot;application/epub+zip&quot;)),</span>
+<span class="a">+        (&quot;files&quot;, (&quot;book.m4b&quot;, b&quot;x&quot; * 100, &quot;audio/mp4&quot;)),</span>
+<span class="a">+    ])</span>
+<span class="a">+    assert r.status_code == 413</span>
+<span class="a">+</span>
+<span class="a">+    new = set(work.iterdir()) - before</span>
+<span class="a">+    assert len(new) == 1</span>
+<span class="a">+    kept = {p.suffix for p in new.pop().rglob(&quot;*&quot;) if p.is_file()}</span>
+<span class="a">+    assert kept == {&quot;.epub&quot;, &quot;.m4b&quot;}</span>
+diff --git a/tests/test_retention.py b/tests/test_retention.py
+deleted file mode 100644
+index 2086ce0..0000000
+--- a/tests/test_retention.py
++++ /dev/null
+<span class="h">@@ -1,80 +0,0 @@</span>
+<span class="d">-&quot;&quot;&quot;Uploaded books and results do not stay on the server past their time.&quot;&quot;&quot;</span>
+<span class="d">-</span>
+<span class="d">-from __future__ import annotations</span>
+<span class="d">-</span>
+<span class="d">-from datetime import timedelta</span>
+<span class="d">-</span>
+<span class="d">-from backend import retention</span>
+<span class="d">-from backend.db import Artifact, Job, JobStatus, SessionLocal, utcnow</span>
+<span class="d">-from backend.runner import Paths</span>
+<span class="d">-from backend.storage import storage</span>
+<span class="d">-</span>
+<span class="d">-from .conftest import get_job_row, make_job</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def age(job_id: str, **delta) -&gt; None:</span>
+<span class="d">-    with SessionLocal() as s:</span>
+<span class="d">-        job = s.get(Job, job_id)</span>
+<span class="d">-        job.created_at = utcnow() - timedelta(**delta)</span>
+<span class="d">-        job.finished_at = utcnow() - timedelta(**delta)</span>
+<span class="d">-        s.commit()</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def stage_inputs(job_id: str):</span>
+<span class="d">-    paths = Paths.for_job(job_id)</span>
+<span class="d">-    paths.create()</span>
+<span class="d">-    (paths.inp / &quot;book.m4b&quot;).write_bytes(b&quot;audio&quot;)</span>
+<span class="d">-    return paths</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def sweep() -&gt; dict:</span>
+<span class="d">-    with SessionLocal() as s:</span>
+<span class="d">-        return retention.sweep(s)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_a_failed_job_keeps_its_upload_for_a_day_and_no_longer(client):</span>
+<span class="d">-    job_id = make_job(client, JobStatus.failed)</span>
+<span class="d">-    paths = stage_inputs(job_id)</span>
+<span class="d">-</span>
+<span class="d">-    age(job_id, hours=23)</span>
+<span class="d">-    sweep()</span>
+<span class="d">-    assert (paths.inp / &quot;book.m4b&quot;).exists()        # still there for another try</span>
+<span class="d">-</span>
+<span class="d">-    age(job_id, hours=25)</span>
+<span class="d">-    assert sweep()[&quot;inputs&quot;] == 1</span>
+<span class="d">-    assert not paths.root.exists()</span>
+<span class="d">-    assert get_job_row(job_id).status == JobStatus.failed   # the list still shows it</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_an_upload_that_was_never_started_goes_away_with_its_job(client):</span>
+<span class="d">-    job_id = make_job(client)                       # a draft</span>
+<span class="d">-    paths = stage_inputs(job_id)</span>
+<span class="d">-    age(job_id, hours=25)</span>
+<span class="d">-    assert sweep()[&quot;drafts&quot;] == 1</span>
+<span class="d">-    assert not paths.root.exists() and get_job_row(job_id) is None</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_results_are_deleted_after_a_week_and_the_job_says_so(client):</span>
+<span class="d">-    fresh = make_job(client, JobStatus.succeeded, with_files=True)</span>
+<span class="d">-    old = make_job(client, JobStatus.succeeded, with_files=True)</span>
+<span class="d">-    age(fresh, days=6)</span>
+<span class="d">-    age(old, days=8)</span>
+<span class="d">-</span>
+<span class="d">-    assert sweep()[&quot;results&quot;] == 1</span>
+<span class="d">-    assert client.get(f&quot;/api/jobs/{fresh}/files/srt&quot;).status_code == 200</span>
+<span class="d">-    assert client.get(f&quot;/api/jobs/{old}/files/srt&quot;).status_code == 404</span>
+<span class="d">-    job = client.get(f&quot;/api/jobs/{old}&quot;).json()</span>
+<span class="d">-    assert job[&quot;artifacts&quot;] == [] and &quot;deleted after 7 days&quot; in job[&quot;stage&quot;]</span>
+<span class="d">-    with SessionLocal() as s:</span>
+<span class="d">-        assert s.query(Artifact).filter(Artifact.job_id == old).count() == 0</span>
+<span class="d">-    assert not storage.exists(f&quot;{old}/book.en.srt&quot;)</span>
+<span class="d">-</span>
+<span class="d">-    assert sweep() == {&quot;inputs&quot;: 0, &quot;drafts&quot;: 0, &quot;results&quot;: 0}      # and once is enough</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_running_jobs_are_left_alone(client):</span>
+<span class="d">-    job_id = make_job(client, JobStatus.running)</span>
+<span class="d">-    paths = stage_inputs(job_id)</span>
+<span class="d">-    age(job_id, days=30)</span>
+<span class="d">-    sweep()</span>
+<span class="d">-    assert (paths.inp / &quot;book.m4b&quot;).exists()</span></pre>
+</div></body></html>

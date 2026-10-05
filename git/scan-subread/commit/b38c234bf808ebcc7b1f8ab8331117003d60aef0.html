@@ -1,0 +1,1312 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread b38c234b - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit b38c234bf808ebcc7b1f8ab8331117003d60aef0
+truex &lt;truex@equwal.com&gt;
+2026-09-24 12:21:59 -0700
+
+Make subtitles from the audiobook and the OCR text
+
+The Audiobook section of the drawer has two paths. The server path
+uploads the audio and the OCR text to subread.space, starts the job,
+polls it and loads the SRT. A 402 answer shows a link to buy credits or
+sign in. The job id stays in localStorage, so the app resumes the poll
+after a restart. The in-app path runs the copied engine with the OCR
+lines as paragraphs. Both results go into an IndexedDB cache keyed by
+the audio file, then down the same path as a hand-picked SRT.
+
+On Android the requests run through the native HTTP plugin, because the
+WebView origin gets no CORS headers from the server. On the web the
+Vite dev proxy forwards /api.
+
+</pre><pre> README.md          | 104 +++++++++++++-
+ index.html         |  50 ++++++-
+ src/audiobook.ts   | 393 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/cloud.ts       | 174 ++++++++++++++++++++++++
+ src/http.ts        | 106 +++++++++++++++
+ src/main.ts        |  26 ++--
+ src/srt-cache.ts   |  34 +++++
+ src/style.css      |  26 +++-
+ test/cloud.test.ts | 155 +++++++++++++++++++++
+ test/http.test.ts  |  41 ++++++
+ 10 files changed, 1084 insertions(+), 25 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 46ccdc0..2cb3f7f 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -9,10 +9,12 @@ for each character. Tap a word on the page, and the app shows the</span>
+ dictionary entries for the longest word that starts at that character,
+ after Japanese deinflection (食べました → 食べる).
+ 
+<span class="d">-Optional: load the audiobook and its subtitle file (SRT or WebVTT). The</span>
+<span class="d">-app aligns each subtitle cue to the OCR text and highlights the region of</span>
+<span class="d">-the page that shows the current cue while the audio plays. Tap a cue in</span>
+<span class="d">-the list to seek the audio.</span>
+<span class="a">+Optional: load the audiobook. The app makes the subtitles from the</span>
+<span class="a">+audiobook and the OCR text, on the subread.space server or in the app</span>
+<span class="a">+itself (see &quot;Audiobook&quot;). You can also load a subtitle file (SRT or</span>
+<span class="a">+WebVTT) by hand. The app aligns each subtitle cue to the OCR text and</span>
+<span class="a">+highlights the region of the page that shows the current cue while the</span>
+<span class="a">+audio plays. Tap a cue in the list to seek the audio.</span>
+ 
+ ## Use
+ 
+<span class="h">@@ -154,6 +156,74 @@ Notes:</span>
+ - Dictionaries live in the WebView&#x27;s IndexedDB. Uninstalling the app
+   deletes them.
+ 
+<span class="a">+## Audiobook</span>
+<span class="a">+</span>
+<span class="a">+The &quot;Audiobook&quot; section of the menu turns an audiobook and the OCR text</span>
+<span class="a">+into subtitles. The subread.space service takes only epubs, not scanned</span>
+<span class="a">+PDFs, so the app sends the OCR text instead: one line per OCR line,</span>
+<span class="a">+pages in order, one blank line between pages (`src/book-text.ts`). A</span>
+<span class="a">+space goes between words, but not between two CJK words. Two paths make</span>
+<span class="a">+the subtitles. Both need a PDF with OCR done and an audio file.</span>
+<span class="a">+</span>
+<span class="a">+1. &quot;Make subtitles on subread.space&quot; uploads the audio and the OCR text</span>
+<span class="a">+   to the server (`POST /api/uploads`), starts the job with the</span>
+<span class="a">+   narration language, and polls the job every 5 seconds. The status</span>
+<span class="a">+   line shows the stage and the progress. &quot;Stop&quot; cancels the job. When</span>
+<span class="a">+   the job succeeds, the app downloads the SRT and loads it. The server</span>
+<span class="a">+   handles a 10-hour book in minutes. One job costs one credit. The</span>
+<span class="a">+   first anonymous job is free. When the server answers 402, the status</span>
+<span class="a">+   line shows the reason and a link to &lt;https://subread.space&gt;, where</span>
+<span class="a">+   you buy credits or sign in. The job id stays in `localStorage`, so</span>
+<span class="a">+   the app resumes the poll after a restart.</span>
+<span class="a">+2. &quot;Make subtitles in this app&quot; runs the SubPlz browser engine from the</span>
+<span class="a">+   subread.space frontend (`src/engine/`): ffmpeg.wasm decodes the audio</span>
+<span class="a">+   in two-minute chunks, whisper-tiny (transformers.js on the ONNX</span>
+<span class="a">+   runtime) transcribes them, and the aligner matches the transcript to</span>
+<span class="a">+   the OCR lines. This is slow on a phone: the speech model runs in</span>
+<span class="a">+   WebAssembly at about real time or slower, and the screen must stay</span>
+<span class="a">+   on. The transcript is saved after each chunk, so a stopped job</span>
+<span class="a">+   resumes with the same audio file. The engine assets are not in the</span>
+<span class="a">+   app: transformers.js, the ONNX runtime, the ffmpeg core (32 MB) and</span>
+<span class="a">+   the model (about 120 MB) load from the &quot;Engine assets URL&quot;, default</span>
+<span class="a">+   `https://subread.space/vendor/`. The browser caches them.</span>
+<span class="a">+</span>
+<span class="a">+The narration language is a Whisper code (ja or en). The app sets it</span>
+<span class="a">+from the OCR language after each OCR run. The result SRT is kept in</span>
+<span class="a">+IndexedDB under the audio file name and size, so the next time you pick</span>
+<span class="a">+the same audio file the subtitles load at once.</span>
+<span class="a">+</span>
+<span class="a">+Sign in: type your email and press &quot;Send link&quot;. The link opens</span>
+<span class="a">+subread.space in the browser. The app has no deep link, so paste the</span>
+<span class="a">+link (or the token in it) into &quot;Paste the sign-in link or token&quot; and</span>
+<span class="a">+press &quot;Verify&quot;. The account line shows the email and the credits. On the</span>
+<span class="a">+web the identity is the `subplz_device` cookie of the dev proxy. On</span>
+<span class="a">+Android the requests run through Capacitor&#x27;s native HTTP plugin</span>
+<span class="a">+(`src/http.ts`), because the WebView origin `https://localhost` gets no</span>
+<span class="a">+CORS headers from the server. The native cookie store keeps the cookie</span>
+<span class="a">+across restarts. The multipart upload crosses the native bridge as</span>
+<span class="a">+base64, so the whole audio file is in memory once during the upload.</span>
+<span class="a">+</span>
+<span class="a">+&quot;Advanced&quot; holds two settings for a self-hosted server: the server URL</span>
+<span class="a">+(default `https://subread.space`; empty on the web, where the Vite dev</span>
+<span class="a">+proxy forwards `/api`) and the engine assets URL.</span>
+<span class="a">+</span>
+<span class="a">+Known limit on Android: the in-app path loads the engine assets from</span>
+<span class="a">+another origin. That needs CORS headers on `/vendor/` of the server,</span>
+<span class="a">+which subread.space does not send yet. Until the server adds</span>
+<span class="a">+`add_header Access-Control-Allow-Origin *;` for `/vendor/` in nginx, the</span>
+<span class="a">+in-app path fails on the phone with a load error, and the server path is</span>
+<span class="a">+the one to use. On the web the Vite proxy makes `/vendor` same-origin,</span>
+<span class="a">+so the in-app path runs in the browser pane end to end.</span>
+<span class="a">+</span>
+<span class="a">+License note: `src/engine/*.js` is copied from the `frontend/engine/`</span>
+<span class="a">+directory of [equwal/subplz-web](https://github.com/equwal/subplz-web)</span>
+<span class="a">+(AGPL-3.0, same author). The files carry a header comment that says so.</span>
+<span class="a">+`align.js` and `align.worker.js` are verbatim. `asr.js`, `media.js` and</span>
+<span class="a">+`job.js` are adapted: the paragraphs come from the OCR lines, the assets</span>
+<span class="a">+load from a configurable base URL, and the ffmpeg wrapper comes from the</span>
+<span class="a">+`@ffmpeg/ffmpeg` package (its worker must be same-origin). The `.d.ts`</span>
+<span class="a">+files next to them give strict TypeScript the used signatures.</span>
+<span class="a">+</span>
+ ## Local audio (Android only)
+ 
+ The lookup popup can play a recorded pronunciation of each word. The
+<span class="h">@@ -199,6 +269,11 @@ Runtime:</span>
+   parser; the browser has no zip API.
+ - `idb`: a thin Promise wrapper around IndexedDB. It replaces the
+   callback and event plumbing of the raw IndexedDB API.
+<span class="a">+- `@ffmpeg/ffmpeg`: the ffmpeg.wasm worker wrapper for the in-app</span>
+<span class="a">+  path. It replaces a copy of the same files from the reference&#x27;s</span>
+<span class="a">+  `frontend/vendor/ffmpeg/`. The 32 MB core is not bundled.</span>
+<span class="a">+- `@capacitor/core`, `@capacitor/android`: the Android shell, the</span>
+<span class="a">+  LocalAudio plugin bridge and the native HTTP plugin.</span>
+ 
+ Development:
+ 
+<span class="h">@@ -234,6 +309,14 @@ any deinflection.</span>
+ - `src/align.ts`: pure alignment of subtitle cues to OCR text.
+ - `src/subtitles.ts`: pure SRT/VTT parser and active-cue lookup.
+ - `src/ocr-tokens.ts`: pure conversion of a tesseract result to tokens.
+<span class="a">+- `src/book-text.ts`: pure OCR tokens to book text and paragraphs.</span>
+<span class="a">+- `src/cloud.ts`: pure client for the subread.space job API over an</span>
+<span class="a">+  injected transport.</span>
+<span class="a">+- `src/http.ts`: the transports: `fetch` on the web, native HTTP on</span>
+<span class="a">+  Android.</span>
+<span class="a">+- `src/srt-cache.ts`: IndexedDB store for finished subtitles (thin).</span>
+<span class="a">+- `src/engine/`: the SubPlz browser engine, copied (see &quot;Audiobook&quot;).</span>
+<span class="a">+- `src/audiobook.ts`: UI wiring of the &quot;Audiobook&quot; section.</span>
+ - `src/ocr.ts`, `src/pdf.ts`: thin browser wrappers around the libraries.
+ - `src/main.ts`: UI wiring.
+ - `test/`: unit and property tests. `test/e2e/`: OCR end-to-end test.
+<span class="h">@@ -242,7 +325,8 @@ any deinflection.</span>
+ 
+ ## Scope limits
+ 
+<span class="d">-- Web only. No backend.</span>
+<span class="a">+- No backend of its own. The subread.space server makes the subtitles</span>
+<span class="a">+  on the server path; the app talks to it as a client.</span>
+ - OCR runs on the first N pages (the &quot;Pages to OCR&quot; field). Tokens are
+   kept in memory. They are not saved between sessions; dictionaries are.
+ - The scan string is the tapped character and the characters after it on
+<span class="h">@@ -251,7 +335,12 @@ any deinflection.</span>
+ - Alignment runs once over the whole book. It takes about 5 s for 200k
+   characters at 10% OCR noise, and well under 1 s for a chapter.
+ - No audiobook pause control, no iOS build.
+<span class="d">-- The fixtures&#x27; `silence.wav` is silent. It only drives the clock.</span>
+<span class="a">+- The fixtures&#x27; `silence.wav` is silent. It only drives the clock. Both</span>
+<span class="a">+  subtitle paths fail or produce nonsense on it: the server reports</span>
+<span class="a">+  that no subtitle file was produced, and whisper-tiny hallucinates one</span>
+<span class="a">+  segment.</span>
+<span class="a">+- The in-app path on Android waits for CORS headers on the server&#x27;s</span>
+<span class="a">+  `/vendor/` (see &quot;Audiobook&quot;).</span>
+ 
+ ## Next steps
+ 
+<span class="h">@@ -266,3 +355,6 @@ any deinflection.</span>
+    sentence, with a setting for the pause length and a key to continue.
+ 5. iOS: `npx cap add ios`. The web code is the same. It needs a Mac with
+    Xcode.
+<span class="a">+6. Server: CORS headers on `/vendor/`, so the in-app path runs on</span>
+<span class="a">+   Android. A streaming native upload, so a 10-hour audiobook does not</span>
+<span class="a">+   sit in memory as base64 during the upload.</span>
+diff --git a/index.html b/index.html
+index 96b28be..32ef7dc 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -53,11 +53,51 @@</span>
+         &lt;/p&gt;
+       &lt;/section&gt;
+ 
+<span class="d">-      &lt;label&gt;Audio (optional) &lt;input id=&quot;audio-file&quot; type=&quot;file&quot; accept=&quot;audio/*&quot; /&gt;&lt;/label&gt;</span>
+<span class="d">-      &lt;label</span>
+<span class="d">-        &gt;Subtitles (optional) &lt;input id=&quot;sub-file&quot; type=&quot;file&quot; accept=&quot;.srt,.vtt,text/*&quot;</span>
+<span class="d">-      /&gt;&lt;/label&gt;</span>
+<span class="d">-      &lt;audio id=&quot;audio&quot; controls&gt;&lt;/audio&gt;</span>
+<span class="a">+      &lt;section id=&quot;audiobook&quot;&gt;</span>
+<span class="a">+        &lt;h2&gt;Audiobook&lt;/h2&gt;</span>
+<span class="a">+        &lt;label&gt;Audio (optional) &lt;input id=&quot;audio-file&quot; type=&quot;file&quot; accept=&quot;audio/*&quot; /&gt;&lt;/label&gt;</span>
+<span class="a">+        &lt;label</span>
+<span class="a">+          &gt;Subtitles (optional) &lt;input id=&quot;sub-file&quot; type=&quot;file&quot; accept=&quot;.srt,.vtt,text/*&quot;</span>
+<span class="a">+        /&gt;&lt;/label&gt;</span>
+<span class="a">+        &lt;label</span>
+<span class="a">+          &gt;Narration language</span>
+<span class="a">+          &lt;select id=&quot;ab-lang&quot;&gt;</span>
+<span class="a">+            &lt;option value=&quot;ja&quot;&gt;Japanese (ja)&lt;/option&gt;</span>
+<span class="a">+            &lt;option value=&quot;en&quot;&gt;English (en)&lt;/option&gt;</span>
+<span class="a">+          &lt;/select&gt;</span>
+<span class="a">+        &lt;/label&gt;</span>
+<span class="a">+        &lt;div class=&quot;row&quot;&gt;</span>
+<span class="a">+          &lt;button id=&quot;ab-cloud&quot; disabled&gt;Make subtitles on subread.space&lt;/button&gt;</span>
+<span class="a">+          &lt;button id=&quot;ab-local&quot; disabled&gt;Make subtitles in this app&lt;/button&gt;</span>
+<span class="a">+          &lt;button id=&quot;ab-stop&quot; hidden&gt;Stop&lt;/button&gt;</span>
+<span class="a">+        &lt;/div&gt;</span>
+<span class="a">+        &lt;div id=&quot;ab-status&quot; class=&quot;hint&quot;&gt;Load a PDF, run OCR and pick an audio file.&lt;/div&gt;</span>
+<span class="a">+        &lt;progress id=&quot;ab-progress&quot; max=&quot;1&quot; value=&quot;0&quot; hidden&gt;&lt;/progress&gt;</span>
+<span class="a">+        &lt;p class=&quot;hint&quot;&gt;</span>
+<span class="a">+          The server is fast and takes one credit per book. In this app the speech model runs in</span>
+<span class="a">+          WebAssembly: about real time or slower on a phone, and the screen must stay on.</span>
+<span class="a">+        &lt;/p&gt;</span>
+<span class="a">+        &lt;div id=&quot;ab-account&quot; class=&quot;hint&quot;&gt;Account: not checked yet.&lt;/div&gt;</span>
+<span class="a">+        &lt;label&gt;Sign in (email) &lt;input id=&quot;ab-email&quot; type=&quot;email&quot; autocomplete=&quot;email&quot; /&gt;&lt;/label&gt;</span>
+<span class="a">+        &lt;div class=&quot;row&quot;&gt;</span>
+<span class="a">+          &lt;button id=&quot;ab-send&quot;&gt;Send link&lt;/button&gt;</span>
+<span class="a">+        &lt;/div&gt;</span>
+<span class="a">+        &lt;label&gt;Paste the sign-in link or token &lt;input id=&quot;ab-token&quot; type=&quot;text&quot; /&gt;&lt;/label&gt;</span>
+<span class="a">+        &lt;div class=&quot;row&quot;&gt;</span>
+<span class="a">+          &lt;button id=&quot;ab-verify&quot;&gt;Verify&lt;/button&gt;</span>
+<span class="a">+        &lt;/div&gt;</span>
+<span class="a">+        &lt;details&gt;</span>
+<span class="a">+          &lt;summary&gt;Advanced&lt;/summary&gt;</span>
+<span class="a">+          &lt;label</span>
+<span class="a">+            &gt;Server URL &lt;input id=&quot;ab-server&quot; type=&quot;url&quot; placeholder=&quot;https://subread.space&quot;</span>
+<span class="a">+          /&gt;&lt;/label&gt;</span>
+<span class="a">+          &lt;label</span>
+<span class="a">+            &gt;Engine assets URL</span>
+<span class="a">+            &lt;input id=&quot;ab-assets&quot; type=&quot;url&quot; placeholder=&quot;https://subread.space/vendor/&quot;</span>
+<span class="a">+          /&gt;&lt;/label&gt;</span>
+<span class="a">+        &lt;/details&gt;</span>
+<span class="a">+        &lt;audio id=&quot;audio&quot; controls&gt;&lt;/audio&gt;</span>
+<span class="a">+      &lt;/section&gt;</span>
+ 
+       &lt;ol id=&quot;cues&quot;&gt;&lt;/ol&gt;
+     &lt;/aside&gt;
+diff --git a/src/audiobook.ts b/src/audiobook.ts
+new file mode 100644
+index 0000000..2683642
+--- /dev/null
++++ b/src/audiobook.ts
+<span class="h">@@ -0,0 +1,393 @@</span>
+<span class="a">+// The &quot;Audiobook&quot; section of the drawer: make subtitles from the audiobook</span>
+<span class="a">+// and the OCR text, on subread.space or in this app. The result is an SRT</span>
+<span class="a">+// that goes down the same path as a hand-picked subtitle file.</span>
+<span class="a">+</span>
+<span class="a">+import { bookFile, paragraphs, bookText, whisperCode } from &#x27;./book-text&#x27;;</span>
+<span class="a">+import type { OcrToken } from &#x27;./align&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  accountLine,</span>
+<span class="a">+  ApiError,</span>
+<span class="a">+  cancelJob,</span>
+<span class="a">+  fetchSrt,</span>
+<span class="a">+  getAccount,</span>
+<span class="a">+  pollUntilDone,</span>
+<span class="a">+  requestSignIn,</span>
+<span class="a">+  SITE,</span>
+<span class="a">+  startJob,</span>
+<span class="a">+  tokenFrom,</span>
+<span class="a">+  upload,</span>
+<span class="a">+  verifySignIn,</span>
+<span class="a">+  type Http,</span>
+<span class="a">+  type JobOut,</span>
+<span class="a">+} from &#x27;./cloud&#x27;;</span>
+<span class="a">+import type { Job, JobStatus } from &#x27;./engine/job.js&#x27;;</span>
+<span class="a">+import { createHttp, DEFAULT_SERVER, defaultAssets } from &#x27;./http&#x27;;</span>
+<span class="a">+import { audioKey, getSrt, putSrt } from &#x27;./srt-cache&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const POLL_MS = 5000;</span>
+<span class="a">+</span>
+<span class="a">+const KEYS = {</span>
+<span class="a">+  server: &#x27;subread.server&#x27;,</span>
+<span class="a">+  assets: &#x27;subread.assets&#x27;,</span>
+<span class="a">+  job: &#x27;subread.job&#x27;,</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+/** The server job that may still run after the app was closed. */</span>
+<span class="a">+interface PendingJob {</span>
+<span class="a">+  id: string;</span>
+<span class="a">+  audioKey: string;</span>
+<span class="a">+  audioName: string;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface AudiobookHooks {</span>
+<span class="a">+  tokens(): readonly OcrToken[];</span>
+<span class="a">+  /** The tesseract language of the last OCR run. */</span>
+<span class="a">+  ocrLang(): string;</span>
+<span class="a">+  /** Load finished subtitles into the reader. */</span>
+<span class="a">+  loadSrt(srt: string, source: string): void;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface Audiobook {</span>
+<span class="a">+  /** Call after an OCR run: enables the buttons and sets the language. */</span>
+<span class="a">+  onTokens(): void;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function el&lt;T extends HTMLElement&gt;(id: string): T {</span>
+<span class="a">+  const e = document.getElementById(id);</span>
+<span class="a">+  if (!e) throw new Error(`Missing element #${id}`);</span>
+<span class="a">+  return e as T;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function read(key: string): string | null {</span>
+<span class="a">+  try {</span>
+<span class="a">+    return localStorage.getItem(key);</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return null;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function write(key: string, value: string | null): void {</span>
+<span class="a">+  try {</span>
+<span class="a">+    if (value === null) localStorage.removeItem(key);</span>
+<span class="a">+    else localStorage.setItem(key, value);</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    // Storage is off. The setting lives for this session only.</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A URL that ends with one slash. */</span>
+<span class="a">+function withSlash(url: string): string {</span>
+<span class="a">+  return url.endsWith(&#x27;/&#x27;) ? url : `${url}/`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function setupAudiobook(hooks: AudiobookHooks): Audiobook {</span>
+<span class="a">+  const ui = {</span>
+<span class="a">+    audioFile: el&lt;HTMLInputElement&gt;(&#x27;audio-file&#x27;),</span>
+<span class="a">+    audio: el&lt;HTMLAudioElement&gt;(&#x27;audio&#x27;),</span>
+<span class="a">+    lang: el&lt;HTMLSelectElement&gt;(&#x27;ab-lang&#x27;),</span>
+<span class="a">+    cloud: el&lt;HTMLButtonElement&gt;(&#x27;ab-cloud&#x27;),</span>
+<span class="a">+    local: el&lt;HTMLButtonElement&gt;(&#x27;ab-local&#x27;),</span>
+<span class="a">+    stop: el&lt;HTMLButtonElement&gt;(&#x27;ab-stop&#x27;),</span>
+<span class="a">+    status: el&lt;HTMLDivElement&gt;(&#x27;ab-status&#x27;),</span>
+<span class="a">+    progress: el&lt;HTMLProgressElement&gt;(&#x27;ab-progress&#x27;),</span>
+<span class="a">+    account: el&lt;HTMLDivElement&gt;(&#x27;ab-account&#x27;),</span>
+<span class="a">+    email: el&lt;HTMLInputElement&gt;(&#x27;ab-email&#x27;),</span>
+<span class="a">+    send: el&lt;HTMLButtonElement&gt;(&#x27;ab-send&#x27;),</span>
+<span class="a">+    token: el&lt;HTMLInputElement&gt;(&#x27;ab-token&#x27;),</span>
+<span class="a">+    verify: el&lt;HTMLButtonElement&gt;(&#x27;ab-verify&#x27;),</span>
+<span class="a">+    server: el&lt;HTMLInputElement&gt;(&#x27;ab-server&#x27;),</span>
+<span class="a">+    assets: el&lt;HTMLInputElement&gt;(&#x27;ab-assets&#x27;),</span>
+<span class="a">+  };</span>
+<span class="a">+</span>
+<span class="a">+  const state = {</span>
+<span class="a">+    audio: null as File | null,</span>
+<span class="a">+    busy: false,</span>
+<span class="a">+    /** Stops the poll loop of the server job. */</span>
+<span class="a">+    abort: null as AbortController | null,</span>
+<span class="a">+    /** The in-app job, while it runs. */</span>
+<span class="a">+    job: null as Job | null,</span>
+<span class="a">+    http: null as Http | null,</span>
+<span class="a">+  };</span>
+<span class="a">+</span>
+<span class="a">+  // --- Settings ---</span>
+<span class="a">+</span>
+<span class="a">+  function server(): string {</span>
+<span class="a">+    return (read(KEYS.server) ?? DEFAULT_SERVER).replace(/\/+$/, &#x27;&#x27;);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function assets(): string {</span>
+<span class="a">+    return withSlash(read(KEYS.assets) ?? defaultAssets());</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function http(): Http {</span>
+<span class="a">+    state.http ??= createHttp(server());</span>
+<span class="a">+    return state.http;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  ui.server.value = read(KEYS.server) ?? &#x27;&#x27;;</span>
+<span class="a">+  ui.server.placeholder = DEFAULT_SERVER || &#x27;(dev proxy)&#x27;;</span>
+<span class="a">+  ui.assets.value = read(KEYS.assets) ?? &#x27;&#x27;;</span>
+<span class="a">+  ui.assets.placeholder = defaultAssets();</span>
+<span class="a">+</span>
+<span class="a">+  ui.server.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+<span class="a">+    write(KEYS.server, ui.server.value.trim() || null);</span>
+<span class="a">+    state.http = null;</span>
+<span class="a">+    void refreshAccount();</span>
+<span class="a">+  });</span>
+<span class="a">+  ui.assets.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+<span class="a">+    write(KEYS.assets, ui.assets.value.trim() || null);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  // --- Status ---</span>
+<span class="a">+</span>
+<span class="a">+  function setStatus(text: string, link?: { href: string; label: string }): void {</span>
+<span class="a">+    ui.status.replaceChildren(text);</span>
+<span class="a">+    if (link) {</span>
+<span class="a">+      const a = document.createElement(&#x27;a&#x27;);</span>
+<span class="a">+      a.href = link.href;</span>
+<span class="a">+      a.target = &#x27;_blank&#x27;;</span>
+<span class="a">+      a.rel = &#x27;noopener&#x27;;</span>
+<span class="a">+      a.textContent = link.label;</span>
+<span class="a">+      ui.status.append(&#x27; &#x27;, a);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function setProgress(value: number | null): void {</span>
+<span class="a">+    ui.progress.hidden = value === null;</span>
+<span class="a">+    if (value !== null) ui.progress.value = value;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function updateButtons(): void {</span>
+<span class="a">+    const ready = !state.busy &amp;&amp; state.audio !== null &amp;&amp; hooks.tokens().length &gt; 0;</span>
+<span class="a">+    ui.cloud.disabled = !ready;</span>
+<span class="a">+    ui.local.disabled = !ready;</span>
+<span class="a">+    ui.stop.hidden = !state.busy;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function setBusy(busy: boolean): void {</span>
+<span class="a">+    state.busy = busy;</span>
+<span class="a">+    updateButtons();</span>
+<span class="a">+    if (!busy) setProgress(null);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // --- Account ---</span>
+<span class="a">+</span>
+<span class="a">+  async function refreshAccount(): Promise&lt;void&gt; {</span>
+<span class="a">+    try {</span>
+<span class="a">+      const account = await getAccount(http());</span>
+<span class="a">+      ui.account.textContent = `Account: ${accountLine(account)}`;</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      ui.account.textContent = `Account: cannot reach the server (${String(err)}).`;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  ui.send.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    ui.send.disabled = true;</span>
+<span class="a">+    try {</span>
+<span class="a">+      const r = await requestSignIn(http(), ui.email.value);</span>
+<span class="a">+      ui.account.textContent = r.dev_link</span>
+<span class="a">+        ? `Account: no mail server. Paste this link below: ${r.dev_link}`</span>
+<span class="a">+        : `Account: link sent to ${r.email}. Open it, then paste the link or token below.`;</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      ui.account.textContent = `Account: ${String(err)}`;</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      ui.send.disabled = false;</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  ui.verify.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    ui.verify.disabled = true;</span>
+<span class="a">+    try {</span>
+<span class="a">+      const account = await verifySignIn(http(), tokenFrom(ui.token.value));</span>
+<span class="a">+      ui.token.value = &#x27;&#x27;;</span>
+<span class="a">+      ui.account.textContent = `Account: ${accountLine(account)}`;</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      ui.account.textContent = `Account: ${String(err)}`;</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      ui.verify.disabled = false;</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  // --- Audio file and the SRT cache ---</span>
+<span class="a">+</span>
+<span class="a">+  ui.audioFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+<span class="a">+    const file = ui.audioFile.files?.[0];</span>
+<span class="a">+    if (!file) return;</span>
+<span class="a">+    state.audio = file;</span>
+<span class="a">+    ui.audio.src = URL.createObjectURL(file);</span>
+<span class="a">+    updateButtons();</span>
+<span class="a">+    const cached = await getSrt(audioKey(file)).catch(() =&gt; undefined);</span>
+<span class="a">+    if (cached) {</span>
+<span class="a">+      hooks.loadSrt(cached, &#x27;the cache&#x27;);</span>
+<span class="a">+      setStatus(`Subtitles for ${file.name} loaded from the cache.`);</span>
+<span class="a">+    } else {</span>
+<span class="a">+      setStatus(`${file.name}: no subtitles yet.`);</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  /** Keep the SRT, and show it when its audio file is the picked one. */</span>
+<span class="a">+  async function finish(srt: string, key: string, name: string, source: string): Promise&lt;void&gt; {</span>
+<span class="a">+    await putSrt(key, srt).catch(() =&gt; {});</span>
+<span class="a">+    if (state.audio &amp;&amp; audioKey(state.audio) === key) {</span>
+<span class="a">+      hooks.loadSrt(srt, source);</span>
+<span class="a">+      setStatus(`Subtitles ready from ${source}.`);</span>
+<span class="a">+    } else {</span>
+<span class="a">+      setStatus(`Subtitles for ${name} are ready. Pick that audio file to load them.`);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // --- Server job ---</span>
+<span class="a">+</span>
+<span class="a">+  function jobLine(job: JobOut): string {</span>
+<span class="a">+    const pct = Math.round(job.progress * 100);</span>
+<span class="a">+    return `Server job ${job.status}: ${job.stage} (${pct}%)`;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /** Poll a server job to its end and load the SRT. */</span>
+<span class="a">+  async function follow(pending: PendingJob): Promise&lt;void&gt; {</span>
+<span class="a">+    const abort = new AbortController();</span>
+<span class="a">+    state.abort = abort;</span>
+<span class="a">+    try {</span>
+<span class="a">+      const job = await pollUntilDone(http(), pending.id, {</span>
+<span class="a">+        intervalMs: POLL_MS,</span>
+<span class="a">+        signal: abort.signal,</span>
+<span class="a">+        onStatus: (j) =&gt; {</span>
+<span class="a">+          setStatus(jobLine(j));</span>
+<span class="a">+          setProgress(j.progress);</span>
+<span class="a">+        },</span>
+<span class="a">+      });</span>
+<span class="a">+      write(KEYS.job, null);</span>
+<span class="a">+      if (job.status === &#x27;succeeded&#x27;) {</span>
+<span class="a">+        const srt = await fetchSrt(http(), job.id);</span>
+<span class="a">+        await finish(srt, pending.audioKey, pending.audioName, &#x27;subread.space&#x27;);</span>
+<span class="a">+      } else {</span>
+<span class="a">+        setStatus(`Server job ${job.status}: ${job.error ?? job.stage}`);</span>
+<span class="a">+      }</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      state.abort = null;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  ui.cloud.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    const audio = state.audio;</span>
+<span class="a">+    if (!audio || state.busy) return;</span>
+<span class="a">+    setBusy(true);</span>
+<span class="a">+    try {</span>
+<span class="a">+      setStatus(`Uploading ${audio.name} and the OCR text...`);</span>
+<span class="a">+      setProgress(0);</span>
+<span class="a">+      const job = await upload(http(), audio, bookFile(hooks.tokens()));</span>
+<span class="a">+      const pending: PendingJob = { id: job.id, audioKey: audioKey(audio), audioName: audio.name };</span>
+<span class="a">+      write(KEYS.job, JSON.stringify(pending));</span>
+<span class="a">+      try {</span>
+<span class="a">+        await startJob(http(), job.id, ui.lang.value);</span>
+<span class="a">+      } catch (err) {</span>
+<span class="a">+        write(KEYS.job, null);</span>
+<span class="a">+        if (err instanceof ApiError &amp;&amp; err.status === 402) {</span>
+<span class="a">+          setStatus(`No credit: ${err.message}`, { href: SITE, label: &#x27;Buy credits or sign in.&#x27; });</span>
+<span class="a">+          return;</span>
+<span class="a">+        }</span>
+<span class="a">+        throw err;</span>
+<span class="a">+      }</span>
+<span class="a">+      await follow(pending);</span>
+<span class="a">+      void refreshAccount();</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      if ((err as Error).name !== &#x27;AbortError&#x27;) setStatus(`Server job failed: ${String(err)}`);</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      setBusy(false);</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  // --- In-app job ---</span>
+<span class="a">+</span>
+<span class="a">+  function phaseLine(s: JobStatus): string {</span>
+<span class="a">+    let line = `${s.phase}: ${s.detail}`;</span>
+<span class="a">+    if (s.eta) line += `, about ${Math.round(s.eta / 60)} min left`;</span>
+<span class="a">+    return line;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  ui.local.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    const audio = state.audio;</span>
+<span class="a">+    if (!audio || state.busy) return;</span>
+<span class="a">+    setBusy(true);</span>
+<span class="a">+    let wakeLock: WakeLockSentinel | null = null;</span>
+<span class="a">+    try {</span>
+<span class="a">+      setStatus(&#x27;preparing: loading the engine&#x27;);</span>
+<span class="a">+      setProgress(0);</span>
+<span class="a">+      const { Job, Cancelled } = await import(&#x27;./engine/job.js&#x27;);</span>
+<span class="a">+      const job = new Job({</span>
+<span class="a">+        audio: [audio],</span>
+<span class="a">+        paragraphs: paragraphs(bookText(hooks.tokens())),</span>
+<span class="a">+        language: ui.lang.value,</span>
+<span class="a">+        assets: assets(),</span>
+<span class="a">+        onStatus: (s) =&gt; {</span>
+<span class="a">+          setStatus(phaseLine(s));</span>
+<span class="a">+          setProgress(s.indeterminate ? null : s.fraction);</span>
+<span class="a">+        },</span>
+<span class="a">+      });</span>
+<span class="a">+      state.job = job;</span>
+<span class="a">+      try {</span>
+<span class="a">+        wakeLock = (await navigator.wakeLock?.request(&#x27;screen&#x27;)) ?? null;</span>
+<span class="a">+      } catch {</span>
+<span class="a">+        // Not granted. The user keeps the screen on by hand.</span>
+<span class="a">+      }</span>
+<span class="a">+      try {</span>
+<span class="a">+        const result = await job.run();</span>
+<span class="a">+        const pct = Math.round(result.matchRate * 100);</span>
+<span class="a">+        await finish(result.srt, audioKey(audio), audio.name, `this app (${pct}% matched)`);</span>
+<span class="a">+      } catch (err) {</span>
+<span class="a">+        setStatus(err instanceof Cancelled ? &#x27;Stopped.&#x27; : `In-app job failed: ${String(err)}`);</span>
+<span class="a">+      } finally {</span>
+<span class="a">+        job.close();</span>
+<span class="a">+      }</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      setStatus(`Cannot load the engine: ${String(err)}`);</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      state.job = null;</span>
+<span class="a">+      await wakeLock?.release().catch(() =&gt; {});</span>
+<span class="a">+      setBusy(false);</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  ui.stop.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    if (state.job) {</span>
+<span class="a">+      state.job.cancel();</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+<span class="a">+    const raw = read(KEYS.job);</span>
+<span class="a">+    state.abort?.abort();</span>
+<span class="a">+    if (raw) {</span>
+<span class="a">+      const pending = JSON.parse(raw) as PendingJob;</span>
+<span class="a">+      write(KEYS.job, null);</span>
+<span class="a">+      try {</span>
+<span class="a">+        await cancelJob(http(), pending.id);</span>
+<span class="a">+        setStatus(&#x27;Server job canceled.&#x27;);</span>
+<span class="a">+      } catch (err) {</span>
+<span class="a">+        setStatus(`Cancel failed: ${String(err)}`);</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+    setBusy(false);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  // --- Start ---</span>
+<span class="a">+</span>
+<span class="a">+  const raw = read(KEYS.job);</span>
+<span class="a">+  if (raw) {</span>
+<span class="a">+    const pending = JSON.parse(raw) as PendingJob;</span>
+<span class="a">+    setStatus(`Resuming the server job for ${pending.audioName}...`);</span>
+<span class="a">+    setBusy(true);</span>
+<span class="a">+    follow(pending)</span>
+<span class="a">+      .catch((err: unknown) =&gt; {</span>
+<span class="a">+        if ((err as Error).name !== &#x27;AbortError&#x27;) setStatus(`Server job failed: ${String(err)}`);</span>
+<span class="a">+      })</span>
+<span class="a">+      .finally(() =&gt; setBusy(false));</span>
+<span class="a">+  }</span>
+<span class="a">+  void refreshAccount();</span>
+<span class="a">+  updateButtons();</span>
+<span class="a">+</span>
+<span class="a">+  return {</span>
+<span class="a">+    onTokens() {</span>
+<span class="a">+      ui.lang.value = whisperCode(hooks.ocrLang());</span>
+<span class="a">+      updateButtons();</span>
+<span class="a">+    },</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+diff --git a/src/cloud.ts b/src/cloud.ts
+new file mode 100644
+index 0000000..00f6411
+--- /dev/null
++++ b/src/cloud.ts
+<span class="h">@@ -0,0 +1,174 @@</span>
+<span class="a">+// Client for the subread.space job API. Pure over an injected `Http`, so the</span>
+<span class="a">+// flow is testable with a fake transport.</span>
+<span class="a">+//</span>
+<span class="a">+// Flow: POST /api/uploads (audio + book.txt) -&gt; POST /api/jobs/{id}/start</span>
+<span class="a">+// -&gt; poll GET /api/jobs/{id} -&gt; GET /api/jobs/{id}/files/srt.</span>
+<span class="a">+// Identity is the `subplz_device` cookie that the server sets on the first</span>
+<span class="a">+// response. The transport keeps it (browser cookie jar or native cookie store).</span>
+<span class="a">+</span>
+<span class="a">+export interface HttpRequest {</span>
+<span class="a">+  method: &#x27;GET&#x27; | &#x27;POST&#x27; | &#x27;DELETE&#x27;;</span>
+<span class="a">+  /** Path under the server base, such as &quot;/api/account&quot;. */</span>
+<span class="a">+  path: string;</span>
+<span class="a">+  /** JSON body. */</span>
+<span class="a">+  json?: unknown;</span>
+<span class="a">+  /** Multipart body: each file goes in the `files` field. */</span>
+<span class="a">+  files?: File[];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface HttpResponse {</span>
+<span class="a">+  status: number;</span>
+<span class="a">+  /** The body as text. JSON is parsed by the caller. */</span>
+<span class="a">+  text: string;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export type Http = (req: HttpRequest) =&gt; Promise&lt;HttpResponse&gt;;</span>
+<span class="a">+</span>
+<span class="a">+/** A non-2xx answer. `status` 402 means: no credit. */</span>
+<span class="a">+export class ApiError extends Error {</span>
+<span class="a">+  constructor(</span>
+<span class="a">+    public readonly status: number,</span>
+<span class="a">+    message: string,</span>
+<span class="a">+  ) {</span>
+<span class="a">+    super(message);</span>
+<span class="a">+    this.name = &#x27;ApiError&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface JobOut {</span>
+<span class="a">+  id: string;</span>
+<span class="a">+  /** draft, queued, running, succeeded, failed or canceled. */</span>
+<span class="a">+  status: string;</span>
+<span class="a">+  stage: string;</span>
+<span class="a">+  progress: number;</span>
+<span class="a">+  language: string;</span>
+<span class="a">+  error: string | null;</span>
+<span class="a">+  artifacts: { kind: string; filename: string; url: string }[];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface AccountOut {</span>
+<span class="a">+  id: string;</span>
+<span class="a">+  signed_in: boolean;</span>
+<span class="a">+  email: string | null;</span>
+<span class="a">+  credits: number;</span>
+<span class="a">+  free_credits: number;</span>
+<span class="a">+  cloud_allowed: boolean;</span>
+<span class="a">+  billing_enabled: boolean;</span>
+<span class="a">+  email_sign_in_available: boolean;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export const DONE = new Set([&#x27;succeeded&#x27;, &#x27;failed&#x27;, &#x27;canceled&#x27;]);</span>
+<span class="a">+</span>
+<span class="a">+/** Where to buy credits or sign in. */</span>
+<span class="a">+export const SITE = &#x27;https://subread.space&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Read the JSON of a 2xx answer. Throw ApiError with the server&#x27;s `detail` otherwise. */</span>
+<span class="a">+async function call&lt;T&gt;(http: Http, req: HttpRequest): Promise&lt;T&gt; {</span>
+<span class="a">+  const res = await http(req);</span>
+<span class="a">+  if (res.status &lt; 200 || res.status &gt;= 300) {</span>
+<span class="a">+    let detail = `HTTP ${res.status}`;</span>
+<span class="a">+    try {</span>
+<span class="a">+      const body = JSON.parse(res.text) as { detail?: unknown };</span>
+<span class="a">+      if (typeof body.detail === &#x27;string&#x27;) detail = body.detail;</span>
+<span class="a">+      else if (body.detail !== undefined) detail = JSON.stringify(body.detail);</span>
+<span class="a">+    } catch {</span>
+<span class="a">+      // Not JSON. Keep the status line.</span>
+<span class="a">+    }</span>
+<span class="a">+    throw new ApiError(res.status, detail);</span>
+<span class="a">+  }</span>
+<span class="a">+  return JSON.parse(res.text) as T;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export async function upload(http: Http, audio: File, book: File): Promise&lt;JobOut&gt; {</span>
+<span class="a">+  const out = await call&lt;{ job: JobOut }&gt;(http, {</span>
+<span class="a">+    method: &#x27;POST&#x27;,</span>
+<span class="a">+    path: &#x27;/api/uploads&#x27;,</span>
+<span class="a">+    files: [audio, book],</span>
+<span class="a">+  });</span>
+<span class="a">+  return out.job;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function startJob(http: Http, id: string, language: string): Promise&lt;JobOut&gt; {</span>
+<span class="a">+  return call&lt;JobOut&gt;(http, { method: &#x27;POST&#x27;, path: `/api/jobs/${id}/start`, json: { language } });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function getJob(http: Http, id: string): Promise&lt;JobOut&gt; {</span>
+<span class="a">+  return call&lt;JobOut&gt;(http, { method: &#x27;GET&#x27;, path: `/api/jobs/${id}` });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function cancelJob(http: Http, id: string): Promise&lt;JobOut&gt; {</span>
+<span class="a">+  return call&lt;JobOut&gt;(http, { method: &#x27;POST&#x27;, path: `/api/jobs/${id}/cancel`, json: {} });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function deleteJob(http: Http, id: string): Promise&lt;unknown&gt; {</span>
+<span class="a">+  return call&lt;unknown&gt;(http, { method: &#x27;DELETE&#x27;, path: `/api/jobs/${id}` });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface PollOptions {</span>
+<span class="a">+  intervalMs: number;</span>
+<span class="a">+  onStatus?: (job: JobOut) =&gt; void;</span>
+<span class="a">+  /** Injectable for tests. Defaults to setTimeout. */</span>
+<span class="a">+  sleep?: (ms: number) =&gt; Promise&lt;void&gt;;</span>
+<span class="a">+  signal?: AbortSignal;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const defaultSleep = (ms: number): Promise&lt;void&gt; =&gt;</span>
+<span class="a">+  new Promise((resolve) =&gt; setTimeout(resolve, ms));</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Poll the job until it is succeeded, failed or canceled. Each answer goes</span>
+<span class="a">+ * to `onStatus`. An aborted signal stops the loop with an AbortError.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function pollUntilDone(http: Http, id: string, opts: PollOptions): Promise&lt;JobOut&gt; {</span>
+<span class="a">+  const sleep = opts.sleep ?? defaultSleep;</span>
+<span class="a">+  for (;;) {</span>
+<span class="a">+    if (opts.signal?.aborted) throw new DOMException(&#x27;Polling stopped.&#x27;, &#x27;AbortError&#x27;);</span>
+<span class="a">+    const job = await getJob(http, id);</span>
+<span class="a">+    opts.onStatus?.(job);</span>
+<span class="a">+    if (DONE.has(job.status)) return job;</span>
+<span class="a">+    await sleep(opts.intervalMs);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The finished SRT. The server may redirect to a presigned URL. The transport follows it. */</span>
+<span class="a">+export async function fetchSrt(http: Http, id: string): Promise&lt;string&gt; {</span>
+<span class="a">+  const res = await http({ method: &#x27;GET&#x27;, path: `/api/jobs/${id}/files/srt` });</span>
+<span class="a">+  if (res.status &lt; 200 || res.status &gt;= 300) throw new ApiError(res.status, `HTTP ${res.status}`);</span>
+<span class="a">+  return res.text;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function getAccount(http: Http): Promise&lt;AccountOut&gt; {</span>
+<span class="a">+  return call&lt;AccountOut&gt;(http, { method: &#x27;GET&#x27;, path: &#x27;/api/account&#x27; });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function requestSignIn(</span>
+<span class="a">+  http: Http,</span>
+<span class="a">+  email: string,</span>
+<span class="a">+): Promise&lt;{ sent: boolean; email: string; dev_link?: string }&gt; {</span>
+<span class="a">+  return call(http, { method: &#x27;POST&#x27;, path: &#x27;/api/auth/request&#x27;, json: { email } });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function verifySignIn(http: Http, token: string): Promise&lt;AccountOut&gt; {</span>
+<span class="a">+  return call&lt;AccountOut&gt;(http, { method: &#x27;POST&#x27;, path: &#x27;/api/auth/verify&#x27;, json: { token } });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The token out of what the user pasted: a sign-in link</span>
+<span class="a">+ * (https://subread.space/?login=TOKEN) or the bare token.</span>
+<span class="a">+ */</span>
+<span class="a">+export function tokenFrom(input: string): string {</span>
+<span class="a">+  const s = input.trim();</span>
+<span class="a">+  try {</span>
+<span class="a">+    const url = new URL(s);</span>
+<span class="a">+    return url.searchParams.get(&#x27;login&#x27;) ?? s;</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return s;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** One line for the account area of the drawer. */</span>
+<span class="a">+export function accountLine(a: AccountOut): string {</span>
+<span class="a">+  const who = a.signed_in &amp;&amp; a.email ? `Signed in as ${a.email}.` : &#x27;Not signed in.&#x27;;</span>
+<span class="a">+  const credits = a.billing_enabled ? ` Credits: ${a.credits} (${a.free_credits} free).` : &#x27;&#x27;;</span>
+<span class="a">+  return who + credits;</span>
+<span class="a">+}</span>
+diff --git a/src/http.ts b/src/http.ts
+new file mode 100644
+index 0000000..bb721f9
+--- /dev/null
++++ b/src/http.ts
+<span class="h">@@ -0,0 +1,106 @@</span>
+<span class="a">+// The two transports behind `Http` (see cloud.ts).</span>
+<span class="a">+//</span>
+<span class="a">+// Web: `fetch` with relative paths. In development the Vite proxy forwards</span>
+<span class="a">+// /api to the server, so the cookie is same-origin.</span>
+<span class="a">+//</span>
+<span class="a">+// Android: the WebView origin is https://localhost and the server sends no</span>
+<span class="a">+// CORS headers, so a browser fetch fails. `CapacitorHttp.request` runs the</span>
+<span class="a">+// request natively. Its cookies live in the WebView cookie store, which</span>
+<span class="a">+// persists across restarts. A multipart body goes over the bridge as</span>
+<span class="a">+// base64 entries, the same shape Capacitor&#x27;s own fetch patch uses.</span>
+<span class="a">+</span>
+<span class="a">+import { Capacitor, CapacitorHttp } from &#x27;@capacitor/core&#x27;;</span>
+<span class="a">+import type { Http, HttpRequest } from &#x27;./cloud&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Default server per platform: the dev proxy on the web, the real host in the app. */</span>
+<span class="a">+export const DEFAULT_SERVER = Capacitor.isNativePlatform() ? &#x27;https://subread.space&#x27; : &#x27;&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Default engine asset base per platform: the dev proxy on the web, the real host in the app. */</span>
+<span class="a">+export function defaultAssets(): string {</span>
+<span class="a">+  return Capacitor.isNativePlatform()</span>
+<span class="a">+    ? &#x27;https://subread.space/vendor/&#x27;</span>
+<span class="a">+    : `${location.origin}/vendor/`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Bytes per `String.fromCharCode` call. More overflows the argument list. */</span>
+<span class="a">+const CHUNK = 0x8000;</span>
+<span class="a">+</span>
+<span class="a">+/** Read a file as base64. The whole file is in memory while it is encoded. */</span>
+<span class="a">+export async function fileToBase64(file: Blob): Promise&lt;string&gt; {</span>
+<span class="a">+  const bytes = new Uint8Array(await file.arrayBuffer());</span>
+<span class="a">+  let binary = &#x27;&#x27;;</span>
+<span class="a">+  for (let i = 0; i &lt; bytes.length; i += CHUNK) {</span>
+<span class="a">+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));</span>
+<span class="a">+  }</span>
+<span class="a">+  return btoa(binary);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface FormEntry {</span>
+<span class="a">+  key: string;</span>
+<span class="a">+  value: string;</span>
+<span class="a">+  type: &#x27;base64File&#x27;;</span>
+<span class="a">+  contentType: string;</span>
+<span class="a">+  fileName: string;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The multipart entries that the native HTTP plugin writes as `files` parts. */</span>
+<span class="a">+export async function formEntries(files: readonly File[]): Promise&lt;FormEntry[]&gt; {</span>
+<span class="a">+  const out: FormEntry[] = [];</span>
+<span class="a">+  for (const file of files) {</span>
+<span class="a">+    out.push({</span>
+<span class="a">+      key: &#x27;files&#x27;,</span>
+<span class="a">+      value: await fileToBase64(file),</span>
+<span class="a">+      type: &#x27;base64File&#x27;,</span>
+<span class="a">+      contentType: file.type || &#x27;application/octet-stream&#x27;,</span>
+<span class="a">+      fileName: file.name,</span>
+<span class="a">+    });</span>
+<span class="a">+  }</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function webHttp(base: string): Http {</span>
+<span class="a">+  return async (req: HttpRequest) =&gt; {</span>
+<span class="a">+    const init: RequestInit = { method: req.method, credentials: &#x27;same-origin&#x27; };</span>
+<span class="a">+    if (req.files) {</span>
+<span class="a">+      const form = new FormData();</span>
+<span class="a">+      for (const f of req.files) form.append(&#x27;files&#x27;, f, f.name);</span>
+<span class="a">+      init.body = form;</span>
+<span class="a">+    } else if (req.json !== undefined) {</span>
+<span class="a">+      init.headers = { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; };</span>
+<span class="a">+      init.body = JSON.stringify(req.json);</span>
+<span class="a">+    }</span>
+<span class="a">+    const res = await fetch(base + req.path, init);</span>
+<span class="a">+    return { status: res.status, text: await res.text() };</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function nativeHttp(base: string): Http {</span>
+<span class="a">+  return async (req: HttpRequest) =&gt; {</span>
+<span class="a">+    const headers: Record&lt;string, string&gt; = {};</span>
+<span class="a">+    let data: unknown;</span>
+<span class="a">+    let dataType: &#x27;formData&#x27; | undefined;</span>
+<span class="a">+    if (req.files) {</span>
+<span class="a">+      data = await formEntries(req.files);</span>
+<span class="a">+      dataType = &#x27;formData&#x27;;</span>
+<span class="a">+    } else if (req.json !== undefined) {</span>
+<span class="a">+      headers[&#x27;Content-Type&#x27;] = &#x27;application/json&#x27;;</span>
+<span class="a">+      data = JSON.stringify(req.json);</span>
+<span class="a">+    }</span>
+<span class="a">+    const res = await CapacitorHttp.request({</span>
+<span class="a">+      url: base + req.path,</span>
+<span class="a">+      method: req.method,</span>
+<span class="a">+      headers,</span>
+<span class="a">+      ...(data !== undefined ? { data } : {}),</span>
+<span class="a">+      ...(dataType ? { dataType } : {}),</span>
+<span class="a">+      responseType: &#x27;text&#x27;,</span>
+<span class="a">+      readTimeout: 120_000,</span>
+<span class="a">+      connectTimeout: 30_000,</span>
+<span class="a">+    });</span>
+<span class="a">+    const text = typeof res.data === &#x27;string&#x27; ? res.data : JSON.stringify(res.data);</span>
+<span class="a">+    return { status: res.status, text };</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function createHttp(base: string): Http {</span>
+<span class="a">+  return Capacitor.isNativePlatform() ? nativeHttp(base) : webHttp(base);</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index 4efdffa..4ce3358 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -1,6 +1,7 @@</span>
+ // UI wiring. Alignment logic lives in align.ts, lookup logic in lookup.ts.
+ 
+ import { alignCuesToTokens, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+<span class="a">+import { setupAudiobook } from &#x27;./audiobook&#x27;;</span>
+ import {
+   deleteDictionary,
+   importDictionary,
+<span class="h">@@ -40,7 +41,6 @@ const ui = {</span>
+   menu: el&lt;HTMLButtonElement&gt;(&#x27;menu&#x27;),
+   panel: el&lt;HTMLElement&gt;(&#x27;panel&#x27;),
+   pdfFile: el&lt;HTMLInputElement&gt;(&#x27;pdf-file&#x27;),
+<span class="d">-  audioFile: el&lt;HTMLInputElement&gt;(&#x27;audio-file&#x27;),</span>
+   subFile: el&lt;HTMLInputElement&gt;(&#x27;sub-file&#x27;),
+   dictFile: el&lt;HTMLInputElement&gt;(&#x27;dict-file&#x27;),
+   dicts: el&lt;HTMLUListElement&gt;(&#x27;dicts&#x27;),
+<span class="h">@@ -125,21 +125,26 @@ ui.pdfFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+   updateRunButton();
+ });
+ 
+<span class="d">-ui.subFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+<span class="d">-  const file = ui.subFile.files?.[0];</span>
+<span class="d">-  if (!file) return;</span>
+<span class="d">-  state.cues = parseSubtitles(await file.text());</span>
+<span class="a">+/** Load subtitles from a file or from a finished job. `source` names where they came from. */</span>
+<span class="a">+function loadSubtitles(text: string, source: string): void {</span>
+<span class="a">+  state.cues = parseSubtitles(text);</span>
+   state.spans = [];
+   state.activeCue = -1;
+<span class="d">-  setStatus(`${state.cues.length} cues loaded.`);</span>
+<span class="a">+  setStatus(`${state.cues.length} cues loaded from ${source}.`);</span>
+   alignIfReady();
+   renderCueList();
+<span class="d">-});</span>
+<span class="a">+}</span>
+ 
+<span class="d">-ui.audioFile.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+<span class="d">-  const file = ui.audioFile.files?.[0];</span>
+<span class="a">+ui.subFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+<span class="a">+  const file = ui.subFile.files?.[0];</span>
+   if (!file) return;
+<span class="d">-  ui.audio.src = URL.createObjectURL(file);</span>
+<span class="a">+  loadSubtitles(await file.text(), file.name);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+const audiobook = setupAudiobook({</span>
+<span class="a">+  tokens: () =&gt; state.tokens,</span>
+<span class="a">+  ocrLang: () =&gt; ui.lang.value,</span>
+<span class="a">+  loadSrt: loadSubtitles,</span>
+ });
+ 
+ // --- Dictionaries ---
+<span class="h">@@ -312,6 +317,7 @@ ui.run.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+       await ocr.terminate();
+     }
+     setStatus(`Done. ${state.tokens.length} characters read. Tap a word to look it up.`);
+<span class="a">+    audiobook.onTokens();</span>
+     alignIfReady();
+     renderCueList();
+     state.activeCue = -1;
+diff --git a/src/srt-cache.ts b/src/srt-cache.ts
+new file mode 100644
+index 0000000..17b391f
+--- /dev/null
++++ b/src/srt-cache.ts
+<span class="h">@@ -0,0 +1,34 @@</span>
+<span class="a">+// Finished subtitles per audio file, in IndexedDB. Thin browser layer.</span>
+<span class="a">+//</span>
+<span class="a">+// Key: audio file name and size. A book is aligned once; the next time the</span>
+<span class="a">+// same audio file is picked, the subtitles load from here.</span>
+<span class="a">+</span>
+<span class="a">+import { openDB, type DBSchema, type IDBPDatabase } from &#x27;idb&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+interface Schema extends DBSchema {</span>
+<span class="a">+  srt: { key: string; value: string };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+let dbPromise: Promise&lt;IDBPDatabase&lt;Schema&gt;&gt; | undefined;</span>
+<span class="a">+</span>
+<span class="a">+function db(): Promise&lt;IDBPDatabase&lt;Schema&gt;&gt; {</span>
+<span class="a">+  dbPromise ??= openDB&lt;Schema&gt;(&#x27;scan-subread-srt&#x27;, 1, {</span>
+<span class="a">+    upgrade(d) {</span>
+<span class="a">+      d.createObjectStore(&#x27;srt&#x27;);</span>
+<span class="a">+    },</span>
+<span class="a">+  });</span>
+<span class="a">+  return dbPromise;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The cache key of an audio file. */</span>
+<span class="a">+export function audioKey(file: Pick&lt;File, &#x27;name&#x27; | &#x27;size&#x27;&gt;): string {</span>
+<span class="a">+  return `${file.name}|${file.size}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export async function getSrt(key: string): Promise&lt;string | undefined&gt; {</span>
+<span class="a">+  return (await db()).get(&#x27;srt&#x27;, key);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export async function putSrt(key: string, srt: string): Promise&lt;void&gt; {</span>
+<span class="a">+  await (await db()).put(&#x27;srt&#x27;, srt, key);</span>
+<span class="a">+}</span>
+diff --git a/src/style.css b/src/style.css
+index 8b99469..96a7ad3 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -102,28 +102,46 @@ body.menu-open #panel {</span>
+   flex: 1;
+ }
+ 
+<span class="d">-#local-audio {</span>
+<span class="a">+#local-audio,</span>
+<span class="a">+#audiobook {</span>
+   display: flex;
+   flex-direction: column;
+   gap: 0.4rem;
+   font-size: 0.85rem;
+ }
+ 
+<span class="d">-#local-audio h2 {</span>
+<span class="a">+#local-audio h2,</span>
+<span class="a">+#audiobook h2 {</span>
+   font-size: 0.95rem;
+   margin: 0;
+ }
+ 
+<span class="d">-#local-audio .row {</span>
+<span class="a">+#local-audio .row,</span>
+<span class="a">+#audiobook .row {</span>
+   display: flex;
+<span class="a">+  flex-wrap: wrap;</span>
+   gap: 0.5rem;
+ }
+ 
+ #local-audio code,
+<span class="d">-#la-status {</span>
+<span class="a">+#la-status,</span>
+<span class="a">+#ab-status,</span>
+<span class="a">+#ab-account {</span>
+   word-break: break-all;
+ }
+ 
+<span class="a">+#ab-status a {</span>
+<span class="a">+  color: inherit;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#audiobook details {</span>
+<span class="a">+  font-size: 0.85rem;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#audiobook details label {</span>
+<span class="a">+  margin-top: 0.4rem;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ #audio {
+   width: 100%;
+ }
+diff --git a/test/cloud.test.ts b/test/cloud.test.ts
+new file mode 100644
+index 0000000..19d4b58
+--- /dev/null
++++ b/test/cloud.test.ts
+<span class="h">@@ -0,0 +1,155 @@</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  accountLine,</span>
+<span class="a">+  ApiError,</span>
+<span class="a">+  fetchSrt,</span>
+<span class="a">+  pollUntilDone,</span>
+<span class="a">+  startJob,</span>
+<span class="a">+  tokenFrom,</span>
+<span class="a">+  upload,</span>
+<span class="a">+  type Http,</span>
+<span class="a">+  type HttpRequest,</span>
+<span class="a">+  type JobOut,</span>
+<span class="a">+} from &#x27;../src/cloud&#x27;;</span>
+<span class="a">+import { parseSubtitles } from &#x27;../src/subtitles&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const job = (status: string, extra: Partial&lt;JobOut&gt; = {}): JobOut =&gt; ({</span>
+<span class="a">+  id: &#x27;job_1&#x27;,</span>
+<span class="a">+  status,</span>
+<span class="a">+  stage: status,</span>
+<span class="a">+  progress: 0,</span>
+<span class="a">+  language: &#x27;ja&#x27;,</span>
+<span class="a">+  error: null,</span>
+<span class="a">+  artifacts: [],</span>
+<span class="a">+  ...extra,</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+const json = (status: number, body: unknown) =&gt; ({ status, text: JSON.stringify(body) });</span>
+<span class="a">+</span>
+<span class="a">+/** A fake transport: one canned answer per call, in order, plus the log of requests. */</span>
+<span class="a">+function fakeHttp(answers: { status: number; text: string }[]): { http: Http; log: HttpRequest[] } {</span>
+<span class="a">+  const log: HttpRequest[] = [];</span>
+<span class="a">+  const http: Http = async (req) =&gt; {</span>
+<span class="a">+    log.push(req);</span>
+<span class="a">+    const next = answers.shift();</span>
+<span class="a">+    if (!next) throw new Error(`No canned answer for ${req.method} ${req.path}`);</span>
+<span class="a">+    return next;</span>
+<span class="a">+  };</span>
+<span class="a">+  return { http, log };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const noSleep = async (): Promise&lt;void&gt; =&gt; {};</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;pollUntilDone&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;polls queued, running, then returns the succeeded job&#x27;, async () =&gt; {</span>
+<span class="a">+    const { http, log } = fakeHttp([</span>
+<span class="a">+      json(200, job(&#x27;queued&#x27;)),</span>
+<span class="a">+      json(200, job(&#x27;running&#x27;, { progress: 0.5 })),</span>
+<span class="a">+      json(200, job(&#x27;succeeded&#x27;, { progress: 1 })),</span>
+<span class="a">+    ]);</span>
+<span class="a">+    const seen: string[] = [];</span>
+<span class="a">+    const done = await pollUntilDone(http, &#x27;job_1&#x27;, {</span>
+<span class="a">+      intervalMs: 5000,</span>
+<span class="a">+      sleep: noSleep,</span>
+<span class="a">+      onStatus: (j) =&gt; seen.push(j.status),</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(done.status).toBe(&#x27;succeeded&#x27;);</span>
+<span class="a">+    expect(seen).toEqual([&#x27;queued&#x27;, &#x27;running&#x27;, &#x27;succeeded&#x27;]);</span>
+<span class="a">+    expect(log.map((r) =&gt; r.path)).toEqual([</span>
+<span class="a">+      &#x27;/api/jobs/job_1&#x27;,</span>
+<span class="a">+      &#x27;/api/jobs/job_1&#x27;,</span>
+<span class="a">+      &#x27;/api/jobs/job_1&#x27;,</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;returns a failed job with its error&#x27;, async () =&gt; {</span>
+<span class="a">+    const { http } = fakeHttp([json(200, job(&#x27;failed&#x27;, { error: &#x27;No speech found.&#x27; }))]);</span>
+<span class="a">+    const done = await pollUntilDone(http, &#x27;job_1&#x27;, { intervalMs: 0, sleep: noSleep });</span>
+<span class="a">+    expect(done.status).toBe(&#x27;failed&#x27;);</span>
+<span class="a">+    expect(done.error).toBe(&#x27;No speech found.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;stops when the signal is aborted&#x27;, async () =&gt; {</span>
+<span class="a">+    const ctrl = new AbortController();</span>
+<span class="a">+    const { http } = fakeHttp([json(200, job(&#x27;running&#x27;))]);</span>
+<span class="a">+    await expect(</span>
+<span class="a">+      pollUntilDone(http, &#x27;job_1&#x27;, {</span>
+<span class="a">+        intervalMs: 0,</span>
+<span class="a">+        sleep: async () =&gt; ctrl.abort(),</span>
+<span class="a">+        signal: ctrl.signal,</span>
+<span class="a">+      }),</span>
+<span class="a">+    ).rejects.toMatchObject({ name: &#x27;AbortError&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;startJob&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;sends the language and returns the job&#x27;, async () =&gt; {</span>
+<span class="a">+    const { http, log } = fakeHttp([json(200, job(&#x27;queued&#x27;))]);</span>
+<span class="a">+    const out = await startJob(http, &#x27;job_1&#x27;, &#x27;ja&#x27;);</span>
+<span class="a">+    expect(out.status).toBe(&#x27;queued&#x27;);</span>
+<span class="a">+    expect(log[0]).toMatchObject({</span>
+<span class="a">+      method: &#x27;POST&#x27;,</span>
+<span class="a">+      path: &#x27;/api/jobs/job_1/start&#x27;,</span>
+<span class="a">+      json: { language: &#x27;ja&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;throws ApiError 402 with the server detail when there is no credit&#x27;, async () =&gt; {</span>
+<span class="a">+    const { http } = fakeHttp([json(402, { detail: &#x27;No credit left.&#x27; })]);</span>
+<span class="a">+    const err = await startJob(http, &#x27;job_1&#x27;, &#x27;ja&#x27;).catch((e: unknown) =&gt; e);</span>
+<span class="a">+    expect(err).toBeInstanceOf(ApiError);</span>
+<span class="a">+    expect((err as ApiError).status).toBe(402);</span>
+<span class="a">+    expect((err as ApiError).message).toBe(&#x27;No credit left.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;upload&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;posts both files in the `files` field&#x27;, async () =&gt; {</span>
+<span class="a">+    const audio = new File([&#x27;x&#x27;], &#x27;book.wav&#x27;, { type: &#x27;audio/wav&#x27; });</span>
+<span class="a">+    const book = new File([&#x27;a\n&#x27;], &#x27;book.txt&#x27;, { type: &#x27;text/plain&#x27; });</span>
+<span class="a">+    const { http, log } = fakeHttp([json(200, { job: job(&#x27;draft&#x27;), detected: {} })]);</span>
+<span class="a">+    const out = await upload(http, audio, book);</span>
+<span class="a">+    expect(out.id).toBe(&#x27;job_1&#x27;);</span>
+<span class="a">+    expect(log[0]?.files?.map((f) =&gt; f.name)).toEqual([&#x27;book.wav&#x27;, &#x27;book.txt&#x27;]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;fetchSrt&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;returns SRT that the subtitle parser reads&#x27;, async () =&gt; {</span>
+<span class="a">+    const srt = &#x27;1\n00:00:01,000 --&gt; 00:00:03,500\n朝の光\n\n&#x27;;</span>
+<span class="a">+    const { http } = fakeHttp([{ status: 200, text: srt }]);</span>
+<span class="a">+    const cues = parseSubtitles(await fetchSrt(http, &#x27;job_1&#x27;));</span>
+<span class="a">+    expect(cues).toEqual([{ start: 1, end: 3.5, text: &#x27;朝の光&#x27; }]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;tokenFrom&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;reads the token out of a sign-in link or takes the bare token&#x27;, () =&gt; {</span>
+<span class="a">+    expect(tokenFrom(&#x27;https://subread.space/?login=abc123&#x27;)).toBe(&#x27;abc123&#x27;);</span>
+<span class="a">+    expect(tokenFrom(&#x27;  abc123 \n&#x27;)).toBe(&#x27;abc123&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;accountLine&#x27;, () =&gt; {</span>
+<span class="a">+  const base = {</span>
+<span class="a">+    id: &#x27;acc&#x27;,</span>
+<span class="a">+    signed_in: false,</span>
+<span class="a">+    email: null,</span>
+<span class="a">+    credits: 1,</span>
+<span class="a">+    free_credits: 1,</span>
+<span class="a">+    cloud_allowed: true,</span>
+<span class="a">+    billing_enabled: true,</span>
+<span class="a">+    email_sign_in_available: true,</span>
+<span class="a">+  };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;shows the sign-in state and the credits&#x27;, () =&gt; {</span>
+<span class="a">+    expect(accountLine(base)).toBe(&#x27;Not signed in. Credits: 1 (1 free).&#x27;);</span>
+<span class="a">+    expect(accountLine({ ...base, signed_in: true, email: &#x27;a@b.c&#x27;, credits: 3 })).toBe(</span>
+<span class="a">+      &#x27;Signed in as a@b.c. Credits: 3 (1 free).&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;hides credits when billing is off&#x27;, () =&gt; {</span>
+<span class="a">+    expect(accountLine({ ...base, billing_enabled: false })).toBe(&#x27;Not signed in.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/http.test.ts b/test/http.test.ts
+new file mode 100644
+index 0000000..a58ae99
+--- /dev/null
++++ b/test/http.test.ts
+<span class="h">@@ -0,0 +1,41 @@</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { fileToBase64, formEntries } from &#x27;../src/http&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;formEntries&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;encodes each file as one base64 `files` part&#x27;, async () =&gt; {</span>
+<span class="a">+    const files = [</span>
+<span class="a">+      new File([new Uint8Array([0, 1, 2, 255])], &#x27;a.wav&#x27;, { type: &#x27;audio/wav&#x27; }),</span>
+<span class="a">+      new File([&#x27;hi\n&#x27;], &#x27;book.txt&#x27;, { type: &#x27;text/plain&#x27; }),</span>
+<span class="a">+    ];</span>
+<span class="a">+    const entries = await formEntries(files);</span>
+<span class="a">+    expect(entries).toEqual([</span>
+<span class="a">+      {</span>
+<span class="a">+        key: &#x27;files&#x27;,</span>
+<span class="a">+        value: &#x27;AAEC/w==&#x27;,</span>
+<span class="a">+        type: &#x27;base64File&#x27;,</span>
+<span class="a">+        contentType: &#x27;audio/wav&#x27;,</span>
+<span class="a">+        fileName: &#x27;a.wav&#x27;,</span>
+<span class="a">+      },</span>
+<span class="a">+      {</span>
+<span class="a">+        key: &#x27;files&#x27;,</span>
+<span class="a">+        value: &#x27;aGkK&#x27;,</span>
+<span class="a">+        type: &#x27;base64File&#x27;,</span>
+<span class="a">+        contentType: &#x27;text/plain&#x27;,</span>
+<span class="a">+        fileName: &#x27;book.txt&#x27;,</span>
+<span class="a">+      },</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;falls back to octet-stream for a file without a type&#x27;, async () =&gt; {</span>
+<span class="a">+    const [entry] = await formEntries([new File([&#x27;x&#x27;], &#x27;raw&#x27;)]);</span>
+<span class="a">+    expect(entry?.contentType).toBe(&#x27;application/octet-stream&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;fileToBase64&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;round trips bytes&#x27;, async () =&gt; {</span>
+<span class="a">+    const bytes = new Uint8Array(300).map((_, i) =&gt; i % 256);</span>
+<span class="a">+    const b64 = await fileToBase64(new Blob([bytes]));</span>
+<span class="a">+    expect(Uint8Array.from(atob(b64), (c) =&gt; c.charCodeAt(0))).toEqual(bytes);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

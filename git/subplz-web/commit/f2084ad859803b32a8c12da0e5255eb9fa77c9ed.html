@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web f2084ad8 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit f2084ad859803b32a8c12da0e5255eb9fa77c9ed
+equwal &lt;truex@equwal.com&gt;
+2026-09-26 21:58:49 -0700
+
+Copy the tables of every model module in the burst database copy
+
+The burst runbook runs python -m tools.copy_database in a new
+interpreter, once when burst mode goes on and once when it goes off.
+The tool imported only backend.db, so Base.metadata held only the
+tables of backend/db.py. The copy skipped caption_balances,
+subrep_licences and waitlist. After the switch, init_db made these
+tables again, empty, and each user lost the cloud caption hours that
+they paid for. A model table of a later module, for example
+play_purchases, had the same problem.
+
+The tool now imports backend.main. backend.main imports every model
+module, as the running app does, so the copy gets the same tables as
+init_db.
+
+The new test runs the command in a subprocess, because the test
+process imported backend.main already through tests/conftest.py.
+Without the fix, the test fails: the target has no caption_balances,
+subrep_licences or waitlist table.
+
+</pre><pre> tests/test_copy_database.py | 35 ++++++++++++++++++++++++++++++++++-
+ tools/copy_database.py      |  4 ++++
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/tests/test_copy_database.py b/tests/test_copy_database.py
+index bb70a67..2f39fc9 100644
+--- a/tests/test_copy_database.py
++++ b/tests/test_copy_database.py
+<span class="h">@@ -2,15 +2,21 @@</span>
+ 
+ from __future__ import annotations
+ 
+<span class="a">+import os</span>
+<span class="a">+import subprocess</span>
+<span class="a">+import sys</span>
+ from datetime import date, datetime, timedelta, timezone
+<span class="a">+from pathlib import Path</span>
+ 
+ import pytest
+ from hypothesis import HealthCheck, given, settings
+ from hypothesis import strategies as st
+<span class="d">-from sqlalchemy import create_engine, select</span>
+<span class="a">+from sqlalchemy import create_engine, inspect, select</span>
+ from sqlalchemy.orm import Session
+ 
+<span class="a">+from backend.captions import CaptionBalance</span>
+ from backend.db import Account, Artifact, Base, Job, JobStatus, Purchase
+<span class="a">+from backend.subrep import SubrepLicence, WaitlistEntry</span>
+ from tools.copy_database import copy_database
+ 
+ T0 = datetime(2026, 9, 22, tzinfo=timezone.utc)
+<span class="h">@@ -81,3 +87,30 @@ def test_the_copy_refuses_a_target_with_rows(tmp_path):</span>
+             s.commit()
+     with pytest.raises(RuntimeError, match=&quot;accounts&quot;):
+         copy_database(source, target)
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_command_copies_the_tables_of_every_model_module(tmp_path):</span>
+<span class="a">+    &quot;&quot;&quot;The burst runbook runs the tool in a new interpreter. There, only the</span>
+<span class="a">+    modules that the tool imports put their tables in Base.metadata. This test</span>
+<span class="a">+    process imported backend.main already (conftest), so only a subprocess</span>
+<span class="a">+    shows a model module that the tool does not import.&quot;&quot;&quot;</span>
+<span class="a">+    source, target = f&quot;sqlite:///{tmp_path / &#x27;source.db&#x27;}&quot;, f&quot;sqlite:///{tmp_path / &#x27;target.db&#x27;}&quot;</span>
+<span class="a">+    engine = create_engine(source)</span>
+<span class="a">+    Base.metadata.create_all(engine)</span>
+<span class="a">+    with Session(engine) as s:</span>
+<span class="a">+        s.add(Account(id=&quot;acct_1&quot;, device_token=&quot;dev_1&quot;, email=&quot;reader@example.com&quot;))</span>
+<span class="a">+        s.add(CaptionBalance(account_id=&quot;acct_1&quot;, seconds_left=20 * 3600, seconds_used=60))</span>
+<span class="a">+        s.add(SubrepLicence(account_id=&quot;acct_1&quot;, refresh_key=&quot;key_1&quot;, subscription_id=&quot;sub_1&quot;,</span>
+<span class="a">+                            status=&quot;active&quot;, plan_id=&quot;subrep_year&quot;, period_end=T0))</span>
+<span class="a">+        s.add(WaitlistEntry(kind=&quot;ios&quot;, email=&quot;reader@example.com&quot;, account_id=&quot;acct_1&quot;))</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+</span>
+<span class="a">+    env = {**os.environ, &quot;SUBPLZ_WEB_DATA_DIR&quot;: str(tmp_path)}</span>
+<span class="a">+    root = Path(__file__).resolve().parent.parent</span>
+<span class="a">+    out = subprocess.run([sys.executable, &quot;-m&quot;, &quot;tools.copy_database&quot;, source, target],</span>
+<span class="a">+                         cwd=root, env=env, capture_output=True, text=True, timeout=120,</span>
+<span class="a">+                         check=False)</span>
+<span class="a">+    assert out.returncode == 0, out.stderr</span>
+<span class="a">+</span>
+<span class="a">+    assert set(Base.metadata.tables) &lt;= set(inspect(create_engine(target)).get_table_names())</span>
+<span class="a">+    assert rows(target) == rows(source)</span>
+diff --git a/tools/copy_database.py b/tools/copy_database.py
+index b59be97..2ab5c3d 100644
+--- a/tools/copy_database.py
++++ b/tools/copy_database.py
+<span class="h">@@ -18,6 +18,10 @@ from datetime import datetime, timezone</span>
+ 
+ from sqlalchemy import DateTime, create_engine, func, insert, select
+ 
+<span class="a">+# The runbook runs this tool in a new interpreter. There, Base.metadata holds</span>
+<span class="a">+# only the tables of the modules that Python imported. backend.main imports</span>
+<span class="a">+# every model module, as the app does, so the copy gets every table.</span>
+<span class="a">+import backend.main  # noqa: F401</span>
+ from backend.db import Base
+ 
+ BATCH = 1000</pre>
+</div></body></html>

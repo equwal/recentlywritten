@@ -1,0 +1,1924 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync dc26d4e9 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit dc26d4e99c675e56200e7edf28dc918b8e341ea0
+equwal &lt;truex@equwal.com&gt;
+2026-09-25 02:15:58 -0700
+
+Follow RSS and Atom feeds on /feed, with sfeed
+
+An account can follow feeds. The list is one plain file, feeds.txt, one
+feed on each line: URL, tab, name. The command `sbm-sync feed` writes an
+sfeedrc from it and runs sfeed_update, which keeps the items of each feed
+in one sfeed(5) file. The page /feed shows the items newest first, can
+open links in a new tab, and has the settings. GET /api/feed gives the
+items in the sfeed format, so sfeed_plain and the other sfeed tools read
+them. GET /api/feeds gives feeds.txt.
+
+Explore: when the account asks for it, the job looks through the
+bookmarked pages for feeds with sfeed_web, 20 pages in each run, and the
+page offers what it found.
+
+Digest: when the account asks for it, the job sends the new items by
+email once a day, in the form of sfeed_plain. The first run after the
+opt-in only notes the items of that day.
+
+The job fetches only public hosts, so a feed URL cannot reach the
+services of the machine or its private networks. A feed URL is printable
+ASCII without single quotes, so it holds between the quotes of the
+sfeedrc. The job writes only its own files under feeds/&lt;account&gt;/, and
+the web server writes only feeds.txt and accounts.json.
+
+</pre><pre> feed.go         | 566 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ feed_test.go    | 378 +++++++++++++++++++++++++++++++++++++
+ feedjob.go      | 372 +++++++++++++++++++++++++++++++++++++
+ feedjob_test.go | 326 ++++++++++++++++++++++++++++++++
+ main.go         |  27 ++-
+ pages.html      |  60 +++++-
+ store.go        |  26 +--
+ 7 files changed, 1732 insertions(+), 23 deletions(-)
+</pre><pre>diff --git a/feed.go b/feed.go
+new file mode 100644
+index 0000000..3d8d537
+--- /dev/null
++++ b/feed.go
+<span class="h">@@ -0,0 +1,566 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+// Feeds. An account can follow RSS and Atom feeds. The list of an account</span>
+<span class="a">+// is one plain file, feeds.txt, with one feed on each line:</span>
+<span class="a">+//</span>
+<span class="a">+//	URL&lt;tab&gt;name</span>
+<span class="a">+//</span>
+<span class="a">+// The command `sbm-sync feed` (feedjob.go) fetches the feeds with</span>
+<span class="a">+// sfeed_update into one sfeed(5) file for each feed, looks through the</span>
+<span class="a">+// bookmarks of the account for feeds with sfeed_web when the account asked</span>
+<span class="a">+// for it, and sends a daily digest of the new items by email. The page /feed</span>
+<span class="a">+// shows the items, the feeds and the settings. GET /api/feed gives the items</span>
+<span class="a">+// in the sfeed format, for sfeed_plain and the other sfeed tools.</span>
+<span class="a">+//</span>
+<span class="a">+// The files of an account are under feeds/&lt;account ID&gt;/:</span>
+<span class="a">+//</span>
+<span class="a">+//	feeds.txt    the feeds, written by the web pages</span>
+<span class="a">+//	sfeedrc      the sfeed_update settings, made from feeds.txt by the job</span>
+<span class="a">+//	items/&lt;file&gt; the items of one feed, written by sfeed_update</span>
+<span class="a">+//	explore      the feeds found on the bookmarked pages, written by the job</span>
+<span class="a">+//	mailed       the keys of the items that went out in a digest</span>
+<span class="a">+//	digest       the time of the last digest</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;errors&quot;</span>
+<span class="a">+	&quot;io&quot;</span>
+<span class="a">+	&quot;io/fs&quot;</span>
+<span class="a">+	&quot;net/http&quot;</span>
+<span class="a">+	&quot;net/url&quot;</span>
+<span class="a">+	&quot;os&quot;</span>
+<span class="a">+	&quot;path/filepath&quot;</span>
+<span class="a">+	&quot;regexp&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strconv&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+const (</span>
+<span class="a">+	maxFeeds    = 200  // feeds that an account can follow</span>
+<span class="a">+	maxFeedURL  = 2048 // bytes in the URL of a feed</span>
+<span class="a">+	maxFeedName = 100  // characters in the name of a feed</span>
+<span class="a">+	maxFileName = 40   // characters in the file name of a feed, before a number</span>
+<span class="a">+	itemsOnPage = 100</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+var (</span>
+<span class="a">+	errFeedURL   = errors.New(&quot;the URL must start with http:// or https:// and have no spaces or quotes&quot;)</span>
+<span class="a">+	errFeedLong  = errors.New(&quot;the URL is longer than 2048 characters&quot;)</span>
+<span class="a">+	errFeedKnown = errors.New(&quot;you follow this feed already&quot;)</span>
+<span class="a">+	errFeedMany  = errors.New(&quot;you follow 200 feeds already, the most that this server keeps&quot;)</span>
+<span class="a">+	notFile      = regexp.MustCompile(`[^A-Za-z0-9._-]+`)</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// feedSettings are the feed choices of an account.</span>
+<span class="a">+type feedSettings struct {</span>
+<span class="a">+	NewTab  bool `json:&quot;newtab,omitempty&quot;`  // the feed page opens links in a new tab</span>
+<span class="a">+	Mail    bool `json:&quot;mail,omitempty&quot;`    // an email with the new items, once a day</span>
+<span class="a">+	Explore bool `json:&quot;explore,omitempty&quot;` // the job looks through the bookmarks for feeds</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Feed is one line of feeds.txt. File is the name of the item file of the</span>
+<span class="a">+// feed under items/, and the name that sfeed_update knows the feed by.</span>
+<span class="a">+type Feed struct {</span>
+<span class="a">+	URL, Name, File string</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedURL checks the URL of a feed. It takes only http and https addresses</span>
+<span class="a">+// of printable ASCII without quotes, so that the URL can go into the</span>
+<span class="a">+// sfeedrc, a shell script, between single quotes.</span>
+<span class="a">+func feedURL(raw string) (string, error) {</span>
+<span class="a">+	u := strings.TrimSpace(raw)</span>
+<span class="a">+	if u == &quot;&quot; {</span>
+<span class="a">+		return &quot;&quot;, errNoURL</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(u) &gt; maxFeedURL {</span>
+<span class="a">+		return &quot;&quot;, errFeedLong</span>
+<span class="a">+	}</span>
+<span class="a">+	for i := 0; i &lt; len(u); i++ {</span>
+<span class="a">+		if c := u[i]; c &lt;= &#x27; &#x27; || c &gt; &#x27;~&#x27; || c == &#x27;\&#x27;&#x27; {</span>
+<span class="a">+			return &quot;&quot;, errFeedURL</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	p, err := url.Parse(u)</span>
+<span class="a">+	if err != nil || p.Host == &quot;&quot; || (p.Scheme != &quot;http&quot; &amp;&amp; p.Scheme != &quot;https&quot;) {</span>
+<span class="a">+		return &quot;&quot;, errFeedURL</span>
+<span class="a">+	}</span>
+<span class="a">+	return u, nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedName gives the name of a feed for feeds.txt: one line of at most</span>
+<span class="a">+// maxFeedName characters. Without a name, the host of the URL is the name.</span>
+<span class="a">+func feedName(name, u string) string {</span>
+<span class="a">+	n := strings.Join(strings.Fields(name), &quot; &quot;)</span>
+<span class="a">+	if n == &quot;&quot; {</span>
+<span class="a">+		n = Bookmark{URL: u}.Host()</span>
+<span class="a">+	}</span>
+<span class="a">+	if r := []rune(n); len(r) &gt; maxFeedName {</span>
+<span class="a">+		n = string(r[:maxFeedName])</span>
+<span class="a">+	}</span>
+<span class="a">+	return n</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// fileName gives the base of the file name of a feed: the letters, digits,</span>
+<span class="a">+// dots, dashes and underscores of its name, or &quot;feed&quot;.</span>
+<span class="a">+func fileName(name string) string {</span>
+<span class="a">+	f := strings.Trim(notFile.ReplaceAllString(name, &quot;-&quot;), &quot;-.&quot;)</span>
+<span class="a">+	if len(f) &gt; maxFileName {</span>
+<span class="a">+		f = strings.Trim(f[:maxFileName], &quot;-.&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if f == &quot;&quot; {</span>
+<span class="a">+		return &quot;feed&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	return f</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// parseFeeds gives the feeds of feeds.txt, in the order of the file. Each</span>
+<span class="a">+// feed gets a file name that no other feed of the file has.</span>
+<span class="a">+func parseFeeds(text string) []Feed {</span>
+<span class="a">+	var out []Feed</span>
+<span class="a">+	used := map[string]bool{}</span>
+<span class="a">+	for _, l := range lines(text) {</span>
+<span class="a">+		u, name, _ := strings.Cut(l, &quot;\t&quot;)</span>
+<span class="a">+		if u == &quot;&quot; {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		f := Feed{URL: u, Name: name, File: fileName(name)}</span>
+<span class="a">+		for i := 2; used[f.File]; i++ {</span>
+<span class="a">+			f.File = fileName(name) + &quot;-&quot; + strconv.Itoa(i)</span>
+<span class="a">+		}</span>
+<span class="a">+		used[f.File] = true</span>
+<span class="a">+		out = append(out, f)</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Item is one line of an sfeed(5) file.</span>
+<span class="a">+type Item struct {</span>
+<span class="a">+	Time   time.Time // zero when the feed gives none</span>
+<span class="a">+	Title  string</span>
+<span class="a">+	Link   string // the address, or &quot;&quot; when it is not http or https</span>
+<span class="a">+	Author string</span>
+<span class="a">+	Feed   string // the name of the feed</span>
+<span class="a">+	File   string // the item file of the feed</span>
+<span class="a">+	Key    string // &quot;file&lt;tab&gt;id&quot; names the item in mailed; the link or the title stand in for a missing id</span>
+<span class="a">+	Raw    string // the line as sfeed wrote it</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// unescape undoes the escapes of the sfeed format: \t, \n and \\.</span>
+<span class="a">+func unescape(s string) string {</span>
+<span class="a">+	if !strings.Contains(s, `\`) {</span>
+<span class="a">+		return s</span>
+<span class="a">+	}</span>
+<span class="a">+	var b strings.Builder</span>
+<span class="a">+	for i := 0; i &lt; len(s); i++ {</span>
+<span class="a">+		if s[i] == &#x27;\\&#x27; &amp;&amp; i+1 &lt; len(s) {</span>
+<span class="a">+			switch s[i+1] {</span>
+<span class="a">+			case &#x27;t&#x27;:</span>
+<span class="a">+				b.WriteByte(&#x27;\t&#x27;)</span>
+<span class="a">+				i++</span>
+<span class="a">+				continue</span>
+<span class="a">+			case &#x27;n&#x27;:</span>
+<span class="a">+				b.WriteByte(&#x27;\n&#x27;)</span>
+<span class="a">+				i++</span>
+<span class="a">+				continue</span>
+<span class="a">+			case &#x27;\\&#x27;:</span>
+<span class="a">+				b.WriteByte(&#x27;\\&#x27;)</span>
+<span class="a">+				i++</span>
+<span class="a">+				continue</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		b.WriteByte(s[i])</span>
+<span class="a">+	}</span>
+<span class="a">+	return b.String()</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// parseItems gives the items of the sfeed file of a feed, in the order of</span>
+<span class="a">+// the file.</span>
+<span class="a">+func parseItems(text string, f Feed) []Item {</span>
+<span class="a">+	var out []Item</span>
+<span class="a">+	for _, l := range lines(text) {</span>
+<span class="a">+		c := strings.Split(l, &quot;\t&quot;)</span>
+<span class="a">+		if len(c) &lt; 3 {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		for len(c) &lt; 9 {</span>
+<span class="a">+			c = append(c, &quot;&quot;)</span>
+<span class="a">+		}</span>
+<span class="a">+		it := Item{Title: unescape(c[1]), Author: unescape(c[6]), Feed: f.Name, File: f.File, Raw: l}</span>
+<span class="a">+		if t, err := strconv.ParseInt(c[0], 10, 64); err == nil {</span>
+<span class="a">+			it.Time = time.Unix(t, 0).UTC()</span>
+<span class="a">+		}</span>
+<span class="a">+		link := unescape(c[2])</span>
+<span class="a">+		if link != &quot;&quot; {</span>
+<span class="a">+			it.Link = Bookmark{URL: link}.Link()</span>
+<span class="a">+		}</span>
+<span class="a">+		id := c[5]</span>
+<span class="a">+		if id == &quot;&quot; {</span>
+<span class="a">+			id = c[2]</span>
+<span class="a">+		}</span>
+<span class="a">+		if id == &quot;&quot; {</span>
+<span class="a">+			id = c[1]</span>
+<span class="a">+		}</span>
+<span class="a">+		it.Key = f.File + &quot;\t&quot; + id</span>
+<span class="a">+		if it.Title == &quot;&quot; {</span>
+<span class="a">+			it.Title = link</span>
+<span class="a">+		}</span>
+<span class="a">+		if it.Title == &quot;&quot; {</span>
+<span class="a">+			it.Title = &quot;(no title)&quot;</span>
+<span class="a">+		}</span>
+<span class="a">+		out = append(out, it)</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- the files of an account ----</span>
+<span class="a">+</span>
+<span class="a">+func (s *Store) feedDir(id string) string {</span>
+<span class="a">+	return filepath.Join(s.dir, &quot;feeds&quot;, id)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// readFeeds gives feeds.txt of the account. A missing file is empty.</span>
+<span class="a">+func (s *Store) readFeeds(a *Account) (string, error) {</span>
+<span class="a">+	m := s.lock(a.ID)</span>
+<span class="a">+	m.Lock()</span>
+<span class="a">+	defer m.Unlock()</span>
+<span class="a">+	b, err := os.ReadFile(filepath.Join(s.feedDir(a.ID), &quot;feeds.txt&quot;))</span>
+<span class="a">+	if errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		return &quot;&quot;, nil</span>
+<span class="a">+	}</span>
+<span class="a">+	return string(b), err</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// changeFeeds gives feeds.txt to f and writes what f gives back. No other</span>
+<span class="a">+// change to the file comes between the two.</span>
+<span class="a">+func (s *Store) changeFeeds(a *Account, f func(text string) (string, error)) error {</span>
+<span class="a">+	m := s.lock(a.ID)</span>
+<span class="a">+	m.Lock()</span>
+<span class="a">+	defer m.Unlock()</span>
+<span class="a">+	dir := s.feedDir(a.ID)</span>
+<span class="a">+	b, err := os.ReadFile(filepath.Join(dir, &quot;feeds.txt&quot;))</span>
+<span class="a">+	if err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	text, err := f(string(b))</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := os.MkdirAll(dir, 0o700); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	return writeFile(filepath.Join(dir, &quot;feeds.txt&quot;), []byte(text))</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func (s *Store) setFeed(a *Account, f feedSettings) error {</span>
+<span class="a">+	s.mu.Lock()</span>
+<span class="a">+	defer s.mu.Unlock()</span>
+<span class="a">+	a.Feed = f</span>
+<span class="a">+	return s.save()</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// all gives every account, oldest first.</span>
+<span class="a">+func (s *Store) all() []*Account {</span>
+<span class="a">+	s.mu.Lock()</span>
+<span class="a">+	defer s.mu.Unlock()</span>
+<span class="a">+	out := make([]*Account, 0, len(s.accounts))</span>
+<span class="a">+	for _, a := range s.accounts {</span>
+<span class="a">+		out = append(out, a)</span>
+<span class="a">+	}</span>
+<span class="a">+	slices.SortFunc(out, func(x, y *Account) int { return x.Created.Compare(y.Created) })</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedItems gives the items of the feeds of the account, newest first.</span>
+<span class="a">+// Items without a time come last.</span>
+<span class="a">+func (s *server) feedItems(a *Account, feeds []Feed) []Item {</span>
+<span class="a">+	var all []Item</span>
+<span class="a">+	for _, f := range feeds {</span>
+<span class="a">+		b, err := os.ReadFile(filepath.Join(s.store.feedDir(a.ID), &quot;items&quot;, f.File))</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			continue // not fetched yet</span>
+<span class="a">+		}</span>
+<span class="a">+		all = append(all, parseItems(string(b), f)...)</span>
+<span class="a">+	}</span>
+<span class="a">+	slices.SortStableFunc(all, func(x, y Item) int { return y.Time.Compare(x.Time) })</span>
+<span class="a">+	return all</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// suggestion is a feed that the job found on a bookmarked page.</span>
+<span class="a">+type suggestion struct {</span>
+<span class="a">+	URL, Page, Name string</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// suggestions gives the feeds of the explore file that the account does not</span>
+<span class="a">+// follow, the number of bookmarked pages that the job looked at, and the</span>
+<span class="a">+// number of bookmarks with a web address.</span>
+<span class="a">+func (s *server) suggestions(a *Account, feeds []Feed) ([]suggestion, int, int, error) {</span>
+<span class="a">+	text, _, err := s.store.read(a, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return nil, 0, 0, err</span>
+<span class="a">+	}</span>
+<span class="a">+	names := map[string]string{}</span>
+<span class="a">+	total := 0</span>
+<span class="a">+	for _, b := range parse(text) {</span>
+<span class="a">+		if l := b.Link(); l != &quot;&quot; {</span>
+<span class="a">+			names[l] = b.Desc</span>
+<span class="a">+			total++</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	b, err := os.ReadFile(filepath.Join(s.store.feedDir(a.ID), &quot;explore&quot;))</span>
+<span class="a">+	if err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		return nil, 0, 0, err</span>
+<span class="a">+	}</span>
+<span class="a">+	known := map[string]bool{}</span>
+<span class="a">+	for _, f := range feeds {</span>
+<span class="a">+		known[norm(f.URL)] = true</span>
+<span class="a">+	}</span>
+<span class="a">+	pages := map[string]bool{}</span>
+<span class="a">+	var out []suggestion</span>
+<span class="a">+	for _, l := range lines(string(b)) {</span>
+<span class="a">+		f := strings.Split(l, &quot;\t&quot;)</span>
+<span class="a">+		if len(f) &lt; 2 {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		if _, ok := names[f[0]]; ok {</span>
+<span class="a">+			pages[f[0]] = true // a page that is a bookmark still</span>
+<span class="a">+		}</span>
+<span class="a">+		if f[1] == &quot;-&quot; || known[norm(f[1])] {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		known[norm(f[1])] = true</span>
+<span class="a">+		out = append(out, suggestion{URL: f[1], Page: f[0], Name: feedName(names[f[0]], f[1])})</span>
+<span class="a">+	}</span>
+<span class="a">+	return out, len(pages), total, nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- pages ----</span>
+<span class="a">+</span>
+<span class="a">+// feedPage is the data of the feed page.</span>
+<span class="a">+type feedPage struct {</span>
+<span class="a">+	page</span>
+<span class="a">+	Feeds       []Feed</span>
+<span class="a">+	Items       []Item</span>
+<span class="a">+	Start, Next int    // the first item on the page, and the start of the next page, or 0</span>
+<span class="a">+	Total       int    // items that match</span>
+<span class="a">+	Filter      string // the file name of the one feed that the page shows, or &quot;&quot;</span>
+<span class="a">+	FilterName  string</span>
+<span class="a">+	Settings    feedSettings</span>
+<span class="a">+	HasMail     bool   // the server sends email, so the digest is a choice</span>
+<span class="a">+	Open        string // &quot;add&quot; when the form to follow a feed must be open</span>
+<span class="a">+	Form        struct{ URL, Name string }</span>
+<span class="a">+	Done        string</span>
+<span class="a">+	Suggestions []suggestion</span>
+<span class="a">+	Checked     int // bookmarked pages that the job looked at</span>
+<span class="a">+	Bookmarks   int // bookmarks with a web address</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+var feedDone = map[string]string{</span>
+<span class="a">+	&quot;added&quot;:    &quot;You follow the feed. Its items come with the next update, within 30 minutes.&quot;,</span>
+<span class="a">+	&quot;deleted&quot;:  &quot;You do not follow the feed any more.&quot;,</span>
+<span class="a">+	&quot;settings&quot;: &quot;Settings saved.&quot;,</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedData gives the feed page of the account: the items from start, or</span>
+<span class="a">+// only the items of the feed with the file name filter.</span>
+<span class="a">+func (s *server) feedData(a *Account, filter string, start int) (feedPage, error) {</span>
+<span class="a">+	p := feedPage{page: s.page(&quot;Your feed&quot;), Filter: filter, Start: start, HasMail: s.mail != nil,</span>
+<span class="a">+		Settings: s.store.view(a).Feed}</span>
+<span class="a">+	text, err := s.store.readFeeds(a)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return p, err</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Feeds = parseFeeds(text)</span>
+<span class="a">+	items := s.feedItems(a, p.Feeds)</span>
+<span class="a">+	if filter != &quot;&quot; {</span>
+<span class="a">+		items = slices.DeleteFunc(items, func(it Item) bool { return it.File != filter })</span>
+<span class="a">+		for _, f := range p.Feeds {</span>
+<span class="a">+			if f.File == filter {</span>
+<span class="a">+				p.FilterName = f.Name</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Total = len(items)</span>
+<span class="a">+	if start &gt; len(items) {</span>
+<span class="a">+		start = len(items)</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Items = items[start:min(start+itemsOnPage, len(items))]</span>
+<span class="a">+	if start+itemsOnPage &lt; len(items) {</span>
+<span class="a">+		p.Next = start + itemsOnPage</span>
+<span class="a">+	}</span>
+<span class="a">+	if p.Settings.Explore {</span>
+<span class="a">+		p.Suggestions, p.Checked, p.Bookmarks, err = s.suggestions(a, p.Feeds)</span>
+<span class="a">+	}</span>
+<span class="a">+	return p, err</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feed shows the items of the feeds of the account, newest first: from item</span>
+<span class="a">+// ?start=, and only the feed ?feed= when that is given.</span>
+<span class="a">+func (s *server) feed(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	q := r.URL.Query()</span>
+<span class="a">+	start, _ := strconv.Atoi(q.Get(&quot;start&quot;))</span>
+<span class="a">+	p, err := s.feedData(u, q.Get(&quot;feed&quot;), max(start, 0))</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Done = feedDone[q.Get(&quot;done&quot;)]</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;feed&quot;, p)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// followFeed adds the feed of the form to feeds.txt.</span>
+<span class="a">+func (s *server) followFeed(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, maxForm)</span>
+<span class="a">+	raw, name := r.PostFormValue(&quot;url&quot;), r.PostFormValue(&quot;name&quot;)</span>
+<span class="a">+	addr, err := feedURL(raw)</span>
+<span class="a">+	if err == nil {</span>
+<span class="a">+		err = s.store.changeFeeds(u, func(text string) (string, error) {</span>
+<span class="a">+			feeds := parseFeeds(text)</span>
+<span class="a">+			if len(feeds) &gt;= maxFeeds {</span>
+<span class="a">+				return &quot;&quot;, errFeedMany</span>
+<span class="a">+			}</span>
+<span class="a">+			for _, f := range feeds {</span>
+<span class="a">+				if norm(f.URL) == norm(addr) {</span>
+<span class="a">+					return &quot;&quot;, errFeedKnown</span>
+<span class="a">+				}</span>
+<span class="a">+			}</span>
+<span class="a">+			return join(append(lines(text), addr+&quot;\t&quot;+feedName(name, addr))), nil</span>
+<span class="a">+		})</span>
+<span class="a">+	}</span>
+<span class="a">+	status := http.StatusBadRequest</span>
+<span class="a">+	switch {</span>
+<span class="a">+	case err == nil:</span>
+<span class="a">+		http.Redirect(w, r, &quot;/feed?done=added&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return</span>
+<span class="a">+	case errors.Is(err, errFeedKnown):</span>
+<span class="a">+		status = http.StatusConflict</span>
+<span class="a">+	case errors.Is(err, errNoURL), errors.Is(err, errFeedURL), errors.Is(err, errFeedLong), errors.Is(err, errFeedMany):</span>
+<span class="a">+	default:</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	p, perr := s.feedData(u, &quot;&quot;, 0)</span>
+<span class="a">+	if perr != nil {</span>
+<span class="a">+		s.fail(w, perr)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Error, p.Open, p.Form.URL, p.Form.Name = sentence(err), &quot;add&quot;, raw, name</span>
+<span class="a">+	s.render(w, status, &quot;feed&quot;, p)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// unfollowFeed removes the feed with the URL of the form from feeds.txt.</span>
+<span class="a">+func (s *server) unfollowFeed(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, maxForm)</span>
+<span class="a">+	k := norm(strings.TrimSpace(r.PostFormValue(&quot;url&quot;)))</span>
+<span class="a">+	err := s.store.changeFeeds(u, func(text string) (string, error) {</span>
+<span class="a">+		var out []string</span>
+<span class="a">+		for _, l := range lines(text) {</span>
+<span class="a">+			if k == &quot;&quot; || key(l) != k {</span>
+<span class="a">+				out = append(out, l)</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		return join(out), nil</span>
+<span class="a">+	})</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, &quot;/feed?done=deleted&quot;, http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// saveFeedSettings takes the check boxes of the settings form.</span>
+<span class="a">+func (s *server) saveFeedSettings(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, maxForm)</span>
+<span class="a">+	f := feedSettings{</span>
+<span class="a">+		NewTab:  r.PostFormValue(&quot;newtab&quot;) != &quot;&quot;,</span>
+<span class="a">+		Mail:    s.mail != nil &amp;&amp; r.PostFormValue(&quot;mail&quot;) != &quot;&quot;,</span>
+<span class="a">+		Explore: r.PostFormValue(&quot;explore&quot;) != &quot;&quot;,</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := s.store.setFeed(u, f); err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, &quot;/feed?done=settings&quot;, http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- API ----</span>
+<span class="a">+</span>
+<span class="a">+// apiOwner gives the account of the token when it can use its bookmarks</span>
+<span class="a">+// and feeds: as for sync, its email is confirmed and sync is not paused.</span>
+<span class="a">+// Else apiOwner answers the request and gives nil.</span>
+<span class="a">+func (s *server) apiOwner(w http.ResponseWriter, r *http.Request) *Account {</span>
+<span class="a">+	u := s.apiUser(r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		http.Error(w, &quot;not signed in: sign in again&quot;, http.StatusUnauthorized)</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	if !s.verified(s.store.view(u)) {</span>
+<span class="a">+		http.Error(w, &quot;confirm your email address first: open the link in the email from sbm Sync, or see &quot;+s.site+&quot;/account&quot;, http.StatusForbidden)</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	if !s.active(s.store.view(u)) {</span>
+<span class="a">+		http.Error(w, &quot;sbm Sync is paused for this account: see &quot;+s.site+&quot;/account&quot;, http.StatusPaymentRequired)</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	return u</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// apiFeed gives the items of all feeds of the account in the sfeed format,</span>
+<span class="a">+// newest first, for the sfeed tools:</span>
+<span class="a">+//</span>
+<span class="a">+//	curl -H &quot;Authorization: Bearer $token&quot; https://sbmsync.com/api/feed | sfeed_plain</span>
+<span class="a">+func (s *server) apiFeed(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.apiOwner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, err := s.store.readFeeds(u)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	w.Header().Set(&quot;Content-Type&quot;, &quot;text/plain; charset=utf-8&quot;)</span>
+<span class="a">+	for _, it := range s.feedItems(u, parseFeeds(text)) {</span>
+<span class="a">+		io.WriteString(w, it.Raw+&quot;\n&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// apiFeeds gives feeds.txt: the feeds that the account follows.</span>
+<span class="a">+func (s *server) apiFeeds(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.apiOwner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, err := s.store.readFeeds(u)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	w.Header().Set(&quot;Content-Type&quot;, &quot;text/plain; charset=utf-8&quot;)</span>
+<span class="a">+	io.WriteString(w, text)</span>
+<span class="a">+}</span>
+diff --git a/feed_test.go b/feed_test.go
+new file mode 100644
+index 0000000..f28caf5
+--- /dev/null
++++ b/feed_test.go
+<span class="h">@@ -0,0 +1,378 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;fmt&quot;</span>
+<span class="a">+	&quot;net/http&quot;</span>
+<span class="a">+	&quot;net/url&quot;</span>
+<span class="a">+	&quot;os&quot;</span>
+<span class="a">+	&quot;path/filepath&quot;</span>
+<span class="a">+	&quot;regexp&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;testing&quot;</span>
+<span class="a">+</span>
+<span class="a">+	&quot;pgregory.net/rapid&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// setFeeds writes text as feeds.txt of the account of the token.</span>
+<span class="a">+func (e *harness) setFeeds(tok, text string) *Account {</span>
+<span class="a">+	a := e.s.store.byTok(tok)</span>
+<span class="a">+	if err := e.s.store.changeFeeds(a, func(string) (string, error) { return text, nil }); err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	return a</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// setItems writes an sfeed file for the feed with the file name.</span>
+<span class="a">+func (e *harness) setItems(a *Account, file, text string) {</span>
+<span class="a">+	dir := filepath.Join(e.s.store.feedDir(a.ID), &quot;items&quot;)</span>
+<span class="a">+	if err := os.MkdirAll(dir, 0o700); err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := os.WriteFile(filepath.Join(dir, file), []byte(text), 0o600); err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// itemTitles gives the titles of the items on the feed page, without the</span>
+<span class="a">+// lists of feeds and suggestions under them.</span>
+<span class="a">+func itemTitles(page string) []string {</span>
+<span class="a">+	head, _, _ := strings.Cut(page, &quot;&lt;h2&gt;&quot;)</span>
+<span class="a">+	return titles(head)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedsOf gives feeds.txt as the API gives it.</span>
+<span class="a">+func (e *harness) feedsOf(tok string) string {</span>
+<span class="a">+	code, body := e.api(&quot;GET&quot;, tok, &quot;/api/feeds&quot;, nil)</span>
+<span class="a">+	if code != http.StatusOK {</span>
+<span class="a">+		e.t.Fatalf(&quot;GET /api/feeds: %d %s&quot;, code, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	return body</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFeedPagesNeedSignIn(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c := e.browser()</span>
+<span class="a">+	if code, to, _ := e.get(c, &quot;/feed&quot;); code != http.StatusSeeOther || to != &quot;/login&quot; {</span>
+<span class="a">+		t.Errorf(&quot;GET /feed: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, path := range []string{&quot;/feed/add&quot;, &quot;/feed/delete&quot;, &quot;/feed/settings&quot;} {</span>
+<span class="a">+		if code, to, _ := e.send(c, path, url.Values{&quot;url&quot;: {&quot;https://a.org/rss.xml&quot;}}); code != http.StatusSeeOther || to != &quot;/login&quot; {</span>
+<span class="a">+			t.Errorf(&quot;POST %s: %d to %q&quot;, path, code, to)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, path := range []string{&quot;/api/feed&quot;, &quot;/api/feeds&quot;} {</span>
+<span class="a">+		if code, _ := e.api(&quot;GET&quot;, &quot;wrong&quot;, path, nil); code != http.StatusUnauthorized {</span>
+<span class="a">+			t.Errorf(&quot;GET %s with a bad token: %d&quot;, path, code)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFeedWaitsForTheEmailCheck(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	c := e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	tok := e.token(&quot;me@example.org&quot;)</span>
+<span class="a">+	if code, to, _ := e.get(c, &quot;/feed&quot;); code != http.StatusSeeOther || to != &quot;/account&quot; {</span>
+<span class="a">+		t.Errorf(&quot;feed before the check: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _ := e.api(&quot;GET&quot;, tok, &quot;/api/feed&quot;, nil); code != http.StatusForbidden {</span>
+<span class="a">+		t.Errorf(&quot;API before the check: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.open(e.link())</span>
+<span class="a">+	if code, _, _ := e.get(c, &quot;/feed&quot;); code != http.StatusOK {</span>
+<span class="a">+		t.Errorf(&quot;feed after the check: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _ := e.api(&quot;GET&quot;, tok, &quot;/api/feed&quot;, nil); code != http.StatusOK {</span>
+<span class="a">+		t.Errorf(&quot;API after the check: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFollowAndUnfollow(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	code, to, _ := e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {&quot; https://a.org/rss.xml &quot;}, &quot;name&quot;: {&quot; A\tfeed &quot;}})</span>
+<span class="a">+	if code != http.StatusSeeOther || to != &quot;/feed?done=added&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;follow: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.feedsOf(tok); got != &quot;https://a.org/rss.xml\tA feed\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;feeds.txt: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, to), &quot;You follow the feed.&quot;) {</span>
+<span class="a">+		t.Error(&quot;the page does not tell that the feed is followed&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	code, _, page := e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {&quot;http://www.A.org/rss.xml/&quot;}, &quot;name&quot;: {&quot;again&quot;}})</span>
+<span class="a">+	if code != http.StatusConflict || !strings.Contains(page, &quot;You follow this feed already.&quot;) || !strings.Contains(page, &quot;&lt;details open&gt;&quot;) || !strings.Contains(page, `value=&quot;again&quot;`) {</span>
+<span class="a">+		t.Errorf(&quot;follow the same feed: %d\n%s&quot;, code, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	// Without a name, the host is the name.</span>
+<span class="a">+	e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {&quot;https://b.org/atom&quot;}})</span>
+<span class="a">+	want := &quot;https://a.org/rss.xml\tA feed\nhttps://b.org/atom\tb.org\n&quot;</span>
+<span class="a">+	if got := e.feedsOf(tok); got != want {</span>
+<span class="a">+		t.Fatalf(&quot;feeds.txt: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, bad := range []string{&quot;javascript:alert(1)&quot;, &quot;https://a.org/it&#x27;s&quot;, &quot;https://a.org/x y&quot;, &quot;ftp://a.org/f&quot;, &quot;a.org/rss&quot;, &quot;&quot;, &quot;https://&quot; + strings.Repeat(&quot;a&quot;, 2100)} {</span>
+<span class="a">+		if code, _, _ := e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {bad}}); code != http.StatusBadRequest {</span>
+<span class="a">+			t.Errorf(&quot;follow %q: %d&quot;, bad, code)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.feedsOf(tok); got != want {</span>
+<span class="a">+		t.Fatalf(&quot;a refusal changed feeds.txt: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/feed/delete&quot;, url.Values{&quot;url&quot;: {&quot;https://A.org/rss.xml/&quot;}}); code != http.StatusSeeOther || to != &quot;/feed?done=deleted&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;unfollow: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.feedsOf(tok); got != &quot;https://b.org/atom\tb.org\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;feeds.txt after the unfollow: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFeedLimit(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	var b strings.Builder</span>
+<span class="a">+	for i := range maxFeeds {</span>
+<span class="a">+		fmt.Fprintf(&amp;b, &quot;https://f%d.org/rss\tF%d\n&quot;, i, i)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.setFeeds(tok, b.String())</span>
+<span class="a">+	if code, _, page := e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {&quot;https://one-more.org/rss&quot;}}); code != http.StatusBadRequest || !strings.Contains(page, &quot;200 feeds already&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;feed 201: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFeedTimeline(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\nhttps://b.org/feed\tBeta &amp; Co\n&quot;)</span>
+<span class="a">+	e.setItems(a, &quot;Alpha&quot;, &quot;1700000000\tOld \\t tab\thttps://a.org/1\t\t\tid1\tAnn\t\t\n1700003600\tNewer\thttps://a.org/2\t\t\t\t\t\t\n&quot;)</span>
+<span class="a">+	e.setItems(a, &quot;Beta-Co&quot;, &quot;1700001800\tScript &lt;b&gt;\tjavascript:alert(1)\t\t\tid3\t\t\t\n\tNo time\thttps://b.org/4\t\t\tid4\t\t\t\n&quot;)</span>
+<span class="a">+	page := e.body(c, &quot;/feed&quot;)</span>
+<span class="a">+	if got := itemTitles(page); !slices.Equal(got, []string{&quot;Newer&quot;, &quot;Script &amp;lt;b&amp;gt;&quot;, &quot;Old \t tab&quot;, &quot;No time&quot;}) {</span>
+<span class="a">+		t.Fatalf(&quot;titles: %q\n%s&quot;, got, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, want := range []string{`&lt;a href=&quot;https://a.org/2&quot;&gt;Newer&lt;/a&gt;`, &quot;Beta &amp;amp; Co&quot;, &quot; · Ann&quot;, &quot;2023-11-14 23:13&quot;, &quot;4 items.&quot;} {</span>
+<span class="a">+		if !strings.Contains(page, want) {</span>
+<span class="a">+			t.Errorf(&quot;the page lacks %q&quot;, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, bad := range []string{`href=&quot;javascript:`, `target=&quot;_blank&quot;`} {</span>
+<span class="a">+		if strings.Contains(page, bad) {</span>
+<span class="a">+			t.Errorf(&quot;the page has %q&quot;, bad)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	page = e.body(c, &quot;/feed?feed=Beta-Co&quot;)</span>
+<span class="a">+	if got := itemTitles(page); !slices.Equal(got, []string{&quot;Script &amp;lt;b&amp;gt;&quot;, &quot;No time&quot;}) || !strings.Contains(page, &quot;from &lt;b&gt;Beta &amp;amp; Co&lt;/b&gt;&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;one feed: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	if page := e.body(c, &quot;/feed?feed=nothing&quot;); !strings.Contains(page, &quot;0 items.&quot;) {</span>
+<span class="a">+		t.Error(&quot;an unknown feed shows items&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;newtab&quot;: {&quot;on&quot;}}); code != http.StatusSeeOther || to != &quot;/feed?done=settings&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;settings: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if page := e.body(c, &quot;/feed&quot;); !strings.Contains(page, `&lt;a href=&quot;https://a.org/2&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;Newer&lt;/a&gt;`) {</span>
+<span class="a">+		t.Error(&quot;links do not open in a new tab&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !e.s.store.view(a).Feed.NewTab {</span>
+<span class="a">+		t.Error(&quot;the setting is not kept&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{})</span>
+<span class="a">+	if page := e.body(c, &quot;/feed&quot;); strings.Contains(page, `target=&quot;_blank&quot;`) || e.s.store.view(a).Feed.NewTab {</span>
+<span class="a">+		t.Error(&quot;links still open in a new tab&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	code, body := e.api(&quot;GET&quot;, tok, &quot;/api/feed&quot;, nil)</span>
+<span class="a">+	want := &quot;1700003600\tNewer\thttps://a.org/2\t\t\t\t\t\t\n&quot; +</span>
+<span class="a">+		&quot;1700001800\tScript &lt;b&gt;\tjavascript:alert(1)\t\t\tid3\t\t\t\n&quot; +</span>
+<span class="a">+		&quot;1700000000\tOld \\t tab\thttps://a.org/1\t\t\tid1\tAnn\t\t\n&quot; +</span>
+<span class="a">+		&quot;\tNo time\thttps://b.org/4\t\t\tid4\t\t\t\n&quot;</span>
+<span class="a">+	if code != http.StatusOK || body != want {</span>
+<span class="a">+		t.Errorf(&quot;GET /api/feed: %d\n%q\nwant\n%q&quot;, code, body, want)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFeedPages(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)</span>
+<span class="a">+	var b strings.Builder</span>
+<span class="a">+	for i := range itemsOnPage + 5 {</span>
+<span class="a">+		fmt.Fprintf(&amp;b, &quot;%d\tn%d\thttps://a.org/%d\t\t\t\t\t\t\n&quot;, 1700000000+i, i, i)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.setItems(a, &quot;Alpha&quot;, b.String())</span>
+<span class="a">+	page := e.body(c, &quot;/feed&quot;)</span>
+<span class="a">+	if got := itemTitles(page); len(got) != itemsOnPage || got[0] != &quot;n104&quot; || !strings.Contains(page, `&lt;a href=&quot;/feed?start=100&quot;&gt;Older items&lt;/a&gt;`) {</span>
+<span class="a">+		t.Errorf(&quot;page 1: %d titles, first %q&quot;, len(got), got[0])</span>
+<span class="a">+	}</span>
+<span class="a">+	page = e.body(c, &quot;/feed?start=100&amp;feed=Alpha&quot;)</span>
+<span class="a">+	if got := itemTitles(page); !slices.Equal(got, []string{&quot;n4&quot;, &quot;n3&quot;, &quot;n2&quot;, &quot;n1&quot;, &quot;n0&quot;}) || strings.Contains(page, &quot;Older items&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;page 2: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFeedMailSettingNeedsAnSMTPServer(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.s.store.byTok(tok)</span>
+<span class="a">+	if strings.Contains(e.body(c, &quot;/feed&quot;), `name=&quot;mail&quot;`) {</span>
+<span class="a">+		t.Error(&quot;the page offers the digest without an SMTP server&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}, &quot;explore&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	if f := e.s.store.view(a).Feed; f.Mail || !f.Explore {</span>
+<span class="a">+		t.Errorf(&quot;settings without an SMTP server: %+v&quot;, f)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/feed&quot;), `name=&quot;mail&quot;`) {</span>
+<span class="a">+		t.Error(&quot;the page does not offer the digest&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	if f := e.s.store.view(a).Feed; !f.Mail || f.Explore {</span>
+<span class="a">+		t.Errorf(&quot;settings with an SMTP server: %+v&quot;, f)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestOtherSiteCannotChangeFeeds(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)</span>
+<span class="a">+	for _, path := range []string{&quot;/feed/add&quot;, &quot;/feed/delete&quot;, &quot;/feed/settings&quot;} {</span>
+<span class="a">+		req, _ := http.NewRequest(&quot;POST&quot;, e.web.URL+path, strings.NewReader(&quot;url=https%3A%2F%2Fa.org%2Frss.xml&amp;newtab=on&quot;))</span>
+<span class="a">+		req.Header.Set(&quot;Content-Type&quot;, &quot;application/x-www-form-urlencoded&quot;)</span>
+<span class="a">+		req.Header.Set(&quot;Origin&quot;, &quot;https://evil.example&quot;)</span>
+<span class="a">+		resp, err := c.Do(req)</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			t.Fatal(err)</span>
+<span class="a">+		}</span>
+<span class="a">+		resp.Body.Close()</span>
+<span class="a">+		if resp.StatusCode != http.StatusForbidden {</span>
+<span class="a">+			t.Errorf(&quot;POST %s from another site: %s&quot;, path, resp.Status)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.feedsOf(tok); got != &quot;https://a.org/rss.xml\tAlpha\n&quot; {</span>
+<span class="a">+		t.Errorf(&quot;another site changed the feeds: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestDeleteAccountRemovesTheFeeds(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)</span>
+<span class="a">+	if resp := e.post(c, &quot;/account/delete&quot;, url.Values{&quot;password&quot;: {&quot;password1&quot;}}); resp.StatusCode != http.StatusSeeOther {</span>
+<span class="a">+		t.Fatalf(&quot;delete: %s&quot;, resp.Status)</span>
+<span class="a">+	}</span>
+<span class="a">+	if _, err := os.Stat(e.s.store.feedDir(a.ID)); !os.IsNotExist(err) {</span>
+<span class="a">+		t.Errorf(&quot;the feeds of the account are still there: %v&quot;, err)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedURLs draws strings that are often feed URLs and often not.</span>
+<span class="a">+var feedURLs = rapid.Custom(func(t *rapid.T) string {</span>
+<span class="a">+	head := rapid.SampledFrom([]string{&quot;https://a.org/&quot;, &quot;http://b.org&quot;, &quot;HTTPS://c.org/x&quot;, &quot;https://&quot;, &quot;ftp://c.org/&quot;, &quot;javascript:&quot;, &quot;&quot;, &quot; https://d.org/&quot;}).Draw(t, &quot;head&quot;)</span>
+<span class="a">+	tail := rapid.StringOf(rapid.SampledFrom([]rune(&quot;abcz09:/.-_?=&amp;%#~&#x27;\&quot; \t\n\\日é\x01&quot;))).Draw(t, &quot;tail&quot;)</span>
+<span class="a">+	return head + tail</span>
+<span class="a">+})</span>
+<span class="a">+</span>
+<span class="a">+// A URL that feedURL takes has only printable ASCII without single quotes,</span>
+<span class="a">+// so that it holds between single quotes in the sfeedrc. Each such http or</span>
+<span class="a">+// https URL with a host is taken.</span>
+<span class="a">+func TestFeedURLIsShellSafe(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		raw := feedURLs.Draw(t, &quot;url&quot;)</span>
+<span class="a">+		u := strings.TrimSpace(raw)</span>
+<span class="a">+		safe := u != &quot;&quot; &amp;&amp; len(u) &lt;= maxFeedURL</span>
+<span class="a">+		for i := 0; i &lt; len(u); i++ {</span>
+<span class="a">+			if c := u[i]; c &lt;= &#x27; &#x27; || c &gt; &#x27;~&#x27; || c == &#x27;\&#x27;&#x27; {</span>
+<span class="a">+				safe = false</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		p, err := url.Parse(u)</span>
+<span class="a">+		want := safe &amp;&amp; err == nil &amp;&amp; p.Host != &quot;&quot; &amp;&amp; (p.Scheme == &quot;http&quot; || p.Scheme == &quot;https&quot;)</span>
+<span class="a">+		got, err := feedURL(raw)</span>
+<span class="a">+		if (err == nil) != want {</span>
+<span class="a">+			t.Fatalf(&quot;feedURL(%q) = %q, %v; want ok %v&quot;, raw, got, err, want)</span>
+<span class="a">+		}</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			return</span>
+<span class="a">+		}</span>
+<span class="a">+		if got != u {</span>
+<span class="a">+			t.Fatalf(&quot;feedURL(%q) = %q, want %q&quot;, raw, got, u)</span>
+<span class="a">+		}</span>
+<span class="a">+		rc := sfeedrc(&quot;/data/items&quot;, []Feed{{URL: got, Name: &quot;x&quot;, File: &quot;x&quot;}})</span>
+<span class="a">+		line := &quot;\tfeed &#x27;x&#x27; &#x27;&quot; + got + &quot;&#x27;\n&quot;</span>
+<span class="a">+		if !strings.Contains(rc, line) || strings.Count(line, &quot;&#x27;&quot;) != 4 {</span>
+<span class="a">+			t.Fatalf(&quot;sfeedrc for %q:\n%s&quot;, got, rc)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+var fileNames = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)</span>
+<span class="a">+</span>
+<span class="a">+// Each line of feeds.txt parses back, and each feed gets a safe file name</span>
+<span class="a">+// that no other feed of the file has.</span>
+<span class="a">+func TestFeedsParseBackWithUniqueFiles(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		var b strings.Builder</span>
+<span class="a">+		var want []Feed</span>
+<span class="a">+		for i := range rapid.IntRange(0, 6).Draw(t, &quot;feeds&quot;) {</span>
+<span class="a">+			u := fmt.Sprintf(&quot;https://f%d.org/rss&quot;, i)</span>
+<span class="a">+			name := feedName(rapid.StringOf(rapid.SampledFrom([]rune(&quot;aA0 -._/\t\n日&#x27;&quot;))).Draw(t, &quot;name&quot;), u)</span>
+<span class="a">+			if strings.ContainsAny(name, &quot;\t\n&quot;) || len([]rune(name)) &gt; maxFeedName {</span>
+<span class="a">+				t.Fatalf(&quot;feedName gave %q&quot;, name)</span>
+<span class="a">+			}</span>
+<span class="a">+			b.WriteString(u + &quot;\t&quot; + name + &quot;\n&quot;)</span>
+<span class="a">+			want = append(want, Feed{URL: u, Name: name})</span>
+<span class="a">+		}</span>
+<span class="a">+		got := parseFeeds(b.String())</span>
+<span class="a">+		if len(got) != len(want) {</span>
+<span class="a">+			t.Fatalf(&quot;%d feeds parsed, want %d&quot;, len(got), len(want))</span>
+<span class="a">+		}</span>
+<span class="a">+		files := map[string]bool{}</span>
+<span class="a">+		for i, f := range got {</span>
+<span class="a">+			if f.URL != want[i].URL || f.Name != want[i].Name {</span>
+<span class="a">+				t.Fatalf(&quot;feed %d is %+v, want %+v&quot;, i, f, want[i])</span>
+<span class="a">+			}</span>
+<span class="a">+			if !fileNames.MatchString(f.File) || files[f.File] || len(f.File) &gt; maxFileName+4 {</span>
+<span class="a">+				t.Fatalf(&quot;feed %d has the file name %q; files %v&quot;, i, f.File, files)</span>
+<span class="a">+			}</span>
+<span class="a">+			files[f.File] = true</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// escape is the escaping of the sfeed format, as a reference.</span>
+<span class="a">+func escape(s string) string {</span>
+<span class="a">+	return strings.NewReplacer(`\`, `\\`, &quot;\t&quot;, `\t`, &quot;\n&quot;, `\n`).Replace(s)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestUnescapeUndoesEscape(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		s := rapid.StringOf(rapid.SampledFrom([]rune(&quot;ab\\tn\t\n日&quot;))).Draw(t, &quot;text&quot;)</span>
+<span class="a">+		if got := unescape(escape(s)); got != s {</span>
+<span class="a">+			t.Fatalf(&quot;unescape(%q) = %q, want %q&quot;, escape(s), got, s)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestParseItems(t *testing.T) {</span>
+<span class="a">+	f := Feed{URL: &quot;https://a.org/rss&quot;, Name: &quot;A&quot;, File: &quot;A&quot;}</span>
+<span class="a">+	items := parseItems(&quot;1700000000\tT\\ta\\\\b\\n\thttps://a.org/1\tbody\thtml\tid1\tAnn\t\tcat\n&quot;+</span>
+<span class="a">+		&quot;x\t\thttps://a.org/2\t\t\t\t\t\n&quot;+</span>
+<span class="a">+		&quot;short\n&quot;+</span>
+<span class="a">+		&quot;1\t\t\t\t\t\t\t\t\n&quot;, f)</span>
+<span class="a">+	if len(items) != 3 {</span>
+<span class="a">+		t.Fatalf(&quot;%d items&quot;, len(items))</span>
+<span class="a">+	}</span>
+<span class="a">+	a, b, c := items[0], items[1], items[2]</span>
+<span class="a">+	if a.Title != &quot;T\ta\\b\n&quot; || a.Link != &quot;https://a.org/1&quot; || a.Author != &quot;Ann&quot; || a.Key != &quot;A\tid1&quot; || a.Time.Unix() != 1700000000 || a.Feed != &quot;A&quot; {</span>
+<span class="a">+		t.Errorf(&quot;item 1: %+v&quot;, a)</span>
+<span class="a">+	}</span>
+<span class="a">+	// Without a time, an id or a title: the time is zero, the link stands in</span>
+<span class="a">+	// for the id, and the title comes from the link.</span>
+<span class="a">+	if !b.Time.IsZero() || b.Key != &quot;A\thttps://a.org/2&quot; || b.Title != &quot;https://a.org/2&quot; {</span>
+<span class="a">+		t.Errorf(&quot;item 2: %+v&quot;, b)</span>
+<span class="a">+	}</span>
+<span class="a">+	if c.Title != &quot;(no title)&quot; || c.Key != &quot;A\t&quot; || c.Link != &quot;&quot; {</span>
+<span class="a">+		t.Errorf(&quot;item 3: %+v&quot;, c)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+diff --git a/feedjob.go b/feedjob.go
+new file mode 100644
+index 0000000..cc56e78
+--- /dev/null
++++ b/feedjob.go
+<span class="h">@@ -0,0 +1,372 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+// The feed job: `sbm-sync feed`. A systemd timer runs it every 30 minutes</span>
+<span class="a">+// (contrib/sbm-feed.timer). For each account it:</span>
+<span class="a">+//</span>
+<span class="a">+//  1. writes an sfeedrc from feeds.txt and runs sfeed_update, which fetches</span>
+<span class="a">+//     each feed and merges the new items into items/&lt;file&gt;;</span>
+<span class="a">+//  2. when the account asked for it, looks through the bookmarks of the</span>
+<span class="a">+//     account for feeds with sfeed_web, and keeps what it found in explore;</span>
+<span class="a">+//  3. when the account asked for it, sends the items that are new since the</span>
+<span class="a">+//     last digest by email, once a day, in the form of sfeed_plain.</span>
+<span class="a">+//</span>
+<span class="a">+// The job writes only its own files under feeds/&lt;account&gt;/. The web server</span>
+<span class="a">+// writes only feeds.txt and accounts.json. So the two never write the same</span>
+<span class="a">+// file.</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;context&quot;</span>
+<span class="a">+	&quot;errors&quot;</span>
+<span class="a">+	&quot;fmt&quot;</span>
+<span class="a">+	&quot;io/fs&quot;</span>
+<span class="a">+	&quot;log&quot;</span>
+<span class="a">+	&quot;net&quot;</span>
+<span class="a">+	&quot;net/url&quot;</span>
+<span class="a">+	&quot;os&quot;</span>
+<span class="a">+	&quot;os/exec&quot;</span>
+<span class="a">+	&quot;path/filepath&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strconv&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+const (</span>
+<span class="a">+	digestEvery  = 24 * time.Hour</span>
+<span class="a">+	crawlPerRun  = 20 // bookmarked pages that explore looks at in one run</span>
+<span class="a">+	feedsPerPage = 5  // feeds that explore keeps from one page</span>
+<span class="a">+	updateTime   = 10 * time.Minute</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// feedTools are the programs and the clock that the job uses. Tests</span>
+<span class="a">+// replace them.</span>
+<span class="a">+type feedTools struct {</span>
+<span class="a">+	update   func(sfeedrc string) error           // runs sfeed_update</span>
+<span class="a">+	plain    func(files []string) (string, error) // runs sfeed_plain on sfeed files</span>
+<span class="a">+	discover func(page string) ([]string, error)  // gives &quot;URL&lt;tab&gt;type&quot; for each feed of a page, as curl | sfeed_web</span>
+<span class="a">+	lookup   func(host string) ([]net.IP, error)  // resolves a host name</span>
+<span class="a">+	now      func() time.Time</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// execTools gives the tools that run the programs.</span>
+<span class="a">+func execTools() feedTools {</span>
+<span class="a">+	return feedTools{</span>
+<span class="a">+		update: func(sfeedrc string) error {</span>
+<span class="a">+			ctx, cancel := context.WithTimeout(context.Background(), updateTime)</span>
+<span class="a">+			defer cancel()</span>
+<span class="a">+			out, err := exec.CommandContext(ctx, &quot;sfeed_update&quot;, sfeedrc).CombinedOutput()</span>
+<span class="a">+			for _, l := range lines(string(out)) {</span>
+<span class="a">+				log.Print(l)</span>
+<span class="a">+			}</span>
+<span class="a">+			return err</span>
+<span class="a">+		},</span>
+<span class="a">+		plain: func(files []string) (string, error) {</span>
+<span class="a">+			out, err := exec.Command(&quot;sfeed_plain&quot;, files...).Output()</span>
+<span class="a">+			return string(out), err</span>
+<span class="a">+		},</span>
+<span class="a">+		discover: func(page string) ([]string, error) {</span>
+<span class="a">+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)</span>
+<span class="a">+			defer cancel()</span>
+<span class="a">+			curl := exec.CommandContext(ctx, &quot;curl&quot;, &quot;-sfL&quot;, &quot;--proto&quot;, &quot;=http,https&quot;, &quot;--max-redirs&quot;, &quot;3&quot;,</span>
+<span class="a">+				&quot;-m&quot;, &quot;10&quot;, &quot;--max-filesize&quot;, &quot;1048576&quot;, &quot;-A&quot;, &quot;sbm-sync (+https://github.com/equwal/sbm-sync)&quot;, page)</span>
+<span class="a">+			web := exec.CommandContext(ctx, &quot;sfeed_web&quot;, page)</span>
+<span class="a">+			pipe, err := curl.StdoutPipe()</span>
+<span class="a">+			if err != nil {</span>
+<span class="a">+				return nil, err</span>
+<span class="a">+			}</span>
+<span class="a">+			web.Stdin = pipe</span>
+<span class="a">+			if err := curl.Start(); err != nil {</span>
+<span class="a">+				return nil, err</span>
+<span class="a">+			}</span>
+<span class="a">+			out, err := web.Output()</span>
+<span class="a">+			curl.Wait() // a page that does not load gives no feeds</span>
+<span class="a">+			if err != nil {</span>
+<span class="a">+				return nil, err</span>
+<span class="a">+			}</span>
+<span class="a">+			return lines(string(out)), nil</span>
+<span class="a">+		},</span>
+<span class="a">+		lookup: net.LookupIP,</span>
+<span class="a">+		now:    time.Now,</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// runFeeds does the work of the job for every account.</span>
+<span class="a">+func (s *server) runFeeds() {</span>
+<span class="a">+	accounts := s.store.all()</span>
+<span class="a">+	for _, a := range accounts {</span>
+<span class="a">+		if err := s.feedAccount(a); err != nil {</span>
+<span class="a">+			log.Printf(&quot;account %s: %v&quot;, a.ID, err)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	log.Printf(&quot;feeds of %d accounts done&quot;, len(accounts))</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// sfeedrc gives the sfeed_update settings for the feeds: the item files go</span>
+<span class="a">+// to itemsDir. Each URL passed feedURL, and each file name has only safe</span>
+<span class="a">+// characters, so the single quotes hold.</span>
+<span class="a">+func sfeedrc(itemsDir string, feeds []Feed) string {</span>
+<span class="a">+	var b strings.Builder</span>
+<span class="a">+	b.WriteString(&quot;# sbm-sync makes this file from feeds.txt. Do not edit it.\n&quot;)</span>
+<span class="a">+	b.WriteString(&quot;sfeedpath=&#x27;&quot; + itemsDir + &quot;&#x27;\n&quot;)</span>
+<span class="a">+	b.WriteString(&quot;maxjobs=4\n&quot;)</span>
+<span class="a">+	b.WriteString(&quot;fetch() {\n\tcurl --proto &#x27;=http,https&#x27; -L --max-redirs 3 -A &#x27;sbm-sync (+https://github.com/equwal/sbm-sync)&#x27; -f -s -m 20 --max-filesize 5242880 -z \&quot;$3\&quot; \&quot;$2\&quot; 2&gt;/dev/null\n}\n&quot;)</span>
+<span class="a">+	b.WriteString(&quot;feeds() {\n&quot;)</span>
+<span class="a">+	for _, f := range feeds {</span>
+<span class="a">+		b.WriteString(&quot;\tfeed &#x27;&quot; + f.File + &quot;&#x27; &#x27;&quot; + f.URL + &quot;&#x27;\n&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	b.WriteString(&quot;}\n&quot;)</span>
+<span class="a">+	return b.String()</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// publicIP tells if an address is on the public internet.</span>
+<span class="a">+func publicIP(ip net.IP) bool {</span>
+<span class="a">+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {</span>
+<span class="a">+		return false</span>
+<span class="a">+	}</span>
+<span class="a">+	// 100.64.0.0/10 is for carrier networks, as private as 10.0.0.0/8.</span>
+<span class="a">+	if v4 := ip.To4(); v4 != nil &amp;&amp; v4[0] == 100 &amp;&amp; v4[1]&amp;0xc0 == 64 {</span>
+<span class="a">+		return false</span>
+<span class="a">+	}</span>
+<span class="a">+	return true</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// public tells if the host of the URL is on the public internet. The job</span>
+<span class="a">+// fetches only such hosts, so that a feed URL cannot reach the services on</span>
+<span class="a">+// this machine or in its private networks. cache keeps the answers of one</span>
+<span class="a">+// run.</span>
+<span class="a">+func (s *server) public(rawURL string, cache map[string]bool) bool {</span>
+<span class="a">+	p, err := url.Parse(rawURL)</span>
+<span class="a">+	if err != nil || p.Hostname() == &quot;&quot; {</span>
+<span class="a">+		return false</span>
+<span class="a">+	}</span>
+<span class="a">+	host := p.Hostname()</span>
+<span class="a">+	if ok, seen := cache[host]; seen {</span>
+<span class="a">+		return ok</span>
+<span class="a">+	}</span>
+<span class="a">+	var ips []net.IP</span>
+<span class="a">+	if ip := net.ParseIP(host); ip != nil {</span>
+<span class="a">+		ips = []net.IP{ip}</span>
+<span class="a">+	} else if r, err := s.feeds.lookup(host); err == nil {</span>
+<span class="a">+		ips = r</span>
+<span class="a">+	}</span>
+<span class="a">+	ok := len(ips) &gt; 0</span>
+<span class="a">+	for _, ip := range ips {</span>
+<span class="a">+		if !publicIP(ip) {</span>
+<span class="a">+			ok = false</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	cache[host] = ok</span>
+<span class="a">+	return ok</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedAccount does the work of the job for one account.</span>
+<span class="a">+func (s *server) feedAccount(p *Account) error {</span>
+<span class="a">+	a := s.store.view(p)</span>
+<span class="a">+	dir := s.store.feedDir(a.ID)</span>
+<span class="a">+	itemsDir := filepath.Join(dir, &quot;items&quot;)</span>
+<span class="a">+	text, err := s.store.readFeeds(p)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	cache := map[string]bool{}</span>
+<span class="a">+	var feeds []Feed</span>
+<span class="a">+	for _, f := range parseFeeds(text) {</span>
+<span class="a">+		if _, err := feedURL(f.URL); err != nil || !s.public(f.URL, cache) {</span>
+<span class="a">+			log.Printf(&quot;account %s: feed %s: not a public http address, skipped&quot;, a.ID, f.URL)</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		feeds = append(feeds, f)</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(feeds) == 0 &amp;&amp; !a.Feed.Explore &amp;&amp; !a.Feed.Mail {</span>
+<span class="a">+		if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+			return nil // the account never used feeds</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := os.MkdirAll(itemsDir, 0o700); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	rcPath := filepath.Join(dir, &quot;sfeedrc&quot;)</span>
+<span class="a">+	if len(feeds) &gt; 0 {</span>
+<span class="a">+		rc := sfeedrc(itemsDir, feeds)</span>
+<span class="a">+		if old, _ := os.ReadFile(rcPath); string(old) != rc {</span>
+<span class="a">+			if err := writeFile(rcPath, []byte(rc)); err != nil {</span>
+<span class="a">+				return err</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		if err := s.feeds.update(rcPath); err != nil {</span>
+<span class="a">+			log.Printf(&quot;account %s: sfeed_update: %v&quot;, a.ID, err)</span>
+<span class="a">+		}</span>
+<span class="a">+	} else {</span>
+<span class="a">+		os.Remove(rcPath)</span>
+<span class="a">+	}</span>
+<span class="a">+	// The items of feeds that the account left go.</span>
+<span class="a">+	keep := map[string]bool{}</span>
+<span class="a">+	for _, f := range feeds {</span>
+<span class="a">+		keep[f.File] = true</span>
+<span class="a">+	}</span>
+<span class="a">+	entries, err := os.ReadDir(itemsDir)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, e := range entries {</span>
+<span class="a">+		if !keep[e.Name()] {</span>
+<span class="a">+			os.Remove(filepath.Join(itemsDir, e.Name()))</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if a.Feed.Explore {</span>
+<span class="a">+		if err := s.explore(p, dir, cache); err != nil {</span>
+<span class="a">+			log.Printf(&quot;account %s: explore: %v&quot;, a.ID, err)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if !a.Feed.Mail {</span>
+<span class="a">+		os.Remove(filepath.Join(dir, &quot;mailed&quot;))</span>
+<span class="a">+		os.Remove(filepath.Join(dir, &quot;digest&quot;))</span>
+<span class="a">+	} else if s.mail != nil &amp;&amp; s.verified(a) &amp;&amp; s.active(a) {</span>
+<span class="a">+		if err := s.digest(a, dir, feeds); err != nil {</span>
+<span class="a">+			log.Printf(&quot;account %s: digest: %v&quot;, a.ID, err)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// explore looks at up to crawlPerRun bookmarked pages that it did not look</span>
+<span class="a">+// at before, newest first, and adds the feeds that it finds to the explore</span>
+<span class="a">+// file. A page without a feed, or one that the job cannot fetch, gets a</span>
+<span class="a">+// line with &quot;-&quot;, so that the job does not look at it again.</span>
+<span class="a">+func (s *server) explore(p *Account, dir string, cache map[string]bool) error {</span>
+<span class="a">+	text, _, err := s.store.read(p, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	path := filepath.Join(dir, &quot;explore&quot;)</span>
+<span class="a">+	old, err := os.ReadFile(path)</span>
+<span class="a">+	if err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	seen := map[string]bool{}</span>
+<span class="a">+	for _, l := range lines(string(old)) {</span>
+<span class="a">+		page, _, _ := strings.Cut(l, &quot;\t&quot;)</span>
+<span class="a">+		seen[page] = true</span>
+<span class="a">+	}</span>
+<span class="a">+	var add []string</span>
+<span class="a">+	n := 0</span>
+<span class="a">+	for _, b := range slices.Backward(parse(text)) {</span>
+<span class="a">+		if n &gt;= crawlPerRun {</span>
+<span class="a">+			break</span>
+<span class="a">+		}</span>
+<span class="a">+		link := b.Link()</span>
+<span class="a">+		if link == &quot;&quot; || seen[link] {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		seen[link] = true</span>
+<span class="a">+		if _, err := feedURL(link); err != nil || !s.public(link, cache) {</span>
+<span class="a">+			add = append(add, link+&quot;\t-\t&quot;)</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		n++</span>
+<span class="a">+		found, err := s.feeds.discover(link)</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			log.Printf(&quot;account %s: explore %s: %v&quot;, p.ID, link, err)</span>
+<span class="a">+		}</span>
+<span class="a">+		kept := 0</span>
+<span class="a">+		for _, f := range found {</span>
+<span class="a">+			u, typ, _ := strings.Cut(f, &quot;\t&quot;)</span>
+<span class="a">+			if _, err := feedURL(u); err != nil || kept &gt;= feedsPerPage {</span>
+<span class="a">+				continue</span>
+<span class="a">+			}</span>
+<span class="a">+			add = append(add, link+&quot;\t&quot;+u+&quot;\t&quot;+typ)</span>
+<span class="a">+			kept++</span>
+<span class="a">+		}</span>
+<span class="a">+		if kept == 0 {</span>
+<span class="a">+			add = append(add, link+&quot;\t-\t&quot;)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(add) == 0 {</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	return writeFile(path, []byte(string(old)+join(add)))</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// digest sends the items that came in since the last digest, once a day.</span>
+<span class="a">+// The first run after the opt-in sends nothing: it only notes the items of</span>
+<span class="a">+// that day, so that nobody gets the whole history.</span>
+<span class="a">+func (s *server) digest(a Account, dir string, feeds []Feed) error {</span>
+<span class="a">+	mailedPath, digestPath := filepath.Join(dir, &quot;mailed&quot;), filepath.Join(dir, &quot;digest&quot;)</span>
+<span class="a">+	now := s.feeds.now()</span>
+<span class="a">+	stamp := []byte(strconv.FormatInt(now.Unix(), 10) + &quot;\n&quot;)</span>
+<span class="a">+	type feedItems struct {</span>
+<span class="a">+		f     Feed</span>
+<span class="a">+		items []Item</span>
+<span class="a">+	}</span>
+<span class="a">+	var all []feedItems</span>
+<span class="a">+	var keys []string</span>
+<span class="a">+	for _, f := range feeds {</span>
+<span class="a">+		b, err := os.ReadFile(filepath.Join(dir, &quot;items&quot;, f.File))</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		items := parseItems(string(b), f)</span>
+<span class="a">+		all = append(all, feedItems{f, items})</span>
+<span class="a">+		for _, it := range items {</span>
+<span class="a">+			keys = append(keys, it.Key)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	old, err := os.ReadFile(mailedPath)</span>
+<span class="a">+	if errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		if err := writeFile(mailedPath, []byte(join(keys))); err != nil {</span>
+<span class="a">+			return err</span>
+<span class="a">+		}</span>
+<span class="a">+		return writeFile(digestPath, stamp)</span>
+<span class="a">+	} else if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	b, _ := os.ReadFile(digestPath)</span>
+<span class="a">+	last, _ := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)</span>
+<span class="a">+	if now.Sub(time.Unix(last, 0)) &lt; digestEvery {</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	mailed := set(lines(string(old)))</span>
+<span class="a">+	tmp, err := os.MkdirTemp(&quot;&quot;, &quot;sbm-digest-&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	defer os.RemoveAll(tmp)</span>
+<span class="a">+	var files, newKeys []string</span>
+<span class="a">+	for _, fi := range all {</span>
+<span class="a">+		var ls []string</span>
+<span class="a">+		for _, it := range fi.items {</span>
+<span class="a">+			if !mailed[it.Key] {</span>
+<span class="a">+				ls = append(ls, it.Raw)</span>
+<span class="a">+				newKeys = append(newKeys, it.Key)</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		if len(ls) == 0 {</span>
+<span class="a">+			continue</span>
+<span class="a">+		}</span>
+<span class="a">+		path := filepath.Join(tmp, fi.f.File)</span>
+<span class="a">+		if err := os.WriteFile(path, []byte(join(ls)), 0o600); err != nil {</span>
+<span class="a">+			return err</span>
+<span class="a">+		}</span>
+<span class="a">+		files = append(files, path)</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(newKeys) == 0 {</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	body, err := s.feeds.plain(files)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	subject := fmt.Sprintf(&quot;sbm feed: %d new items&quot;, len(newKeys))</span>
+<span class="a">+	if len(newKeys) == 1 {</span>
+<span class="a">+		subject = &quot;sbm feed: 1 new item&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	body = strings.TrimRight(body, &quot;\n&quot;) + &quot;\n\nYour feed: &quot; + s.site + &quot;/feed\n&quot; +</span>
+<span class="a">+		&quot;To stop these emails, turn off the daily digest in the settings of that page.\n&quot;</span>
+<span class="a">+	if err := s.mail(a.Email, subject, body); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := writeFile(mailedPath, []byte(string(old)+join(newKeys))); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	return writeFile(digestPath, stamp)</span>
+<span class="a">+}</span>
+diff --git a/feedjob_test.go b/feedjob_test.go
+new file mode 100644
+index 0000000..c5bcf22
+--- /dev/null
++++ b/feedjob_test.go
+<span class="h">@@ -0,0 +1,326 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;errors&quot;</span>
+<span class="a">+	&quot;fmt&quot;</span>
+<span class="a">+	&quot;net&quot;</span>
+<span class="a">+	&quot;net/url&quot;</span>
+<span class="a">+	&quot;os&quot;</span>
+<span class="a">+	&quot;path/filepath&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;testing&quot;</span>
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// fakeTools are feed tools that need no sfeed: &quot;sfeed_update&quot; writes the</span>
+<span class="a">+// items of a table, and &quot;sfeed_web&quot; answers from a table.</span>
+<span class="a">+type fakeTools struct {</span>
+<span class="a">+	items   map[string]string   // feed URL: the sfeed lines of the feed</span>
+<span class="a">+	pages   map[string][]string // page URL: the &quot;URL&lt;tab&gt;type&quot; lines that sfeed_web finds</span>
+<span class="a">+	updates []string            // the sfeedrc of each update</span>
+<span class="a">+	crawled []string            // the pages given to discover</span>
+<span class="a">+	plain   int                 // calls of plain</span>
+<span class="a">+	now     time.Time</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func (f *fakeTools) tools() feedTools {</span>
+<span class="a">+	return feedTools{</span>
+<span class="a">+		update: func(rc string) error {</span>
+<span class="a">+			f.updates = append(f.updates, rc)</span>
+<span class="a">+			b, err := os.ReadFile(rc)</span>
+<span class="a">+			if err != nil {</span>
+<span class="a">+				return err</span>
+<span class="a">+			}</span>
+<span class="a">+			dir := &quot;&quot;</span>
+<span class="a">+			for _, l := range lines(string(b)) {</span>
+<span class="a">+				if v, ok := strings.CutPrefix(l, &quot;sfeedpath=&#x27;&quot;); ok {</span>
+<span class="a">+					dir = strings.TrimSuffix(v, &quot;&#x27;&quot;)</span>
+<span class="a">+				}</span>
+<span class="a">+				if v, ok := strings.CutPrefix(l, &quot;\tfeed &#x27;&quot;); ok {</span>
+<span class="a">+					file, u, _ := strings.Cut(strings.TrimSuffix(v, &quot;&#x27;&quot;), &quot;&#x27; &#x27;&quot;)</span>
+<span class="a">+					if err := os.WriteFile(filepath.Join(dir, file), []byte(f.items[u]), 0o600); err != nil {</span>
+<span class="a">+						return err</span>
+<span class="a">+					}</span>
+<span class="a">+				}</span>
+<span class="a">+			}</span>
+<span class="a">+			return nil</span>
+<span class="a">+		},</span>
+<span class="a">+		plain: func(files []string) (string, error) {</span>
+<span class="a">+			f.plain++</span>
+<span class="a">+			var b strings.Builder</span>
+<span class="a">+			for _, path := range files {</span>
+<span class="a">+				text, err := os.ReadFile(path)</span>
+<span class="a">+				if err != nil {</span>
+<span class="a">+					return &quot;&quot;, err</span>
+<span class="a">+				}</span>
+<span class="a">+				b.WriteString(filepath.Base(path) + &quot;:\n&quot;)</span>
+<span class="a">+				for _, l := range lines(string(text)) {</span>
+<span class="a">+					c := strings.Split(l, &quot;\t&quot;)</span>
+<span class="a">+					b.WriteString(&quot;  &quot; + c[1] + &quot;  &quot; + c[2] + &quot;\n&quot;)</span>
+<span class="a">+				}</span>
+<span class="a">+			}</span>
+<span class="a">+			return b.String(), nil</span>
+<span class="a">+		},</span>
+<span class="a">+		discover: func(page string) ([]string, error) {</span>
+<span class="a">+			f.crawled = append(f.crawled, page)</span>
+<span class="a">+			return f.pages[page], nil</span>
+<span class="a">+		},</span>
+<span class="a">+		lookup: func(host string) ([]net.IP, error) {</span>
+<span class="a">+			switch host {</span>
+<span class="a">+			case &quot;internal.test&quot;:</span>
+<span class="a">+				return []net.IP{net.ParseIP(&quot;10.66.0.4&quot;)}, nil</span>
+<span class="a">+			case &quot;nowhere.test&quot;:</span>
+<span class="a">+				return nil, errors.New(&quot;no such host&quot;)</span>
+<span class="a">+			}</span>
+<span class="a">+			return []net.IP{net.ParseIP(&quot;93.184.216.34&quot;)}, nil</span>
+<span class="a">+		},</span>
+<span class="a">+		now: func() time.Time { return f.now },</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// fileOf gives the text of a file of the feed directory of the account, or</span>
+<span class="a">+// &quot;&quot; when the file is missing.</span>
+<span class="a">+func (e *harness) feedFile(a *Account, name string) string {</span>
+<span class="a">+	b, err := os.ReadFile(filepath.Join(e.s.store.feedDir(a.ID), name))</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return &quot;&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	return string(b)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const oneItem = &quot;1700000000\tOne\thttps://a.org/1\t\t\tid1\t\t\t\n&quot;</span>
+<span class="a">+</span>
+<span class="a">+func TestJobFetchesTheFeeds(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\nhttp://internal.test/rss\tInside\nhttps://nowhere.test/x\tGone\nhttps://10.0.0.7/rss\tPrivate\n&quot;)</span>
+<span class="a">+	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: oneItem}, now: time.Unix(1_800_000_000, 0)}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	rc := e.feedFile(a, &quot;sfeedrc&quot;)</span>
+<span class="a">+	itemsDir := filepath.Join(e.s.store.feedDir(a.ID), &quot;items&quot;)</span>
+<span class="a">+	for _, want := range []string{&quot;sfeedpath=&#x27;&quot; + itemsDir + &quot;&#x27;\n&quot;, &quot;\tfeed &#x27;Alpha&#x27; &#x27;https://a.org/rss.xml&#x27;\n&quot;, &quot;curl --proto &#x27;=http,https&#x27;&quot;} {</span>
+<span class="a">+		if !strings.Contains(rc, want) {</span>
+<span class="a">+			t.Errorf(&quot;the sfeedrc lacks %q:\n%s&quot;, want, rc)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	// A host on a private network, an unknown host and an address on a</span>
+<span class="a">+	// private network stay out of the sfeedrc.</span>
+<span class="a">+	for _, bad := range []string{&quot;internal.test&quot;, &quot;nowhere.test&quot;, &quot;10.0.0.7&quot;} {</span>
+<span class="a">+		if strings.Contains(rc, bad) {</span>
+<span class="a">+			t.Errorf(&quot;the sfeedrc has %q&quot;, bad)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(f.updates) != 1 || f.updates[0] != filepath.Join(e.s.store.feedDir(a.ID), &quot;sfeedrc&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;updates: %q&quot;, f.updates)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.feedFile(a, filepath.Join(&quot;items&quot;, &quot;Alpha&quot;)); got != oneItem {</span>
+<span class="a">+		t.Errorf(&quot;items of Alpha: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	if page := e.body(c, &quot;/feed&quot;); !strings.Contains(page, `&lt;a href=&quot;https://a.org/1&quot;&gt;One&lt;/a&gt;`) {</span>
+<span class="a">+		t.Error(&quot;the page does not show the item&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	// The items of a feed that the account left go.</span>
+<span class="a">+	e.setFeeds(tok, &quot;&quot;)</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.feedFile(a, filepath.Join(&quot;items&quot;, &quot;Alpha&quot;)) != &quot;&quot; || e.feedFile(a, &quot;sfeedrc&quot;) != &quot;&quot; || len(f.updates) != 1 {</span>
+<span class="a">+		t.Error(&quot;the items or the sfeedrc of the left feed stay&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestJobLeavesAccountsWithoutFeedsAlone(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	_, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.s.store.byTok(tok)</span>
+<span class="a">+	f := &amp;fakeTools{now: time.Now()}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if _, err := os.Stat(e.s.store.feedDir(a.ID)); !os.IsNotExist(err) {</span>
+<span class="a">+		t.Errorf(&quot;the job made a feed directory: %v&quot;, err)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestJobSendsADailyDigest(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)</span>
+<span class="a">+	start := time.Unix(1_800_000_000, 0)</span>
+<span class="a">+	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: oneItem}, now: start}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 0 || e.feedFile(a, &quot;mailed&quot;) != &quot;&quot; {</span>
+<span class="a">+		t.Fatal(&quot;the job mails without the opt-in&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	// The first run after the opt-in notes the items and sends nothing.</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 0 || e.feedFile(a, &quot;mailed&quot;) != &quot;Alpha\tid1\n&quot; || strings.TrimSpace(e.feedFile(a, &quot;digest&quot;)) != &quot;1800000000&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;first run: %d emails, mailed %q, digest %q&quot;, e.sent(), e.feedFile(a, &quot;mailed&quot;), e.feedFile(a, &quot;digest&quot;))</span>
+<span class="a">+	}</span>
+<span class="a">+	f.items[&quot;https://a.org/rss.xml&quot;] = &quot;1700003600\tTwo\thttps://a.org/2\t\t\tid2\t\t\t\n&quot; + oneItem</span>
+<span class="a">+	f.now = start.Add(time.Hour)</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 0 {</span>
+<span class="a">+		t.Fatal(&quot;a digest went out within a day&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	f.now = start.Add(25 * time.Hour)</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 1 {</span>
+<span class="a">+		t.Fatalf(&quot;%d emails after a day&quot;, e.sent())</span>
+<span class="a">+	}</span>
+<span class="a">+	mail := e.mails[0]</span>
+<span class="a">+	for _, want := range []string{&quot;me@example.org\nsbm feed: 1 new item\n&quot;, &quot;Alpha:\n  Two  https://a.org/2\n&quot;, &quot;Your feed: &quot; + e.s.site + &quot;/feed\n&quot;} {</span>
+<span class="a">+		if !strings.Contains(mail, want) {</span>
+<span class="a">+			t.Errorf(&quot;the digest lacks %q:\n%s&quot;, want, mail)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if strings.Contains(mail, &quot;One&quot;) {</span>
+<span class="a">+		t.Error(&quot;the digest has the old item&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if e.feedFile(a, &quot;mailed&quot;) != &quot;Alpha\tid1\nAlpha\tid2\n&quot; || strings.TrimSpace(e.feedFile(a, &quot;digest&quot;)) != fmt.Sprint(f.now.Unix()) {</span>
+<span class="a">+		t.Errorf(&quot;after the digest: mailed %q, digest %q&quot;, e.feedFile(a, &quot;mailed&quot;), e.feedFile(a, &quot;digest&quot;))</span>
+<span class="a">+	}</span>
+<span class="a">+	f.now = start.Add(50 * time.Hour)</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 1 {</span>
+<span class="a">+		t.Error(&quot;a digest went out without new items&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	f.items[&quot;https://a.org/rss.xml&quot;] = &quot;1700007200\tThree\thttps://a.org/3\t\t\tid3\t\t\t\n&quot; + f.items[&quot;https://a.org/rss.xml&quot;]</span>
+<span class="a">+	f.now = start.Add(51 * time.Hour)</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 2 || !strings.Contains(e.mails[1], &quot;sbm feed: 1 new item\n&quot;) || !strings.Contains(e.mails[1], &quot;Three&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;second digest: %d emails, %q&quot;, e.sent(), e.mails[len(e.mails)-1])</span>
+<span class="a">+	}</span>
+<span class="a">+	// The opt-out forgets the digests, so that a later opt-in starts fresh.</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{})</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.feedFile(a, &quot;mailed&quot;) != &quot;&quot; || e.feedFile(a, &quot;digest&quot;) != &quot;&quot; {</span>
+<span class="a">+		t.Error(&quot;the opt-out kept the digest files&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if e.sent() != 2 {</span>
+<span class="a">+		t.Error(&quot;a digest went out after the opt-out&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// A digest that does not go out is sent again with the next run.</span>
+<span class="a">+func TestJobKeepsTheItemsOfAFailedDigest(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)</span>
+<span class="a">+	start := time.Unix(1_800_000_000, 0)</span>
+<span class="a">+	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: &quot;&quot;}, now: start}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	f.items[&quot;https://a.org/rss.xml&quot;] = oneItem</span>
+<span class="a">+	f.now = start.Add(25 * time.Hour)</span>
+<span class="a">+	e.s.mail = func(string, string, string) error { return errors.New(&quot;no SMTP server&quot;) }</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.feedFile(a, &quot;mailed&quot;) != &quot;&quot; || strings.TrimSpace(e.feedFile(a, &quot;digest&quot;)) != &quot;1800000000&quot; {</span>
+<span class="a">+		t.Errorf(&quot;a failed digest changed the files: mailed %q, digest %q&quot;, e.feedFile(a, &quot;mailed&quot;), e.feedFile(a, &quot;digest&quot;))</span>
+<span class="a">+	}</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 1 || !strings.Contains(e.mails[0], &quot;One&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;the next run: %d emails&quot;, e.sent())</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestJobMailsOnlyConfirmedAccounts(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	tok := e.token(&quot;me@example.org&quot;)</span>
+<span class="a">+	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)</span>
+<span class="a">+	e.s.store.setFeed(a, feedSettings{Mail: true})</span>
+<span class="a">+	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: oneItem}, now: time.Now()}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	// The one email is the email check of the sign-up.</span>
+<span class="a">+	if e.sent() != 1 || e.feedFile(a, &quot;mailed&quot;) != &quot;&quot; {</span>
+<span class="a">+		t.Errorf(&quot;an unconfirmed account got a digest: %d emails, mailed %q&quot;, e.sent(), e.feedFile(a, &quot;mailed&quot;))</span>
+<span class="a">+	}</span>
+<span class="a">+	if e.feedFile(a, filepath.Join(&quot;items&quot;, &quot;Alpha&quot;)) != oneItem {</span>
+<span class="a">+		t.Error(&quot;the feed of an unconfirmed account is not fetched&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestJobExploresTheBookmarks(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;https://old.org\tOld\t\nhttps://blog.org\tBlog\t\nhttp://internal.test/\tInside\t\njavascript:x\tBad\t\n&quot;)</span>
+<span class="a">+	a := e.s.store.byTok(tok)</span>
+<span class="a">+	f := &amp;fakeTools{now: time.Now(), pages: map[string][]string{</span>
+<span class="a">+		&quot;https://blog.org&quot;: {&quot;https://blog.org/feed.xml\tapplication/rss+xml&quot;, &quot;https://blog.org/it&#x27;s\tapplication/atom+xml&quot;},</span>
+<span class="a">+	}}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if len(f.crawled) != 0 || e.feedFile(a, &quot;explore&quot;) != &quot;&quot; {</span>
+<span class="a">+		t.Fatal(&quot;the job looked at the bookmarks without the opt-in&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;explore&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	// Newest first. The page on a private network is not fetched.</span>
+<span class="a">+	if want := []string{&quot;https://blog.org&quot;, &quot;https://old.org&quot;}; strings.Join(f.crawled, &quot; &quot;) != strings.Join(want, &quot; &quot;) {</span>
+<span class="a">+		t.Errorf(&quot;crawled %q, want %q&quot;, f.crawled, want)</span>
+<span class="a">+	}</span>
+<span class="a">+	want := &quot;http://internal.test/\t-\t\nhttps://blog.org\thttps://blog.org/feed.xml\tapplication/rss+xml\nhttps://old.org\t-\t\n&quot;</span>
+<span class="a">+	if got := e.feedFile(a, &quot;explore&quot;); got != want {</span>
+<span class="a">+		t.Errorf(&quot;explore:\n%q\nwant\n%q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+	page := e.body(c, &quot;/feed&quot;)</span>
+<span class="a">+	for _, want := range []string{&quot;looked at 3 of your 3 bookmarked pages&quot;, `value=&quot;https://blog.org/feed.xml&quot;`, `value=&quot;Blog&quot;`, &quot;on https://blog.org&quot;} {</span>
+<span class="a">+		if !strings.Contains(page, want) {</span>
+<span class="a">+			t.Errorf(&quot;the page lacks %q&quot;, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	// The next run looks at no page twice.</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if len(f.crawled) != 2 {</span>
+<span class="a">+		t.Errorf(&quot;crawled %q&quot;, f.crawled)</span>
+<span class="a">+	}</span>
+<span class="a">+	// A feed that the account follows is no suggestion any more.</span>
+<span class="a">+	e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {&quot;https://blog.org/feed.xml&quot;}, &quot;name&quot;: {&quot;Blog&quot;}})</span>
+<span class="a">+	_, explore, _ := strings.Cut(e.body(c, &quot;/feed&quot;), &quot;&lt;h2&gt;Explore&lt;/h2&gt;&quot;)</span>
+<span class="a">+	if strings.Contains(explore, &quot;feed.xml&quot;) || !strings.Contains(explore, &quot;No new feed to follow yet.&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;the page still suggests the followed feed:\n%s&quot;, explore)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestJobExploresTwentyPagesInOneRun(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	var b strings.Builder</span>
+<span class="a">+	for i := range crawlPerRun + 5 {</span>
+<span class="a">+		fmt.Fprintf(&amp;b, &quot;https://p%d.org\tP%d\t\n&quot;, i, i)</span>
+<span class="a">+	}</span>
+<span class="a">+	c, tok, _ := e.account(b.String())</span>
+<span class="a">+	f := &amp;fakeTools{now: time.Now()}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;explore&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if len(f.crawled) != crawlPerRun || f.crawled[0] != &quot;https://p24.org&quot; {</span>
+<span class="a">+		t.Errorf(&quot;first run: %d pages, first %q&quot;, len(f.crawled), f.crawled[0])</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/feed&quot;), &quot;looked at 20 of your 25 bookmarked pages&quot;) {</span>
+<span class="a">+		t.Error(&quot;the page does not show the count&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if len(f.crawled) != crawlPerRun+5 {</span>
+<span class="a">+		t.Errorf(&quot;second run: %d pages&quot;, len(f.crawled))</span>
+<span class="a">+	}</span>
+<span class="a">+	_ = tok</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestPublicIP(t *testing.T) {</span>
+<span class="a">+	for ip, want := range map[string]bool{</span>
+<span class="a">+		&quot;93.184.216.34&quot;: true, &quot;2606:2800:220:1:248:1893:25c8:1946&quot;: true,</span>
+<span class="a">+		&quot;127.0.0.1&quot;: false, &quot;10.66.0.4&quot;: false, &quot;192.168.1.1&quot;: false, &quot;172.16.0.9&quot;: false,</span>
+<span class="a">+		&quot;169.254.169.254&quot;: false, &quot;100.64.0.1&quot;: false, &quot;0.0.0.0&quot;: false, &quot;::1&quot;: false, &quot;fd00::1&quot;: false, &quot;fe80::1&quot;: false,</span>
+<span class="a">+	} {</span>
+<span class="a">+		if got := publicIP(net.ParseIP(ip)); got != want {</span>
+<span class="a">+			t.Errorf(&quot;publicIP(%s) = %v, want %v&quot;, ip, got, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+diff --git a/main.go b/main.go
+index 261ec2d..a0bc4ab 100644
+--- a/main.go
++++ b/main.go
+<span class="h">@@ -51,6 +51,8 @@ type server struct {</span>
+ 	// mail sends an email. It is nil when the server has no SMTP server:
+ 	// then accounts need no email check.
+ 	mail func(to, subject, body string) error
+<span class="a">+	// feeds are the programs of the feed job, see feedjob.go.</span>
+<span class="a">+	feeds feedTools</span>
+ }
+ 
+ func main() {
+<span class="h">@@ -115,6 +117,14 @@ func main() {</span>
+ 			From: from, Hello: u.Hostname()}
+ 		s.mail = m.send
+ 	}
+<span class="a">+	if len(os.Args) &gt; 1 {</span>
+<span class="a">+		if os.Args[1] != &quot;feed&quot; {</span>
+<span class="a">+			log.Fatalf(&quot;unknown command %q: the one command is feed&quot;, os.Args[1])</span>
+<span class="a">+		}</span>
+<span class="a">+		s.feeds = execTools()</span>
+<span class="a">+		s.runFeeds()</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+ 	addr := env(&quot;SBM_ADDR&quot;, &quot;127.0.0.1:8750&quot;)
+ 	log.Printf(&quot;sbm-sync on %s for %s, billing %v, email check %v&quot;, addr, site, s.stripe != nil, s.mail != nil)
+ 	hs := &amp;http.Server{
+<span class="h">@@ -180,6 +190,12 @@ func (s *server) routes() http.Handler {</span>
+ 	m.HandleFunc(&quot;GET /bookmarks.txt&quot;, s.download)
+ 	m.HandleFunc(&quot;GET /search.js&quot;, s.script)
+ 	m.HandleFunc(&quot;GET /opensearch.xml&quot;, s.openSearch)
+<span class="a">+	m.HandleFunc(&quot;GET /feed&quot;, s.feed)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /feed/add&quot;, s.followFeed)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /feed/delete&quot;, s.unfollowFeed)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /feed/settings&quot;, s.saveFeedSettings)</span>
+<span class="a">+	m.HandleFunc(&quot;GET /api/feed&quot;, s.apiFeed)</span>
+<span class="a">+	m.HandleFunc(&quot;GET /api/feeds&quot;, s.apiFeeds)</span>
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		h := w.Header()
+ 		// Scripts only from this server: the live search of the bookmark
+<span class="h">@@ -664,17 +680,8 @@ func (s *server) apiLogout(w http.ResponseWriter, r *http.Request) {</span>
+ // name of its version in the Sbm-Version header. The device writes the file
+ // and sends that name as base next time.
+ func (s *server) sync(w http.ResponseWriter, r *http.Request) {
+<span class="d">-	u := s.apiUser(r)</span>
+<span class="a">+	u := s.apiOwner(w, r)</span>
+ 	if u == nil {
+<span class="d">-		http.Error(w, &quot;not signed in: sign in again&quot;, http.StatusUnauthorized)</span>
+<span class="d">-		return</span>
+<span class="d">-	}</span>
+<span class="d">-	if !s.verified(s.store.view(u)) {</span>
+<span class="d">-		http.Error(w, &quot;confirm your email address first: open the link in the email from sbm Sync, or see &quot;+s.site+&quot;/account&quot;, http.StatusForbidden)</span>
+<span class="d">-		return</span>
+<span class="d">-	}</span>
+<span class="d">-	if !s.active(s.store.view(u)) {</span>
+<span class="d">-		http.Error(w, &quot;sbm Sync is paused for this account: see &quot;+s.site+&quot;/account&quot;, http.StatusPaymentRequired)</span>
+ 		return
+ 	}
+ 	base := r.URL.Query().Get(&quot;base&quot;)
+diff --git a/pages.html b/pages.html
+index 9e4d4d4..3288acd 100644
+--- a/pages.html
++++ b/pages.html
+<span class="h">@@ -25,6 +25,8 @@ select { font: inherit; padding: .3em; margin: .2em 0 1em; }</span>
+ textarea { display: block; width: 100%; box-sizing: border-box; height: 60vh; margin: .2em 0 1em; font: 13px/1.4 monospace; }
+ details { margin: 1em 0; } summary { cursor: pointer; }
+ .bookmarks { list-style: none; padding: 0; } .bookmarks li { margin: .8em 0; overflow-wrap: anywhere; } .bookmarks small { color: #555; }
+<span class="a">+.bookmarks form { display: inline; } .bookmarks form button { padding: .1em .5em; margin: 0; font-size: .9em; }</span>
+<span class="a">+.check { display: inline; width: auto; margin: 0 .4em 0 0; } pre { overflow-x: auto; }</span>
+ @media (prefers-color-scheme: dark) {
+   body { background: #111; color: #ddd; } a { color: #4fb3d9; } .note, footer, .bookmarks small { color: #999; } .error { color: #f77; }
+ }
+<span class="h">@@ -61,7 +63,10 @@ text file. sbm Sync keeps that file the same on each of your devices: bm on</span>
+ your computers, the sbm app for Android, and the sbm add-on for Firefox and
+ Chrome. You can also use your bookmarks on this site, in any browser.&lt;/p&gt;
+ {{if .Billing}}&lt;p&gt;Free for {{.TrialDays}} days. Then {{.Year}} or {{.Month}}. Cancel at any time.&lt;/p&gt;{{end}}
+<span class="d">-&lt;p&gt;{{if .Email}}{{if .Active}}&lt;a href=&quot;/bookmarks&quot;&gt;Your bookmarks&lt;/a&gt; · {{end}}&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt;{{else}}&lt;a href=&quot;/signup&quot;&gt;Create an account&lt;/a&gt; or &lt;a href=&quot;/login&quot;&gt;sign in&lt;/a&gt;.{{end}}&lt;/p&gt;</span>
+<span class="a">+&lt;p&gt;{{if .Email}}{{if .Active}}&lt;a href=&quot;/bookmarks&quot;&gt;Your bookmarks&lt;/a&gt; · &lt;a href=&quot;/feed&quot;&gt;Your feed&lt;/a&gt; · {{end}}&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt;{{else}}&lt;a href=&quot;/signup&quot;&gt;Create an account&lt;/a&gt; or &lt;a href=&quot;/login&quot;&gt;sign in&lt;/a&gt;.{{end}}&lt;/p&gt;</span>
+<span class="a">+&lt;p&gt;The &lt;a href=&quot;/feed&quot;&gt;feed page&lt;/a&gt; follows RSS and Atom feeds for you, and can</span>
+<span class="a">+look through your bookmarks for feeds. Read it here, or with the sfeed tools</span>
+<span class="a">+in a terminal.&lt;/p&gt;</span>
+ {{with .Teams}}&lt;h2&gt;Teams&lt;/h2&gt;
+ &lt;p&gt;Coming: bookmarks for teams. The members of a team share one bookmark
+ file, and sync it on each of their devices. Pre-order the founding plan: &lt;a href=&quot;{{.}}&quot;&gt;for up to 10 people&lt;/a&gt;{{with $.TeamsLarge}},
+<span class="h">@@ -106,7 +111,7 @@ your own server&lt;/a&gt;. See the &lt;a href=&quot;/privacy&quot;&gt;privacy policy&lt;/a&gt;.&lt;/p&gt;</span>
+ {{define &quot;account&quot;}}{{template &quot;head&quot; .}}
+ &lt;h1&gt;Your account&lt;/h1&gt;
+ &lt;p&gt;Signed in as {{.Email}}.&lt;/p&gt;
+<span class="d">-{{if .Active}}&lt;p&gt;&lt;a href=&quot;/bookmarks&quot;&gt;&lt;b&gt;Open your bookmarks&lt;/b&gt;&lt;/a&gt;&lt;/p&gt;{{end}}</span>
+<span class="a">+{{if .Active}}&lt;p&gt;&lt;a href=&quot;/bookmarks&quot;&gt;&lt;b&gt;Open your bookmarks&lt;/b&gt;&lt;/a&gt; · &lt;a href=&quot;/feed&quot;&gt;Your feed&lt;/a&gt;&lt;/p&gt;{{end}}</span>
+ {{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}
+ {{if .Unconfirmed}}&lt;p&gt;&lt;b&gt;Confirm your email address.&lt;/b&gt; Open the link in the
+ email that this server sent to {{.Email}}. Sync starts after that.&lt;/p&gt;
+<span class="h">@@ -142,8 +147,56 @@ their bookmark files.&lt;/p&gt;</span>
+ {{define &quot;nav&quot;}}&lt;p class=&quot;note&quot;&gt;&lt;a href=&quot;/bookmarks&quot;&gt;Bookmarks&lt;/a&gt; ·
+ &lt;a href=&quot;/bookmarks/file&quot;&gt;Edit the file&lt;/a&gt; ·
+ &lt;a href=&quot;/bookmarks.txt&quot;&gt;Download&lt;/a&gt; ·
+<span class="a">+&lt;a href=&quot;/feed&quot;&gt;Feed&lt;/a&gt; ·</span>
+ &lt;a href=&quot;/account&quot;&gt;Account&lt;/a&gt;&lt;/p&gt;{{end}}
+ 
+<span class="a">+{{define &quot;feed&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+{{template &quot;nav&quot;}}</span>
+<span class="a">+&lt;h1&gt;Your feed&lt;/h1&gt;</span>
+<span class="a">+{{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}</span>
+<span class="a">+{{with .Done}}&lt;p&gt;&lt;b&gt;{{.}}&lt;/b&gt;&lt;/p&gt;{{end}}</span>
+<span class="a">+{{if not .Feeds}}&lt;p&gt;Follow a feed: type the address of an RSS or Atom feed</span>
+<span class="a">+below, or turn on Explore in the settings, and the server looks through your</span>
+<span class="a">+bookmarks for feeds. The server fetches new items every 30 minutes.&lt;/p&gt;{{end}}</span>
+<span class="a">+&lt;details{{if eq .Open &quot;add&quot;}} open{{end}}&gt;&lt;summary&gt;Follow a feed&lt;/summary&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/feed/add&quot;&gt;</span>
+<span class="a">+&lt;label&gt;Feed URL &lt;input name=&quot;url&quot; value=&quot;{{.Form.URL}}&quot; placeholder=&quot;https://example.org/rss.xml&quot; required&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;label&gt;Name &lt;input name=&quot;name&quot; value=&quot;{{.Form.Name}}&quot;&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;button&gt;Follow&lt;/button&gt;</span>
+<span class="a">+&lt;/form&gt;&lt;/details&gt;</span>
+<span class="a">+&lt;details&gt;&lt;summary&gt;Settings&lt;/summary&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/feed/settings&quot;&gt;</span>
+<span class="a">+&lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;newtab&quot;{{if .Settings.NewTab}} checked{{end}}&gt;Open links in a new tab&lt;/label&gt;</span>
+<span class="a">+{{if .HasMail}}&lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;mail&quot;{{if .Settings.Mail}} checked{{end}}&gt;Send me the new items by email, once a day&lt;/label&gt;{{end}}</span>
+<span class="a">+&lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;explore&quot;{{if .Settings.Explore}} checked{{end}}&gt;Explore: look through my bookmarks for feeds&lt;/label&gt;</span>
+<span class="a">+&lt;button&gt;Save&lt;/button&gt;</span>
+<span class="a">+&lt;/form&gt;&lt;/details&gt;</span>
+<span class="a">+&lt;details&gt;&lt;summary&gt;Read the feed in a terminal&lt;/summary&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;The items come in the &lt;a href=&quot;https://codemadness.org/sfeed.html&quot;&gt;sfeed&lt;/a&gt;</span>
+<span class="a">+format, newest first, with the token of a device (&lt;code&gt;bm-sync login&lt;/code&gt;</span>
+<span class="a">+keeps one in &lt;code&gt;~/.config/sbm/sync&lt;/code&gt;):&lt;/p&gt;</span>
+<span class="a">+&lt;pre&gt;curl -H &quot;Authorization: Bearer $token&quot; {{.URL}}/api/feed | sfeed_plain&lt;/pre&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;&lt;code&gt;{{.URL}}/api/feeds&lt;/code&gt; gives the feeds that you follow, one on each line: the URL, a tab and the name.&lt;/p&gt;</span>
+<span class="a">+&lt;/details&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;{{.Total}} items{{with .FilterName}} from &lt;b&gt;{{.}}&lt;/b&gt;{{end}}.{{if .Filter}} &lt;a href=&quot;/feed&quot;&gt;All feeds&lt;/a&gt;{{end}}&lt;/p&gt;</span>
+<span class="a">+&lt;ul class=&quot;bookmarks&quot;&gt;</span>
+<span class="a">+{{range .Items}}&lt;li&gt;{{if .Link}}&lt;a href=&quot;{{.Link}}&quot;{{if $.Settings.NewTab}} target=&quot;_blank&quot; rel=&quot;noopener&quot;{{end}}&gt;{{.Title}}&lt;/a&gt;{{else}}{{.Title}}{{end}}&lt;br&gt;</span>
+<span class="a">+&lt;small&gt;&lt;a href=&quot;/feed?feed={{.File}}&quot;&gt;{{.Feed}}&lt;/a&gt;{{if not .Time.IsZero}} · {{.Time.Format &quot;2006-01-02 15:04&quot;}}{{end}}{{with .Author}} · {{.}}{{end}}&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+{{end}}&lt;/ul&gt;</span>
+<span class="a">+{{if .Next}}&lt;p&gt;&lt;a href=&quot;/feed?start={{.Next}}{{with .Filter}}&amp;amp;feed={{.}}{{end}}&quot;&gt;Older items&lt;/a&gt;&lt;/p&gt;{{end}}</span>
+<span class="a">+{{with .Feeds}}&lt;h2&gt;Feeds you follow&lt;/h2&gt;</span>
+<span class="a">+&lt;ul class=&quot;bookmarks&quot;&gt;</span>
+<span class="a">+{{range .}}&lt;li&gt;&lt;a href=&quot;/feed?feed={{.File}}&quot;&gt;{{.Name}}&lt;/a&gt; &lt;small&gt;{{.URL}}&lt;/small&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/feed/delete&quot;&gt;&lt;input type=&quot;hidden&quot; name=&quot;url&quot; value=&quot;{{.URL}}&quot;&gt;&lt;button&gt;Unfollow&lt;/button&gt;&lt;/form&gt;&lt;/li&gt;</span>
+<span class="a">+{{end}}&lt;/ul&gt;{{end}}</span>
+<span class="a">+{{if .Settings.Explore}}&lt;h2&gt;Explore&lt;/h2&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;The server looked at {{.Checked}} of your {{.Bookmarks}} bookmarked pages for feeds, 20 more with each update.{{if not .Suggestions}} No new feed to follow yet.{{end}}&lt;/p&gt;</span>
+<span class="a">+{{with .Suggestions}}&lt;ul class=&quot;bookmarks&quot;&gt;</span>
+<span class="a">+{{range .}}&lt;li&gt;{{.URL}}&lt;br&gt;&lt;small&gt;on {{.Page}}&lt;/small&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/feed/add&quot;&gt;&lt;input type=&quot;hidden&quot; name=&quot;url&quot; value=&quot;{{.URL}}&quot;&gt;&lt;input type=&quot;hidden&quot; name=&quot;name&quot; value=&quot;{{.Name}}&quot;&gt;&lt;button&gt;Follow&lt;/button&gt;&lt;/form&gt;&lt;/li&gt;</span>
+<span class="a">+{{end}}&lt;/ul&gt;{{end}}{{end}}</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+ {{define &quot;bookmarks&quot;}}{{template &quot;head&quot; .}}
+ {{template &quot;nav&quot;}}
+ &lt;h1&gt;Your bookmarks&lt;/h1&gt;
+<span class="h">@@ -283,6 +336,9 @@ When this server checks email addresses, it also sends you an email with a link</span>
+ &lt;li&gt;Your bookmark file, the last 50 versions that your devices sent: to sync your devices.&lt;/li&gt;
+ &lt;li&gt;A hash of the sign-in token of each device: to know your devices.&lt;/li&gt;
+ &lt;li&gt;When you subscribe: your Stripe customer ID and the state of your subscription: to bill you.&lt;/li&gt;
+<span class="a">+&lt;li&gt;When you follow feeds: the addresses of the feeds, the items that the server fetched from them, and</span>
+<span class="a">+the addresses of the feeds that the server found on your bookmarked pages when you asked it to look:</span>
+<span class="a">+to show you the items, and to send them to you by email once a day when you asked for that.&lt;/li&gt;</span>
+ &lt;/ul&gt;
+ &lt;p&gt;The server does not sell or share this data, and does not use it for ads.
+ There are no analytics and no trackers. The only cookie keeps you signed in.&lt;/p&gt;
+diff --git a/store.go b/store.go
+index e66122d..478b3ac 100644
+--- a/store.go
++++ b/store.go
+<span class="h">@@ -36,15 +36,16 @@ var (</span>
+ 
+ // Account is one user. The file of the user is in files/&lt;ID&gt;.
+ type Account struct {
+<span class="d">-	ID       string    `json:&quot;id&quot;`</span>
+<span class="d">-	Email    string    `json:&quot;email&quot;`</span>
+<span class="d">-	Hash     string    `json:&quot;hash&quot;` // bcrypt hash of the password</span>
+<span class="d">-	Created  time.Time `json:&quot;created&quot;`</span>
+<span class="d">-	Tokens   []string  `json:&quot;tokens&quot;` // SHA-256 of each sign-in token</span>
+<span class="d">-	Customer string    `json:&quot;customer,omitempty&quot;`</span>
+<span class="d">-	Status   string    `json:&quot;status,omitempty&quot;`    // of the Stripe subscription</span>
+<span class="d">-	StatusAt int64     `json:&quot;status_at,omitempty&quot;` // time of the Stripe event that set Status</span>
+<span class="d">-	Verify   string    `json:&quot;verify,omitempty&quot;`    // SHA-256 of the code that confirms the email; empty when confirmed</span>
+<span class="a">+	ID       string       `json:&quot;id&quot;`</span>
+<span class="a">+	Email    string       `json:&quot;email&quot;`</span>
+<span class="a">+	Hash     string       `json:&quot;hash&quot;` // bcrypt hash of the password</span>
+<span class="a">+	Created  time.Time    `json:&quot;created&quot;`</span>
+<span class="a">+	Tokens   []string     `json:&quot;tokens&quot;` // SHA-256 of each sign-in token</span>
+<span class="a">+	Customer string       `json:&quot;customer,omitempty&quot;`</span>
+<span class="a">+	Status   string       `json:&quot;status,omitempty&quot;`    // of the Stripe subscription</span>
+<span class="a">+	StatusAt int64        `json:&quot;status_at,omitempty&quot;` // time of the Stripe event that set Status</span>
+<span class="a">+	Verify   string       `json:&quot;verify,omitempty&quot;`    // SHA-256 of the code that confirms the email; empty when confirmed</span>
+<span class="a">+	Feed     feedSettings `json:&quot;feed,omitzero&quot;`       // the feed choices, see feed.go</span>
+ }
+ 
+ // Store keeps the accounts in one JSON file, accounts.json, and the versions
+<span class="h">@@ -337,7 +338,7 @@ func (s *Store) lock(id string) *sync.Mutex {</span>
+ 	return m
+ }
+ 
+<span class="d">-// remove deletes the account and all versions of its file.</span>
+<span class="a">+// remove deletes the account, all versions of its file and its feeds.</span>
+ func (s *Store) remove(a *Account) error {
+ 	m := s.lock(a.ID)
+ 	m.Lock()
+<span class="h">@@ -353,7 +354,10 @@ func (s *Store) remove(a *Account) error {</span>
+ 	if err != nil {
+ 		return err
+ 	}
+<span class="d">-	return os.RemoveAll(filepath.Join(s.dir, &quot;files&quot;, a.ID))</span>
+<span class="a">+	if err := os.RemoveAll(filepath.Join(s.dir, &quot;files&quot;, a.ID)); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	return os.RemoveAll(s.feedDir(a.ID))</span>
+ }
+ 
+ // sync merges the file that a device sends into the current version, keeps</pre>
+</div></body></html>

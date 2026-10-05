@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 2fcb2c87 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 2fcb2c87fef05cd4c1646398e1b5f95c0c107f5e
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:45:22 -0700
+
+Add the burst controller
+
+tools/burst_controller.py runs on the web server once a minute. It reads
+the paid queue and the burst workers in Redis, and decides the set of
+worker machines: it adds machines when paid jobs wait, up to a cap; it
+sends the rq shutdown command to a worker that is idle for 10 minutes
+while nothing waits, so the worker stops after its job; and it destroys
+the machine of a worker that stopped, or that did not start in 20
+minutes. After a deploy, the workers of the old commit stop and new ones
+start. The controller writes the set to a Terraform variable file and
+runs terraform apply only when the set changes. It puts the app, at the
+commit of the web server, in the bucket for new workers, because the
+repository is private.
+
+Property tests check that a worker known to rq is never destroyed, that
+the cap holds, and that an idle worker stops only when no job waits.
+
+</pre><pre> tests/test_burst_controller.py | 251 +++++++++++++++++++++++++++++++++
+ tools/burst_controller.py      | 313 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 564 insertions(+)
+</pre><pre>diff --git a/tests/test_burst_controller.py b/tests/test_burst_controller.py
+new file mode 100644
+index 0000000..4613764
+--- /dev/null
++++ b/tests/test_burst_controller.py
+<span class="h">@@ -0,0 +1,251 @@</span>
+<span class="a">+&quot;&quot;&quot;The burst controller: when it adds, stops and destroys burst workers.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import json</span>
+<span class="a">+import sys</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+import fakeredis</span>
+<span class="a">+import pytest</span>
+<span class="a">+from hypothesis import given, settings</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+from rq import Queue, Worker</span>
+<span class="a">+</span>
+<span class="a">+from tools import burst_controller as bc</span>
+<span class="a">+from tools.burst_controller import Config, Memory, decide</span>
+<span class="a">+</span>
+<span class="a">+REF = &quot;new&quot;</span>
+<span class="a">+NOW = 1_000_000.0</span>
+<span class="a">+MIN = 60.0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def worker(created_ago: float, ref: str = REF) -&gt; dict:</span>
+<span class="a">+    return {&quot;created&quot;: NOW - created_ago, &quot;ref&quot;: ref}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- invariants over any state -------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+names = st.sampled_from([f&quot;{bc.NAME_PREFIX}{i}&quot; for i in range(8)])</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@st.composite</span>
+<span class="a">+def states(draw):</span>
+<span class="a">+    pool = draw(st.sets(names, max_size=8))</span>
+<span class="a">+    workers = {</span>
+<span class="a">+        n: {&quot;created&quot;: NOW - draw(st.floats(0, 60 * MIN)), &quot;ref&quot;: draw(st.sampled_from([&quot;old&quot;, REF]))}</span>
+<span class="a">+        for n in pool</span>
+<span class="a">+    }</span>
+<span class="a">+    live = {n: draw(st.sampled_from([&quot;busy&quot;, &quot;idle&quot;])) for n in pool if draw(st.booleans())}</span>
+<span class="a">+    registered = {n for n in pool if n in live or draw(st.booleans())}</span>
+<span class="a">+    draining = {n for n in registered if draw(st.booleans())}</span>
+<span class="a">+    idle_since = {n: NOW - draw(st.floats(0, 30 * MIN)) for n in live if live[n] == &quot;idle&quot;}</span>
+<span class="a">+    memory = Memory(workers=workers, registered=registered, idle_since=idle_since, draining=draining)</span>
+<span class="a">+    return draw(st.integers(0, 12)), live, memory, Config(max_workers=draw(st.integers(0, 6)))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=500)</span>
+<span class="a">+@given(states())</span>
+<span class="a">+def test_invariants(state):</span>
+<span class="a">+    waiting, live, memory, config = state</span>
+<span class="a">+    d, after = decide(NOW, waiting, live, memory, config, REF)</span>
+<span class="a">+</span>
+<span class="a">+    # A worker that rq knows is never destroyed: it must stop by itself first.</span>
+<span class="a">+    assert not d.remove &amp; set(live)</span>
+<span class="a">+    # Every old worker is kept or destroyed, never both; new ones are new.</span>
+<span class="a">+    assert set(after.workers) == (set(memory.workers) - d.remove) | set(d.add)</span>
+<span class="a">+    assert not d.remove &amp; set(after.workers)</span>
+<span class="a">+    assert all(n.startswith(bc.NAME_PREFIX) and n not in memory.workers and n not in live</span>
+<span class="a">+               for n in d.add)</span>
+<span class="a">+    # Never more workers at work than the cap, and never more new ones than waiting jobs.</span>
+<span class="a">+    assert len([n for n in after.workers if n not in after.draining]) &lt;= config.max_workers</span>
+<span class="a">+    assert len(d.add) &lt;= waiting</span>
+<span class="a">+    # Only a worker that rq knows can get the shutdown command.</span>
+<span class="a">+    assert d.drain &lt;= set(live)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=500)</span>
+<span class="a">+@given(states())</span>
+<span class="a">+def test_a_fresh_busy_worker_under_the_cap_is_never_stopped(state):</span>
+<span class="a">+    waiting, live, memory, config = state</span>
+<span class="a">+    d, _ = decide(NOW, waiting, live, memory, config, REF)</span>
+<span class="a">+    at_work = [n for n in memory.workers if n not in memory.draining</span>
+<span class="a">+               and (n in live or n not in memory.registered)]</span>
+<span class="a">+    if len(at_work) &lt;= config.max_workers:</span>
+<span class="a">+        for n, s in live.items():</span>
+<span class="a">+            if s == &quot;busy&quot; and n in memory.workers and memory.workers[n][&quot;ref&quot;] == REF:</span>
+<span class="a">+                assert n not in d.drain</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=500)</span>
+<span class="a">+@given(states())</span>
+<span class="a">+def test_an_idle_worker_is_stopped_for_idleness_only_when_no_job_waits(state):</span>
+<span class="a">+    waiting, live, memory, config = state</span>
+<span class="a">+    d, _ = decide(NOW, waiting, live, memory, config, REF)</span>
+<span class="a">+    at_work = [n for n in memory.workers if n not in memory.draining</span>
+<span class="a">+               and (n in live or n not in memory.registered)]</span>
+<span class="a">+    if waiting &gt; 0 and len(at_work) &lt;= config.max_workers:</span>
+<span class="a">+        for n in d.drain:</span>
+<span class="a">+            assert live[n] == &quot;busy&quot; or memory.workers[n][&quot;ref&quot;] != REF</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- scenarios -------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_a_backlog_adds_workers_up_to_the_cap():</span>
+<span class="a">+    d, after = decide(NOW, 5, {}, Memory(), Config(max_workers=3), REF)</span>
+<span class="a">+    assert len(d.add) == 3 and not d.remove and not d.drain</span>
+<span class="a">+    assert all(after.workers[n] == {&quot;created&quot;: NOW, &quot;ref&quot;: REF} for n in d.add)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_booting_and_idle_workers_count_as_capacity():</span>
+<span class="a">+    memory = Memory(workers={&quot;subplz-burst-a&quot;: worker(2 * MIN), &quot;subplz-burst-b&quot;: worker(15 * MIN)},</span>
+<span class="a">+                    registered={&quot;subplz-burst-b&quot;})</span>
+<span class="a">+    d, _ = decide(NOW, 2, {&quot;subplz-burst-b&quot;: &quot;idle&quot;}, memory, Config(max_workers=5), REF)</span>
+<span class="a">+    assert d.add == () and not d.drain and not d.remove</span>
+<span class="a">+    d, _ = decide(NOW, 3, {&quot;subplz-burst-b&quot;: &quot;idle&quot;}, memory, Config(max_workers=5), REF)</span>
+<span class="a">+    assert len(d.add) == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_idle_worker_stops_after_the_grace_time_then_its_droplet_goes():</span>
+<span class="a">+    name = &quot;subplz-burst-a&quot;</span>
+<span class="a">+    memory = Memory(workers={name: worker(60 * MIN)}, registered={name},</span>
+<span class="a">+                    idle_since={name: NOW - 11 * MIN})</span>
+<span class="a">+    d, after = decide(NOW, 0, {name: &quot;idle&quot;}, memory, Config(max_workers=3), REF)</span>
+<span class="a">+    assert d.drain == {name} and not d.remove</span>
+<span class="a">+    # It stopped: rq no longer lists it, so the droplet is destroyed.</span>
+<span class="a">+    d, after = decide(NOW + MIN, 0, {}, after, Config(max_workers=3), REF)</span>
+<span class="a">+    assert d.remove == {name} and after.workers == {}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_idle_worker_waits_for_new_jobs_during_the_grace_time():</span>
+<span class="a">+    name = &quot;subplz-burst-a&quot;</span>
+<span class="a">+    memory = Memory(workers={name: worker(60 * MIN)}, registered={name},</span>
+<span class="a">+                    idle_since={name: NOW - 5 * MIN})</span>
+<span class="a">+    d, _ = decide(NOW, 0, {name: &quot;idle&quot;}, memory, Config(max_workers=3), REF)</span>
+<span class="a">+    assert not d.drain and not d.remove</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_droplet_that_never_starts_its_worker_is_destroyed():</span>
+<span class="a">+    memory = Memory(workers={&quot;subplz-burst-a&quot;: worker(21 * MIN)})</span>
+<span class="a">+    d, _ = decide(NOW, 1, {}, memory, Config(max_workers=1), REF)</span>
+<span class="a">+    assert d.remove == {&quot;subplz-burst-a&quot;}</span>
+<span class="a">+    assert len(d.add) == 1  # and a new one takes its place</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_after_a_deploy_the_workers_of_the_old_commit_are_replaced():</span>
+<span class="a">+    memory = Memory(</span>
+<span class="a">+        workers={&quot;subplz-burst-idle&quot;: worker(60 * MIN, &quot;old&quot;),</span>
+<span class="a">+                 &quot;subplz-burst-busy&quot;: worker(60 * MIN, &quot;old&quot;),</span>
+<span class="a">+                 &quot;subplz-burst-boot&quot;: worker(2 * MIN, &quot;old&quot;)},</span>
+<span class="a">+        registered={&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;},</span>
+<span class="a">+    )</span>
+<span class="a">+    live = {&quot;subplz-burst-idle&quot;: &quot;idle&quot;, &quot;subplz-burst-busy&quot;: &quot;busy&quot;}</span>
+<span class="a">+    d, after = decide(NOW, 2, live, memory, Config(max_workers=3), REF)</span>
+<span class="a">+    assert d.drain == {&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;}  # the busy one finishes first</span>
+<span class="a">+    assert d.remove == {&quot;subplz-burst-boot&quot;}</span>
+<span class="a">+    assert len(d.add) == 2 and all(after.workers[n][&quot;ref&quot;] == REF for n in d.add)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_cap_of_zero_stops_every_worker_and_starts_none():</span>
+<span class="a">+    memory = Memory(</span>
+<span class="a">+        workers={&quot;subplz-burst-boot&quot;: worker(MIN), &quot;subplz-burst-idle&quot;: worker(60 * MIN),</span>
+<span class="a">+                 &quot;subplz-burst-busy&quot;: worker(60 * MIN)},</span>
+<span class="a">+        registered={&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;},</span>
+<span class="a">+    )</span>
+<span class="a">+    live = {&quot;subplz-burst-idle&quot;: &quot;idle&quot;, &quot;subplz-burst-busy&quot;: &quot;busy&quot;}</span>
+<span class="a">+    d, _ = decide(NOW, 4, live, memory, Config(max_workers=0), REF)</span>
+<span class="a">+    assert d.remove == {&quot;subplz-burst-boot&quot;}</span>
+<span class="a">+    assert d.drain == {&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;}</span>
+<span class="a">+    assert d.add == ()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- Redis side -----------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_the_controller_counts_the_paid_queue_of_the_app():</span>
+<span class="a">+    from backend.queue import PAID_QUEUE</span>
+<span class="a">+    assert bc.QUEUE_NAME == PAID_QUEUE</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def register(conn, rq_name: str, host: str, state: str) -&gt; None:</span>
+<span class="a">+    w = Worker([Queue(bc.QUEUE_NAME, connection=conn)], connection=conn, name=rq_name)</span>
+<span class="a">+    w.hostname = host</span>
+<span class="a">+    w.register_birth()</span>
+<span class="a">+    w.set_state(state)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_read_queue_reports_burst_workers_only():</span>
+<span class="a">+    conn = fakeredis.FakeRedis()</span>
+<span class="a">+    register(conn, &quot;rq-1&quot;, &quot;subplz-burst-1-0&quot;, &quot;busy&quot;)</span>
+<span class="a">+    register(conn, &quot;rq-2&quot;, &quot;subplz-burst-1-1&quot;, &quot;idle&quot;)</span>
+<span class="a">+    register(conn, &quot;rq-web&quot;, &quot;racknerd-655a1e9&quot;, &quot;busy&quot;)  # the web server&#x27;s own worker</span>
+<span class="a">+    Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="a">+    waiting, live, rq_names = bc.read_queue(conn)</span>
+<span class="a">+    assert waiting == 1</span>
+<span class="a">+    assert live == {&quot;subplz-burst-1-0&quot;: &quot;busy&quot;, &quot;subplz-burst-1-1&quot;: &quot;idle&quot;}</span>
+<span class="a">+    assert rq_names == {&quot;subplz-burst-1-0&quot;: &quot;rq-1&quot;, &quot;subplz-burst-1-1&quot;: &quot;rq-2&quot;}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_send_drain_sends_the_rq_shutdown_command(monkeypatch):</span>
+<span class="a">+    sent = []</span>
+<span class="a">+    monkeypatch.setattr(&quot;rq.command.send_shutdown_command&quot;, lambda conn, name: sent.append(name))</span>
+<span class="a">+    bc.send_drain(None, {&quot;subplz-burst-a&quot;: &quot;rq-a&quot;, &quot;subplz-burst-b&quot;: &quot;rq-b&quot;},</span>
+<span class="a">+                  frozenset({&quot;subplz-burst-a&quot;}))</span>
+<span class="a">+    assert sent == [&quot;rq-a&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- one run, with a fake Terraform -------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def world(tmp_path, monkeypatch):</span>
+<span class="a">+    conn = fakeredis.FakeRedis()</span>
+<span class="a">+    monkeypatch.setattr(&quot;redis.Redis.from_url&quot;, lambda url: conn)</span>
+<span class="a">+    released = []</span>
+<span class="a">+    monkeypatch.setattr(bc, &quot;ensure_release&quot;, lambda app_dir, ref, bucket: released.append(ref))</span>
+<span class="a">+    calls = tmp_path / &quot;calls.txt&quot;</span>
+<span class="a">+    fake = tmp_path / &quot;fake_terraform.py&quot;</span>
+<span class="a">+    fake.write_text(</span>
+<span class="a">+        &quot;import sys, pathlib\n&quot;</span>
+<span class="a">+        f&quot;pathlib.Path({str(calls)!r}).open(&#x27;a&#x27;).write(&#x27; &#x27;.join(sys.argv[1:]) + &#x27;\\n&#x27;)\n&quot;</span>
+<span class="a">+        f&quot;sys.exit(int(pathlib.Path({str(tmp_path / &#x27;exit_code&#x27;)!r}).read_text() or 0))\n&quot;</span>
+<span class="a">+    )</span>
+<span class="a">+    (tmp_path / &quot;exit_code&quot;).write_text(&quot;0&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    def run(extra=()):</span>
+<span class="a">+        argv = [&quot;--redis-url&quot;, &quot;redis://x&quot;, &quot;--bucket&quot;, &quot;b&quot;, &quot;--max-workers&quot;, &quot;2&quot;,</span>
+<span class="a">+                &quot;--app-dir&quot;, str(Path(__file__).resolve().parents[1]),</span>
+<span class="a">+                &quot;--module-dir&quot;, str(tmp_path / &quot;workers&quot;),</span>
+<span class="a">+                &quot;--state&quot;, str(tmp_path / &quot;state.json&quot;),</span>
+<span class="a">+                &quot;--var-file&quot;, str(tmp_path / &quot;vars.json&quot;),</span>
+<span class="a">+                &quot;--terraform&quot;, sys.executable, str(fake), *extra]</span>
+<span class="a">+        return bc.main(argv)</span>
+<span class="a">+</span>
+<span class="a">+    return conn, run, tmp_path, calls, released</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_run_writes_the_workers_and_applies(world):</span>
+<span class="a">+    conn, run, tmp, calls, released = world</span>
+<span class="a">+    for _ in range(3):</span>
+<span class="a">+        Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="a">+    assert run() == 0</span>
+<span class="a">+    workers = json.loads((tmp / &quot;vars.json&quot;).read_text())[&quot;workers&quot;]</span>
+<span class="a">+    assert len(workers) == 2  # the cap</span>
+<span class="a">+    assert &quot;apply -auto-approve&quot; in calls.read_text()</span>
+<span class="a">+    assert len(released) == 1  # the app went to the bucket for the new workers</span>
+<span class="a">+    state = json.loads((tmp / &quot;state.json&quot;).read_text())</span>
+<span class="a">+    assert set(state[&quot;workers&quot;]) == set(workers)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_failed_apply_keeps_the_old_state(world):</span>
+<span class="a">+    conn, run, tmp, calls, released = world</span>
+<span class="a">+    Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="a">+    (tmp / &quot;exit_code&quot;).write_text(&quot;1&quot;)</span>
+<span class="a">+    assert run() == 1</span>
+<span class="a">+    assert json.loads((tmp / &quot;vars.json&quot;).read_text()) == {&quot;workers&quot;: {}}</span>
+<span class="a">+    assert not (tmp / &quot;state.json&quot;).exists()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_dry_run_changes_nothing(world):</span>
+<span class="a">+    conn, run, tmp, calls, released = world</span>
+<span class="a">+    Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="a">+    assert run([&quot;--dry-run&quot;]) == 0</span>
+<span class="a">+    assert not calls.exists() and not (tmp / &quot;vars.json&quot;).exists() and not released</span>
+diff --git a/tools/burst_controller.py b/tools/burst_controller.py
+new file mode 100644
+index 0000000..84e453b
+--- /dev/null
++++ b/tools/burst_controller.py
+<span class="h">@@ -0,0 +1,313 @@</span>
+<span class="a">+&quot;&quot;&quot;Burst workers: add them when jobs wait, remove them when they are idle.</span>
+<span class="a">+</span>
+<span class="a">+The web server runs this once a minute (a systemd timer, see</span>
+<span class="a">+infra/burst/README.md). One run does this:</span>
+<span class="a">+</span>
+<span class="a">+1. Read the Redis queue: how many jobs wait, and which burst workers are busy</span>
+<span class="a">+   or idle.</span>
+<span class="a">+2. Decide the set of burst workers (`decide`).</span>
+<span class="a">+3. Send the rq shutdown command to each worker that is no longer needed. rq</span>
+<span class="a">+   lets a worker finish its job before it stops, so a scale-in never kills a</span>
+<span class="a">+   paid job.</span>
+<span class="a">+4. Write the set to the Terraform variables of infra/burst/workers and run</span>
+<span class="a">+   `terraform apply` when the set changed. Terraform makes the new droplets,</span>
+<span class="a">+   and destroys each droplet whose worker has stopped.</span>
+<span class="a">+</span>
+<span class="a">+The host name of a burst worker is its droplet name, and rq records the host</span>
+<span class="a">+name of each worker. That is how a droplet and its rq worker are matched.</span>
+<span class="a">+Workers run the app at the git commit of this server (`ref`). After a deploy,</span>
+<span class="a">+the workers of the old commit stop and new ones take their place.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import argparse</span>
+<span class="a">+import json</span>
+<span class="a">+import logging</span>
+<span class="a">+import os</span>
+<span class="a">+import subprocess</span>
+<span class="a">+import sys</span>
+<span class="a">+import tempfile</span>
+<span class="a">+import time</span>
+<span class="a">+from dataclasses import dataclass, field</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+log = logging.getLogger(&quot;subplz.burst&quot;)</span>
+<span class="a">+</span>
+<span class="a">+NAME_PREFIX = &quot;subplz-burst-&quot;</span>
+<span class="a">+QUEUE_NAME = &quot;subplz-jobs-paid&quot;  # backend.queue.PAID_QUEUE: burst workers take paid jobs only</span>
+<span class="a">+RELEASE_PREFIX = &quot;releases/&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Config:</span>
+<span class="a">+    max_workers: int</span>
+<span class="a">+    # A new droplet installs the speech stack before its worker starts.</span>
+<span class="a">+    boot_timeout_s: float = 20 * 60</span>
+<span class="a">+    # An idle worker waits this long for a new job before it stops.</span>
+<span class="a">+    idle_grace_s: float = 10 * 60</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass</span>
+<span class="a">+class Memory:</span>
+<span class="a">+    &quot;&quot;&quot;What the controller keeps between runs, in a JSON file.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    # name -&gt; {&quot;created&quot;: unix time, &quot;ref&quot;: git commit of the app}</span>
+<span class="a">+    workers: dict[str, dict] = field(default_factory=dict)</span>
+<span class="a">+    # Names that had an rq worker at least once.</span>
+<span class="a">+    registered: set[str] = field(default_factory=set)</span>
+<span class="a">+    # name -&gt; unix time from which the worker was idle without a break.</span>
+<span class="a">+    idle_since: dict[str, float] = field(default_factory=dict)</span>
+<span class="a">+    # Names that received the rq shutdown command.</span>
+<span class="a">+    draining: set[str] = field(default_factory=set)</span>
+<span class="a">+</span>
+<span class="a">+    def to_json(self) -&gt; dict:</span>
+<span class="a">+        return {</span>
+<span class="a">+            &quot;workers&quot;: self.workers,</span>
+<span class="a">+            &quot;registered&quot;: sorted(self.registered),</span>
+<span class="a">+            &quot;idle_since&quot;: self.idle_since,</span>
+<span class="a">+            &quot;draining&quot;: sorted(self.draining),</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+    @classmethod</span>
+<span class="a">+    def from_json(cls, data: dict) -&gt; Memory:</span>
+<span class="a">+        return cls(</span>
+<span class="a">+            workers=dict(data.get(&quot;workers&quot;, {})),</span>
+<span class="a">+            registered=set(data.get(&quot;registered&quot;, [])),</span>
+<span class="a">+            idle_since=dict(data.get(&quot;idle_since&quot;, {})),</span>
+<span class="a">+            draining=set(data.get(&quot;draining&quot;, [])),</span>
+<span class="a">+        )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Decision:</span>
+<span class="a">+    add: tuple[str, ...]  # new droplets</span>
+<span class="a">+    drain: frozenset[str]  # send these workers the rq shutdown command</span>
+<span class="a">+    remove: frozenset[str]  # destroy these droplets</span>
+<span class="a">+</span>
+<span class="a">+    @property</span>
+<span class="a">+    def changes_droplets(self) -&gt; bool:</span>
+<span class="a">+        return bool(self.add or self.remove)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def decide(</span>
+<span class="a">+    now: float,</span>
+<span class="a">+    waiting: int,</span>
+<span class="a">+    live: dict[str, str],</span>
+<span class="a">+    memory: Memory,</span>
+<span class="a">+    config: Config,</span>
+<span class="a">+    ref: str,</span>
+<span class="a">+) -&gt; tuple[Decision, Memory]:</span>
+<span class="a">+    &quot;&quot;&quot;The next set of burst workers. Pure: no I/O.</span>
+<span class="a">+</span>
+<span class="a">+    `waiting` is the number of queued jobs that no worker has taken. `live`</span>
+<span class="a">+    maps the host name of each burst worker that rq knows to &quot;busy&quot; or &quot;idle&quot;.</span>
+<span class="a">+    `ref` is the app commit for new workers.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    keep: set[str] = set()</span>
+<span class="a">+    remove: set[str] = set()</span>
+<span class="a">+    drain: set[str] = set()</span>
+<span class="a">+    registered = set(memory.registered)</span>
+<span class="a">+    idle_since = dict(memory.idle_since)</span>
+<span class="a">+    draining = set(memory.draining)</span>
+<span class="a">+    booting: list[str] = []</span>
+<span class="a">+    idle_ready: list[str] = []</span>
+<span class="a">+    busy: list[str] = []</span>
+<span class="a">+</span>
+<span class="a">+    for name, info in memory.workers.items():</span>
+<span class="a">+        state = live.get(name)</span>
+<span class="a">+        stale = info.get(&quot;ref&quot;) != ref</span>
+<span class="a">+        if state is None:</span>
+<span class="a">+            if name in registered or stale:</span>
+<span class="a">+                remove.add(name)  # it stopped, or it would run an old commit</span>
+<span class="a">+            elif now - info[&quot;created&quot;] &gt;= config.boot_timeout_s:</span>
+<span class="a">+                remove.add(name)  # it never started</span>
+<span class="a">+            else:</span>
+<span class="a">+                keep.add(name)</span>
+<span class="a">+                booting.append(name)</span>
+<span class="a">+            continue</span>
+<span class="a">+</span>
+<span class="a">+        keep.add(name)</span>
+<span class="a">+        registered.add(name)</span>
+<span class="a">+        if state == &quot;busy&quot;:</span>
+<span class="a">+            idle_since.pop(name, None)</span>
+<span class="a">+            if stale and name not in draining:</span>
+<span class="a">+                drain.add(name)  # it finishes the job, then stops</span>
+<span class="a">+            elif name not in draining:</span>
+<span class="a">+                busy.append(name)</span>
+<span class="a">+            continue</span>
+<span class="a">+</span>
+<span class="a">+        idle_since.setdefault(name, now)</span>
+<span class="a">+        if name in draining:</span>
+<span class="a">+            continue  # it stops soon</span>
+<span class="a">+        if stale or (waiting == 0 and now - idle_since[name] &gt;= config.idle_grace_s):</span>
+<span class="a">+            drain.add(name)</span>
+<span class="a">+        else:</span>
+<span class="a">+            idle_ready.append(name)</span>
+<span class="a">+</span>
+<span class="a">+    # Above the cap (the operator lowered it): stop the cheapest workers first.</span>
+<span class="a">+    active = len(booting) + len(idle_ready) + len(busy)</span>
+<span class="a">+    excess = active - config.max_workers</span>
+<span class="a">+    while excess &gt; 0 and booting:</span>
+<span class="a">+        name = booting.pop()</span>
+<span class="a">+        keep.discard(name)</span>
+<span class="a">+        remove.add(name)</span>
+<span class="a">+        excess -= 1</span>
+<span class="a">+    for group in (idle_ready, busy):</span>
+<span class="a">+        while excess &gt; 0 and group:</span>
+<span class="a">+            drain.add(group.pop())</span>
+<span class="a">+            excess -= 1</span>
+<span class="a">+</span>
+<span class="a">+    active = len(booting) + len(idle_ready) + len(busy)</span>
+<span class="a">+    need = waiting - len(idle_ready) - len(booting)</span>
+<span class="a">+    room = config.max_workers - active</span>
+<span class="a">+    count = max(0, min(need, room))</span>
+<span class="a">+    taken = set(memory.workers) | set(live)</span>
+<span class="a">+    new_names: list[str] = []</span>
+<span class="a">+    i = 0</span>
+<span class="a">+    while len(new_names) &lt; count:</span>
+<span class="a">+        name = f&quot;{NAME_PREFIX}{int(now)}-{i}&quot;</span>
+<span class="a">+        i += 1</span>
+<span class="a">+        if name not in taken:</span>
+<span class="a">+            new_names.append(name)</span>
+<span class="a">+    add = tuple(new_names)</span>
+<span class="a">+</span>
+<span class="a">+    workers = {n: memory.workers[n] for n in keep}</span>
+<span class="a">+    workers.update({n: {&quot;created&quot;: now, &quot;ref&quot;: ref} for n in add})</span>
+<span class="a">+    draining = (draining | drain) &amp; keep</span>
+<span class="a">+    new_memory = Memory(</span>
+<span class="a">+        workers=workers,</span>
+<span class="a">+        registered=registered &amp; keep,</span>
+<span class="a">+        idle_since={n: t for n, t in idle_since.items() if n in keep and live.get(n) == &quot;idle&quot;},</span>
+<span class="a">+        draining=draining,</span>
+<span class="a">+    )</span>
+<span class="a">+    return Decision(add=add, drain=frozenset(drain), remove=frozenset(remove)), new_memory</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- I/O ---------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def read_queue(conn) -&gt; tuple[int, dict[str, str], dict[str, str]]:</span>
+<span class="a">+    &quot;&quot;&quot;Queued jobs, the state of each burst worker, and its rq worker name.&quot;&quot;&quot;</span>
+<span class="a">+    from rq import Queue, Worker</span>
+<span class="a">+</span>
+<span class="a">+    waiting = Queue(QUEUE_NAME, connection=conn).count</span>
+<span class="a">+    live: dict[str, str] = {}</span>
+<span class="a">+    rq_names: dict[str, str] = {}</span>
+<span class="a">+    for worker in Worker.all(connection=conn):</span>
+<span class="a">+        host = worker.hostname or &quot;&quot;</span>
+<span class="a">+        if not host.startswith(NAME_PREFIX):</span>
+<span class="a">+            continue  # the web server&#x27;s own worker, or one this code does not manage</span>
+<span class="a">+        live[host] = &quot;busy&quot; if worker.get_state() == &quot;busy&quot; else &quot;idle&quot;</span>
+<span class="a">+        rq_names[host] = worker.name</span>
+<span class="a">+    return waiting, live, rq_names</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def send_drain(conn, rq_names: dict[str, str], names: frozenset[str]) -&gt; None:</span>
+<span class="a">+    from rq.command import send_shutdown_command</span>
+<span class="a">+</span>
+<span class="a">+    for name in sorted(names):</span>
+<span class="a">+        if name in rq_names:</span>
+<span class="a">+            send_shutdown_command(conn, rq_names[name])</span>
+<span class="a">+            log.info(&quot;told %s to stop after its current job&quot;, name)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def load_memory(path: Path) -&gt; Memory:</span>
+<span class="a">+    if not path.exists():</span>
+<span class="a">+        return Memory()</span>
+<span class="a">+    return Memory.from_json(json.loads(path.read_text(encoding=&quot;utf-8&quot;)))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def save_json(path: Path, data: dict) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Write `data` so that a crash never leaves half a file.&quot;&quot;&quot;</span>
+<span class="a">+    path.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=&quot;.tmp&quot;)</span>
+<span class="a">+    with os.fdopen(fd, &quot;w&quot;, encoding=&quot;utf-8&quot;) as out:</span>
+<span class="a">+        json.dump(data, out, indent=2, sort_keys=True)</span>
+<span class="a">+    os.replace(tmp, path)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def terraform_vars(memory: Memory) -&gt; dict:</span>
+<span class="a">+    return {&quot;workers&quot;: {n: {&quot;ref&quot;: info[&quot;ref&quot;]} for n, info in sorted(memory.workers.items())}}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def terraform_apply(terraform: list[str], module_dir: Path, var_file: Path) -&gt; bool:</span>
+<span class="a">+    cmd = [*terraform, f&quot;-chdir={module_dir}&quot;, &quot;apply&quot;, &quot;-auto-approve&quot;,</span>
+<span class="a">+           &quot;-input=false&quot;, &quot;-no-color&quot;, f&quot;-var-file={var_file}&quot;]</span>
+<span class="a">+    result = subprocess.run(cmd, capture_output=True, text=True)</span>
+<span class="a">+    if result.returncode != 0:</span>
+<span class="a">+        log.error(&quot;terraform apply failed (%s):\n%s&quot;, result.returncode, result.stderr[-4000:])</span>
+<span class="a">+        return False</span>
+<span class="a">+    return True</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def ensure_release(app_dir: Path, ref: str, bucket: str) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Put the app at `ref` in the bucket, where new workers download it.&quot;&quot;&quot;</span>
+<span class="a">+    import boto3</span>
+<span class="a">+    from botocore.exceptions import ClientError</span>
+<span class="a">+</span>
+<span class="a">+    s3 = boto3.client(&quot;s3&quot;)</span>
+<span class="a">+    key = f&quot;{RELEASE_PREFIX}{ref}.tar.gz&quot;</span>
+<span class="a">+    try:</span>
+<span class="a">+        s3.head_object(Bucket=bucket, Key=key)</span>
+<span class="a">+        return</span>
+<span class="a">+    except ClientError as exc:</span>
+<span class="a">+        if exc.response.get(&quot;Error&quot;, {}).get(&quot;Code&quot;) not in (&quot;404&quot;, &quot;NoSuchKey&quot;, &quot;NotFound&quot;):</span>
+<span class="a">+            raise</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as tmp:</span>
+<span class="a">+        archive = Path(tmp) / &quot;app.tar.gz&quot;</span>
+<span class="a">+        subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(app_dir), &quot;archive&quot;, &quot;--format=tar.gz&quot;,</span>
+<span class="a">+                        &quot;-o&quot;, str(archive), ref], check=True)</span>
+<span class="a">+        s3.upload_file(str(archive), bucket, key)</span>
+<span class="a">+    log.info(&quot;uploaded %s&quot;, key)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def run(args: argparse.Namespace) -&gt; int:</span>
+<span class="a">+    from redis import Redis</span>
+<span class="a">+</span>
+<span class="a">+    config = Config(max_workers=args.max_workers)</span>
+<span class="a">+    ref = subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(args.app_dir), &quot;rev-parse&quot;, &quot;HEAD&quot;],</span>
+<span class="a">+                         check=True, capture_output=True, text=True).stdout.strip()</span>
+<span class="a">+    conn = Redis.from_url(args.redis_url)</span>
+<span class="a">+    waiting, live, rq_names = read_queue(conn)</span>
+<span class="a">+    memory = load_memory(args.state)</span>
+<span class="a">+    decision, new_memory = decide(time.time(), waiting, live, memory, config, ref)</span>
+<span class="a">+    log.info(&quot;waiting=%d live=%s add=%s drain=%s remove=%s&quot;, waiting, live,</span>
+<span class="a">+             list(decision.add), sorted(decision.drain), sorted(decision.remove))</span>
+<span class="a">+    if args.dry_run:</span>
+<span class="a">+        return 0</span>
+<span class="a">+</span>
+<span class="a">+    send_drain(conn, rq_names, decision.drain)</span>
+<span class="a">+    if decision.changes_droplets:</span>
+<span class="a">+        if decision.add:</span>
+<span class="a">+            ensure_release(args.app_dir, ref, args.bucket)</span>
+<span class="a">+        save_json(args.var_file, terraform_vars(new_memory))</span>
+<span class="a">+        if not terraform_apply(args.terraform, args.module_dir, args.var_file):</span>
+<span class="a">+            # Keep the old memory: the next run decides again from the facts.</span>
+<span class="a">+            save_json(args.var_file, terraform_vars(memory))</span>
+<span class="a">+            return 1</span>
+<span class="a">+    save_json(args.state, new_memory.to_json())</span>
+<span class="a">+    return 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main(argv: list[str] | None = None) -&gt; int:</span>
+<span class="a">+    logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)</span>
+<span class="a">+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])</span>
+<span class="a">+    p.add_argument(&quot;--max-workers&quot;, type=int,</span>
+<span class="a">+                   default=int(os.environ.get(&quot;SUBPLZ_BURST_MAX_WORKERS&quot;, &quot;3&quot;)))</span>
+<span class="a">+    p.add_argument(&quot;--redis-url&quot;, default=os.environ.get(&quot;SUBPLZ_WEB_REDIS_URL&quot;, &quot;&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--bucket&quot;, default=os.environ.get(&quot;SUBPLZ_WEB_S3_BUCKET&quot;, &quot;&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--app-dir&quot;, type=Path, default=Path(&quot;/opt/subplz-web&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--module-dir&quot;, type=Path,</span>
+<span class="a">+                   default=Path(&quot;/opt/subplz-web/infra/burst/workers&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--state&quot;, type=Path, default=Path(&quot;/var/lib/subplz-burst/controller.json&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--var-file&quot;, type=Path, default=Path(&quot;/var/lib/subplz-burst/workers.tfvars.json&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--terraform&quot;, nargs=&quot;+&quot;, default=[&quot;terraform&quot;])</span>
+<span class="a">+    p.add_argument(&quot;--dry-run&quot;, action=&quot;store_true&quot;, help=&quot;decide and log, change nothing&quot;)</span>
+<span class="a">+    args = p.parse_args(argv)</span>
+<span class="a">+    if not args.redis_url or not args.bucket:</span>
+<span class="a">+        p.error(&quot;set SUBPLZ_WEB_REDIS_URL and SUBPLZ_WEB_S3_BUCKET (or --redis-url, --bucket)&quot;)</span>
+<span class="a">+    return run(args)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    sys.exit(main())</span></pre>
+</div></body></html>

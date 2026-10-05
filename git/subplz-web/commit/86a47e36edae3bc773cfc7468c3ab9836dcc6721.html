@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 86a47e36 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 86a47e36edae3bc773cfc7468c3ab9836dcc6721
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:45:08 -0700
+
+Put paid and free server jobs on separate queues
+
+A burst worker must take paid jobs only, so that a free credit never
+starts a machine that costs money. With the Redis queue, a paid job now
+goes to subplz-jobs-paid and a free job to subplz-jobs. billing.is_paid
+tells them apart: a bought credit, a book of a monthly plan and an
+unlimited plan pay; a free credit, the daily credit and a browser job do
+not. worker.py takes the queues in SUBPLZ_WEB_WORKER_QUEUES, paid jobs
+first by default.
+
+With Redis, a restart of the web server no longer puts running jobs back
+on the queue. A worker on another machine can still run them, and a
+second copy would convert the book twice. The in-process queue keeps the
+old behaviour, because its jobs stop with the process.
+
+The dev requirements add rq, redis and fakeredis for the queue tests,
+and hypothesis for the property tests of the next commits.
+
+</pre><pre> backend/api.py           |   2 +-
+ backend/billing.py       |   7 +++
+ backend/main.py          |  13 +++--
+ backend/queue.py         |  22 ++++++---
+ requirements-dev.txt     |   7 +++
+ tests/conftest.py        |   2 +-
+ tests/test_local_jobs.py |   2 +-
+ tests/test_paid_queue.py | 123 +++++++++++++++++++++++++++++++++++++++++++++++
+ worker.py                |  27 +++++++++--
+ 9 files changed, 186 insertions(+), 19 deletions(-)
+</pre><pre>diff --git a/backend/api.py b/backend/api.py
+index 08c31e0..5211e66 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -675,7 +675,7 @@ def start_job(</span>
+     job.error = None
+     session.commit()
+ 
+<span class="d">-    queue.enqueue(job.id)</span>
+<span class="a">+    queue.enqueue(job.id, paid=billing.is_paid(job))</span>
+     return _job_out(job, [])
+ 
+ 
+diff --git a/backend/billing.py b/backend/billing.py
+index e3b7bab..48fab13 100644
+--- a/backend/billing.py
++++ b/backend/billing.py
+<span class="h">@@ -290,3 +290,10 @@ def refund_job(job_id: str) -&gt; None:</span>
+         if job is not None:
+             refund(session, job)
+             session.commit()
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def is_paid(job: Job) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;True for a server job that money pays for: a bought credit, a book of a</span>
+<span class="a">+    monthly plan, or an unlimited plan. False for a free credit, the daily</span>
+<span class="a">+    credit, and a browser job. Only paid jobs may start a burst worker.&quot;&quot;&quot;</span>
+<span class="a">+    return not (job.local or job.free_credit_spent or job.daily_credit_on is not None)</span>
+diff --git a/backend/main.py b/backend/main.py
+index ffe9c0e..11d98c7 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -19,7 +19,7 @@ from fastapi import FastAPI</span>
+ from fastapi.responses import FileResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+<span class="d">-from . import captions, subrep</span>
+<span class="a">+from . import billing, captions, subrep</span>
+ from .api import router
+ from .db import Job, JobStatus, SessionLocal, init_db
+ from .languages import all_languages
+<span class="h">@@ -61,7 +61,12 @@ def _requeue_interrupted() -&gt; None:</span>
+ 
+     An in-process queue dies with the process, so anything left `running` is
+     orphaned. Put it back in the queue rather than leaving a stuck progress bar.
+<span class="a">+</span>
+<span class="a">+    A Redis queue keeps its jobs, and a worker on another machine may still run</span>
+<span class="a">+    one. Putting that job on the queue again would convert the book twice.</span>
+     &quot;&quot;&quot;
+<span class="a">+    if settings.queue_backend != &quot;memory&quot;:</span>
+<span class="a">+        return</span>
+     with SessionLocal() as s:
+         stale = (
+             s.query(Job)
+<span class="h">@@ -73,10 +78,10 @@ def _requeue_interrupted() -&gt; None:</span>
+             job.stage = &quot;Queued (resumed after restart)&quot;
+             job.progress = 0.0
+         s.commit()
+<span class="d">-        ids = [j.id for j in stale]</span>
+<span class="a">+        ids = [(j.id, billing.is_paid(j)) for j in stale]</span>
+ 
+<span class="d">-    for job_id in ids:</span>
+<span class="d">-        queue.enqueue(job_id)</span>
+<span class="a">+    for job_id, paid in ids:</span>
+<span class="a">+        queue.enqueue(job_id, paid=paid)</span>
+     if ids:
+         log.info(&quot;re-queued %d interrupted job(s)&quot;, len(ids))
+ 
+diff --git a/backend/queue.py b/backend/queue.py
+index dc0bf82..2283d12 100644
+--- a/backend/queue.py
++++ b/backend/queue.py
+<span class="h">@@ -3,6 +3,10 @@</span>
+ Localhost runs jobs on a small thread pool inside the API process. The public
+ deployment sets SUBPLZ_WEB_QUEUE_BACKEND=redis and runs `worker.py` on separate
+ machines; the API side then only enqueues. Same `enqueue(job_id)` call either way.
+<span class="a">+</span>
+<span class="a">+A paid job and a free job go to different Redis queues. The web server&#x27;s own</span>
+<span class="a">+worker takes both, paid jobs first. A burst worker takes paid jobs only (see</span>
+<span class="a">+infra/burst/README.md), so a free credit never starts a machine that costs money.</span>
+ &quot;&quot;&quot;
+ 
+ from __future__ import annotations
+<span class="h">@@ -16,11 +20,14 @@ from .settings import settings</span>
+ 
+ log = logging.getLogger(__name__)
+ 
+<span class="a">+PAID_QUEUE = &quot;subplz-jobs-paid&quot;</span>
+<span class="a">+FREE_QUEUE = &quot;subplz-jobs&quot;</span>
+<span class="a">+</span>
+ 
+ class JobQueue(ABC):
+     @abstractmethod
+<span class="d">-    def enqueue(self, job_id: str) -&gt; None:</span>
+<span class="d">-        ...</span>
+<span class="a">+    def enqueue(self, job_id: str, paid: bool = True) -&gt; None:</span>
+<span class="a">+        &quot;&quot;&quot;Run `job_id`. `paid` is False for a job that a free credit pays for.&quot;&quot;&quot;</span>
+ 
+     @abstractmethod
+     def depth(self) -&gt; int:
+<span class="h">@@ -44,7 +51,7 @@ class InProcessQueue(JobQueue):</span>
+         self._lock = threading.Lock()
+         self._pending: set[str] = set()
+ 
+<span class="d">-    def enqueue(self, job_id: str) -&gt; None:</span>
+<span class="a">+    def enqueue(self, job_id: str, paid: bool = True) -&gt; None:</span>
+         with self._lock:
+             if job_id in self._pending:
+                 return
+<span class="h">@@ -79,10 +86,11 @@ class RedisQueue(JobQueue):</span>
+         from rq import Queue as RQQueue
+ 
+         self._conn = Redis.from_url(url)
+<span class="d">-        self._q = RQQueue(&quot;subplz-jobs&quot;, connection=self._conn)</span>
+<span class="a">+        self._paid = RQQueue(PAID_QUEUE, connection=self._conn)</span>
+<span class="a">+        self._free = RQQueue(FREE_QUEUE, connection=self._conn)</span>
+ 
+<span class="d">-    def enqueue(self, job_id: str) -&gt; None:</span>
+<span class="d">-        self._q.enqueue(</span>
+<span class="a">+    def enqueue(self, job_id: str, paid: bool = True) -&gt; None:</span>
+<span class="a">+        (self._paid if paid else self._free).enqueue(</span>
+             &quot;backend.runner.run_job&quot;,
+             job_id,
+             job_timeout=settings.job_timeout_seconds,
+<span class="h">@@ -90,7 +98,7 @@ class RedisQueue(JobQueue):</span>
+         )
+ 
+     def depth(self) -&gt; int:
+<span class="d">-        return self._q.count + self._q.started_job_registry.count</span>
+<span class="a">+        return sum(q.count + q.started_job_registry.count for q in (self._paid, self._free))</span>
+ 
+ 
+ def build_queue() -&gt; JobQueue:
+diff --git a/requirements-dev.txt b/requirements-dev.txt
+index e3fcd49..66de55e 100644
+--- a/requirements-dev.txt
++++ b/requirements-dev.txt
+<span class="h">@@ -1,3 +1,10 @@</span>
+ -r requirements.txt
+ pytest&gt;=8
+ httpx&gt;=0.27
+<span class="a">+</span>
+<span class="a">+# Property tests (tests/test_burst_controller.py, tests/test_copy_database.py).</span>
+<span class="a">+hypothesis&gt;=6.100</span>
+<span class="a">+# The burst controller reads the rq queue. Its tests use a fake Redis.</span>
+<span class="a">+rq&gt;=2.0</span>
+<span class="a">+redis&gt;=5.0</span>
+<span class="a">+fakeredis&gt;=2.20</span>
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 8ed33c7..9b362ea 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+<span class="h">@@ -43,7 +43,7 @@ init_db()</span>
+ @pytest.fixture(autouse=True)
+ def _no_real_work(monkeypatch):
+     &quot;&quot;&quot;Starting a job must not actually launch an alignment.&quot;&quot;&quot;
+<span class="d">-    monkeypatch.setattr(api.queue, &quot;enqueue&quot;, lambda job_id: None)</span>
+<span class="a">+    monkeypatch.setattr(api.queue, &quot;enqueue&quot;, lambda job_id, paid=True: None)</span>
+ 
+ 
+ @pytest.fixture(autouse=True)
+diff --git a/tests/test_local_jobs.py b/tests/test_local_jobs.py
+index 6ca0daf..4cffb6a 100644
+--- a/tests/test_local_jobs.py
++++ b/tests/test_local_jobs.py
+<span class="h">@@ -101,7 +101,7 @@ def test_restart_does_not_queue_browser_jobs(client, monkeypatch):</span>
+ 
+     job = begin(client).json()
+     queued = []
+<span class="d">-    monkeypatch.setattr(main.queue, &quot;enqueue&quot;, queued.append)</span>
+<span class="a">+    monkeypatch.setattr(main.queue, &quot;enqueue&quot;, lambda job_id, paid=True: queued.append(job_id))</span>
+     main._requeue_interrupted()
+     assert job[&quot;id&quot;] not in queued
+     assert get_job_row(job[&quot;id&quot;]).status == JobStatus.running
+diff --git a/tests/test_paid_queue.py b/tests/test_paid_queue.py
+new file mode 100644
+index 0000000..e7ca08a
+--- /dev/null
++++ b/tests/test_paid_queue.py
+<span class="h">@@ -0,0 +1,123 @@</span>
+<span class="a">+&quot;&quot;&quot;Burst workers take paid jobs only.</span>
+<span class="a">+</span>
+<span class="a">+Each server job goes to the paid queue or to the free queue. The web server&#x27;s</span>
+<span class="a">+own worker takes both, paid jobs first. A burst worker takes paid jobs only, so</span>
+<span class="a">+free credits never start a machine that costs money.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import time</span>
+<span class="a">+from datetime import date</span>
+<span class="a">+</span>
+<span class="a">+import fakeredis</span>
+<span class="a">+import pytest</span>
+<span class="a">+from rq import Queue</span>
+<span class="a">+</span>
+<span class="a">+import worker</span>
+<span class="a">+from backend import api, billing, main</span>
+<span class="a">+from backend import queue as jobqueue</span>
+<span class="a">+from backend.db import Job, JobStatus, SessionLocal</span>
+<span class="a">+from backend.settings import settings</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import account_id, checkout_event, make_job, post_webhook</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def cloud(monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;cloud_enabled&quot;, True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def sent(monkeypatch):</span>
+<span class="a">+    &quot;&quot;&quot;What the API put on the queue: (job id, paid).&quot;&quot;&quot;</span>
+<span class="a">+    calls: list[tuple[str, bool]] = []</span>
+<span class="a">+    monkeypatch.setattr(api.queue, &quot;enqueue&quot;, lambda job_id, paid=True: calls.append((job_id, paid)))</span>
+<span class="a">+    return calls</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def start(client, job_id: str):</span>
+<span class="a">+    return client.post(f&quot;/api/jobs/{job_id}/start&quot;, json={&quot;language&quot;: &quot;en&quot;})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.mark.parametrize(&quot;fields, paid&quot;, [</span>
+<span class="a">+    ({&quot;credit_spent&quot;: 1}, True),  # a bought credit</span>
+<span class="a">+    ({&quot;plan_credit_spent&quot;: 1}, True),  # a book of a monthly plan</span>
+<span class="a">+    ({}, True),  # an unlimited plan spends no credit</span>
+<span class="a">+    ({&quot;free_credit_spent&quot;: 1}, False),</span>
+<span class="a">+    ({&quot;daily_credit_on&quot;: date(2026, 9, 22)}, False),</span>
+<span class="a">+    ({&quot;local&quot;: 1}, False),  # a browser job never goes to a worker</span>
+<span class="a">+])</span>
+<span class="a">+def test_is_paid(fields, paid):</span>
+<span class="a">+    job = Job(**{&quot;local&quot;: 0, &quot;credit_spent&quot;: 0, &quot;plan_credit_spent&quot;: 0,</span>
+<span class="a">+                 &quot;free_credit_spent&quot;: 0, &quot;daily_credit_on&quot;: None, **fields})</span>
+<span class="a">+    assert billing.is_paid(job) is paid</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_free_credit_job_goes_to_the_free_queue(client, cloud, sent):</span>
+<span class="a">+    job_id = make_job(client, with_files=True)</span>
+<span class="a">+    assert start(client, job_id).status_code == 200</span>
+<span class="a">+    assert sent == [(job_id, False)]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_bought_credit_job_goes_to_the_paid_queue(client, cloud, sent):</span>
+<span class="a">+    assert start(client, make_job(client, with_files=True)).status_code == 200  # the free one</span>
+<span class="a">+    event = checkout_event(f&quot;cs_{time.time_ns()}&quot;, account_id(client), &quot;pack10&quot;,</span>
+<span class="a">+                           email=f&quot;paid-{time.time_ns()}@example.com&quot;)</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+<span class="a">+    job_id = make_job(client, with_files=True)</span>
+<span class="a">+    assert start(client, job_id).status_code == 200</span>
+<span class="a">+    assert sent[-1] == (job_id, True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_redis_queue_keeps_paid_and_free_jobs_apart(monkeypatch):</span>
+<span class="a">+    conn = fakeredis.FakeRedis()</span>
+<span class="a">+    monkeypatch.setattr(&quot;redis.Redis.from_url&quot;, lambda url: conn)</span>
+<span class="a">+    q = jobqueue.RedisQueue(&quot;redis://unused&quot;)</span>
+<span class="a">+    q.enqueue(&quot;job_paid&quot;, paid=True)</span>
+<span class="a">+    q.enqueue(&quot;job_free&quot;, paid=False)</span>
+<span class="a">+    assert [j.args for j in Queue(jobqueue.PAID_QUEUE, connection=conn).jobs] == [(&quot;job_paid&quot;,)]</span>
+<span class="a">+    assert [j.args for j in Queue(jobqueue.FREE_QUEUE, connection=conn).jobs] == [(&quot;job_free&quot;,)]</span>
+<span class="a">+    assert q.depth() == 2</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_web_server_worker_takes_paid_jobs_first(monkeypatch):</span>
+<span class="a">+    monkeypatch.delenv(&quot;SUBPLZ_WEB_WORKER_QUEUES&quot;, raising=False)</span>
+<span class="a">+    assert worker.queue_names() == [jobqueue.PAID_QUEUE, jobqueue.FREE_QUEUE]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_burst_worker_takes_paid_jobs_only(monkeypatch):</span>
+<span class="a">+    monkeypatch.setenv(&quot;SUBPLZ_WEB_WORKER_QUEUES&quot;, &quot;paid&quot;)</span>
+<span class="a">+    assert worker.queue_names() == [jobqueue.PAID_QUEUE]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_unknown_queue_is_refused(monkeypatch):</span>
+<span class="a">+    monkeypatch.setenv(&quot;SUBPLZ_WEB_WORKER_QUEUES&quot;, &quot;paid,vip&quot;)</span>
+<span class="a">+    with pytest.raises(ValueError, match=&quot;vip&quot;):</span>
+<span class="a">+        worker.queue_names()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _running_job(client) -&gt; str:</span>
+<span class="a">+    job_id = make_job(client, JobStatus.running)</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        s.get(Job, job_id).credit_spent = 1</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+    return job_id</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_restart_with_the_redis_queue_leaves_running_jobs_alone(client, sent, monkeypatch):</span>
+<span class="a">+    # With Redis, a worker on another machine still runs the job. Putting it on</span>
+<span class="a">+    # the queue again would convert the book twice.</span>
+<span class="a">+    job_id = _running_job(client)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;queue_backend&quot;, &quot;redis&quot;)</span>
+<span class="a">+    main._requeue_interrupted()</span>
+<span class="a">+    assert sent == []</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        assert s.get(Job, job_id).status == JobStatus.running</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_restart_with_the_memory_queue_runs_interrupted_jobs_again(client, sent, monkeypatch):</span>
+<span class="a">+    job_id = _running_job(client)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;queue_backend&quot;, &quot;memory&quot;)</span>
+<span class="a">+    main._requeue_interrupted()</span>
+<span class="a">+    assert (job_id, True) in sent</span>
+diff --git a/worker.py b/worker.py
+index 6a1e0fd..3103f15 100644
+--- a/worker.py
++++ b/worker.py
+<span class="h">@@ -16,11 +16,15 @@ Workers and the API must share the database and the storage bucket. They do not</span>
+ need to share a filesystem: staged uploads are the one thing that is local to
+ whoever received them, which is why the API writes uploads to shared storage
+ before enqueuing when the queue backend is redis.
+<span class="a">+</span>
+<span class="a">+SUBPLZ_WEB_WORKER_QUEUES says which jobs this worker takes, in order: &quot;paid,free&quot;</span>
+<span class="a">+(the default: paid jobs first) or &quot;paid&quot; (a burst worker, see infra/burst).</span>
+ &quot;&quot;&quot;
+ 
+ from __future__ import annotations
+ 
+ import logging
+<span class="a">+import os</span>
+ import sys
+ 
+ from backend.settings import settings
+<span class="h">@@ -32,6 +36,18 @@ logging.basicConfig(</span>
+ log = logging.getLogger(&quot;subplz.worker&quot;)
+ 
+ 
+<span class="a">+def queue_names() -&gt; list[str]:</span>
+<span class="a">+    &quot;&quot;&quot;The Redis queues of this worker, the first one first.&quot;&quot;&quot;</span>
+<span class="a">+    from backend.queue import FREE_QUEUE, PAID_QUEUE</span>
+<span class="a">+</span>
+<span class="a">+    known = {&quot;paid&quot;: PAID_QUEUE, &quot;free&quot;: FREE_QUEUE}</span>
+<span class="a">+    wanted = [n.strip() for n in os.environ.get(&quot;SUBPLZ_WEB_WORKER_QUEUES&quot;, &quot;paid,free&quot;).split(&quot;,&quot;)]</span>
+<span class="a">+    unknown = [n for n in wanted if n not in known]</span>
+<span class="a">+    if unknown or not wanted:</span>
+<span class="a">+        raise ValueError(f&quot;SUBPLZ_WEB_WORKER_QUEUES: unknown queue {unknown}; use paid and free&quot;)</span>
+<span class="a">+    return [known[n] for n in wanted]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def main() -&gt; int:
+     if settings.queue_backend != &quot;redis&quot;:
+         log.error(
+<span class="h">@@ -49,15 +65,16 @@ def main() -&gt; int:</span>
+         return 2
+ 
+     conn = Redis.from_url(settings.redis_url)
+<span class="d">-    queue = Queue(&quot;subplz-jobs&quot;, connection=conn)</span>
+<span class="a">+    queues = [Queue(name, connection=conn) for name in queue_names()]</span>
+ 
+     log.info(
+<span class="d">-        &quot;worker starting | redis=%s | device=%s model=%s | storage=%s&quot;,</span>
+<span class="d">-        settings.redis_url, settings.device, settings.model,</span>
+<span class="a">+        &quot;worker starting | queues=%s | device=%s model=%s | storage=%s&quot;,</span>
+<span class="a">+        &quot;,&quot;.join(q.name for q in queues), settings.device, settings.model,</span>
+         settings.storage_backend,
+     )
+<span class="d">-    # burst=False: stay alive and keep taking jobs.</span>
+<span class="d">-    Worker([queue], connection=conn).work(with_scheduler=False)</span>
+<span class="a">+    # burst=False: stay alive and keep taking jobs. rq takes a job from the</span>
+<span class="a">+    # first queue that has one, so the order of the queues is their priority.</span>
+<span class="a">+    Worker(queues, connection=conn).work(with_scheduler=False)</span>
+     return 0
+ 
+ </pre>
+</div></body></html>

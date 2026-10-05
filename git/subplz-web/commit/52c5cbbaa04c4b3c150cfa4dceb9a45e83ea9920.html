@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 52c5cbba - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 52c5cbbaa04c4b3c150cfa4dceb9a45e83ea9920
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:00:31 -0700
+
+Sell hours of cloud captions for Subrep
+
+Subrep makes live captions on the phone for free. The Android app can
+now send each piece of speech to /api/captions/transcribe. The server
+gives it to Groq (whisper-large-v3-turbo) and takes the length of the
+piece from the hour balance of the account.
+
+- backend/captions.py: the hour balance (table caption_balances), three
+  packs (20 h $4.99, 80 h $16.99, 200 h $39), GET /api/captions,
+  POST /api/captions/checkout and POST /api/captions/transcribe.
+- The server takes the seconds before it calls Groq, and gives them back
+  when Groq fails. It keeps no sound and no text.
+- payments.fulfil sells a pack like a book pack and adds its hours.
+  accounts.merge moves the hours to the account that stays.
+- The packs are not in pricing.plans(), so the book page does not show
+  them.
+- Without SUBPLZ_WEB_GROQ_API_KEY the transcribe route answers 503.
+
+Tests: 17 in tests/test_captions.py, with property tests for the
+balance, the WAV wrapper and the billed seconds, and a check of the
+form that Groq receives. Without the hooks in payments and accounts,
+2 of them fail.
+
+</pre><pre> backend/accounts.py    |   3 +
+ backend/captions.py    | 253 +++++++++++++++++++++++++++++++++++++++++++++++++
+ backend/main.py        |   2 +
+ backend/payments.py    |   6 +-
+ backend/settings.py    |   9 ++
+ tests/test_captions.py | 223 +++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 495 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/backend/accounts.py b/backend/accounts.py
+index e3e389c..48b8acb 100644
+--- a/backend/accounts.py
++++ b/backend/accounts.py
+<span class="h">@@ -64,6 +64,9 @@ def merge(session: Session, src: Account, dst: Account) -&gt; None:</span>
+     session.query(Purchase).filter(Purchase.account_id == src.id).update(
+         {Purchase.account_id: dst.id}, synchronize_session=False
+     )
+<span class="a">+    from . import captions  # captions imports api, which imports this module</span>
+<span class="a">+</span>
+<span class="a">+    captions.merge(session, src, dst)</span>
+     dst.purchased_credits += src.purchased_credits
+     src.purchased_credits = 0
+     # Add the free credits used, not the free credits left: a second device
+diff --git a/backend/captions.py b/backend/captions.py
+new file mode 100644
+index 0000000..697d5b3
+--- /dev/null
++++ b/backend/captions.py
+<span class="h">@@ -0,0 +1,253 @@</span>
+<span class="a">+&quot;&quot;&quot;Cloud captions for Subrep: hours of speech recognition, bought in packs.</span>
+<span class="a">+</span>
+<span class="a">+Subrep makes live captions on the phone for free. With cloud captions, the app</span>
+<span class="a">+sends each piece of speech here, and this server gives it to Groq</span>
+<span class="a">+(whisper-large-v3-turbo), a larger model than a phone can run. The account</span>
+<span class="a">+pays with hours from a pack.</span>
+<span class="a">+</span>
+<span class="a">+  20 hours    $4.99</span>
+<span class="a">+  80 hours    $16.99</span>
+<span class="a">+  200 hours   $39.00</span>
+<span class="a">+</span>
+<span class="a">+Groq bills about $0.04 for each audio hour, and at least 10 seconds for each</span>
+<span class="a">+request. Pieces of speech are 1 to 11 seconds long, so one hour costs about</span>
+<span class="a">+$0.08. The packs keep more than half of the price after that cost and the</span>
+<span class="a">+Stripe fee (owner decision, 2026-09-22).</span>
+<span class="a">+</span>
+<span class="a">+The server takes the seconds of a piece before it calls Groq, and gives them</span>
+<span class="a">+back if Groq fails. So two requests at the same time cannot spend one second</span>
+<span class="a">+twice. The server does not keep the sound or the text.</span>
+<span class="a">+</span>
+<span class="a">+A pack is a pricing.Plan, so payments.py sells it the same way as a book pack.</span>
+<span class="a">+The packs are not in pricing.plans(): the book page does not show them.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import io</span>
+<span class="a">+import json</span>
+<span class="a">+import logging</span>
+<span class="a">+import math</span>
+<span class="a">+import secrets</span>
+<span class="a">+import urllib.error</span>
+<span class="a">+import urllib.request</span>
+<span class="a">+import wave</span>
+<span class="a">+from typing import Annotated</span>
+<span class="a">+</span>
+<span class="a">+from fastapi import APIRouter, Depends, HTTPException, Query, Request</span>
+<span class="a">+from fastapi.concurrency import run_in_threadpool</span>
+<span class="a">+from pydantic import BaseModel</span>
+<span class="a">+from sqlalchemy import ForeignKey, Integer, String, update</span>
+<span class="a">+from sqlalchemy.orm import Mapped, Session, mapped_column</span>
+<span class="a">+</span>
+<span class="a">+from .api import get_account, get_session</span>
+<span class="a">+from .db import Account, Base</span>
+<span class="a">+from .pricing import Plan</span>
+<span class="a">+from .settings import settings</span>
+<span class="a">+</span>
+<span class="a">+log = logging.getLogger(__name__)</span>
+<span class="a">+</span>
+<span class="a">+SAMPLE_RATE = 16_000</span>
+<span class="a">+BYTES_PER_SECOND = SAMPLE_RATE * 2  # 16-bit mono</span>
+<span class="a">+</span>
+<span class="a">+PACKS: list[Plan] = [</span>
+<span class="a">+    Plan(id=&quot;captions20&quot;, name=&quot;20 hours of cloud captions&quot;, credits=0, price_cents=499),</span>
+<span class="a">+    Plan(id=&quot;captions80&quot;, name=&quot;80 hours of cloud captions&quot;, credits=0, price_cents=1699),</span>
+<span class="a">+    Plan(id=&quot;captions200&quot;, name=&quot;200 hours of cloud captions&quot;, credits=0, price_cents=3900),</span>
+<span class="a">+]</span>
+<span class="a">+HOURS = {&quot;captions20&quot;: 20, &quot;captions80&quot;: 80, &quot;captions200&quot;: 200}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class CaptionBalance(Base):</span>
+<span class="a">+    &quot;&quot;&quot;The seconds of cloud captions that an account has.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    __tablename__ = &quot;caption_balances&quot;</span>
+<span class="a">+</span>
+<span class="a">+    account_id: Mapped[str] = mapped_column(</span>
+<span class="a">+        String(64), ForeignKey(&quot;accounts.id&quot;), primary_key=True</span>
+<span class="a">+    )</span>
+<span class="a">+    seconds_left: Mapped[int] = mapped_column(Integer, default=0)</span>
+<span class="a">+    seconds_used: Mapped[int] = mapped_column(Integer, default=0)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def pack(plan_id: str) -&gt; Plan | None:</span>
+<span class="a">+    return next((p for p in PACKS if p.id == plan_id), None)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def seconds_left(session: Session, account_id: str) -&gt; int:</span>
+<span class="a">+    row = session.get(CaptionBalance, account_id)</span>
+<span class="a">+    return row.seconds_left if row else 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def add(session: Session, account_id: str, seconds: int) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Give `seconds` to the account. The caller commits.&quot;&quot;&quot;</span>
+<span class="a">+    row = session.get(CaptionBalance, account_id)</span>
+<span class="a">+    if row is None:</span>
+<span class="a">+        row = CaptionBalance(account_id=account_id, seconds_left=0, seconds_used=0)</span>
+<span class="a">+        session.add(row)</span>
+<span class="a">+    row.seconds_left += seconds</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def spend(session: Session, account_id: str, seconds: int) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Take `seconds` from the account, and commit. False if it has fewer.&quot;&quot;&quot;</span>
+<span class="a">+    done = session.execute(</span>
+<span class="a">+        update(CaptionBalance)</span>
+<span class="a">+        .where(CaptionBalance.account_id == account_id,</span>
+<span class="a">+               CaptionBalance.seconds_left &gt;= seconds)</span>
+<span class="a">+        .values(seconds_left=CaptionBalance.seconds_left - seconds,</span>
+<span class="a">+                seconds_used=CaptionBalance.seconds_used + seconds)</span>
+<span class="a">+    ).rowcount</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return done == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def refund(session: Session, account_id: str, seconds: int) -&gt; None:</span>
+<span class="a">+    session.execute(</span>
+<span class="a">+        update(CaptionBalance)</span>
+<span class="a">+        .where(CaptionBalance.account_id == account_id)</span>
+<span class="a">+        .values(seconds_left=CaptionBalance.seconds_left + seconds,</span>
+<span class="a">+                seconds_used=CaptionBalance.seconds_used - seconds)</span>
+<span class="a">+    )</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def fulfil(session: Session, account: Account, plan: Plan) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Called by payments.fulfil for a paid pack. The caller commits.&quot;&quot;&quot;</span>
+<span class="a">+    if plan.id in HOURS:</span>
+<span class="a">+        add(session, account.id, HOURS[plan.id] * 3600)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def merge(session: Session, src: Account, dst: Account) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Called by accounts.merge: the hours of `src` go to `dst`.&quot;&quot;&quot;</span>
+<span class="a">+    row = session.get(CaptionBalance, src.id)</span>
+<span class="a">+    if row is None or row.seconds_left == 0:</span>
+<span class="a">+        return</span>
+<span class="a">+    add(session, dst.id, row.seconds_left)</span>
+<span class="a">+    row.seconds_left = 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def billed_seconds(pcm_bytes: int) -&gt; int:</span>
+<span class="a">+    &quot;&quot;&quot;The seconds that a piece of `pcm_bytes` costs: its length, rounded up.&quot;&quot;&quot;</span>
+<span class="a">+    return max(1, math.ceil(pcm_bytes / BYTES_PER_SECOND))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def wav(pcm: bytes) -&gt; bytes:</span>
+<span class="a">+    out = io.BytesIO()</span>
+<span class="a">+    with wave.open(out, &quot;wb&quot;) as w:</span>
+<span class="a">+        w.setnchannels(1)</span>
+<span class="a">+        w.setsampwidth(2)</span>
+<span class="a">+        w.setframerate(SAMPLE_RATE)</span>
+<span class="a">+        w.writeframes(pcm)</span>
+<span class="a">+    return out.getvalue()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class TranscribeError(RuntimeError):</span>
+<span class="a">+    pass</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def transcribe(pcm: bytes, language: str) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;Send one piece of speech to Groq. Returns its text.&quot;&quot;&quot;</span>
+<span class="a">+    boundary = secrets.token_hex(16)</span>
+<span class="a">+    fields = [(&quot;model&quot;, settings.caption_model), (&quot;response_format&quot;, &quot;json&quot;),</span>
+<span class="a">+              (&quot;temperature&quot;, &quot;0&quot;)]</span>
+<span class="a">+    if language and language != &quot;auto&quot;:</span>
+<span class="a">+        fields.append((&quot;language&quot;, language))</span>
+<span class="a">+    body = io.BytesIO()</span>
+<span class="a">+    for name, value in fields:</span>
+<span class="a">+        body.write(f&#x27;--{boundary}\r\nContent-Disposition: form-data; name=&quot;{name}&quot;&#x27;</span>
+<span class="a">+                   f&quot;\r\n\r\n{value}\r\n&quot;.encode())</span>
+<span class="a">+    body.write(f&#x27;--{boundary}\r\nContent-Disposition: form-data; name=&quot;file&quot;; &#x27;</span>
+<span class="a">+               f&#x27;filename=&quot;piece.wav&quot;\r\nContent-Type: audio/wav\r\n\r\n&#x27;.encode())</span>
+<span class="a">+    body.write(wav(pcm))</span>
+<span class="a">+    body.write(f&quot;\r\n--{boundary}--\r\n&quot;.encode())</span>
+<span class="a">+    request = urllib.request.Request(</span>
+<span class="a">+        settings.caption_api_url, data=body.getvalue(), method=&quot;POST&quot;,</span>
+<span class="a">+        headers={&quot;Authorization&quot;: f&quot;Bearer {settings.groq_api_key}&quot;,</span>
+<span class="a">+                 &quot;Content-Type&quot;: f&quot;multipart/form-data; boundary={boundary}&quot;},</span>
+<span class="a">+    )</span>
+<span class="a">+    try:</span>
+<span class="a">+        with urllib.request.urlopen(request, timeout=30) as response:</span>
+<span class="a">+            return json.load(response).get(&quot;text&quot;, &quot;&quot;).strip()</span>
+<span class="a">+    except urllib.error.HTTPError as exc:</span>
+<span class="a">+        raise TranscribeError(f&quot;speech service answered {exc.code}&quot;) from exc</span>
+<span class="a">+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:</span>
+<span class="a">+        raise TranscribeError(f&quot;speech service unreachable: {exc}&quot;) from exc</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# routes</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+router = APIRouter(prefix=&quot;/api/captions&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class PackIn(BaseModel):</span>
+<span class="a">+    pack_id: str</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _state(session: Session, account: Account) -&gt; dict:</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;account_id&quot;: account.id,</span>
+<span class="a">+        &quot;seconds_left&quot;: seconds_left(session, account.id),</span>
+<span class="a">+        &quot;available&quot;: bool(settings.groq_api_key) and settings.payments_configured,</span>
+<span class="a">+        &quot;packs&quot;: [</span>
+<span class="a">+            {&quot;id&quot;: p.id, &quot;name&quot;: p.name, &quot;hours&quot;: HOURS[p.id],</span>
+<span class="a">+             &quot;price_display&quot;: p.price_display}</span>
+<span class="a">+            for p in PACKS</span>
+<span class="a">+        ],</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.get(&quot;&quot;)</span>
+<span class="a">+def caption_state(</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    return _state(session, account)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/checkout&quot;)</span>
+<span class="a">+def caption_checkout(</span>
+<span class="a">+    body: PackIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    from . import payments</span>
+<span class="a">+</span>
+<span class="a">+    plan = pack(body.pack_id)</span>
+<span class="a">+    if plan is None:</span>
+<span class="a">+        raise HTTPException(404, &quot;No such pack.&quot;)</span>
+<span class="a">+    try:</span>
+<span class="a">+        return {&quot;url&quot;: payments.start_checkout(session, account, plan)}</span>
+<span class="a">+    except payments.PaymentsUnavailable as exc:</span>
+<span class="a">+        raise HTTPException(503, str(exc)) from exc</span>
+<span class="a">+    except payments.PaymentError as exc:</span>
+<span class="a">+        raise HTTPException(400, str(exc)) from exc</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/transcribe&quot;)</span>
+<span class="a">+async def caption_transcribe(</span>
+<span class="a">+    request: Request,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+    lang: Annotated[str, Query(max_length=8)] = &quot;auto&quot;,</span>
+<span class="a">+):</span>
+<span class="a">+    &quot;&quot;&quot;The body is one piece of speech: 16 kHz mono 16-bit little-endian PCM.&quot;&quot;&quot;</span>
+<span class="a">+    if not settings.groq_api_key:</span>
+<span class="a">+        raise HTTPException(503, &quot;Cloud captions are not set up on this server.&quot;)</span>
+<span class="a">+    pcm = await request.body()</span>
+<span class="a">+    if not pcm or len(pcm) % 2:</span>
+<span class="a">+        raise HTTPException(400, &quot;The body must be 16-bit PCM.&quot;)</span>
+<span class="a">+    if len(pcm) &gt; settings.caption_max_seconds * BYTES_PER_SECOND:</span>
+<span class="a">+        raise HTTPException(413, f&quot;A piece is at most {settings.caption_max_seconds} s.&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    cost = billed_seconds(len(pcm))</span>
+<span class="a">+    if not spend(session, account.id, cost):</span>
+<span class="a">+        raise HTTPException(402, &quot;No cloud caption hours left.&quot;)</span>
+<span class="a">+    try:</span>
+<span class="a">+        text = await run_in_threadpool(transcribe, pcm, lang)</span>
+<span class="a">+    except TranscribeError as exc:</span>
+<span class="a">+        refund(session, account.id, cost)</span>
+<span class="a">+        log.warning(&quot;caption piece for %s failed: %s&quot;, account.id, exc)</span>
+<span class="a">+        raise HTTPException(502, str(exc)) from exc</span>
+<span class="a">+    return {&quot;text&quot;: text, &quot;seconds&quot;: cost,</span>
+<span class="a">+            &quot;seconds_left&quot;: seconds_left(session, account.id)}</span>
+diff --git a/backend/main.py b/backend/main.py
+index c08cf4b..d50ca52 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -19,6 +19,7 @@ from fastapi import FastAPI</span>
+ from fastapi.responses import FileResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+<span class="a">+from . import captions</span>
+ from .api import router
+ from .db import Job, JobStatus, SessionLocal, init_db
+ from .languages import all_languages
+<span class="h">@@ -126,6 +127,7 @@ app = FastAPI(</span>
+     lifespan=lifespan,
+ )
+ app.include_router(router)
+<span class="a">+app.include_router(captions.router)</span>
+ 
+ 
+ @app.middleware(&quot;http&quot;)
+diff --git a/backend/payments.py b/backend/payments.py
+index 166d270..6653225 100644
+--- a/backend/payments.py
++++ b/backend/payments.py
+<span class="h">@@ -189,7 +189,10 @@ def fulfil(session: Session, checkout: dict) -&gt; Account | None:</span>
+     )
+     # A retired plan too: the buyer may have opened the payment page before
+     # the plan was retired.
+<span class="d">-    plan = pricing.get(meta.get(&quot;plan_id&quot;) or &quot;&quot;, retired=True)</span>
+<span class="a">+    from . import captions  # captions imports api, which imports this module</span>
+<span class="a">+</span>
+<span class="a">+    plan = (pricing.get(meta.get(&quot;plan_id&quot;) or &quot;&quot;, retired=True)</span>
+<span class="a">+            or captions.pack(meta.get(&quot;plan_id&quot;) or &quot;&quot;))</span>
+     if account is None or plan is None:
+         log.error(&quot;checkout %s: unknown account or plan %r&quot;, checkout.get(&quot;id&quot;), meta)
+         return None
+<span class="h">@@ -221,6 +224,7 @@ def fulfil(session: Session, checkout: dict) -&gt; Account | None:</span>
+         account.stripe_customer_id = checkout[&quot;customer&quot;]
+     if plan.credits:
+         account.purchased_credits += plan.credits
+<span class="a">+    captions.fulfil(session, account, plan)</span>
+     session.commit()
+ 
+     if checkout.get(&quot;subscription&quot;):
+diff --git a/backend/settings.py b/backend/settings.py
+index 9b5de23..f78cf3e 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -124,6 +124,15 @@ class Settings(BaseSettings):</span>
+     video_encoder: str = &quot;auto&quot;
+     video_crf: int = 28
+ 
+<span class="a">+    # --- cloud captions (Subrep) ------------------------------------------</span>
+<span class="a">+    # Without a key, /api/captions/transcribe answers 503. Set it with</span>
+<span class="a">+    # tools/set-secret.sh SUBPLZ_WEB_GROQ_API_KEY on the server.</span>
+<span class="a">+    groq_api_key: str = &quot;&quot;</span>
+<span class="a">+    caption_api_url: str = &quot;https://api.groq.com/openai/v1/audio/transcriptions&quot;</span>
+<span class="a">+    caption_model: str = &quot;whisper-large-v3-turbo&quot;</span>
+<span class="a">+    # The longest piece of speech in one request. The app sends 11 s at most.</span>
+<span class="a">+    caption_max_seconds: int = 30</span>
+<span class="a">+</span>
+     # --- uploads -----------------------------------------------------------
+     max_upload_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GiB
+ 
+diff --git a/tests/test_captions.py b/tests/test_captions.py
+new file mode 100644
+index 0000000..4ef29d8
+--- /dev/null
++++ b/tests/test_captions.py
+<span class="h">@@ -0,0 +1,223 @@</span>
+<span class="a">+&quot;&quot;&quot;Cloud captions for Subrep: hour packs, the balance, and the speech proxy.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import io</span>
+<span class="a">+import wave</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+import stripe</span>
+<span class="a">+from hypothesis import given</span>
+<span class="a">+from hypothesis import settings as hsettings</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+</span>
+<span class="a">+from backend import accounts, captions</span>
+<span class="a">+from backend.db import Account, SessionLocal</span>
+<span class="a">+from backend.settings import settings</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import FakeStripeObject, account_id, checkout_event, post_webhook</span>
+<span class="a">+</span>
+<span class="a">+HOUR = 3600</span>
+<span class="a">+SECOND = captions.BYTES_PER_SECOND</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def groq(monkeypatch):</span>
+<span class="a">+    &quot;&quot;&quot;A server with a Groq key, and Groq faked: it answers with a fixed text.&quot;&quot;&quot;</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;groq_api_key&quot;, &quot;gsk_test&quot;)</span>
+<span class="a">+    calls = []</span>
+<span class="a">+</span>
+<span class="a">+    def fake(pcm, language):</span>
+<span class="a">+        calls.append((len(pcm), language))</span>
+<span class="a">+        return &quot;こんにちは&quot;</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(captions, &quot;transcribe&quot;, fake)</span>
+<span class="a">+    return calls</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def give(client, seconds):</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        captions.add(s, account_id(client), seconds)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def left(client):</span>
+<span class="a">+    return client.get(&quot;/api/captions&quot;).json()[&quot;seconds_left&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def post_piece(client, n_bytes, lang=&quot;ja&quot;):</span>
+<span class="a">+    return client.post(f&quot;/api/captions/transcribe?lang={lang}&quot;, content=b&quot;\0&quot; * n_bytes)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- packs -------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_the_book_page_does_not_show_the_caption_packs(client):</span>
+<span class="a">+    ids = {p[&quot;id&quot;] for p in client.get(&quot;/api/pricing&quot;).json()[&quot;plans&quot;]}</span>
+<span class="a">+    assert not ids &amp; set(captions.HOURS)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_app_sees_three_packs_and_an_empty_balance(client):</span>
+<span class="a">+    state = client.get(&quot;/api/captions&quot;).json()</span>
+<span class="a">+    assert [(p[&quot;id&quot;], p[&quot;hours&quot;], p[&quot;price_display&quot;]) for p in state[&quot;packs&quot;]] == [</span>
+<span class="a">+        (&quot;captions20&quot;, 20, &quot;$4.99&quot;), (&quot;captions80&quot;, 80, &quot;$16.99&quot;),</span>
+<span class="a">+        (&quot;captions200&quot;, 200, &quot;$39.00&quot;),</span>
+<span class="a">+    ]</span>
+<span class="a">+    assert state[&quot;seconds_left&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_checkout_sells_the_pack_to_this_account(client, monkeypatch):</span>
+<span class="a">+    seen = {}</span>
+<span class="a">+    monkeypatch.setattr(stripe.checkout.Session, &quot;create&quot;,</span>
+<span class="a">+                        lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/pay&quot;}))</span>
+<span class="a">+    r = client.post(&quot;/api/captions/checkout&quot;, json={&quot;pack_id&quot;: &quot;captions80&quot;})</span>
+<span class="a">+    assert r.status_code == 200 and r.json()[&quot;url&quot;] == &quot;https://stripe.test/pay&quot;</span>
+<span class="a">+    assert seen[&quot;metadata&quot;][&quot;plan_id&quot;] == &quot;captions80&quot;</span>
+<span class="a">+    assert seen[&quot;client_reference_id&quot;] == account_id(client)</span>
+<span class="a">+    assert seen[&quot;line_items&quot;][0][&quot;price_data&quot;][&quot;unit_amount&quot;] == 1699</span>
+<span class="a">+    assert client.post(&quot;/api/captions/checkout&quot;, json={&quot;pack_id&quot;: &quot;pack10&quot;}).status_code == 404</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_paid_pack_gives_its_hours_once(client):</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    event = checkout_event(&quot;cs_captions&quot;, acct, &quot;captions20&quot;)</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200  # Stripe retries</span>
+<span class="a">+    assert left(client) == 20 * HOUR</span>
+<span class="a">+    # A caption pack is not a book credit.</span>
+<span class="a">+    assert client.get(&quot;/api/account&quot;).json()[&quot;credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_merge_moves_the_hours(client, second_client):</span>
+<span class="a">+    give(client, 5 * HOUR)</span>
+<span class="a">+    give(second_client, 2 * HOUR)</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        src = s.get(Account, account_id(client))</span>
+<span class="a">+        dst = s.get(Account, account_id(second_client))</span>
+<span class="a">+        accounts.merge(s, src, dst)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert captions.seconds_left(s, dst.id) == 7 * HOUR</span>
+<span class="a">+        assert captions.seconds_left(s, src.id) == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- transcribe --------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_no_key_on_the_server_is_503(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;groq_api_key&quot;, &quot;&quot;)</span>
+<span class="a">+    give(client, HOUR)</span>
+<span class="a">+    assert post_piece(client, 3 * SECOND).status_code == 503</span>
+<span class="a">+    assert left(client) == HOUR</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_no_hours_is_402_and_groq_is_not_called(client, groq):</span>
+<span class="a">+    assert post_piece(client, 3 * SECOND).status_code == 402</span>
+<span class="a">+    assert groq == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_piece_costs_its_length_rounded_up(client, groq):</span>
+<span class="a">+    give(client, 60)</span>
+<span class="a">+    r = post_piece(client, int(2.5 * SECOND))</span>
+<span class="a">+    assert r.status_code == 200</span>
+<span class="a">+    assert r.json() == {&quot;text&quot;: &quot;こんにちは&quot;, &quot;seconds&quot;: 3, &quot;seconds_left&quot;: 57}</span>
+<span class="a">+    assert groq == [(int(2.5 * SECOND), &quot;ja&quot;)]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_last_seconds_do_not_pay_for_a_longer_piece(client, groq):</span>
+<span class="a">+    give(client, 2)</span>
+<span class="a">+    assert post_piece(client, 3 * SECOND).status_code == 402</span>
+<span class="a">+    assert left(client) == 2</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_failure_of_groq_gives_the_seconds_back(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;groq_api_key&quot;, &quot;gsk_test&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    def down(pcm, language):</span>
+<span class="a">+        raise captions.TranscribeError(&quot;speech service answered 500&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(captions, &quot;transcribe&quot;, down)</span>
+<span class="a">+    give(client, 60)</span>
+<span class="a">+    assert post_piece(client, 4 * SECOND).status_code == 502</span>
+<span class="a">+    assert left(client) == 60</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.mark.parametrize(&quot;n_bytes, status&quot;, [(0, 400), (3, 400), (31 * SECOND, 413)])</span>
+<span class="a">+def test_a_bad_piece_is_refused_without_cost(client, groq, n_bytes, status):</span>
+<span class="a">+    give(client, HOUR)</span>
+<span class="a">+    assert post_piece(client, n_bytes).status_code == status</span>
+<span class="a">+    assert left(client) == HOUR and groq == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- properties --------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+@hsettings(max_examples=50, deadline=None)</span>
+<span class="a">+@given(given_seconds=st.integers(0, 100),</span>
+<span class="a">+       pieces=st.lists(st.integers(1, 40 * SECOND), max_size=12),</span>
+<span class="a">+       failures=st.lists(st.booleans(), max_size=12))</span>
+<span class="a">+def test_the_balance_never_goes_below_zero_and_no_second_is_lost(given_seconds, pieces, failures):</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        acct = accounts.new_account(s)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        captions.add(s, acct.id, given_seconds)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        for i, n in enumerate(pieces):</span>
+<span class="a">+            cost = captions.billed_seconds(n)</span>
+<span class="a">+            if captions.spend(s, acct.id, cost) and i &lt; len(failures) and failures[i]:</span>
+<span class="a">+                captions.refund(s, acct.id, cost)</span>
+<span class="a">+            row = s.get(captions.CaptionBalance, acct.id)</span>
+<span class="a">+            s.refresh(row)</span>
+<span class="a">+            assert row.seconds_left &gt;= 0</span>
+<span class="a">+            assert row.seconds_left + row.seconds_used == given_seconds</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@given(st.binary(max_size=4 * SECOND).filter(lambda b: len(b) % 2 == 0))</span>
+<span class="a">+def test_wav_holds_the_pcm_unchanged(pcm):</span>
+<span class="a">+    with wave.open(io.BytesIO(captions.wav(pcm))) as w:</span>
+<span class="a">+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, 16_000)</span>
+<span class="a">+        assert w.readframes(w.getnframes()) == pcm</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@given(st.integers(1, 60 * SECOND))</span>
+<span class="a">+def test_the_billed_seconds_cover_the_piece(n_bytes):</span>
+<span class="a">+    billed = captions.billed_seconds(n_bytes)</span>
+<span class="a">+    assert billed * SECOND &gt;= n_bytes &gt; (billed - 1) * SECOND</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_request_to_groq_is_the_openai_form(monkeypatch):</span>
+<span class="a">+    &quot;&quot;&quot;transcribe() against a local server that reads the form as Groq does.&quot;&quot;&quot;</span>
+<span class="a">+    import json</span>
+<span class="a">+    import threading</span>
+<span class="a">+    from email.parser import BytesParser</span>
+<span class="a">+    from email.policy import HTTP</span>
+<span class="a">+    from http.server import BaseHTTPRequestHandler, HTTPServer</span>
+<span class="a">+</span>
+<span class="a">+    seen = {}</span>
+<span class="a">+</span>
+<span class="a">+    class Groq(BaseHTTPRequestHandler):</span>
+<span class="a">+        def do_POST(self):</span>
+<span class="a">+            body = self.rfile.read(int(self.headers[&quot;Content-Length&quot;]))</span>
+<span class="a">+            head = f&quot;Content-Type: {self.headers[&#x27;Content-Type&#x27;]}\r\n\r\n&quot;.encode()</span>
+<span class="a">+            form = BytesParser(policy=HTTP).parsebytes(head + body)</span>
+<span class="a">+            for part in form.iter_parts():</span>
+<span class="a">+                seen[part.get_param(&quot;name&quot;, header=&quot;content-disposition&quot;)] = part.get_payload(decode=True)</span>
+<span class="a">+            seen[&quot;auth&quot;] = self.headers[&quot;Authorization&quot;]</span>
+<span class="a">+            out = json.dumps({&quot;text&quot;: &quot; 今日は &quot;}).encode()</span>
+<span class="a">+            self.send_response(200)</span>
+<span class="a">+            self.send_header(&quot;Content-Length&quot;, str(len(out)))</span>
+<span class="a">+            self.end_headers()</span>
+<span class="a">+            self.wfile.write(out)</span>
+<span class="a">+</span>
+<span class="a">+        def log_message(self, *args):</span>
+<span class="a">+            pass</span>
+<span class="a">+</span>
+<span class="a">+    server = HTTPServer((&quot;127.0.0.1&quot;, 0), Groq)</span>
+<span class="a">+    threading.Thread(target=server.handle_request, daemon=True).start()</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;caption_api_url&quot;, f&quot;http://127.0.0.1:{server.server_port}/&quot;)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;groq_api_key&quot;, &quot;gsk_test&quot;)</span>
+<span class="a">+    pcm = bytes(range(256)) * 10</span>
+<span class="a">+</span>
+<span class="a">+    assert captions.transcribe(pcm, &quot;ja&quot;) == &quot;今日は&quot;</span>
+<span class="a">+    server.server_close()</span>
+<span class="a">+    assert seen[&quot;auth&quot;] == &quot;Bearer gsk_test&quot;</span>
+<span class="a">+    assert seen[&quot;model&quot;] == b&quot;whisper-large-v3-turbo&quot;</span>
+<span class="a">+    assert seen[&quot;language&quot;] == b&quot;ja&quot;</span>
+<span class="a">+    assert seen[&quot;file&quot;] == captions.wav(pcm)</span></pre>
+</div></body></html>

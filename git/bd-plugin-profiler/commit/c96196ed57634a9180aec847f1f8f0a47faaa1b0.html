@@ -1,0 +1,1254 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bd-plugin-profiler c96196ed - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>bd-plugin-profiler</h1><span class="desc">BetterDiscord plugin that measures the main-thread time of each plugin</span><p class="url">git clone https://github.com/equwal/bd-plugin-profiler</p><p><a href="../../bd-plugin-profiler/index.html">Log</a> | <a href="../../bd-plugin-profiler/files.html">Files</a> | <a href="../../bd-plugin-profiler/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c96196ed57634a9180aec847f1f8f0a47faaa1b0
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-09-26 20:45:02 -0700
+
+Add PluginProfiler BetterDiscord plugin
+
+The plugin measures the main-thread time of each BetterDiscord plugin.
+It wraps BetterDiscord patch callbacks, the plugin callbacks that BDFDB
+runs, the plugin hook methods, and the timers and observers that
+plugins make. It also shows the CPU of all Discord processes, the
+renderer JS heap, and long animation frames.
+
+Property tests check the time accounting. Other tests check the hooks
+against the patcher of the installed BetterDiscord and the suppress
+function of the installed BDFDB.
+
+</pre><pre> .gitignore                 |   2 +
+ 00PluginProfiler.plugin.js | 567 +++++++++++++++++++++++++++++++++++++++++++++
+ README.md                  |  26 +++
+ package-lock.json          |  53 +++++
+ package.json               |   1 +
+ test/bd-patcher.test.js    | 101 ++++++++
+ test/helpers/installed.js  |  50 ++++
+ test/hooks.test.js         | 174 ++++++++++++++
+ test/lifecycle.test.js     |  82 +++++++
+ test/recorder.test.js      | 100 ++++++++
+ 10 files changed, 1156 insertions(+)
+</pre><pre>diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..d653a28
+--- /dev/null
++++ b/.gitignore
+<span class="h">@@ -0,0 +1,2 @@</span>
+<span class="a">+node_modules/</span>
+<span class="a">+.mutants/</span>
+diff --git a/00PluginProfiler.plugin.js b/00PluginProfiler.plugin.js
+new file mode 100644
+index 0000000..a4256a6
+--- /dev/null
++++ b/00PluginProfiler.plugin.js
+<span class="h">@@ -0,0 +1,567 @@</span>
+<span class="a">+/**</span>
+<span class="a">+ * @name PluginProfiler</span>
+<span class="a">+ * @description Measures the main-thread time of each plugin and shows the CPU and memory use of Discord. Open the plugin settings to see the report.</span>
+<span class="a">+ * @version 1.0.0</span>
+<span class="a">+ */</span>
+<span class="a">+</span>
+<span class="a">+&quot;use strict&quot;;</span>
+<span class="a">+</span>
+<span class="a">+const NAME = &quot;PluginProfiler&quot;;</span>
+<span class="a">+const VERSION = &quot;1.0.0&quot;;</span>
+<span class="a">+// BetterDiscord gives each plugin file this source URL. Old versions do not have &quot;betterdiscord/&quot;.</span>
+<span class="a">+const PLUGIN_URL = /^betterdiscord:\/\/(?:betterdiscord\/)?plugins\/(.+)$/;</span>
+<span class="a">+// A timer that a library makes for a plugin belongs to that plugin, not to the library.</span>
+<span class="a">+const LIBRARY_FILES = new Set([&quot;0BDFDB.plugin.js&quot;, &quot;0PluginLibrary.plugin.js&quot;, &quot;1XenoLib.plugin.js&quot;]);</span>
+<span class="a">+// BetterDiscord and BDFDB call these plugin methods by name, so a wrapper on the instance sees each call.</span>
+<span class="a">+const INSTANCE_HOOKS = /^(observer|onSwitch|process[A-Z]\w*)$/;</span>
+<span class="a">+const OBSERVERS = [</span>
+<span class="a">+    [&quot;MutationObserver&quot;, &quot;mutation observer&quot;],</span>
+<span class="a">+    [&quot;ResizeObserver&quot;, &quot;resize observer&quot;],</span>
+<span class="a">+    [&quot;IntersectionObserver&quot;, &quot;intersection observer&quot;]</span>
+<span class="a">+];</span>
+<span class="a">+const ORIGINAL = Symbol(&quot;PluginProfiler.original&quot;);</span>
+<span class="a">+const SAMPLE_MS = 1000;</span>
+<span class="a">+const RESCAN_EVERY = 5;</span>
+<span class="a">+const MAX_SCRIPTS = 500;</span>
+<span class="a">+const NOTE = &quot;The table counts synchronous work in patches, plugin hooks, timers, and observers. &quot;</span>
+<span class="a">+    + &quot;Plugin time is wall time on the main thread. It includes waits for disk and for paged-out memory, so it can be more than the CPU time. &quot;</span>
+<span class="a">+    + &quot;It does not count event listeners, async work, CSS, or memory per plugin. &quot;</span>
+<span class="a">+    + &quot;Reload Discord (Ctrl+R) to also count the timers that plugins make when they start.&quot;;</span>
+<span class="a">+</span>
+<span class="a">+/** Adds up the self time of each owner. The time of a nested call goes to the nested owner only. */</span>
+<span class="a">+class Recorder {</span>
+<span class="a">+    constructor(now) {</span>
+<span class="a">+        this.now = now;</span>
+<span class="a">+        this.active = true;</span>
+<span class="a">+        this.reset();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    reset() {</span>
+<span class="a">+        this.startedAt = this.now();</span>
+<span class="a">+        this.owners = new Map();</span>
+<span class="a">+        this.unattributedMs = 0;</span>
+<span class="a">+        this.stack = [];</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Calls fn and adds its self time to owner. A null owner marks time that no plugin owns. */</span>
+<span class="a">+    run(owner, kind, fn, thisArg, args) {</span>
+<span class="a">+        if (!this.active) return Reflect.apply(fn, thisArg, args);</span>
+<span class="a">+        const stack = this.stack;</span>
+<span class="a">+        const frame = {start: this.now(), child: 0};</span>
+<span class="a">+        stack.push(frame);</span>
+<span class="a">+        try {</span>
+<span class="a">+            return Reflect.apply(fn, thisArg, args);</span>
+<span class="a">+        }</span>
+<span class="a">+        finally {</span>
+<span class="a">+            const total = this.now() - frame.start;</span>
+<span class="a">+            stack.pop();</span>
+<span class="a">+            if (stack.length) stack[stack.length - 1].child += total;</span>
+<span class="a">+            const self = total - frame.child;</span>
+<span class="a">+            if (owner === null) this.unattributedMs += self;</span>
+<span class="a">+            else this.add(owner, kind, self);</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    add(owner, kind, ms) {</span>
+<span class="a">+        let entry = this.owners.get(owner);</span>
+<span class="a">+        if (!entry) this.owners.set(owner, entry = {ms: 0, calls: 0, maxMs: 0, kinds: new Map()});</span>
+<span class="a">+        entry.ms += ms;</span>
+<span class="a">+        entry.calls += 1;</span>
+<span class="a">+        if (ms &gt; entry.maxMs) entry.maxMs = ms;</span>
+<span class="a">+        entry.kinds.set(kind, (entry.kinds.get(kind) || 0) + ms);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Returns one row for each owner. The row with the most CPU time is first. */</span>
+<span class="a">+    rows() {</span>
+<span class="a">+        const elapsed = Math.max(1, this.now() - this.startedAt);</span>
+<span class="a">+        return [...this.owners].map(([name, entry]) =&gt; ({</span>
+<span class="a">+            name,</span>
+<span class="a">+            ms: entry.ms,</span>
+<span class="a">+            calls: entry.calls,</span>
+<span class="a">+            maxMs: entry.maxMs,</span>
+<span class="a">+            percent: entry.ms / elapsed * 100,</span>
+<span class="a">+            topKind: [...entry.kinds].sort((a, b) =&gt; b[1] - a[1])[0][0]</span>
+<span class="a">+        })).sort((a, b) =&gt; b.ms - a.ms);</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function timed(recorder, owner, kind, fn) {</span>
+<span class="a">+    const wrapper = function (...args) {</span>
+<span class="a">+        return recorder.run(owner, kind, fn, this, args);</span>
+<span class="a">+    };</span>
+<span class="a">+    wrapper[ORIGINAL] = fn;</span>
+<span class="a">+    return wrapper;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Returns the file of each plugin frame on the stack, innermost first. */</span>
+<span class="a">+function pluginFilesOnStack() {</span>
+<span class="a">+    const prepare = Error.prepareStackTrace;</span>
+<span class="a">+    const limit = Error.stackTraceLimit;</span>
+<span class="a">+    const holder = {};</span>
+<span class="a">+    let sites;</span>
+<span class="a">+    try {</span>
+<span class="a">+        // Call sites cost less than a formatted stack string.</span>
+<span class="a">+        Error.prepareStackTrace = (_, callSites) =&gt; callSites;</span>
+<span class="a">+        Error.stackTraceLimit = 40;</span>
+<span class="a">+        Error.captureStackTrace(holder, pluginFilesOnStack);</span>
+<span class="a">+        sites = holder.stack;</span>
+<span class="a">+    }</span>
+<span class="a">+    finally {</span>
+<span class="a">+        Error.prepareStackTrace = prepare;</span>
+<span class="a">+        Error.stackTraceLimit = limit;</span>
+<span class="a">+    }</span>
+<span class="a">+    const files = [];</span>
+<span class="a">+    if (!Array.isArray(sites)) return files;</span>
+<span class="a">+    for (const site of sites) {</span>
+<span class="a">+        const match = PLUGIN_URL.exec(site.getScriptNameOrSourceURL() || &quot;&quot;);</span>
+<span class="a">+        if (match) files.push(match[1]);</span>
+<span class="a">+    }</span>
+<span class="a">+    return files;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Picks the innermost plugin that is not a library. If only libraries are on the stack, picks the innermost library. */</span>
+<span class="a">+function ownerFile(files, ownFile) {</span>
+<span class="a">+    let library = null;</span>
+<span class="a">+    for (const file of files) {</span>
+<span class="a">+        if (file === ownFile) continue;</span>
+<span class="a">+        if (!LIBRARY_FILES.has(file)) return file;</span>
+<span class="a">+        if (!library) library = file;</span>
+<span class="a">+    }</span>
+<span class="a">+    return library;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function hookTimers(scope, recorder, resolveOwner, undo) {</span>
+<span class="a">+    for (const name of [&quot;setTimeout&quot;, &quot;setInterval&quot;]) {</span>
+<span class="a">+        const original = scope[name];</span>
+<span class="a">+        if (typeof original !== &quot;function&quot;) continue;</span>
+<span class="a">+        const hooked = function (handler, ...rest) {</span>
+<span class="a">+            if (typeof handler === &quot;function&quot; &amp;&amp; recorder.active) {</span>
+<span class="a">+                const owner = recorder.run(NAME, &quot;stack capture&quot;, resolveOwner, null, []);</span>
+<span class="a">+                if (owner) handler = timed(recorder, owner, &quot;timer&quot;, handler);</span>
+<span class="a">+            }</span>
+<span class="a">+            return Reflect.apply(original, scope, [handler, ...rest]);</span>
+<span class="a">+        };</span>
+<span class="a">+        hooked[ORIGINAL] = original;</span>
+<span class="a">+        scope[name] = hooked;</span>
+<span class="a">+        undo.push(() =&gt; {</span>
+<span class="a">+            if (scope[name] === hooked) scope[name] = original;</span>
+<span class="a">+        });</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function hookObservers(scope, recorder, resolveOwner, undo) {</span>
+<span class="a">+    for (const [name, kind] of OBSERVERS) {</span>
+<span class="a">+        const Original = scope[name];</span>
+<span class="a">+        if (typeof Original !== &quot;function&quot;) continue;</span>
+<span class="a">+        const Hooked = class extends Original {</span>
+<span class="a">+            constructor(callback, ...rest) {</span>
+<span class="a">+                if (typeof callback === &quot;function&quot; &amp;&amp; recorder.active) {</span>
+<span class="a">+                    const owner = recorder.run(NAME, &quot;stack capture&quot;, resolveOwner, null, []);</span>
+<span class="a">+                    if (owner) callback = timed(recorder, owner, kind, callback);</span>
+<span class="a">+                }</span>
+<span class="a">+                super(callback, ...rest);</span>
+<span class="a">+            }</span>
+<span class="a">+        };</span>
+<span class="a">+        Object.defineProperty(Hooked, &quot;name&quot;, {value: name});</span>
+<span class="a">+        scope[name] = Hooked;</span>
+<span class="a">+        undo.push(() =&gt; {</span>
+<span class="a">+            if (scope[name] === Hooked) scope[name] = Original;</span>
+<span class="a">+        });</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Wraps the plugin methods that BetterDiscord and BDFDB call by name. */</span>
+<span class="a">+function hookInstance(recorder, instance, owner, undo) {</span>
+<span class="a">+    const seen = new Set();</span>
+<span class="a">+    for (let proto = instance; proto &amp;&amp; proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {</span>
+<span class="a">+        for (const key of Object.getOwnPropertyNames(proto)) {</span>
+<span class="a">+            if (seen.has(key) || !INSTANCE_HOOKS.test(key)) continue;</span>
+<span class="a">+            seen.add(key);</span>
+<span class="a">+            const current = Object.getOwnPropertyDescriptor(proto, key).value;</span>
+<span class="a">+            if (typeof current !== &quot;function&quot; || current[ORIGINAL]) continue;</span>
+<span class="a">+            const wrapper = timed(recorder, owner, key.startsWith(&quot;process&quot;) ? &quot;BDFDB process&quot; : key, current);</span>
+<span class="a">+            const hadOwn = proto === instance;</span>
+<span class="a">+            try {</span>
+<span class="a">+                instance[key] = wrapper;</span>
+<span class="a">+            }</span>
+<span class="a">+            catch {</span>
+<span class="a">+                continue;</span>
+<span class="a">+            }</span>
+<span class="a">+            undo.push(() =&gt; {</span>
+<span class="a">+                if (instance[key] !== wrapper) return;</span>
+<span class="a">+                if (hadOwn) instance[key] = current;</span>
+<span class="a">+                else delete instance[key];</span>
+<span class="a">+            });</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Wraps the callback of one BetterDiscord patch. BetterDiscord reads the callback on each call. */</span>
+<span class="a">+function wrapPatchChild(recorder, child, owner) {</span>
+<span class="a">+    const original = child.callback;</span>
+<span class="a">+    if (typeof original !== &quot;function&quot; || original[ORIGINAL]) return false;</span>
+<span class="a">+    const kind = `patch ${child.type}`;</span>
+<span class="a">+    const wrapper = child.type === &quot;instead&quot;</span>
+<span class="a">+        ? function (thisObject, args, next) {</span>
+<span class="a">+            // &quot;next&quot; runs the original function or the next plugin. That time is not the time of this plugin.</span>
+<span class="a">+            const timedNext = typeof next === &quot;function&quot; ? timed(recorder, null, &quot;original&quot;, next) : next;</span>
+<span class="a">+            return recorder.run(owner, kind, original, this, [thisObject, args, timedNext]);</span>
+<span class="a">+        }</span>
+<span class="a">+        : function (...args) {</span>
+<span class="a">+            return recorder.run(owner, kind, original, this, args);</span>
+<span class="a">+        };</span>
+<span class="a">+    wrapper[ORIGINAL] = original;</span>
+<span class="a">+    child.callback = wrapper;</span>
+<span class="a">+    return true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function unwrapPatchChild(child) {</span>
+<span class="a">+    const original = child.callback &amp;&amp; child.callback[ORIGINAL];</span>
+<span class="a">+    if (original) child.callback = original;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * BDFDB puts all its plugins behind one BetterDiscord patch. It calls each plugin callback</span>
+<span class="a">+ * through TimeUtils.suppress with the plugin name, so a hook there splits the time per plugin.</span>
+<span class="a">+ */</span>
+<span class="a">+function hookSuppress(recorder, bdfdb, canonicalName, undo) {</span>
+<span class="a">+    const timeUtils = bdfdb &amp;&amp; bdfdb.TimeUtils;</span>
+<span class="a">+    const original = timeUtils &amp;&amp; timeUtils.suppress;</span>
+<span class="a">+    if (typeof original !== &quot;function&quot; || original[ORIGINAL]) return false;</span>
+<span class="a">+    const hooked = function (callback, strings, config) {</span>
+<span class="a">+        const inner = Reflect.apply(original, this, [callback, strings, config]);</span>
+<span class="a">+        const name = config &amp;&amp; typeof config.name === &quot;string&quot; ? config.name : &quot;&quot;;</span>
+<span class="a">+        if (!name || typeof inner !== &quot;function&quot;) return inner;</span>
+<span class="a">+        // BDFDB uses the name &quot;Discord&quot; when it calls the original Discord function.</span>
+<span class="a">+        return timed(recorder, name === &quot;Discord&quot; ? null : canonicalName(name), &quot;BDFDB hook&quot;, inner);</span>
+<span class="a">+    };</span>
+<span class="a">+    hooked[ORIGINAL] = original;</span>
+<span class="a">+    timeUtils.suppress = hooked;</span>
+<span class="a">+    undo.push(() =&gt; {</span>
+<span class="a">+        if (timeUtils.suppress === hooked) timeUtils.suppress = original;</span>
+<span class="a">+    });</span>
+<span class="a">+    return true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Returns the names that a plugin can use as the caller of its patches. */</span>
+<span class="a">+function callerNames(addon) {</span>
+<span class="a">+    const names = new Set([addon.name, addon.id]);</span>
+<span class="a">+    if (typeof addon.name === &quot;string&quot;) names.add(addon.name.replace(/\s+/g, &quot;&quot;));</span>
+<span class="a">+    if (typeof addon.filename === &quot;string&quot;) names.add(addon.filename.replace(/\.plugin\.js$/, &quot;&quot;));</span>
+<span class="a">+    try {</span>
+<span class="a">+        if (addon.instance &amp;&amp; typeof addon.instance.getName === &quot;function&quot;) names.add(addon.instance.getName());</span>
+<span class="a">+    }</span>
+<span class="a">+    catch {</span>
+<span class="a">+        // A broken getName does not stop the scan.</span>
+<span class="a">+    }</span>
+<span class="a">+    return [...names].filter(name =&gt; typeof name === &quot;string&quot; &amp;&amp; name);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function formatDuration(ms) {</span>
+<span class="a">+    const seconds = Math.floor(ms / 1000);</span>
+<span class="a">+    return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function percent(value, digits = 1) {</span>
+<span class="a">+    return `${value.toFixed(digits)}%`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function megabytes(bytes) {</span>
+<span class="a">+    return `${(bytes / 1048576).toFixed(0)} MB`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const COLUMNS = [</span>
+<span class="a">+    {label: &quot;Plugin&quot;, align: &quot;left&quot;, value: row =&gt; row.name},</span>
+<span class="a">+    {label: &quot;Main thread ms&quot;, align: &quot;right&quot;, value: row =&gt; row.ms.toFixed(1)},</span>
+<span class="a">+    {label: &quot;% of time&quot;, align: &quot;right&quot;, value: row =&gt; row.percent.toFixed(2)},</span>
+<span class="a">+    {label: &quot;Calls&quot;, align: &quot;right&quot;, value: row =&gt; String(row.calls)},</span>
+<span class="a">+    {label: &quot;Worst call ms&quot;, align: &quot;right&quot;, value: row =&gt; row.maxMs.toFixed(1)},</span>
+<span class="a">+    {label: &quot;Main source&quot;, align: &quot;left&quot;, value: row =&gt; row.topKind}</span>
+<span class="a">+];</span>
+<span class="a">+</span>
+<span class="a">+function summaryLines(snap) {</span>
+<span class="a">+    const samples = snap.samples;</span>
+<span class="a">+    const frames = snap.frames;</span>
+<span class="a">+    const lines = [`Session: ${formatDuration(snap.elapsedMs)}. All plugins: ${snap.pluginMs.toFixed(0)} ms on the main thread, ${percent(snap.pluginMs / snap.elapsedMs * 100, 2)} of the time.`];</span>
+<span class="a">+    if (samples.count) {</span>
+<span class="a">+        lines.push(`Discord CPU, all processes: now ${percent(samples.cpuNow)}, average ${percent(samples.cpuSum / samples.count)}, max ${percent(samples.cpuMax)} of one core.`);</span>
+<span class="a">+        const types = [...samples.types].map(([type, sum]) =&gt; `${type} ${percent(sum / samples.count)}`).join(&quot;, &quot;);</span>
+<span class="a">+        if (types) lines.push(`Average CPU by process type: ${types}.`);</span>
+<span class="a">+    }</span>
+<span class="a">+    else {</span>
+<span class="a">+        lines.push(&quot;Discord CPU: no data yet.&quot;);</span>
+<span class="a">+    }</span>
+<span class="a">+    if (samples.heapNow !== null) {</span>
+<span class="a">+        const blink = samples.blinkKB ? ` Blink memory: ${megabytes(samples.blinkKB * 1024)}.` : &quot;&quot;;</span>
+<span class="a">+        lines.push(`Renderer JS heap: ${megabytes(samples.heapNow)} (max ${megabytes(samples.heapMax)}).${blink}`);</span>
+<span class="a">+    }</span>
+<span class="a">+    if (snap.framesSupported) {</span>
+<span class="a">+        lines.push(`Long frames (over 50 ms): ${frames.count}, worst ${frames.worstMs.toFixed(0)} ms, blocking time ${frames.blockingMs.toFixed(0)} ms.`);</span>
+<span class="a">+    }</span>
+<span class="a">+    return lines;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const STYLE = {</span>
+<span class="a">+    root: {color: &quot;var(--text-default, var(--text-normal, #dbdee1))&quot;, fontSize: 14, lineHeight: 1.45, userSelect: &quot;text&quot;},</span>
+<span class="a">+    buttons: {display: &quot;flex&quot;, gap: 8, marginBottom: 12},</span>
+<span class="a">+    button: {padding: &quot;6px 14px&quot;, borderRadius: 4, border: 0, cursor: &quot;pointer&quot;, color: &quot;#fff&quot;, background: &quot;var(--button-secondary-background, #4e5058)&quot;},</span>
+<span class="a">+    scroll: {overflowX: &quot;auto&quot;, marginTop: 12},</span>
+<span class="a">+    table: {width: &quot;100%&quot;, borderCollapse: &quot;collapse&quot;, fontVariantNumeric: &quot;tabular-nums&quot;},</span>
+<span class="a">+    th: {padding: &quot;4px 8px&quot;, fontWeight: 600, whiteSpace: &quot;nowrap&quot;, borderBottom: &quot;1px solid var(--background-modifier-accent, #4e5058)&quot;},</span>
+<span class="a">+    td: {padding: &quot;4px 8px&quot;, whiteSpace: &quot;nowrap&quot;, borderBottom: &quot;1px solid var(--background-modifier-accent, #3f4147)&quot;},</span>
+<span class="a">+    heading: {fontWeight: 600, marginTop: 14},</span>
+<span class="a">+    note: {opacity: 0.7, fontSize: 12, marginTop: 14}</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+function Panel({plugin}) {</span>
+<span class="a">+    const {createElement: h, useEffect, useState} = BdApi.React;</span>
+<span class="a">+    const [, setTick] = useState(0);</span>
+<span class="a">+    useEffect(() =&gt; {</span>
+<span class="a">+        const id = setInterval(() =&gt; setTick(n =&gt; n + 1), SAMPLE_MS);</span>
+<span class="a">+        return () =&gt; clearInterval(id);</span>
+<span class="a">+    }, []);</span>
+<span class="a">+    const snap = plugin.snapshot();</span>
+<span class="a">+    if (!snap) return h(&quot;div&quot;, {style: STYLE.root}, &quot;Enable the plugin to start the profiler.&quot;);</span>
+<span class="a">+    const cell = (column, content, base) =&gt; h(base === STYLE.th ? &quot;th&quot; : &quot;td&quot;, {key: column.label, style: {...base, textAlign: column.align}}, content);</span>
+<span class="a">+    return h(&quot;div&quot;, {style: STYLE.root},</span>
+<span class="a">+        h(&quot;div&quot;, {style: STYLE.buttons},</span>
+<span class="a">+            h(&quot;button&quot;, {style: STYLE.button, onClick: () =&gt; { plugin.reset(); setTick(n =&gt; n + 1); }}, &quot;Reset&quot;),</span>
+<span class="a">+            h(&quot;button&quot;, {style: STYLE.button, onClick: () =&gt; plugin.copyReport()}, &quot;Copy report&quot;)),</span>
+<span class="a">+        summaryLines(snap).map((line, i) =&gt; h(&quot;div&quot;, {key: i}, line)),</span>
+<span class="a">+        h(&quot;div&quot;, {style: STYLE.scroll},</span>
+<span class="a">+            h(&quot;table&quot;, {style: STYLE.table},</span>
+<span class="a">+                h(&quot;thead&quot;, null, h(&quot;tr&quot;, null, COLUMNS.map(column =&gt; cell(column, column.label, STYLE.th)))),</span>
+<span class="a">+                h(&quot;tbody&quot;, null, snap.rows.map(row =&gt; h(&quot;tr&quot;, {key: row.name}, COLUMNS.map(column =&gt; cell(column, column.value(row), STYLE.td))))))),</span>
+<span class="a">+        snap.scripts.length ? h(&quot;div&quot;, {style: STYLE.heading}, &quot;Scripts in long frames&quot;) : null,</span>
+<span class="a">+        snap.scripts.map(([label, ms]) =&gt; h(&quot;div&quot;, {key: label}, `${ms.toFixed(0)} ms: ${label}`)),</span>
+<span class="a">+        h(&quot;div&quot;, {style: STYLE.note}, NOTE));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+class PluginProfiler {</span>
+<span class="a">+    constructor(meta) {</span>
+<span class="a">+        this.meta = meta || {};</span>
+<span class="a">+        this.ownFile = this.meta.filename || pluginFilesOnStack()[0] || &quot;&quot;;</span>
+<span class="a">+        this.recorder = null;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    start() {</span>
+<span class="a">+        const recorder = this.recorder = new Recorder(() =&gt; performance.now());</span>
+<span class="a">+        this.undo = [];</span>
+<span class="a">+        this.callers = new Set();</span>
+<span class="a">+        this.fileOwners = new Map();</span>
+<span class="a">+        this.names = new Map();</span>
+<span class="a">+        this.bdfdbGlobal = null;</span>
+<span class="a">+        this.ticks = 0;</span>
+<span class="a">+        this.resetStats();</span>
+<span class="a">+        const resolveOwner = () =&gt; {</span>
+<span class="a">+            const file = ownerFile(pluginFilesOnStack(), this.ownFile);</span>
+<span class="a">+            return file ? this.fileOwners.get(file) || file : null;</span>
+<span class="a">+        };</span>
+<span class="a">+        try {</span>
+<span class="a">+            recorder.run(NAME, &quot;setup&quot;, () =&gt; {</span>
+<span class="a">+                hookTimers(window, recorder, resolveOwner, this.undo);</span>
+<span class="a">+                hookObservers(window, recorder, resolveOwner, this.undo);</span>
+<span class="a">+                this.rescan();</span>
+<span class="a">+                this.observeFrames();</span>
+<span class="a">+            }, null, []);</span>
+<span class="a">+        }</span>
+<span class="a">+        catch (error) {</span>
+<span class="a">+            // BetterDiscord does not call stop() after a failed start(), so remove the hooks here.</span>
+<span class="a">+            this.stop();</span>
+<span class="a">+            throw error;</span>
+<span class="a">+        }</span>
+<span class="a">+        this.timer = setInterval(() =&gt; recorder.run(NAME, &quot;sampling&quot;, () =&gt; this.tick(), null, []), SAMPLE_MS);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    stop() {</span>
+<span class="a">+        if (!this.recorder) return;</span>
+<span class="a">+        clearInterval(this.timer);</span>
+<span class="a">+        if (this.frameObserver) this.frameObserver.disconnect();</span>
+<span class="a">+        this.frameObserver = null;</span>
+<span class="a">+        this.recorder.active = false;</span>
+<span class="a">+        for (const caller of this.callers) {</span>
+<span class="a">+            for (const child of BdApi.Patcher.getPatchesByCaller(caller)) unwrapPatchChild(child);</span>
+<span class="a">+        }</span>
+<span class="a">+        while (this.undo.length) {</span>
+<span class="a">+            try {</span>
+<span class="a">+                this.undo.pop()();</span>
+<span class="a">+            }</span>
+<span class="a">+            catch (error) {</span>
+<span class="a">+                console.error(NAME, &quot;could not remove a hook&quot;, error);</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        this.recorder = null;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    getSettingsPanel() {</span>
+<span class="a">+        return BdApi.React.createElement(Panel, {plugin: this});</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    resetStats() {</span>
+<span class="a">+        this.samples = {count: 0, cpuNow: 0, cpuSum: 0, cpuMax: 0, types: new Map(), heapNow: null, heapMax: 0, blinkKB: 0};</span>
+<span class="a">+        this.frames = {count: 0, totalMs: 0, blockingMs: 0, worstMs: 0, scripts: new Map()};</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    reset() {</span>
+<span class="a">+        if (!this.recorder) return;</span>
+<span class="a">+        this.recorder.reset();</span>
+<span class="a">+        this.resetStats();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    tick() {</span>
+<span class="a">+        this.ticks += 1;</span>
+<span class="a">+        if (this.ticks % RESCAN_EVERY === 0) this.rescan();</span>
+<span class="a">+        this.sample();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Finds new patches, plugin instances, and a new BDFDB. Plugins can patch at any time. */</span>
+<span class="a">+    rescan() {</span>
+<span class="a">+        this.fileOwners = new Map();</span>
+<span class="a">+        this.names = new Map();</span>
+<span class="a">+        for (const addon of BdApi.Plugins.getAll()) {</span>
+<span class="a">+            if (!addon || addon.name === NAME) continue;</span>
+<span class="a">+            if (addon.filename) this.fileOwners.set(addon.filename, addon.name);</span>
+<span class="a">+            this.names.set(String(addon.name).toLowerCase(), addon.name);</span>
+<span class="a">+            for (const caller of callerNames(addon)) {</span>
+<span class="a">+                this.callers.add(caller);</span>
+<span class="a">+                for (const child of BdApi.Patcher.getPatchesByCaller(caller)) wrapPatchChild(this.recorder, child, addon.name);</span>
+<span class="a">+            }</span>
+<span class="a">+            if (addon.instance) hookInstance(this.recorder, addon.instance, addon.name, this.undo);</span>
+<span class="a">+        }</span>
+<span class="a">+        this.hookBdfdb();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    hookBdfdb() {</span>
+<span class="a">+        const global = window.BDFDB_Global;</span>
+<span class="a">+        if (!global || !global.loaded || global === this.bdfdbGlobal) return;</span>
+<span class="a">+        this.bdfdbGlobal = global;</span>
+<span class="a">+        let bdfdb;</span>
+<span class="a">+        try {</span>
+<span class="a">+            // buildPlugin only makes a class and returns it with the library object.</span>
+<span class="a">+            bdfdb = global.PluginUtils.buildPlugin({})[1];</span>
+<span class="a">+        }</span>
+<span class="a">+        catch {</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        hookSuppress(this.recorder, bdfdb, name =&gt; this.names.get(name.toLowerCase()) || name, this.undo);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    sample() {</span>
+<span class="a">+        const samples = this.samples;</span>
+<span class="a">+        const utils = window.DiscordNative &amp;&amp; window.DiscordNative.processUtils;</span>
+<span class="a">+        if (utils &amp;&amp; typeof utils.getCurrentCPUUsagePercent === &quot;function&quot;) {</span>
+<span class="a">+            // Discord adds up the CPU of all its processes. 100 means one full core.</span>
+<span class="a">+            const cpu = Number(utils.getCurrentCPUUsagePercent());</span>
+<span class="a">+            if (Number.isFinite(cpu)) {</span>
+<span class="a">+                samples.count += 1;</span>
+<span class="a">+                samples.cpuNow = cpu;</span>
+<span class="a">+                samples.cpuSum += cpu;</span>
+<span class="a">+                samples.cpuMax = Math.max(samples.cpuMax, cpu);</span>
+<span class="a">+                const types = typeof utils.getCpuUsageElectronProcessTypeDetails === &quot;function&quot; ? utils.getCpuUsageElectronProcessTypeDetails() : null;</span>
+<span class="a">+                for (const [type, detail] of Object.entries(types || {})) {</span>
+<span class="a">+                    const value = Number(detail &amp;&amp; detail.percent_cpu);</span>
+<span class="a">+                    if (Number.isFinite(value)) samples.types.set(type, (samples.types.get(type) || 0) + value);</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        if (performance.memory) {</span>
+<span class="a">+            samples.heapNow = performance.memory.usedJSHeapSize;</span>
+<span class="a">+            samples.heapMax = Math.max(samples.heapMax, samples.heapNow);</span>
+<span class="a">+        }</span>
+<span class="a">+        if (utils &amp;&amp; typeof utils.getBlinkMemoryInfo === &quot;function&quot;) {</span>
+<span class="a">+            const blink = utils.getBlinkMemoryInfo();</span>
+<span class="a">+            if (blink &amp;&amp; Number.isFinite(blink.allocated)) samples.blinkKB = blink.allocated;</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    observeFrames() {</span>
+<span class="a">+        const types = typeof PerformanceObserver === &quot;function&quot; ? PerformanceObserver.supportedEntryTypes || [] : [];</span>
+<span class="a">+        this.framesSupported = types.includes(&quot;long-animation-frame&quot;);</span>
+<span class="a">+        if (!this.framesSupported) return;</span>
+<span class="a">+        const recorder = this.recorder;</span>
+<span class="a">+        this.frameObserver = new PerformanceObserver(list =&gt; recorder.run(NAME, &quot;frame stats&quot;, () =&gt; this.addFrames(list.getEntries()), null, []));</span>
+<span class="a">+        this.frameObserver.observe({type: &quot;long-animation-frame&quot;});</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    addFrames(entries) {</span>
+<span class="a">+        const frames = this.frames;</span>
+<span class="a">+        for (const entry of entries) {</span>
+<span class="a">+            frames.count += 1;</span>
+<span class="a">+            frames.totalMs += entry.duration;</span>
+<span class="a">+            frames.blockingMs += entry.blockingDuration || 0;</span>
+<span class="a">+            frames.worstMs = Math.max(frames.worstMs, entry.duration);</span>
+<span class="a">+            for (const script of entry.scripts || []) {</span>
+<span class="a">+                const label = this.scriptLabel(script);</span>
+<span class="a">+                if (frames.scripts.has(label) || frames.scripts.size &lt; MAX_SCRIPTS) {</span>
+<span class="a">+                    frames.scripts.set(label, (frames.scripts.get(label) || 0) + script.duration);</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    scriptLabel(script) {</span>
+<span class="a">+        const url = script.sourceURL || &quot;&quot;;</span>
+<span class="a">+        const match = PLUGIN_URL.exec(url);</span>
+<span class="a">+        const file = url.split(/[?#]/)[0].split(&quot;/&quot;).pop();</span>
+<span class="a">+        // A URL that is not a .js file is the page itself. It can hold a channel ID, so the label does not show it.</span>
+<span class="a">+        const where = match ? this.fileOwners.get(match[1]) || match[1] : /\.js$/.test(file) ? file : &quot;page&quot;;</span>
+<span class="a">+        const invoker = script.sourceFunctionName || script.invoker || &quot;&quot;;</span>
+<span class="a">+        const what = invoker.includes(&quot;://&quot;) ? &quot;&quot; : invoker;</span>
+<span class="a">+        return what ? `${where} (${what})` : where;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    snapshot() {</span>
+<span class="a">+        if (!this.recorder) return null;</span>
+<span class="a">+        const elapsedMs = Math.max(1, this.recorder.now() - this.recorder.startedAt);</span>
+<span class="a">+        const rows = this.recorder.rows();</span>
+<span class="a">+        const pluginMs = rows.filter(row =&gt; row.name !== NAME).reduce((sum, row) =&gt; sum + row.ms, 0);</span>
+<span class="a">+        const scripts = [...this.frames.scripts].sort((a, b) =&gt; b[1] - a[1]).slice(0, 5);</span>
+<span class="a">+        return {elapsedMs, rows, pluginMs, samples: this.samples, frames: this.frames, framesSupported: this.framesSupported, scripts};</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    report() {</span>
+<span class="a">+        const snap = this.snapshot();</span>
+<span class="a">+        if (!snap) return `${NAME}: the plugin is not running.`;</span>
+<span class="a">+        const table = [COLUMNS.map(column =&gt; column.label), ...snap.rows.map(row =&gt; COLUMNS.map(column =&gt; column.value(row)))];</span>
+<span class="a">+        const widths = COLUMNS.map((_, i) =&gt; Math.max(...table.map(cells =&gt; cells[i].length)));</span>
+<span class="a">+        const lines = [`${NAME} ${VERSION} report`, ...summaryLines(snap), &quot;&quot;];</span>
+<span class="a">+        for (const cells of table) {</span>
+<span class="a">+            lines.push(cells.map((text, i) =&gt; COLUMNS[i].align === &quot;right&quot; ? text.padStart(widths[i]) : text.padEnd(widths[i])).join(&quot;  &quot;).trimEnd());</span>
+<span class="a">+        }</span>
+<span class="a">+        if (snap.scripts.length) {</span>
+<span class="a">+            lines.push(&quot;&quot;, &quot;Scripts in long frames:&quot;);</span>
+<span class="a">+            for (const [label, ms] of snap.scripts) lines.push(`${ms.toFixed(0).padStart(7)} ms  ${label}`);</span>
+<span class="a">+        }</span>
+<span class="a">+        lines.push(&quot;&quot;, NOTE);</span>
+<span class="a">+        return lines.join(&quot;\n&quot;);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    copyReport() {</span>
+<span class="a">+        const text = this.report();</span>
+<span class="a">+        const done = () =&gt; BdApi.UI.showToast(&quot;Profiler report copied.&quot;, {type: &quot;success&quot;});</span>
+<span class="a">+        const fail = error =&gt; {</span>
+<span class="a">+            console.error(NAME, &quot;could not copy the report&quot;, error);</span>
+<span class="a">+            BdApi.UI.showToast(&quot;Could not copy the report. The console has the error.&quot;, {type: &quot;error&quot;});</span>
+<span class="a">+        };</span>
+<span class="a">+        try {</span>
+<span class="a">+            const clipboard = window.DiscordNative &amp;&amp; window.DiscordNative.clipboard;</span>
+<span class="a">+            if (clipboard &amp;&amp; typeof clipboard.copy === &quot;function&quot;) {</span>
+<span class="a">+                clipboard.copy(text);</span>
+<span class="a">+                done();</span>
+<span class="a">+            }</span>
+<span class="a">+            else {</span>
+<span class="a">+                navigator.clipboard.writeText(text).then(done, fail);</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        catch (error) {</span>
+<span class="a">+            fail(error);</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+PluginProfiler.internals = {</span>
+<span class="a">+    Recorder, timed, pluginFilesOnStack, ownerFile, hookTimers, hookObservers, hookInstance,</span>
+<span class="a">+    wrapPatchChild, unwrapPatchChild, hookSuppress, callerNames, ORIGINAL</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+module.exports = PluginProfiler;</span>
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..30f8e61
+--- /dev/null
++++ b/README.md
+<span class="h">@@ -0,0 +1,26 @@</span>
+<span class="a">+# PluginProfiler</span>
+<span class="a">+</span>
+<span class="a">+PluginProfiler is a BetterDiscord plugin. It measures the main-thread time that each plugin uses. It also shows the CPU and memory use of Discord.</span>
+<span class="a">+</span>
+<span class="a">+## Install</span>
+<span class="a">+</span>
+<span class="a">+1. Copy `00PluginProfiler.plugin.js` into the BetterDiscord plugins folder (`%APPDATA%\BetterDiscord\plugins`).</span>
+<span class="a">+2. In Discord, open Settings &gt; Plugins and turn on PluginProfiler.</span>
+<span class="a">+3. Press Ctrl+R. The file name starts with `00`, so the profiler starts before the other plugins. Then it also sees the timers that the other plugins make when they start.</span>
+<span class="a">+4. Open the settings of PluginProfiler to see the table. Click &quot;Copy report&quot; to copy the data as text.</span>
+<span class="a">+</span>
+<span class="a">+## What it measures</span>
+<span class="a">+</span>
+<span class="a">+- Time in BetterDiscord patch callbacks, per plugin. The time of the original Discord function does not count.</span>
+<span class="a">+- Time in the plugin callbacks that the BDFDB library runs, per plugin.</span>
+<span class="a">+- Time in the `observer`, `onSwitch`, and BDFDB `process*` methods of each plugin.</span>
+<span class="a">+- Time in the timers and observers that a plugin makes. The profiler finds the plugin from the call stack.</span>
+<span class="a">+- The CPU of all Discord processes, the renderer JS heap, and long animation frames.</span>
+<span class="a">+</span>
+<span class="a">+The time is wall time on the main thread. It includes waits for disk and for paged-out memory, so it can be more than the CPU time.</span>
+<span class="a">+</span>
+<span class="a">+The profiler does not measure event listeners, async work, CSS, or memory per plugin.</span>
+<span class="a">+</span>
+<span class="a">+## Tests</span>
+<span class="a">+</span>
+<span class="a">+Run `npm test` with Node 22 or later. The tests load the patcher of the installed BetterDiscord and `TimeUtils.suppress` of the installed BDFDB, so both must be installed.</span>
+diff --git a/package-lock.json b/package-lock.json
+new file mode 100644
+index 0000000..0ec38d2
+--- /dev/null
++++ b/package-lock.json
+<span class="h">@@ -0,0 +1,53 @@</span>
+<span class="a">+{</span>
+<span class="a">+  &quot;name&quot;: &quot;plugin-profiler&quot;,</span>
+<span class="a">+  &quot;lockfileVersion&quot;: 3,</span>
+<span class="a">+  &quot;requires&quot;: true,</span>
+<span class="a">+  &quot;packages&quot;: {</span>
+<span class="a">+    &quot;&quot;: {</span>
+<span class="a">+      &quot;name&quot;: &quot;plugin-profiler&quot;,</span>
+<span class="a">+      &quot;devDependencies&quot;: {</span>
+<span class="a">+        &quot;fast-check&quot;: &quot;^4.10.2&quot;</span>
+<span class="a">+      }</span>
+<span class="a">+    },</span>
+<span class="a">+    &quot;node_modules/fast-check&quot;: {</span>
+<span class="a">+      &quot;version&quot;: &quot;4.10.2&quot;,</span>
+<span class="a">+      &quot;resolved&quot;: &quot;https://registry.npmjs.org/fast-check/-/fast-check-4.10.2.tgz&quot;,</span>
+<span class="a">+      &quot;integrity&quot;: &quot;sha512-iK2f+YrcmoeGqk6fA0ea2bptcu/itMIm4NfEozq6N25+aG6h7s5HZbB/k1aV7b5w5sFLMCbbtRUsTVR+BgC3xw==&quot;,</span>
+<span class="a">+      &quot;dev&quot;: true,</span>
+<span class="a">+      &quot;funding&quot;: [</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;individual&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://github.com/sponsors/dubzzz&quot;</span>
+<span class="a">+        },</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;opencollective&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://opencollective.com/fast-check&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;license&quot;: &quot;MIT&quot;,</span>
+<span class="a">+      &quot;dependencies&quot;: {</span>
+<span class="a">+        &quot;pure-rand&quot;: &quot;^8.0.0&quot;</span>
+<span class="a">+      },</span>
+<span class="a">+      &quot;engines&quot;: {</span>
+<span class="a">+        &quot;node&quot;: &quot;&gt;=12.17.0&quot;</span>
+<span class="a">+      }</span>
+<span class="a">+    },</span>
+<span class="a">+    &quot;node_modules/pure-rand&quot;: {</span>
+<span class="a">+      &quot;version&quot;: &quot;8.4.2&quot;,</span>
+<span class="a">+      &quot;resolved&quot;: &quot;https://registry.npmjs.org/pure-rand/-/pure-rand-8.4.2.tgz&quot;,</span>
+<span class="a">+      &quot;integrity&quot;: &quot;sha512-vvuOGgcuPJAirlHvuQw1TrOiw7ptaIXXmIbNuiNOY6lNGJJH49PQ1Kj4nd783nPdQhQdicgOjVI2yI/9BD6/Ng==&quot;,</span>
+<span class="a">+      &quot;dev&quot;: true,</span>
+<span class="a">+      &quot;funding&quot;: [</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;individual&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://github.com/sponsors/dubzzz&quot;</span>
+<span class="a">+        },</span>
+<span class="a">+        {</span>
+<span class="a">+          &quot;type&quot;: &quot;opencollective&quot;,</span>
+<span class="a">+          &quot;url&quot;: &quot;https://opencollective.com/fast-check&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;license&quot;: &quot;MIT&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/package.json b/package.json
+new file mode 100644
+index 0000000..5ae868a
+--- /dev/null
++++ b/package.json
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+{&quot;name&quot;:&quot;plugin-profiler&quot;,&quot;private&quot;:true,&quot;scripts&quot;:{&quot;test&quot;:&quot;node --test test/*.test.js&quot;},&quot;devDependencies&quot;:{&quot;fast-check&quot;:&quot;^4.10.2&quot;}}</span>
+\ No newline at end of file
+diff --git a/test/bd-patcher.test.js b/test/bd-patcher.test.js
+new file mode 100644
+index 0000000..5dcb72f
+--- /dev/null
++++ b/test/bd-patcher.test.js
+<span class="h">@@ -0,0 +1,101 @@</span>
+<span class="a">+&quot;use strict&quot;;</span>
+<span class="a">+const test = require(&quot;node:test&quot;);</span>
+<span class="a">+const assert = require(&quot;node:assert/strict&quot;);</span>
+<span class="a">+const {loadBdPatcher} = require(&quot;./helpers/installed.js&quot;);</span>
+<span class="a">+const {Recorder, wrapPatchChild, unwrapPatchChild} = require(&quot;../00PluginProfiler.plugin.js&quot;).internals;</span>
+<span class="a">+</span>
+<span class="a">+function setup() {</span>
+<span class="a">+    const errors = [];</span>
+<span class="a">+    const Patcher = loadBdPatcher({err: (...args) =&gt; errors.push(args)});</span>
+<span class="a">+    const clock = {t: 0};</span>
+<span class="a">+    const recorder = new Recorder(() =&gt; clock.t);</span>
+<span class="a">+    const msByOwner = () =&gt; Object.fromEntries([...recorder.owners].map(([name, entry]) =&gt; [name, entry.ms]));</span>
+<span class="a">+    const wrapAll = callers =&gt; {</span>
+<span class="a">+        const children = callers.flatMap(caller =&gt; Patcher.getPatchesByCaller(caller));</span>
+<span class="a">+        for (const child of children) assert.equal(wrapPatchChild(recorder, child, child.caller), true);</span>
+<span class="a">+        return children;</span>
+<span class="a">+    };</span>
+<span class="a">+    return {Patcher, errors, clock, recorder, msByOwner, wrapAll};</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;patch time goes to the plugin, the original function time does not, and results stay the same&quot;, () =&gt; {</span>
+<span class="a">+    const {Patcher, errors, clock, recorder, msByOwner, wrapAll} = setup();</span>
+<span class="a">+    const target = {work(x) { clock.t += 100; return x * 2; }};</span>
+<span class="a">+    Patcher.before(&quot;A&quot;, target, &quot;work&quot;, () =&gt; { clock.t += 5; });</span>
+<span class="a">+    Patcher.instead(&quot;B&quot;, target, &quot;work&quot;, (self, args, next) =&gt; { clock.t += 7; return next(...args) + 1; });</span>
+<span class="a">+    Patcher.after(&quot;C&quot;, target, &quot;work&quot;, (self, args, value) =&gt; { clock.t += 3; return value + 10; });</span>
+<span class="a">+    const expected = target.work(4);</span>
+<span class="a">+    assert.equal(expected, 19);</span>
+<span class="a">+</span>
+<span class="a">+    const children = wrapAll([&quot;A&quot;, &quot;B&quot;, &quot;C&quot;]);</span>
+<span class="a">+    assert.equal(target.work(4), expected);</span>
+<span class="a">+    assert.deepEqual(msByOwner(), {A: 5, B: 7, C: 3});</span>
+<span class="a">+    assert.equal(recorder.unattributedMs, 100);</span>
+<span class="a">+</span>
+<span class="a">+    // A second scan must not wrap a wrapper.</span>
+<span class="a">+    for (const child of children) assert.equal(wrapPatchChild(recorder, child, child.caller), false);</span>
+<span class="a">+    for (const child of children) unwrapPatchChild(child);</span>
+<span class="a">+    assert.equal(target.work(4), expected);</span>
+<span class="a">+    assert.deepEqual(errors, []);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;unwrap puts back the exact callbacks&quot;, () =&gt; {</span>
+<span class="a">+    const {Patcher, wrapAll} = setup();</span>
+<span class="a">+    const target = {work() { return 1; }};</span>
+<span class="a">+    const before = () =&gt; {};</span>
+<span class="a">+    const after = (self, args, value) =&gt; value;</span>
+<span class="a">+    Patcher.before(&quot;A&quot;, target, &quot;work&quot;, before);</span>
+<span class="a">+    Patcher.after(&quot;A&quot;, target, &quot;work&quot;, after);</span>
+<span class="a">+    const children = wrapAll([&quot;A&quot;]);</span>
+<span class="a">+    assert.notEqual(children[0].callback, before);</span>
+<span class="a">+    for (const child of children) unwrapPatchChild(child);</span>
+<span class="a">+    assert.deepEqual(children.map(child =&gt; child.callback), [before, after]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;chained instead patches each get only their own time&quot;, () =&gt; {</span>
+<span class="a">+    const {Patcher, clock, recorder, msByOwner, wrapAll} = setup();</span>
+<span class="a">+    const target = {work(x) { clock.t += 40; return x; }};</span>
+<span class="a">+    Patcher.instead(&quot;B1&quot;, target, &quot;work&quot;, (self, args, next) =&gt; { clock.t += 2; const value = next(...args); clock.t += 1; return value + 1; });</span>
+<span class="a">+    Patcher.instead(&quot;B2&quot;, target, &quot;work&quot;, (self, args, next) =&gt; { clock.t += 4; return next(...args) * 10; });</span>
+<span class="a">+    const expected = target.work(1);</span>
+<span class="a">+    wrapAll([&quot;B1&quot;, &quot;B2&quot;]);</span>
+<span class="a">+    assert.equal(target.work(1), expected);</span>
+<span class="a">+    assert.deepEqual(msByOwner(), {B1: 3, B2: 4});</span>
+<span class="a">+    assert.equal(recorder.unattributedMs, 40);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;a patch that calls a patched function pays for the Discord work but not for the other plugin&quot;, () =&gt; {</span>
+<span class="a">+    const {Patcher, clock, msByOwner, wrapAll} = setup();</span>
+<span class="a">+    const inner = {step() { clock.t += 10; }};</span>
+<span class="a">+    const outer = {work() { clock.t += 1; }};</span>
+<span class="a">+    Patcher.after(&quot;C&quot;, inner, &quot;step&quot;, () =&gt; { clock.t += 6; });</span>
+<span class="a">+    Patcher.before(&quot;A&quot;, outer, &quot;work&quot;, () =&gt; { clock.t += 2; inner.step(); });</span>
+<span class="a">+    wrapAll([&quot;A&quot;, &quot;C&quot;]);</span>
+<span class="a">+    outer.work();</span>
+<span class="a">+    // Without plugin A, Discord does not call inner.step here. So A owns those 10 ms. Plugin C owns its 6 ms.</span>
+<span class="a">+    assert.deepEqual(msByOwner(), {A: 12, C: 6});</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;a plugin can unpatch while the profiler wraps its callback&quot;, () =&gt; {</span>
+<span class="a">+    const {Patcher, clock, msByOwner, wrapAll} = setup();</span>
+<span class="a">+    const target = {work() { return &quot;original&quot;; }};</span>
+<span class="a">+    const unpatch = Patcher.after(&quot;A&quot;, target, &quot;work&quot;, () =&gt; { clock.t += 1; return &quot;patched&quot;; });</span>
+<span class="a">+    wrapAll([&quot;A&quot;]);</span>
+<span class="a">+    assert.equal(target.work(), &quot;patched&quot;);</span>
+<span class="a">+    unpatch();</span>
+<span class="a">+    assert.equal(target.work(), &quot;original&quot;);</span>
+<span class="a">+    assert.deepEqual(Patcher.getPatchesByCaller(&quot;A&quot;), []);</span>
+<span class="a">+    assert.deepEqual(msByOwner(), {A: 1});</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;an error in a wrapped callback reaches the BetterDiscord logger as before&quot;, () =&gt; {</span>
+<span class="a">+    const {Patcher, errors, recorder, wrapAll} = setup();</span>
+<span class="a">+    const target = {work() { return 5; }};</span>
+<span class="a">+    Patcher.before(&quot;A&quot;, target, &quot;work&quot;, () =&gt; { throw new Error(&quot;plugin bug&quot;); });</span>
+<span class="a">+    wrapAll([&quot;A&quot;]);</span>
+<span class="a">+    assert.equal(target.work(), 5);</span>
+<span class="a">+    assert.equal(errors.length, 1);</span>
+<span class="a">+    assert.equal(errors[0][2].message, &quot;plugin bug&quot;);</span>
+<span class="a">+    assert.equal(recorder.stack.length, 0);</span>
+<span class="a">+    assert.equal(recorder.owners.get(&quot;A&quot;).calls, 1);</span>
+<span class="a">+});</span>
+diff --git a/test/helpers/installed.js b/test/helpers/installed.js
+new file mode 100644
+index 0000000..7b6fea0
+--- /dev/null
++++ b/test/helpers/installed.js
+<span class="h">@@ -0,0 +1,50 @@</span>
+<span class="a">+&quot;use strict&quot;;</span>
+<span class="a">+// Loads code from the installed BetterDiscord and BDFDB, so the tests check the versions that Discord runs.</span>
+<span class="a">+const fs = require(&quot;node:fs&quot;);</span>
+<span class="a">+const path = require(&quot;node:path&quot;);</span>
+<span class="a">+</span>
+<span class="a">+const BD_FOLDER = path.join(process.env.APPDATA || &quot;&quot;, &quot;BetterDiscord&quot;);</span>
+<span class="a">+const BD_ASAR = path.join(BD_FOLDER, &quot;data&quot;, &quot;betterdiscord.asar&quot;);</span>
+<span class="a">+const BDFDB_FILE = path.join(BD_FOLDER, &quot;plugins&quot;, &quot;0BDFDB.plugin.js&quot;);</span>
+<span class="a">+</span>
+<span class="a">+/** Reads one top-level file from an asar archive. */</span>
+<span class="a">+function readAsarFile(archive, name) {</span>
+<span class="a">+    const buffer = fs.readFileSync(archive);</span>
+<span class="a">+    const headerPickleSize = buffer.readUInt32LE(4);</span>
+<span class="a">+    const jsonLength = buffer.readUInt32LE(12);</span>
+<span class="a">+    const header = JSON.parse(buffer.toString(&quot;utf8&quot;, 16, 16 + jsonLength));</span>
+<span class="a">+    const entry = header.files[name];</span>
+<span class="a">+    const start = 8 + headerPickleSize + Number(entry.offset);</span>
+<span class="a">+    return buffer.toString(&quot;utf8&quot;, start, start + entry.size);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Returns the index of the brace that closes the brace at openIndex. */</span>
+<span class="a">+function closingBrace(text, openIndex) {</span>
+<span class="a">+    let depth = 0;</span>
+<span class="a">+    for (let i = openIndex; i &lt; text.length; i++) {</span>
+<span class="a">+        if (text[i] === &quot;{&quot;) depth++;</span>
+<span class="a">+        else if (text[i] === &quot;}&quot; &amp;&amp; --depth === 0) return i;</span>
+<span class="a">+    }</span>
+<span class="a">+    throw new Error(&quot;no closing brace&quot;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Returns the internal Patcher class of the installed BetterDiscord. */</span>
+<span class="a">+function loadBdPatcher(logger) {</span>
+<span class="a">+    const source = readAsarFile(BD_ASAR, &quot;betterdiscord.js&quot;);</span>
+<span class="a">+    const marker = source.indexOf(&quot;static getPatchesByCaller(&quot;);</span>
+<span class="a">+    if (marker &lt; 0) throw new Error(&quot;BetterDiscord Patcher not found&quot;);</span>
+<span class="a">+    const classStart = source.lastIndexOf(&quot;=class{&quot;, marker) + 1;</span>
+<span class="a">+    const body = source.slice(classStart, closingBrace(source, classStart + &quot;class&quot;.length) + 1);</span>
+<span class="a">+    // The minified class uses g (logger), w (module cache), and ae (module search) from its bundle.</span>
+<span class="a">+    return new Function(&quot;g&quot;, &quot;w&quot;, &quot;ae&quot;, `return ${body};`)(logger, {}, () =&gt; null);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Returns BDFDB.TimeUtils.suppress from the installed BDFDB library. */</span>
+<span class="a">+function loadBdfdbSuppress(logUtils) {</span>
+<span class="a">+    const source = fs.readFileSync(BDFDB_FILE, &quot;utf8&quot;);</span>
+<span class="a">+    const match = /BDFDB\.TimeUtils\.suppress = (function \(callback, strings, config\) \{[\s\S]*?\n\t*\}\};)/.exec(source);</span>
+<span class="a">+    if (!match) throw new Error(&quot;BDFDB TimeUtils.suppress not found&quot;);</span>
+<span class="a">+    return new Function(&quot;BDFDB&quot;, `return ${match[1].slice(0, -1)}`)({LogUtils: logUtils});</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+module.exports = {BD_ASAR, BDFDB_FILE, loadBdPatcher, loadBdfdbSuppress};</span>
+diff --git a/test/hooks.test.js b/test/hooks.test.js
+new file mode 100644
+index 0000000..0792e86
+--- /dev/null
++++ b/test/hooks.test.js
+<span class="h">@@ -0,0 +1,174 @@</span>
+<span class="a">+&quot;use strict&quot;;</span>
+<span class="a">+const test = require(&quot;node:test&quot;);</span>
+<span class="a">+const assert = require(&quot;node:assert/strict&quot;);</span>
+<span class="a">+const {loadBdfdbSuppress} = require(&quot;./helpers/installed.js&quot;);</span>
+<span class="a">+const {</span>
+<span class="a">+    Recorder, pluginFilesOnStack, ownerFile, hookTimers, hookObservers, hookInstance, hookSuppress, callerNames, ORIGINAL</span>
+<span class="a">+} = require(&quot;../00PluginProfiler.plugin.js&quot;).internals;</span>
+<span class="a">+</span>
+<span class="a">+const OWN_FILE = &quot;00PluginProfiler.plugin.js&quot;;</span>
+<span class="a">+</span>
+<span class="a">+/** Makes a function whose code has the source URL that BetterDiscord gives to a plugin file. */</span>
+<span class="a">+function inPluginFile(url, param, body) {</span>
+<span class="a">+    return new Function(param, `${body}\n//# sourceURL=${url}`);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function setup() {</span>
+<span class="a">+    const clock = {t: 0};</span>
+<span class="a">+    const recorder = new Recorder(() =&gt; clock.t);</span>
+<span class="a">+    const entry = name =&gt; recorder.owners.get(name);</span>
+<span class="a">+    return {clock, recorder, entry, undo: []};</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;the stack gives the plugin file, and a library gives way to the plugin that called it&quot;, () =&gt; {</span>
+<span class="a">+    const library = inPluginFile(&quot;betterdiscord://betterdiscord/plugins/0BDFDB.plugin.js&quot;, &quot;callback&quot;, &quot;return function libraryHelper() { return callback(); };&quot;)(pluginFilesOnStack);</span>
+<span class="a">+    const plugin = inPluginFile(&quot;betterdiscord://betterdiscord/plugins/FriendNotifications.plugin.js&quot;, &quot;library&quot;, &quot;return function pluginWork() { return library(); };&quot;)(library);</span>
+<span class="a">+    const files = plugin();</span>
+<span class="a">+    assert.deepEqual(files, [&quot;0BDFDB.plugin.js&quot;, &quot;FriendNotifications.plugin.js&quot;]);</span>
+<span class="a">+    assert.equal(ownerFile(files, OWN_FILE), &quot;FriendNotifications.plugin.js&quot;);</span>
+<span class="a">+    assert.equal(ownerFile([&quot;0BDFDB.plugin.js&quot;], OWN_FILE), &quot;0BDFDB.plugin.js&quot;);</span>
+<span class="a">+    assert.equal(ownerFile([OWN_FILE, OWN_FILE], OWN_FILE), null);</span>
+<span class="a">+    assert.equal(ownerFile([], OWN_FILE), null);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;old BetterDiscord source URLs also match&quot;, () =&gt; {</span>
+<span class="a">+    const plugin = inPluginFile(&quot;betterdiscord://plugins/Old.plugin.js&quot;, &quot;capture&quot;, &quot;return function oldWork() { return capture(); };&quot;)(pluginFilesOnStack);</span>
+<span class="a">+    assert.deepEqual(plugin(), [&quot;Old.plugin.js&quot;]);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;the stack capture puts back Error.prepareStackTrace and Error.stackTraceLimit&quot;, () =&gt; {</span>
+<span class="a">+    const prepare = () =&gt; &quot;custom&quot;;</span>
+<span class="a">+    const savedPrepare = Error.prepareStackTrace;</span>
+<span class="a">+    const savedLimit = Error.stackTraceLimit;</span>
+<span class="a">+    try {</span>
+<span class="a">+        Error.prepareStackTrace = prepare;</span>
+<span class="a">+        Error.stackTraceLimit = 7;</span>
+<span class="a">+        pluginFilesOnStack();</span>
+<span class="a">+        assert.equal(Error.prepareStackTrace, prepare);</span>
+<span class="a">+        assert.equal(Error.stackTraceLimit, 7);</span>
+<span class="a">+        assert.equal(new Error(&quot;x&quot;).stack, &quot;custom&quot;);</span>
+<span class="a">+    }</span>
+<span class="a">+    finally {</span>
+<span class="a">+        Error.prepareStackTrace = savedPrepare;</span>
+<span class="a">+        Error.stackTraceLimit = savedLimit;</span>
+<span class="a">+    }</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;timer callbacks count for the plugin that made the timer&quot;, () =&gt; {</span>
+<span class="a">+    const {clock, recorder, entry, undo} = setup();</span>
+<span class="a">+    const calls = [];</span>
+<span class="a">+    const setTimeout = (handler, ms, ...args) =&gt; { calls.push({handler, ms, args}); return 7; };</span>
+<span class="a">+    const setInterval = (handler, ms) =&gt; { calls.push({handler, ms}); return 8; };</span>
+<span class="a">+    const scope = {setTimeout, setInterval};</span>
+<span class="a">+    let owner = &quot;FriendNotifications&quot;;</span>
+<span class="a">+    hookTimers(scope, recorder, () =&gt; owner, undo);</span>
+<span class="a">+</span>
+<span class="a">+    assert.equal(scope.setTimeout(() =&gt; { clock.t += 4; return &quot;done&quot;; }, 50, &quot;x&quot;), 7);</span>
+<span class="a">+    assert.deepEqual([calls[0].ms, calls[0].args], [50, [&quot;x&quot;]]);</span>
+<span class="a">+    assert.equal(calls[0].handler(), &quot;done&quot;);</span>
+<span class="a">+    assert.equal(entry(&quot;FriendNotifications&quot;).ms, 4);</span>
+<span class="a">+    assert.equal(entry(&quot;FriendNotifications&quot;).kinds.get(&quot;timer&quot;), 4);</span>
+<span class="a">+    assert.ok(entry(&quot;PluginProfiler&quot;).kinds.has(&quot;stack capture&quot;));</span>
+<span class="a">+</span>
+<span class="a">+    // A string handler and a handler that no plugin owns pass through unchanged.</span>
+<span class="a">+    scope.setInterval(&quot;code()&quot;, 5);</span>
+<span class="a">+    assert.equal(calls[1].handler, &quot;code()&quot;);</span>
+<span class="a">+    owner = null;</span>
+<span class="a">+    const discordHandler = () =&gt; {};</span>
+<span class="a">+    scope.setTimeout(discordHandler, 1);</span>
+<span class="a">+    assert.equal(calls[2].handler, discordHandler);</span>
+<span class="a">+</span>
+<span class="a">+    while (undo.length) undo.pop()();</span>
+<span class="a">+    assert.equal(scope.setTimeout, setTimeout);</span>
+<span class="a">+    assert.equal(scope.setInterval, setInterval);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;observer callbacks count for the plugin that made the observer&quot;, () =&gt; {</span>
+<span class="a">+    const {clock, recorder, entry, undo} = setup();</span>
+<span class="a">+    class FakeObserver {</span>
+<span class="a">+        constructor(callback, options) { this.callback = callback; this.options = options; }</span>
+<span class="a">+    }</span>
+<span class="a">+    const scope = {MutationObserver: FakeObserver, ResizeObserver: FakeObserver};</span>
+<span class="a">+    hookObservers(scope, recorder, () =&gt; &quot;SpellCheck&quot;, undo);</span>
+<span class="a">+    const observer = new scope.MutationObserver(() =&gt; { clock.t += 6; }, {subtree: true});</span>
+<span class="a">+    assert.ok(observer instanceof FakeObserver);</span>
+<span class="a">+    assert.equal(scope.MutationObserver.name, &quot;MutationObserver&quot;);</span>
+<span class="a">+    assert.deepEqual(observer.options, {subtree: true});</span>
+<span class="a">+    observer.callback();</span>
+<span class="a">+    assert.equal(entry(&quot;SpellCheck&quot;).kinds.get(&quot;mutation observer&quot;), 6);</span>
+<span class="a">+    while (undo.length) undo.pop()();</span>
+<span class="a">+    assert.equal(scope.MutationObserver, FakeObserver);</span>
+<span class="a">+    assert.equal(scope.ResizeObserver, FakeObserver);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;plugin methods that BetterDiscord and BDFDB call by name count for the plugin&quot;, () =&gt; {</span>
+<span class="a">+    const {clock, recorder, entry, undo} = setup();</span>
+<span class="a">+    class Base {</span>
+<span class="a">+        processMessageToolbar(e) { clock.t += 2; return e + 1; }</span>
+<span class="a">+        start() {}</span>
+<span class="a">+    }</span>
+<span class="a">+    class Plugin extends Base {</span>
+<span class="a">+        observer() { clock.t += 3; }</span>
+<span class="a">+    }</span>
+<span class="a">+    const instance = new Plugin();</span>
+<span class="a">+    const ownSwitch = function () { clock.t += 1; return this; };</span>
+<span class="a">+    instance.onSwitch = ownSwitch;</span>
+<span class="a">+    hookInstance(recorder, instance, &quot;SpellCheck&quot;, undo);</span>
+<span class="a">+    const undoCount = undo.length;</span>
+<span class="a">+    hookInstance(recorder, instance, &quot;SpellCheck&quot;, undo);</span>
+<span class="a">+    assert.equal(undo.length, undoCount, &quot;a second scan adds no hooks&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    assert.equal(instance.processMessageToolbar(1), 2);</span>
+<span class="a">+    instance.observer();</span>
+<span class="a">+    assert.equal(instance.onSwitch(), instance);</span>
+<span class="a">+    assert.equal(instance.start, Base.prototype.start);</span>
+<span class="a">+    const kinds = Object.fromEntries(entry(&quot;SpellCheck&quot;).kinds);</span>
+<span class="a">+    assert.deepEqual(kinds, {&quot;BDFDB process&quot;: 2, observer: 3, onSwitch: 1});</span>
+<span class="a">+</span>
+<span class="a">+    while (undo.length) undo.pop()();</span>
+<span class="a">+    assert.equal(Object.hasOwn(instance, &quot;processMessageToolbar&quot;), false);</span>
+<span class="a">+    assert.equal(Object.hasOwn(instance, &quot;observer&quot;), false);</span>
+<span class="a">+    assert.equal(instance.onSwitch, ownSwitch);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;BDFDB callbacks count for each plugin, and the original Discord call counts for no plugin&quot;, () =&gt; {</span>
+<span class="a">+    const {clock, recorder, entry, undo} = setup();</span>
+<span class="a">+    const logged = [];</span>
+<span class="a">+    const originalSuppress = loadBdfdbSuppress({error: (...args) =&gt; logged.push(args)});</span>
+<span class="a">+    const bdfdb = {TimeUtils: {suppress: originalSuppress}};</span>
+<span class="a">+    const names = {spellcheck: &quot;SpellCheck&quot;};</span>
+<span class="a">+    assert.equal(hookSuppress(recorder, bdfdb, name =&gt; names[name.toLowerCase()] || name, undo), true);</span>
+<span class="a">+    assert.equal(hookSuppress(recorder, bdfdb, name =&gt; name, undo), false, &quot;no second hook&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    // The same loop shape as BDFDB.PatchUtils.patch: one BetterDiscord patch calls all plugin callbacks.</span>
+<span class="a">+    const callbacks = [</span>
+<span class="a">+        Object.assign(() =&gt; { clock.t += 9; }, {pluginName: &quot;spellcheck&quot;}),</span>
+<span class="a">+        Object.assign(() =&gt; { clock.t += 4; throw new Error(&quot;plugin bug&quot;); }, {pluginName: &quot;Translator&quot;})</span>
+<span class="a">+    ];</span>
+<span class="a">+    const dispatcher = () =&gt; {</span>
+<span class="a">+        clock.t += 1;</span>
+<span class="a">+        for (const callback of callbacks) bdfdb.TimeUtils.suppress(callback, &quot;after callback&quot;, {name: callback.pluginName})({});</span>
+<span class="a">+        bdfdb.TimeUtils.suppress(() =&gt; { clock.t += 50; }, &quot;originalMethod&quot;, {name: &quot;Discord&quot;})();</span>
+<span class="a">+    };</span>
+<span class="a">+    recorder.run(&quot;BDFDB&quot;, &quot;patch after&quot;, dispatcher, null, []);</span>
+<span class="a">+    assert.equal(entry(&quot;SpellCheck&quot;).ms, 9);</span>
+<span class="a">+    assert.equal(entry(&quot;Translator&quot;).ms, 4);</span>
+<span class="a">+    assert.equal(entry(&quot;BDFDB&quot;).ms, 1);</span>
+<span class="a">+    assert.equal(recorder.unattributedMs, 50);</span>
+<span class="a">+    assert.equal(logged.length, 1, &quot;BDFDB still logs the plugin error&quot;);</span>
+<span class="a">+</span>
+<span class="a">+    const plain = bdfdb.TimeUtils.suppress(() =&gt; 3, &quot;no config&quot;);</span>
+<span class="a">+    assert.equal(plain[ORIGINAL], undefined);</span>
+<span class="a">+    assert.equal(plain(), 3);</span>
+<span class="a">+    while (undo.length) undo.pop()();</span>
+<span class="a">+    assert.equal(bdfdb.TimeUtils.suppress, originalSuppress);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;caller names cover the forms that plugins use&quot;, () =&gt; {</span>
+<span class="a">+    const names = callerNames({</span>
+<span class="a">+        name: &quot;Hide Channels&quot;, id: &quot;Hide Channels&quot;, filename: &quot;HideChannels.plugin.js&quot;,</span>
+<span class="a">+        instance: {getName: () =&gt; &quot;HideChannelsPlugin&quot;}</span>
+<span class="a">+    });</span>
+<span class="a">+    assert.deepEqual(names.sort(), [&quot;Hide Channels&quot;, &quot;HideChannels&quot;, &quot;HideChannelsPlugin&quot;]);</span>
+<span class="a">+    assert.deepEqual(callerNames({name: &quot;X&quot;, instance: {getName() { throw new Error(&quot;broken&quot;); }}}), [&quot;X&quot;]);</span>
+<span class="a">+});</span>
+diff --git a/test/lifecycle.test.js b/test/lifecycle.test.js
+new file mode 100644
+index 0000000..82d188b
+--- /dev/null
++++ b/test/lifecycle.test.js
+<span class="h">@@ -0,0 +1,82 @@</span>
+<span class="a">+&quot;use strict&quot;;</span>
+<span class="a">+const test = require(&quot;node:test&quot;);</span>
+<span class="a">+const assert = require(&quot;node:assert/strict&quot;);</span>
+<span class="a">+const {loadBdPatcher} = require(&quot;./helpers/installed.js&quot;);</span>
+<span class="a">+const PluginProfiler = require(&quot;../00PluginProfiler.plugin.js&quot;);</span>
+<span class="a">+</span>
+<span class="a">+const META = {filename: &quot;00PluginProfiler.plugin.js&quot;, name: &quot;PluginProfiler&quot;};</span>
+<span class="a">+</span>
+<span class="a">+function fakeWindow() {</span>
+<span class="a">+    return {</span>
+<span class="a">+        setTimeout: () =&gt; 1,</span>
+<span class="a">+        setInterval: () =&gt; 2,</span>
+<span class="a">+        MutationObserver: class {},</span>
+<span class="a">+        ResizeObserver: class {},</span>
+<span class="a">+        IntersectionObserver: class {}</span>
+<span class="a">+    };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+test.afterEach(() =&gt; {</span>
+<span class="a">+    delete globalThis.window;</span>
+<span class="a">+    delete globalThis.BdApi;</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;long-frame labels show script files and plugin names, but never the page URL&quot;, () =&gt; {</span>
+<span class="a">+    const plugin = new PluginProfiler(META);</span>
+<span class="a">+    plugin.fileOwners = new Map([[&quot;Foo.plugin.js&quot;, &quot;Foo&quot;]]);</span>
+<span class="a">+    const page = &quot;https://discord.com/channels/@me/123456789012345678&quot;;</span>
+<span class="a">+    assert.equal(plugin.scriptLabel({sourceURL: page, invoker: page, invokerType: &quot;classic-script&quot;}), &quot;page&quot;);</span>
+<span class="a">+    assert.equal(plugin.scriptLabel({sourceURL: page, invoker: &quot;DIV.onclick&quot;}), &quot;page (DIV.onclick)&quot;);</span>
+<span class="a">+    assert.equal(plugin.scriptLabel({sourceURL: &quot;https://discord.com/assets/8fe5.js&quot;, invoker: &quot;https://discord.com/assets/8fe5.js&quot;}), &quot;8fe5.js&quot;);</span>
+<span class="a">+    assert.equal(plugin.scriptLabel({sourceURL: &quot;https://discord.com/assets/5567.js?v=1&quot;, sourceFunctionName: &quot;r&quot;}), &quot;5567.js (r)&quot;);</span>
+<span class="a">+    assert.equal(plugin.scriptLabel({sourceURL: &quot;betterdiscord://betterdiscord/plugins/Foo.plugin.js&quot;, invoker: &quot;Window.setTimeout&quot;}), &quot;Foo (Window.setTimeout)&quot;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;a failed start removes every hook&quot;, () =&gt; {</span>
+<span class="a">+    const scope = globalThis.window = fakeWindow();</span>
+<span class="a">+    const originals = {...scope};</span>
+<span class="a">+    globalThis.BdApi = {</span>
+<span class="a">+        Plugins: {getAll() { throw new Error(&quot;broken API&quot;); }},</span>
+<span class="a">+        Patcher: {getPatchesByCaller: () =&gt; []}</span>
+<span class="a">+    };</span>
+<span class="a">+    const plugin = new PluginProfiler(META);</span>
+<span class="a">+    assert.throws(() =&gt; plugin.start(), /broken API/);</span>
+<span class="a">+    for (const key of Object.keys(originals)) assert.equal(scope[key], originals[key], key);</span>
+<span class="a">+    assert.equal(plugin.recorder, null);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;start wraps patches and hooks of other plugins, and stop removes all of them&quot;, () =&gt; {</span>
+<span class="a">+    const Patcher = loadBdPatcher({err() {}});</span>
+<span class="a">+    const target = {work() { return 1; }};</span>
+<span class="a">+    const callback = () =&gt; 2;</span>
+<span class="a">+    Patcher.after(&quot;Foo&quot;, target, &quot;work&quot;, callback);</span>
+<span class="a">+    const observer = () =&gt; {};</span>
+<span class="a">+    const instance = {observer, start() {}, stop() {}};</span>
+<span class="a">+    const scope = globalThis.window = fakeWindow();</span>
+<span class="a">+    const originals = {...scope};</span>
+<span class="a">+    globalThis.BdApi = {</span>
+<span class="a">+        Plugins: {getAll: () =&gt; [{name: &quot;Foo&quot;, id: &quot;Foo&quot;, filename: &quot;Foo.plugin.js&quot;, instance}, {...META, id: META.name, instance: {}}]},</span>
+<span class="a">+        Patcher: {getPatchesByCaller: caller =&gt; Patcher.getPatchesByCaller(caller)}</span>
+<span class="a">+    };</span>
+<span class="a">+</span>
+<span class="a">+    const plugin = new PluginProfiler(META);</span>
+<span class="a">+    plugin.start();</span>
+<span class="a">+    try {</span>
+<span class="a">+        assert.notEqual(Patcher.getPatchesByCaller(&quot;Foo&quot;)[0].callback, callback);</span>
+<span class="a">+        assert.notEqual(instance.observer, observer);</span>
+<span class="a">+        assert.notEqual(scope.setTimeout, originals.setTimeout);</span>
+<span class="a">+        assert.equal(target.work(), 2);</span>
+<span class="a">+        instance.observer();</span>
+<span class="a">+        const row = plugin.snapshot().rows.find(r =&gt; r.name === &quot;Foo&quot;);</span>
+<span class="a">+        assert.equal(row.calls, 2);</span>
+<span class="a">+        assert.match(plugin.report(), /^PluginProfiler 1\.0\.0 report/);</span>
+<span class="a">+        assert.match(plugin.report(), /\nFoo /);</span>
+<span class="a">+    }</span>
+<span class="a">+    finally {</span>
+<span class="a">+        plugin.stop();</span>
+<span class="a">+    }</span>
+<span class="a">+    assert.equal(Patcher.getPatchesByCaller(&quot;Foo&quot;)[0].callback, callback);</span>
+<span class="a">+    assert.equal(instance.observer, observer);</span>
+<span class="a">+    for (const key of Object.keys(originals)) assert.equal(scope[key], originals[key], key);</span>
+<span class="a">+    assert.equal(plugin.snapshot(), null);</span>
+<span class="a">+});</span>
+diff --git a/test/recorder.test.js b/test/recorder.test.js
+new file mode 100644
+index 0000000..fc290ad
+--- /dev/null
++++ b/test/recorder.test.js
+<span class="h">@@ -0,0 +1,100 @@</span>
+<span class="a">+&quot;use strict&quot;;</span>
+<span class="a">+const test = require(&quot;node:test&quot;);</span>
+<span class="a">+const assert = require(&quot;node:assert/strict&quot;);</span>
+<span class="a">+const fc = require(&quot;fast-check&quot;);</span>
+<span class="a">+const {Recorder} = require(&quot;../00PluginProfiler.plugin.js&quot;).internals;</span>
+<span class="a">+</span>
+<span class="a">+const owner = fc.constantFrom(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;, null);</span>
+<span class="a">+const {node: callTree} = fc.letrec(tie =&gt; ({</span>
+<span class="a">+    node: fc.record({</span>
+<span class="a">+        owner,</span>
+<span class="a">+        before: fc.nat({max: 50}),</span>
+<span class="a">+        after: fc.nat({max: 50}),</span>
+<span class="a">+        throws: fc.nat({max: 9}).map(n =&gt; n === 0),</span>
+<span class="a">+        children: fc.oneof({depthSize: &quot;small&quot;}, fc.constant([]), fc.array(tie(&quot;node&quot;), {maxLength: 3}))</span>
+<span class="a">+    })</span>
+<span class="a">+}));</span>
+<span class="a">+</span>
+<span class="a">+/** Runs a call tree through the recorder. The clock moves only when a node does work. */</span>
+<span class="a">+function execute(recorder, clock, node) {</span>
+<span class="a">+    return recorder.run(node.owner, &quot;test&quot;, () =&gt; {</span>
+<span class="a">+        clock.t += node.before;</span>
+<span class="a">+        for (const child of node.children) execute(recorder, clock, child);</span>
+<span class="a">+        if (node.throws) throw new Error(&quot;planned failure&quot;);</span>
+<span class="a">+        clock.t += node.after;</span>
+<span class="a">+        return node;</span>
+<span class="a">+    }, null, []);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Slow reference: adds up the work of each owner directly. Returns true when the node throws. */</span>
+<span class="a">+function reference(node, totals) {</span>
+<span class="a">+    const key = String(node.owner);</span>
+<span class="a">+    totals[key] = totals[key] || {ms: 0, calls: 0};</span>
+<span class="a">+    totals[key].calls += 1;</span>
+<span class="a">+    totals[key].ms += node.before;</span>
+<span class="a">+    for (const child of node.children) {</span>
+<span class="a">+        if (reference(child, totals)) return true;</span>
+<span class="a">+    }</span>
+<span class="a">+    if (node.throws) return true;</span>
+<span class="a">+    totals[key].ms += node.after;</span>
+<span class="a">+    return false;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;each owner gets exactly its own work, also when calls throw&quot;, () =&gt; {</span>
+<span class="a">+    fc.assert(fc.property(fc.array(callTree, {minLength: 1, maxLength: 4}), roots =&gt; {</span>
+<span class="a">+        const clock = {t: 1000};</span>
+<span class="a">+        const recorder = new Recorder(() =&gt; clock.t);</span>
+<span class="a">+        const expected = {};</span>
+<span class="a">+        for (const root of roots) {</span>
+<span class="a">+            let threw = false;</span>
+<span class="a">+            try {</span>
+<span class="a">+                assert.equal(execute(recorder, clock, root), root);</span>
+<span class="a">+            }</span>
+<span class="a">+            catch (error) {</span>
+<span class="a">+                assert.equal(error.message, &quot;planned failure&quot;);</span>
+<span class="a">+                threw = true;</span>
+<span class="a">+            }</span>
+<span class="a">+            assert.equal(reference(root, expected), threw);</span>
+<span class="a">+            assert.equal(recorder.stack.length, 0);</span>
+<span class="a">+        }</span>
+<span class="a">+        const actual = {};</span>
+<span class="a">+        for (const [name, entry] of recorder.owners) actual[name] = {ms: entry.ms, calls: entry.calls};</span>
+<span class="a">+        const attributed = Object.fromEntries(Object.entries(expected).filter(([key]) =&gt; key !== &quot;null&quot;));</span>
+<span class="a">+        assert.deepEqual(actual, attributed);</span>
+<span class="a">+        assert.equal(recorder.unattributedMs, expected.null ? expected.null.ms : 0);</span>
+<span class="a">+    }), {numRuns: 500});</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;rows are sorted by time and give the share of the elapsed time&quot;, () =&gt; {</span>
+<span class="a">+    fc.assert(fc.property(fc.array(fc.tuple(fc.constantFrom(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;, &quot;D&quot;), fc.nat({max: 100})), {maxLength: 30}), calls =&gt; {</span>
+<span class="a">+        const clock = {t: 0};</span>
+<span class="a">+        const recorder = new Recorder(() =&gt; clock.t);</span>
+<span class="a">+        for (const [name, ms] of calls) recorder.run(name, &quot;test&quot;, () =&gt; { clock.t += ms; }, null, []);</span>
+<span class="a">+        clock.t += 7;</span>
+<span class="a">+        const rows = recorder.rows();</span>
+<span class="a">+        const elapsed = Math.max(1, clock.t);</span>
+<span class="a">+        for (let i = 1; i &lt; rows.length; i++) assert.ok(rows[i - 1].ms &gt;= rows[i].ms);</span>
+<span class="a">+        for (const row of rows) assert.equal(row.percent, row.ms / elapsed * 100);</span>
+<span class="a">+        assert.equal(rows.reduce((sum, row) =&gt; sum + row.ms, 0), calls.reduce((sum, [, ms]) =&gt; sum + ms, 0));</span>
+<span class="a">+    }));</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;an inactive recorder calls through and records nothing&quot;, () =&gt; {</span>
+<span class="a">+    const clock = {t: 0};</span>
+<span class="a">+    const recorder = new Recorder(() =&gt; clock.t);</span>
+<span class="a">+    recorder.active = false;</span>
+<span class="a">+    const self = {};</span>
+<span class="a">+    const result = recorder.run(&quot;A&quot;, &quot;test&quot;, function (x) { clock.t += 5; return [this, x]; }, self, [3]);</span>
+<span class="a">+    assert.deepEqual(result, [self, 3]);</span>
+<span class="a">+    assert.equal(recorder.owners.size, 0);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&quot;the worst call and the main source come from the recorded calls&quot;, () =&gt; {</span>
+<span class="a">+    const clock = {t: 0};</span>
+<span class="a">+    const recorder = new Recorder(() =&gt; clock.t);</span>
+<span class="a">+    recorder.run(&quot;A&quot;, &quot;timer&quot;, () =&gt; { clock.t += 2; }, null, []);</span>
+<span class="a">+    recorder.run(&quot;A&quot;, &quot;patch after&quot;, () =&gt; { clock.t += 9; }, null, []);</span>
+<span class="a">+    recorder.run(&quot;A&quot;, &quot;timer&quot;, () =&gt; { clock.t += 3; }, null, []);</span>
+<span class="a">+    const [row] = recorder.rows();</span>
+<span class="a">+    assert.deepEqual({ms: row.ms, calls: row.calls, maxMs: row.maxMs, topKind: row.topKind}, {ms: 14, calls: 3, maxMs: 9, topKind: &quot;patch after&quot;});</span>
+<span class="a">+});</span></pre>
+</div></body></html>

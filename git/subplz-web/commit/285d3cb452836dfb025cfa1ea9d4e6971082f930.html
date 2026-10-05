@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 285d3cb4 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 285d3cb452836dfb025cfa1ea9d4e6971082f930
+equwal &lt;truex@equwal.com&gt;
+2026-09-26 22:18:14 -0700
+
+Make the caption credit atomic in the database
+
+captions.add read seconds_left with the ORM and wrote back the sum. On
+Postgres (burst mode, READ COMMITTED), another transaction can commit
+between that read and that write. Then a credit or a captions.spend of
+that transaction for the same account is lost. Two credits for an
+account without a row can also both insert the row, and one of them
+fails with a unique violation.
+
+captions.add now uses two statements. INSERT ... ON CONFLICT DO NOTHING
+makes a missing row without a race. UPDATE ... SET seconds_left =
+seconds_left + n adds the seconds, as captions.spend and
+captions.refund do. The ORM UPDATE also keeps a loaded row in the
+session up to date, as in captions.spend.
+
+The test suite runs on SQLite, so the tests cannot show the race on
+Postgres. SQLite has one writer at a time, and each caller of
+captions.add on main writes before the call (payments.fulfil adds the
+purchase, accounts.merge moves the jobs), so production on SQLite is
+safe today. The new Hypothesis test makes the Postgres order of events
+on SQLite: it calls captions.add in a new transaction, and another
+session gives or spends seconds just before the first write of
+captions.add. Without the fix, Hypothesis finds two failures: a lost
+credit, and a unique violation when the row is missing. A lost spend
+fails the same assertion as a lost credit.
+
+</pre><pre> backend/captions.py    | 27 ++++++++++++++++++-----
+ tests/test_captions.py | 60 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 81 insertions(+), 6 deletions(-)
+</pre><pre>diff --git a/backend/captions.py b/backend/captions.py
+index da43c0d..e6297a6 100644
+--- a/backend/captions.py
++++ b/backend/captions.py
+<span class="h">@@ -41,6 +41,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request</span>
+ from fastapi.concurrency import run_in_threadpool
+ from pydantic import BaseModel
+ from sqlalchemy import ForeignKey, Integer, String, update
+<span class="a">+from sqlalchemy.dialects import postgresql, sqlite</span>
+ from sqlalchemy.orm import Mapped, Session, mapped_column
+ 
+ from .api import get_account, get_session
+<span class="h">@@ -60,6 +61,9 @@ PACKS: list[Plan] = [</span>
+ ]
+ HOURS = {&quot;captions20&quot;: 20, &quot;captions80&quot;: 80, &quot;captions200&quot;: 200}
+ 
+<span class="a">+# INSERT ... ON CONFLICT is not standard SQL, so SQLAlchemy has one for each database.</span>
+<span class="a">+_INSERT = {&quot;postgresql&quot;: postgresql.insert, &quot;sqlite&quot;: sqlite.insert}</span>
+<span class="a">+</span>
+ 
+ class CaptionBalance(Base):
+     &quot;&quot;&quot;The seconds of cloud captions that an account has.&quot;&quot;&quot;
+<span class="h">@@ -83,12 +87,23 @@ def seconds_left(session: Session, account_id: str) -&gt; int:</span>
+ 
+ 
+ def add(session: Session, account_id: str, seconds: int) -&gt; None:
+<span class="d">-    &quot;&quot;&quot;Give `seconds` to the account. The caller commits.&quot;&quot;&quot;</span>
+<span class="d">-    row = session.get(CaptionBalance, account_id)</span>
+<span class="d">-    if row is None:</span>
+<span class="d">-        row = CaptionBalance(account_id=account_id, seconds_left=0, seconds_used=0)</span>
+<span class="d">-        session.add(row)</span>
+<span class="d">-    row.seconds_left += seconds</span>
+<span class="a">+    &quot;&quot;&quot;Give `seconds` to the account. The caller commits.</span>
+<span class="a">+</span>
+<span class="a">+    The database does each step in one statement, as in spend: the INSERT</span>
+<span class="a">+    makes a missing row, and the UPDATE adds to the row. A sum made in Python</span>
+<span class="a">+    could lose a credit or a spend of another transaction on Postgres.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    insert = _INSERT[session.get_bind().dialect.name]</span>
+<span class="a">+    session.execute(</span>
+<span class="a">+        insert(CaptionBalance)</span>
+<span class="a">+        .values(account_id=account_id, seconds_left=0, seconds_used=0)</span>
+<span class="a">+        .on_conflict_do_nothing(index_elements=[CaptionBalance.account_id])</span>
+<span class="a">+    )</span>
+<span class="a">+    session.execute(</span>
+<span class="a">+        update(CaptionBalance)</span>
+<span class="a">+        .where(CaptionBalance.account_id == account_id)</span>
+<span class="a">+        .values(seconds_left=CaptionBalance.seconds_left + seconds)</span>
+<span class="a">+    )</span>
+ 
+ 
+ def spend(session: Session, account_id: str, seconds: int) -&gt; bool:
+diff --git a/tests/test_captions.py b/tests/test_captions.py
+index 75cd38f..0ebd0fa 100644
+--- a/tests/test_captions.py
++++ b/tests/test_captions.py
+<span class="h">@@ -4,12 +4,14 @@ from __future__ import annotations</span>
+ 
+ import io
+ import wave
+<span class="a">+from contextlib import contextmanager</span>
+ 
+ import pytest
+ import stripe
+ from hypothesis import given
+ from hypothesis import settings as hsettings
+ from hypothesis import strategies as st
+<span class="a">+from sqlalchemy import event</span>
+ 
+ from backend import accounts, captions
+ from backend.db import Account, SessionLocal
+<span class="h">@@ -168,6 +170,64 @@ def test_the_balance_never_goes_below_zero_and_no_second_is_lost(given_seconds,</span>
+             assert row.seconds_left + row.seconds_used == given_seconds
+ 
+ 
+<span class="a">+@contextmanager</span>
+<span class="a">+def before_the_first_write(action):</span>
+<span class="a">+    &quot;&quot;&quot;Run `action` in another session, and commit it, just before the first</span>
+<span class="a">+    INSERT or UPDATE of caption_balances.</span>
+<span class="a">+</span>
+<span class="a">+    Postgres lets another transaction commit between a SELECT and a later</span>
+<span class="a">+    write of a transaction (READ COMMITTED). SQLite lets it only while the</span>
+<span class="a">+    transaction has not written yet, so a test must call add in a new</span>
+<span class="a">+    transaction to see that race on SQLite.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    engine = SessionLocal.kw[&quot;bind&quot;]</span>
+<span class="a">+    results = []</span>
+<span class="a">+</span>
+<span class="a">+    def before(conn, cursor, statement, parameters, context, executemany):</span>
+<span class="a">+        if not results and statement.startswith(</span>
+<span class="a">+                (&quot;INSERT INTO caption_balances&quot;, &quot;UPDATE caption_balances&quot;)):</span>
+<span class="a">+            results.append(None)  # the other session writes too</span>
+<span class="a">+            with SessionLocal() as other:</span>
+<span class="a">+                results[0] = action(other)</span>
+<span class="a">+                other.commit()</span>
+<span class="a">+</span>
+<span class="a">+    event.listen(engine, &quot;before_cursor_execute&quot;, before)</span>
+<span class="a">+    try:</span>
+<span class="a">+        yield results</span>
+<span class="a">+    finally:</span>
+<span class="a">+        event.remove(engine, &quot;before_cursor_execute&quot;, before)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@hsettings(max_examples=50, deadline=None)</span>
+<span class="a">+@given(start=st.none() | st.integers(0, 100), ours=st.integers(1, 100),</span>
+<span class="a">+       theirs=st.integers(1, 100), spend=st.booleans())</span>
+<span class="a">+def test_a_credit_loses_no_credit_or_spend_of_another_session(start, ours, theirs, spend):</span>
+<span class="a">+    &quot;&quot;&quot;Another session gives or spends `theirs` seconds while add gives `ours`.</span>
+<span class="a">+    With `start` None, the account has no row yet.&quot;&quot;&quot;</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        acct = accounts.new_account(s).id</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        if start is not None:</span>
+<span class="a">+            captions.add(s, acct, start)</span>
+<span class="a">+            s.commit()</span>
+<span class="a">+</span>
+<span class="a">+    def other(session):</span>
+<span class="a">+        if spend:</span>
+<span class="a">+            return captions.spend(session, acct, theirs)</span>
+<span class="a">+        return captions.add(session, acct, theirs)</span>
+<span class="a">+</span>
+<span class="a">+    with SessionLocal() as s, before_the_first_write(other) as done:</span>
+<span class="a">+        captions.add(s, acct, ours)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+</span>
+<span class="a">+    assert done</span>
+<span class="a">+    spent = theirs if spend and done == [True] else 0</span>
+<span class="a">+    credited = (start or 0) + ours + (0 if spend else theirs)</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        row = s.get(captions.CaptionBalance, acct)</span>
+<span class="a">+        assert (row.seconds_left, row.seconds_used) == (credited - spent, spent)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @given(st.binary(max_size=4 * SECOND).filter(lambda b: len(b) % 2 == 0))
+ def test_wav_holds_the_pcm_unchanged(pcm):
+     with wave.open(io.BytesIO(captions.wav(pcm))) as w:</pre>
+</div></body></html>

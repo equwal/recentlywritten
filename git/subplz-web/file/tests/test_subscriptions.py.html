@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/tests/test_subscriptions.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tests/test_subscriptions.py (10542 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Subscriptions: a plan renews each month until the customer cancels it.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a>   capped     a number of books a month. The books of one month do not carry
+<a id="l4" href="#l4">4</a>              over to the next. A server job spends the daily free credit
+<a id="l5" href="#l5">5</a>              first (it ends sooner), then the books of the plan, then free
+<a id="l6" href="#l6">6</a>              and bought credits.
+<a id="l7" href="#l7">7</a>   unlimited  no credit is spent while the plan is active.
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> Stripe tells the server about a plan with customer.subscription.* events. A
+<a id="l10" href="#l10">10</a> new month (a new current_period_end) starts the count again. The lookup key
+<a id="l11" href="#l11">11</a> of the price names the plan, so a switch in the customer portal changes the
+<a id="l12" href="#l12">12</a> plan. The Stripe account also sells other products: a subscription that is
+<a id="l13" href="#l13">13</a> not for a plan of this site is ignored.
+<a id="l14" href="#l14">14</a> &quot;&quot;&quot;
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> from __future__ import annotations
+<a id="l17" href="#l17">17</a> 
+<a id="l18" href="#l18">18</a> import json
+<a id="l19" href="#l19">19</a> import time
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> import pytest
+<a id="l22" href="#l22">22</a> import stripe
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> from backend import runner
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> from .conftest import (
+<a id="l27" href="#l27">27</a>     FakeStripeObject, account_id, checkout_event, get_account_row, get_job_row,
+<a id="l28" href="#l28">28</a>     make_job, post_webhook,
+<a id="l29" href="#l29">29</a> )
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> # Its own catalogue, so that these tests do not depend on the plans for sale.
+<a id="l32" href="#l32">32</a> TEST_PLANS = [
+<a id="l33" href="#l33">33</a>     {&quot;id&quot;: &quot;pack10&quot;, &quot;name&quot;: &quot;10 books&quot;, &quot;credits&quot;: 10, &quot;price_cents&quot;: 499},
+<a id="l34" href="#l34">34</a>     {&quot;id&quot;: &quot;month10&quot;, &quot;name&quot;: &quot;10 books a month&quot;, &quot;credits&quot;: 10, &quot;price_cents&quot;: 499,
+<a id="l35" href="#l35">35</a>      &quot;recurring&quot;: True},
+<a id="l36" href="#l36">36</a>     {&quot;id&quot;: &quot;month30&quot;, &quot;name&quot;: &quot;30 books a month&quot;, &quot;credits&quot;: 30, &quot;price_cents&quot;: 999,
+<a id="l37" href="#l37">37</a>      &quot;recurring&quot;: True},
+<a id="l38" href="#l38">38</a>     {&quot;id&quot;: &quot;forever&quot;, &quot;name&quot;: &quot;Unlimited&quot;, &quot;credits&quot;: None, &quot;price_cents&quot;: 5000,
+<a id="l39" href="#l39">39</a>      &quot;recurring&quot;: True},
+<a id="l40" href="#l40">40</a> ]
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> 
+<a id="l43" href="#l43">43</a> @pytest.fixture(autouse=True)
+<a id="l44" href="#l44">44</a> def catalogue(monkeypatch):
+<a id="l45" href="#l45">45</a>     monkeypatch.setenv(&quot;SUBPLZ_WEB_PLANS_JSON&quot;, json.dumps(TEST_PLANS))
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> def subscription_event(kind, account, plan_id, status=&quot;active&quot;, period_end=None,
+<a id="l49" href="#l49">49</a>                        price_key=None):
+<a id="l50" href="#l50">50</a>     &quot;&quot;&quot;`plan_id` goes in the checkout metadata; `price_key` is the lookup key
+<a id="l51" href="#l51">51</a>     of the price, which the portal changes when the customer switches plans.&quot;&quot;&quot;
+<a id="l52" href="#l52">52</a>     end = period_end or int(time.time()) + 30 * 86400
+<a id="l53" href="#l53">53</a>     item = {&quot;current_period_end&quot;: end}
+<a id="l54" href="#l54">54</a>     if price_key is not None:
+<a id="l55" href="#l55">55</a>         item[&quot;price&quot;] = {&quot;id&quot;: f&quot;price_{price_key}&quot;, &quot;lookup_key&quot;: price_key}
+<a id="l56" href="#l56">56</a>     return {
+<a id="l57" href="#l57">57</a>         &quot;id&quot;: f&quot;evt_{kind}_{time.time_ns()}&quot;,
+<a id="l58" href="#l58">58</a>         &quot;type&quot;: f&quot;customer.subscription.{kind}&quot;,
+<a id="l59" href="#l59">59</a>         &quot;data&quot;: {&quot;object&quot;: {
+<a id="l60" href="#l60">60</a>             &quot;id&quot;: f&quot;sub_{account}&quot;, &quot;object&quot;: &quot;subscription&quot;, &quot;status&quot;: status,
+<a id="l61" href="#l61">61</a>             &quot;customer&quot;: f&quot;cus_{account}&quot;,
+<a id="l62" href="#l62">62</a>             &quot;metadata&quot;: {&quot;account_id&quot;: account, &quot;plan_id&quot;: plan_id},
+<a id="l63" href="#l63">63</a>             &quot;items&quot;: {&quot;data&quot;: [item]},
+<a id="l64" href="#l64">64</a>         }},
+<a id="l65" href="#l65">65</a>     }
+<a id="l66" href="#l66">66</a> 
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> def subscribe(client, plan_id, **kw) -&gt; str:
+<a id="l69" href="#l69">69</a>     acct = account_id(client)
+<a id="l70" href="#l70">70</a>     event = subscription_event(&quot;created&quot;, acct, plan_id, **kw)
+<a id="l71" href="#l71">71</a>     assert post_webhook(client, event).status_code == 200
+<a id="l72" href="#l72">72</a>     return acct
+<a id="l73" href="#l73">73</a> 
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a> def start(client, job_id: str):
+<a id="l76" href="#l76">76</a>     return client.post(f&quot;/api/jobs/{job_id}/start&quot;, json={&quot;language&quot;: &quot;en&quot;})
+<a id="l77" href="#l77">77</a> 
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a> def account(client) -&gt; dict:
+<a id="l80" href="#l80">80</a>     return client.get(&quot;/api/account&quot;).json()
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> 
+<a id="l83" href="#l83">83</a> def test_a_capped_plan_checks_out_as_a_monthly_subscription(client, monkeypatch):
+<a id="l84" href="#l84">84</a>     seen = {}
+<a id="l85" href="#l85">85</a>     monkeypatch.setattr(
+<a id="l86" href="#l86">86</a>         stripe.checkout.Session, &quot;create&quot;,
+<a id="l87" href="#l87">87</a>         lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),
+<a id="l88" href="#l88">88</a>     )
+<a id="l89" href="#l89">89</a>     assert client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 200
+<a id="l90" href="#l90">90</a>     assert seen[&quot;mode&quot;] == &quot;subscription&quot;
+<a id="l91" href="#l91">91</a>     item = seen[&quot;line_items&quot;][0][&quot;price_data&quot;]
+<a id="l92" href="#l92">92</a>     assert item[&quot;recurring&quot;] == {&quot;interval&quot;: &quot;month&quot;} and item[&quot;unit_amount&quot;] == 499
+<a id="l93" href="#l93">93</a>     assert seen[&quot;subscription_data&quot;][&quot;metadata&quot;][&quot;plan_id&quot;] == &quot;month10&quot;
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a> 
+<a id="l96" href="#l96">96</a> def test_paying_for_a_plan_gives_the_books_of_the_month_not_a_pack(client, monkeypatch):
+<a id="l97" href="#l97">97</a>     acct = account_id(client)
+<a id="l98" href="#l98">98</a>     sub = subscription_event(&quot;created&quot;, acct, &quot;month10&quot;)[&quot;data&quot;][&quot;object&quot;]
+<a id="l99" href="#l99">99</a>     monkeypatch.setattr(stripe.Subscription, &quot;retrieve&quot;, lambda sid: FakeStripeObject(sub))
+<a id="l100" href="#l100">100</a>     event = checkout_event(f&quot;cs_{time.time_ns()}&quot;, acct, &quot;month10&quot;,
+<a id="l101" href="#l101">101</a>                            email=f&quot;plan-{time.time_ns()}@example.com&quot;, subscription=sub[&quot;id&quot;])
+<a id="l102" href="#l102">102</a>     assert post_webhook(client, event).status_code == 200
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a>     a = account(client)
+<a id="l105" href="#l105">105</a>     assert a[&quot;subscribed&quot;] is True and a[&quot;unlimited&quot;] is False
+<a id="l106" href="#l106">106</a>     assert a[&quot;plan_credits&quot;] == 10 and a[&quot;credits&quot;] == 10
+<a id="l107" href="#l107">107</a>     assert get_account_row(acct).purchased_credits == 0
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a> 
+<a id="l110" href="#l110">110</a> def test_a_capped_plan_is_spent_and_a_failed_job_gives_it_back(client):
+<a id="l111" href="#l111">111</a>     subscribe(client, &quot;month10&quot;)
+<a id="l112" href="#l112">112</a>     job_id = make_job(client)
+<a id="l113" href="#l113">113</a>     assert start(client, job_id).status_code == 200
+<a id="l114" href="#l114">114</a>     job = get_job_row(job_id)
+<a id="l115" href="#l115">115</a>     assert job.plan_credit_spent == 1 and job.credit_spent == 0
+<a id="l116" href="#l116">116</a>     assert account(client)[&quot;plan_credits&quot;] == 9
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a>     runner.run_job(job_id)  # fails: nothing was staged
+<a id="l119" href="#l119">119</a>     assert account(client)[&quot;plan_credits&quot;] == 10
+<a id="l120" href="#l120">120</a>     assert get_job_row(job_id).plan_credit_spent == 0
+<a id="l121" href="#l121">121</a> 
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a> def test_the_books_of_a_month_do_not_carry_over(client):
+<a id="l124" href="#l124">124</a>     acct = account_id(client)
+<a id="l125" href="#l125">125</a>     end = int(time.time()) + 30 * 86400
+<a id="l126" href="#l126">126</a>     post_webhook(client, subscription_event(&quot;created&quot;, acct, &quot;month10&quot;, period_end=end))
+<a id="l127" href="#l127">127</a>     for _ in range(10):
+<a id="l128" href="#l128">128</a>         assert start(client, make_job(client)).status_code == 200
+<a id="l129" href="#l129">129</a>     assert start(client, make_job(client)).status_code == 402
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a>     # The same month, told again: nothing changes.
+<a id="l132" href="#l132">132</a>     post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;, period_end=end))
+<a id="l133" href="#l133">133</a>     assert account(client)[&quot;plan_credits&quot;] == 0
+<a id="l134" href="#l134">134</a> 
+<a id="l135" href="#l135">135</a>     # A new month starts the count again.
+<a id="l136" href="#l136">136</a>     post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;,
+<a id="l137" href="#l137">137</a>                                             period_end=end + 30 * 86400))
+<a id="l138" href="#l138">138</a>     assert account(client)[&quot;plan_credits&quot;] == 10
+<a id="l139" href="#l139">139</a> 
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a> def test_an_unlimited_plan_spends_nothing(client):
+<a id="l142" href="#l142">142</a>     subscribe(client, &quot;forever&quot;)
+<a id="l143" href="#l143">143</a>     a = account(client)
+<a id="l144" href="#l144">144</a>     assert a[&quot;unlimited&quot;] is True and a[&quot;cloud_allowed&quot;] is True
+<a id="l145" href="#l145">145</a>     for _ in range(3):
+<a id="l146" href="#l146">146</a>         job_id = make_job(client)
+<a id="l147" href="#l147">147</a>         assert start(client, job_id).status_code == 200
+<a id="l148" href="#l148">148</a>         job = get_job_row(job_id)
+<a id="l149" href="#l149">149</a>         assert job.plan_credit_spent == 0 and job.credit_spent == 0
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a> 
+<a id="l152" href="#l152">152</a> def test_a_cancelled_plan_gives_nothing(client):
+<a id="l153" href="#l153">153</a>     acct = subscribe(client, &quot;month10&quot;)
+<a id="l154" href="#l154">154</a>     post_webhook(client, subscription_event(&quot;deleted&quot;, acct, &quot;month10&quot;, status=&quot;canceled&quot;))
+<a id="l155" href="#l155">155</a>     a = account(client)
+<a id="l156" href="#l156">156</a>     assert a[&quot;subscribed&quot;] is False and a[&quot;plan_credits&quot;] == 0
+<a id="l157" href="#l157">157</a>     assert start(client, make_job(client)).status_code == 402
+<a id="l158" href="#l158">158</a> 
+<a id="l159" href="#l159">159</a> 
+<a id="l160" href="#l160">160</a> def test_a_subscription_to_another_product_is_ignored(client):
+<a id="l161" href="#l161">161</a>     # The same Stripe account sells other products (sbm Team). Their events
+<a id="l162" href="#l162">162</a>     # reach this webhook too, and must not touch an account here. This is also
+<a id="l163" href="#l163">163</a>     # why a sold plan must be retired (pricing.RETIRED_PLANS), not deleted.
+<a id="l164" href="#l164">164</a>     acct = account_id(client)
+<a id="l165" href="#l165">165</a>     event = subscription_event(&quot;created&quot;, acct, None, price_key=&quot;sbm-team&quot;)
+<a id="l166" href="#l166">166</a>     assert post_webhook(client, event).status_code == 200
+<a id="l167" href="#l167">167</a>     a = account(client)
+<a id="l168" href="#l168">168</a>     assert a[&quot;subscribed&quot;] is False and a[&quot;plan_credits&quot;] == 0
+<a id="l169" href="#l169">169</a> 
+<a id="l170" href="#l170">170</a> 
+<a id="l171" href="#l171">171</a> def test_a_plan_checks_out_with_its_stripe_price_when_one_exists(client, monkeypatch):
+<a id="l172" href="#l172">172</a>     # The portal can switch a subscription only between catalogue prices.
+<a id="l173" href="#l173">173</a>     monkeypatch.setattr(stripe.Price, &quot;list&quot;, lambda **kw: FakeStripeObject({&quot;data&quot;: [
+<a id="l174" href="#l174">174</a>         {&quot;id&quot;: &quot;price_m10&quot;, &quot;lookup_key&quot;: &quot;month10&quot;, &quot;unit_amount&quot;: 499,
+<a id="l175" href="#l175">175</a>          &quot;currency&quot;: &quot;usd&quot;, &quot;recurring&quot;: {&quot;interval&quot;: &quot;month&quot;}},
+<a id="l176" href="#l176">176</a>     ]}))
+<a id="l177" href="#l177">177</a>     seen = {}
+<a id="l178" href="#l178">178</a>     monkeypatch.setattr(
+<a id="l179" href="#l179">179</a>         stripe.checkout.Session, &quot;create&quot;,
+<a id="l180" href="#l180">180</a>         lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),
+<a id="l181" href="#l181">181</a>     )
+<a id="l182" href="#l182">182</a>     assert client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 200
+<a id="l183" href="#l183">183</a>     assert seen[&quot;line_items&quot;] == [{&quot;quantity&quot;: 1, &quot;price&quot;: &quot;price_m10&quot;}]
+<a id="l184" href="#l184">184</a> 
+<a id="l185" href="#l185">185</a> 
+<a id="l186" href="#l186">186</a> def test_a_stripe_price_that_does_not_match_the_plan_is_not_used(client, monkeypatch):
+<a id="l187" href="#l187">187</a>     monkeypatch.setattr(stripe.Price, &quot;list&quot;, lambda **kw: FakeStripeObject({&quot;data&quot;: [
+<a id="l188" href="#l188">188</a>         {&quot;id&quot;: &quot;price_old&quot;, &quot;lookup_key&quot;: &quot;month10&quot;, &quot;unit_amount&quot;: 999,
+<a id="l189" href="#l189">189</a>          &quot;currency&quot;: &quot;usd&quot;, &quot;recurring&quot;: {&quot;interval&quot;: &quot;month&quot;}},
+<a id="l190" href="#l190">190</a>     ]}))
+<a id="l191" href="#l191">191</a>     seen = {}
+<a id="l192" href="#l192">192</a>     monkeypatch.setattr(
+<a id="l193" href="#l193">193</a>         stripe.checkout.Session, &quot;create&quot;,
+<a id="l194" href="#l194">194</a>         lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),
+<a id="l195" href="#l195">195</a>     )
+<a id="l196" href="#l196">196</a>     assert client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 200
+<a id="l197" href="#l197">197</a>     assert seen[&quot;line_items&quot;][0][&quot;price_data&quot;][&quot;unit_amount&quot;] == 499
+<a id="l198" href="#l198">198</a> 
+<a id="l199" href="#l199">199</a> 
+<a id="l200" href="#l200">200</a> def test_the_plan_prices_are_made_once(monkeypatch):
+<a id="l201" href="#l201">201</a>     from backend import payments
+<a id="l202" href="#l202">202</a> 
+<a id="l203" href="#l203">203</a>     prices = []  # what Stripe has
+<a id="l204" href="#l204">204</a> 
+<a id="l205" href="#l205">205</a>     def price_list(lookup_keys, **kw):
+<a id="l206" href="#l206">206</a>         return FakeStripeObject({&quot;data&quot;: [p for p in prices if p[&quot;lookup_key&quot;] in lookup_keys]})
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a>     def price_create(**kw):
+<a id="l209" href="#l209">209</a>         price = {&quot;id&quot;: f&quot;price_{kw[&#x27;lookup_key&#x27;]}&quot;, &quot;lookup_key&quot;: kw[&quot;lookup_key&quot;],
+<a id="l210" href="#l210">210</a>                  &quot;unit_amount&quot;: kw[&quot;unit_amount&quot;], &quot;currency&quot;: kw[&quot;currency&quot;],
+<a id="l211" href="#l211">211</a>                  &quot;recurring&quot;: kw[&quot;recurring&quot;]}
+<a id="l212" href="#l212">212</a>         prices.append(price)
+<a id="l213" href="#l213">213</a>         return FakeStripeObject(price)
+<a id="l214" href="#l214">214</a> 
+<a id="l215" href="#l215">215</a>     monkeypatch.setattr(stripe.Price, &quot;list&quot;, price_list)
+<a id="l216" href="#l216">216</a>     monkeypatch.setattr(stripe.Price, &quot;create&quot;, price_create)
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a>     first = payments.ensure_plan_prices()
+<a id="l219" href="#l219">219</a>     assert [(plan, made) for plan, _, made in first] == [
+<a id="l220" href="#l220">220</a>         (&quot;month10&quot;, True), (&quot;month30&quot;, True), (&quot;forever&quot;, True)]
+<a id="l221" href="#l221">221</a>     assert [p[&quot;unit_amount&quot;] for p in prices] == [499, 999, 5000]
+<a id="l222" href="#l222">222</a> 
+<a id="l223" href="#l223">223</a>     second = payments.ensure_plan_prices()
+<a id="l224" href="#l224">224</a>     assert [made for _, _, made in second] == [False, False, False]
+<a id="l225" href="#l225">225</a>     assert len(prices) == 3
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a> def test_switching_plans_in_the_portal_changes_the_plan(client):
+<a id="l229" href="#l229">229</a>     acct = account_id(client)
+<a id="l230" href="#l230">230</a>     end = int(time.time()) + 30 * 86400
+<a id="l231" href="#l231">231</a>     post_webhook(client, subscription_event(&quot;created&quot;, acct, &quot;month10&quot;,
+<a id="l232" href="#l232">232</a>                                             period_end=end, price_key=&quot;month10&quot;))
+<a id="l233" href="#l233">233</a>     for _ in range(8):
+<a id="l234" href="#l234">234</a>         assert start(client, make_job(client)).status_code == 200
+<a id="l235" href="#l235">235</a>     assert account(client)[&quot;plan_credits&quot;] == 2
+<a id="l236" href="#l236">236</a> 
+<a id="l237" href="#l237">237</a>     # The portal changes the price; the checkout metadata still says month10.
+<a id="l238" href="#l238">238</a>     post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;,
+<a id="l239" href="#l239">239</a>                                             period_end=end, price_key=&quot;month30&quot;))
+<a id="l240" href="#l240">240</a>     assert account(client)[&quot;plan_credits&quot;] == 22  # 30 this month, 8 used
+<a id="l241" href="#l241">241</a> 
+<a id="l242" href="#l242">242</a>     post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;,
+<a id="l243" href="#l243">243</a>                                             period_end=end, price_key=&quot;forever&quot;))
+<a id="l244" href="#l244">244</a>     assert account(client)[&quot;unlimited&quot;] is True
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a> 
+<a id="l247" href="#l247">247</a> def test_a_second_plan_is_refused(client, monkeypatch):
+<a id="l248" href="#l248">248</a>     subscribe(client, &quot;month10&quot;)
+<a id="l249" href="#l249">249</a>     monkeypatch.setattr(stripe.checkout.Session, &quot;create&quot;,
+<a id="l250" href="#l250">250</a>                         lambda **p: FakeStripeObject({&quot;url&quot;: &quot;x&quot;}))
+<a id="l251" href="#l251">251</a>     r = client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;forever&quot;})
+<a id="l252" href="#l252">252</a>     assert r.status_code == 400 and &quot;Manage plan&quot; in r.json()[&quot;detail&quot;]</pre>
+</div></body></html>

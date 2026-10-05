@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 4fcf7731 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 4fcf77316ee177404def0e80f569491305c70277
+truex &lt;truex@equwal.com&gt;
+2026-09-26 13:59:40 -0700
+
+Let SubRead write the subtitles into a result file
+
+A SubRead job can take hours. Android can stop the reader in that
+time, and then the activity result is lost. SubRead 0.10.0 and later
+take space.subread.extra.RESULT: a content Uri that they write the .srt
+into before they answer. Older versions ignore it, and the activity
+result path stays as it is.
+
+makeSubtitles takes an optional resultName. The plugin keeps only
+A-Z, a-z, 0-9, ., _ and - of the name and refuses . and ...
+The file is files/subread/&lt;name&gt;, shared through the FileProvider. The
+call removes the result of an earlier job, puts the Uri in the extra
+and in the clip data, and gives SubRead write access to that file only.
+FLAG_GRANT_WRITE_URI_PERMISSION on the intent would also ask for write
+access to the audio file. The reader can only read that file, so
+startActivity would throw SecurityException.
+
+The new method pendingSubtitles reads the file when it is there and
+not empty, removes it, and takes back the write access. On the web it
+resolves no srt.
+
+</pre><pre> .../java/com/equwal/scansubread/SubReadPlugin.java | 106 ++++++++++++++++++++-
+ android/app/src/main/res/xml/file_paths.xml        |   2 +
+ .../com/equwal/scansubread/SafeFileNameTest.java   |  36 +++++++
+ src/subread.ts                                     |  26 +++++
+ test/subread.test.ts                               |   4 +
+ 5 files changed, 173 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+index 5d6e7a6..ec59eee 100644
+--- a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
++++ b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+<span class="h">@@ -28,6 +28,7 @@ import com.getcapacitor.annotation.ActivityCallback;</span>
+ import com.getcapacitor.annotation.CapacitorPlugin;
+ import java.io.ByteArrayOutputStream;
+ import java.io.File;
+<span class="a">+import java.io.FileInputStream;</span>
+ import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.io.InputStream;
+<span class="h">@@ -46,7 +47,8 @@ import java.util.List;</span>
+  *   Dictionary, Takoboto, AnkiDroid and other apps in the text selection
+  *   menu. The lookup resolves when the dictionary closes.
+  * - The subtitle maker, through the intent API of the SubRead app
+<span class="d">- *   (`space.subread.app.action.ALIGN`).</span>
+<span class="a">+ *   (`space.subread.app.action.ALIGN`). SubRead 0.10.0 and later also</span>
+<span class="a">+ *   write the .srt into a result file of this app.</span>
+  * - SubRead Anki, through `space.subread.anki.action.ADD`: a card for a
+  *   word and its sentence.
+  * - The package manager: which apps of the suite are installed. SubRead
+<span class="h">@@ -79,9 +81,13 @@ public class SubReadPlugin extends Plugin {</span>
+     private static final String EXTRA_CUES = &quot;space.subread.extra.CUES&quot;;
+     private static final String EXTRA_MATCH_RATE = &quot;space.subread.extra.MATCH_RATE&quot;;
+     private static final String EXTRA_ERROR = &quot;space.subread.extra.ERROR&quot;;
+<span class="a">+    private static final String EXTRA_RESULT = &quot;space.subread.extra.RESULT&quot;;</span>
+ 
+     private static final String SHARE_DIR = &quot;share&quot;;
+ 
+<span class="a">+    /** The folder in filesDir for the result files of SubRead. See file_paths.xml. */</span>
+<span class="a">+    private static final String RESULT_DIR = &quot;subread&quot;;</span>
+<span class="a">+</span>
+     private static final String ANKI_PACKAGE = &quot;space.subread.anki&quot;;
+     private static final String ACTION_ANKI_ADD = &quot;space.subread.anki.action.ADD&quot;;
+     private static final String EXTRA_ANKI_WORD = &quot;space.subread.anki.extra.WORD&quot;;
+<span class="h">@@ -423,15 +429,54 @@ public class SubReadPlugin extends Plugin {</span>
+         return ret;
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * A safe file name: the name keeps A-Z, a-z, 0-9, &quot;.&quot;, &quot;_&quot; and &quot;-&quot;, and</span>
+<span class="a">+     * each other character becomes &quot;_&quot;. So the name cannot point to another</span>
+<span class="a">+     * folder. Null when no file can have the name.</span>
+<span class="a">+     */</span>
+<span class="a">+    static String safeFileName(String name) {</span>
+<span class="a">+        String safe = name.replaceAll(&quot;[^A-Za-z0-9._-]&quot;, &quot;_&quot;);</span>
+<span class="a">+        if (safe.isEmpty() || safe.equals(&quot;.&quot;) || safe.equals(&quot;..&quot;) || safe.length() &gt; 255) return null;</span>
+<span class="a">+        return safe;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The result file for `resultName`: filesDir/subread/&lt;safe name&gt;, or null. */</span>
+<span class="a">+    private File resultFile(String resultName) {</span>
+<span class="a">+        String name = safeFileName(resultName);</span>
+<span class="a">+        return name == null ? null : new File(new File(getContext().getFilesDir(), RESULT_DIR), name);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Makes the folder of a result file and removes the result of an earlier</span>
+<span class="a">+     * job, so that pendingSubtitles gives only the result of the new job.</span>
+<span class="a">+     * Returns the FileProvider Uri of the file.</span>
+<span class="a">+     */</span>
+<span class="a">+    private Uri clearResult(File file) throws IOException {</span>
+<span class="a">+        File dir = file.getParentFile();</span>
+<span class="a">+        if (dir != null &amp;&amp; !dir.isDirectory() &amp;&amp; !dir.mkdirs()) throw new IOException(&quot;Cannot create &quot; + dir);</span>
+<span class="a">+        if (file.exists() &amp;&amp; !file.delete()) throw new IOException(&quot;Cannot remove &quot; + file);</span>
+<span class="a">+        return FileProvider.getUriForFile(getContext(), getContext().getPackageName() + &quot;.fileprovider&quot;, file);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Asks SubRead for the .srt of the audio and the book text. The optional</span>
+<span class="a">+     * `resultName` names a result file, see pendingSubtitles.</span>
+<span class="a">+     */</span>
+     @PluginMethod
+     public void makeSubtitles(PluginCall call) {
+         String audio = call.getString(&quot;audio&quot;);
+         String bookText = call.getString(&quot;bookText&quot;);
+         String language = call.getString(&quot;language&quot;, &quot;auto&quot;);
+<span class="a">+        String resultName = call.getString(&quot;resultName&quot;);</span>
+         if (audio == null || bookText == null) {
+             call.reject(&quot;audio and bookText are required.&quot;);
+             return;
+         }
+<span class="a">+        File result = resultName == null ? null : resultFile(resultName);</span>
+<span class="a">+        if (resultName != null &amp;&amp; result == null) {</span>
+<span class="a">+            call.reject(&quot;resultName is not a usable file name.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+         Uri bookUri;
+         try {
+             bookUri = shareFile(&quot;book.txt&quot;, bookText);
+<span class="h">@@ -439,6 +484,15 @@ public class SubReadPlugin extends Plugin {</span>
+             call.reject(&quot;Cannot write the book text: &quot; + e.getMessage(), e);
+             return;
+         }
+<span class="a">+        Uri resultUri = null;</span>
+<span class="a">+        if (result != null) {</span>
+<span class="a">+            try {</span>
+<span class="a">+                resultUri = clearResult(result);</span>
+<span class="a">+            } catch (IOException e) {</span>
+<span class="a">+                call.reject(&quot;Cannot make the result file: &quot; + e.getMessage(), e);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+         // While SubRead runs, Capacitor keeps the options of this call two
+         // times in the saved state of the activity. That state has a limit of
+         // about 1 MB. With a large book text, the reader crashes when SubRead
+<span class="h">@@ -453,15 +507,65 @@ public class SubReadPlugin extends Plugin {</span>
+         // SubRead must be able to read both files.
+         ClipData clip = ClipData.newRawUri(&quot;audio&quot;, audioUri);
+         clip.addItem(new ClipData.Item(bookUri));
+<span class="a">+        if (resultUri != null) {</span>
+<span class="a">+            // SubRead 0.10.0 and later write the .srt into this file before</span>
+<span class="a">+            // they answer, so the .srt is safe when Android stops the reader</span>
+<span class="a">+            // during the job. Older versions ignore the extra.</span>
+<span class="a">+            ask.putExtra(EXTRA_RESULT, resultUri);</span>
+<span class="a">+            clip.addItem(new ClipData.Item(resultUri));</span>
+<span class="a">+        }</span>
+         ask.setClipData(clip);
+         ask.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+         if (ask.resolveActivity(getContext().getPackageManager()) == null) {
+             call.resolve(errorObject(&quot;not_installed&quot;));
+             return;
+         }
+<span class="a">+        if (resultUri != null) {</span>
+<span class="a">+            // SubRead must be able to write the result file. The intent flag</span>
+<span class="a">+            // FLAG_GRANT_WRITE_URI_PERMISSION asks for write access to each</span>
+<span class="a">+            // file of the clip, the audio file too. This app can only read the</span>
+<span class="a">+            // audio file, so startActivity would throw SecurityException. So</span>
+<span class="a">+            // only the result file gets write access.</span>
+<span class="a">+            getContext().grantUriPermission(SUBREAD_PACKAGE, resultUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);</span>
+<span class="a">+        }</span>
+         startActivityForResult(call, ask, &quot;subtitlesResult&quot;);
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Gives the .srt that SubRead wrote into the result file `resultName`,</span>
+<span class="a">+     * and removes the file. SubRead can finish while Android has stopped the</span>
+<span class="a">+     * reader. Then the activity result is lost, but the file is there.</span>
+<span class="a">+     * Resolves no srt when the file is not there or is empty.</span>
+<span class="a">+     */</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void pendingSubtitles(PluginCall call) {</span>
+<span class="a">+        String resultName = call.getString(&quot;resultName&quot;);</span>
+<span class="a">+        if (resultName == null) {</span>
+<span class="a">+            call.reject(&quot;resultName is required.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        File file = resultFile(resultName);</span>
+<span class="a">+        if (file == null) {</span>
+<span class="a">+            call.reject(&quot;resultName is not a usable file name.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        JSObject ret = new JSObject();</span>
+<span class="a">+        if (file.isFile() &amp;&amp; file.length() &gt; 0) {</span>
+<span class="a">+            try (InputStream in = new FileInputStream(file)) {</span>
+<span class="a">+                ret.put(&quot;srt&quot;, readAll(in));</span>
+<span class="a">+            } catch (IOException e) {</span>
+<span class="a">+                call.reject(&quot;Cannot read the result file: &quot; + e.getMessage(), e);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            // The job is done, so SubRead needs no more write access.</span>
+<span class="a">+            Uri uri = FileProvider.getUriForFile(getContext(), getContext().getPackageName() + &quot;.fileprovider&quot;, file);</span>
+<span class="a">+            getContext().revokeUriPermission(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);</span>
+<span class="a">+            // When the delete fails, the next call gives the same .srt again.</span>
+<span class="a">+            file.delete();</span>
+<span class="a">+        }</span>
+<span class="a">+        call.resolve(ret);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     private static String readAll(InputStream in) throws IOException {
+         ByteArrayOutputStream out = new ByteArrayOutputStream();
+         byte[] buf = new byte[64 * 1024];
+diff --git a/android/app/src/main/res/xml/file_paths.xml b/android/app/src/main/res/xml/file_paths.xml
+index d2460ee..5c12152 100644
+--- a/android/app/src/main/res/xml/file_paths.xml
++++ b/android/app/src/main/res/xml/file_paths.xml
+<span class="h">@@ -4,4 +4,6 @@</span>
+     &lt;cache-path name=&quot;my_cache_images&quot; path=&quot;.&quot; /&gt;
+     &lt;!-- The book text for SubRead and the finished .srt for the share sheet. --&gt;
+     &lt;cache-path name=&quot;share&quot; path=&quot;share/&quot; /&gt;
+<span class="a">+    &lt;!-- The result files that SubRead writes the .srt into. --&gt;</span>
+<span class="a">+    &lt;files-path name=&quot;subread&quot; path=&quot;subread/&quot; /&gt;</span>
+ &lt;/paths&gt;
+diff --git a/android/app/src/test/java/com/equwal/scansubread/SafeFileNameTest.java b/android/app/src/test/java/com/equwal/scansubread/SafeFileNameTest.java
+new file mode 100644
+index 0000000..1ccd415
+--- /dev/null
++++ b/android/app/src/test/java/com/equwal/scansubread/SafeFileNameTest.java
+<span class="h">@@ -0,0 +1,36 @@</span>
+<span class="a">+package com.equwal.scansubread;</span>
+<span class="a">+</span>
+<span class="a">+import static org.junit.Assert.assertEquals;</span>
+<span class="a">+import static org.junit.Assert.assertNull;</span>
+<span class="a">+</span>
+<span class="a">+import org.junit.Test;</span>
+<span class="a">+</span>
+<span class="a">+/** The name of a result file comes from the web page, so it must stay in its folder. */</span>
+<span class="a">+public class SafeFileNameTest {</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void keepsLettersDigitsDotsLowLinesAndHyphens() {</span>
+<span class="a">+        assertEquals(&quot;Book_1.2-a.srt&quot;, SubReadPlugin.safeFileName(&quot;Book_1.2-a.srt&quot;));</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void changesEachOtherCharacterToALowLine() {</span>
+<span class="a">+        assertEquals(&quot;_____.pdf_1234.srt&quot;, SubReadPlugin.safeFileName(&quot;吾輩は猫だ.pdf|1234.srt&quot;));</span>
+<span class="a">+        assertEquals(&quot;a_b_c_d&quot;, SubReadPlugin.safeFileName(&quot;a b/c\\d&quot;));</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void cannotPointToAnotherFolder() {</span>
+<span class="a">+        assertEquals(&quot;.._.._x&quot;, SubReadPlugin.safeFileName(&quot;../../x&quot;));</span>
+<span class="a">+        assertNull(SubReadPlugin.safeFileName(&quot;..&quot;));</span>
+<span class="a">+        assertNull(SubReadPlugin.safeFileName(&quot;.&quot;));</span>
+<span class="a">+        assertNull(SubReadPlugin.safeFileName(&quot;&quot;));</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void refusesANameThatIsTooLong() {</span>
+<span class="a">+        String longest = new String(new char[255]).replace(&#x27;\0&#x27;, &#x27;a&#x27;);</span>
+<span class="a">+        assertEquals(longest, SubReadPlugin.safeFileName(longest));</span>
+<span class="a">+        assertNull(SubReadPlugin.safeFileName(longest + &quot;a&quot;));</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/src/subread.ts b/src/subread.ts
+index 0cb0519..3791d72 100644
+--- a/src/subread.ts
++++ b/src/subread.ts
+<span class="h">@@ -110,11 +110,34 @@ export interface SubReadPlugin {</span>
+    * On the web: rejects with Error(&#x27;Android only.&#x27;).
+    */
+   openOverlay(): Promise&lt;{ opened: &#x27;overlay&#x27; | &#x27;settings&#x27; }&gt;;
+<span class="a">+  /**</span>
+<span class="a">+   * Asks SubRead for the .srt of the audio and the book text</span>
+<span class="a">+   * (`space.subread.app.action.ALIGN`), and resolves with the answer of</span>
+<span class="a">+   * SubRead.</span>
+<span class="a">+   *</span>
+<span class="a">+   * `resultName` names a result file for the book, for example a name that</span>
+<span class="a">+   * the caller makes from the book key. The plugin keeps A-Z, a-z, 0-9, &quot;.&quot;,</span>
+<span class="a">+   * &quot;_&quot; and &quot;-&quot; of the name, and changes each other character to &quot;_&quot;. The</span>
+<span class="a">+   * call removes the result of an earlier job with the same name. SubRead</span>
+<span class="a">+   * 0.10.0 and later write the .srt into the file before they answer, so</span>
+<span class="a">+   * the .srt is safe when Android stops the reader during the job. Older</span>
+<span class="a">+   * versions ignore the file. See `pendingSubtitles`.</span>
+<span class="a">+   */</span>
+   makeSubtitles(options: {
+     audio: string;
+     bookText: string;
+     language: string;
+<span class="a">+    resultName?: string;</span>
+   }): Promise&lt;SubtitlesResult&gt;;
+<span class="a">+  /**</span>
+<span class="a">+   * The .srt that SubRead wrote into the result file `resultName` of</span>
+<span class="a">+   * `makeSubtitles`, or `{}` when the file is not there or is empty. The</span>
+<span class="a">+   * call removes the file after it reads it. Call it when the book opens,</span>
+<span class="a">+   * for a job that ended while the reader was stopped. The file stays also</span>
+<span class="a">+   * after a normal answer of `makeSubtitles`, so call it then too, and use</span>
+<span class="a">+   * one of the two copies. On the web: `{}`.</span>
+<span class="a">+   */</span>
+<span class="a">+  pendingSubtitles(options: { resultName: string }): Promise&lt;{ srt?: string }&gt;;</span>
+   pickAudio(): Promise&lt;{ uri: string; name: string }&gt;;
+   shareText(options: { name: string; text: string }): Promise&lt;void&gt;;
+ }
+<span class="h">@@ -183,6 +206,9 @@ class SubReadWeb implements SubReadPlugin {</span>
+   makeSubtitles(): Promise&lt;SubtitlesResult&gt; {
+     return Promise.resolve({ error: &#x27;not_installed&#x27; });
+   }
+<span class="a">+  pendingSubtitles(): Promise&lt;{ srt?: string }&gt; {</span>
+<span class="a">+    return Promise.resolve({});</span>
+<span class="a">+  }</span>
+   pickAudio(): Promise&lt;{ uri: string; name: string }&gt; {
+     return Promise.reject(new Error(&#x27;Android only.&#x27;));
+   }
+diff --git a/test/subread.test.ts b/test/subread.test.ts
+index babfe04..9a8b340 100644
+--- a/test/subread.test.ts
++++ b/test/subread.test.ts
+<span class="h">@@ -63,6 +63,10 @@ describe(&#x27;the web fallback of the plugin&#x27;, () =&gt; {</span>
+     });
+   });
+ 
+<span class="a">+  it(&#x27;has no result file of SubRead&#x27;, async () =&gt; {</span>
+<span class="a">+    await expect(SubRead.pendingSubtitles({ resultName: &#x27;book.srt&#x27; })).resolves.toEqual({});</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;cannot open SubRead Overlay&#x27;, async () =&gt; {
+     await expect(SubRead.openOverlay()).rejects.toThrow(&#x27;Android only.&#x27;);
+   });</pre>
+</div></body></html>

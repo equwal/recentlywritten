@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 80bc6fac - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 80bc6fac71fb5aa28604e436cc63484f132b69dc
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 15:04:20 -0700
+
+Give free server credits, and show the browser switch first
+
+A visitor without an account gets one free credit for a job on the
+server. An account gets ten in all. A free credit that a device used
+before sign-in counts toward the ten, and a second device adds no free
+credits. There are no free credits while SUBPLZ_WEB_CLOUD_ENABLED is
+false. SUBPLZ_WEB_FREE_CREDITS_ANONYMOUS and
+SUBPLZ_WEB_FREE_CREDITS_SIGNED_IN set the numbers.
+
+A server job spends a free credit first, then a bought one. A failed or
+cancelled job gives its credit back to the same kind. The account counts
+the free credits apart from the bought ones (free_credits_used), so a
+refund of bought credits never pays out a free one.
+
+The switch &quot;Convert in this browser (JavaScript)&quot; is now above the drop
+zone, so it shows before a file is chosen. Each visit starts with the
+switch on: the page no longer keeps an &quot;off&quot; from an earlier visit.
+
+The page shows the free credits in the credit badge, on the sign-in
+button and in the pricing dialog. The Ko-fi request counts bought
+credits only. The terms say that free credits have no cash value.
+
+</pre><pre> .env.example               |   5 ++
+ README.md                  |  17 +++--
+ backend/accounts.py        |   4 ++
+ backend/api.py             |  10 +++
+ backend/billing.py         |  62 +++++++++++++++++--
+ backend/db.py              |  13 +++-
+ backend/settings.py        |   7 +++
+ frontend/app.js            |  69 +++++++++++++++------
+ frontend/index.html        |  22 ++++---
+ frontend/style.css         |  14 ++++-
+ frontend/terms.html        |   5 +-
+ tests/test_free_credits.py | 150 +++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_migration.py    |   9 +--
+ tests/test_page.py         |  20 ++++++
+ 14 files changed, 361 insertions(+), 46 deletions(-)
+</pre><pre>diff --git a/.env.example b/.env.example
+index a492708..ab3b5d2 100644
+--- a/.env.example
++++ b/.env.example
+<span class="h">@@ -55,6 +55,11 @@ SUBPLZ_WEB_BILLING_ENABLED=false</span>
+ # True when fast conversion on this server&#x27;s hardware is on offer. While it is
+ # false the page sells nothing, whatever BILLING_ENABLED says.
+ SUBPLZ_WEB_CLOUD_ENABLED=false
+<span class="a">+# Free credits for conversions on this server, while CLOUD_ENABLED is true.</span>
+<span class="a">+# A visitor without an account gets FREE_CREDITS_ANONYMOUS. An account gets</span>
+<span class="a">+# FREE_CREDITS_SIGNED_IN in all. Set both to 0 to give none.</span>
+<span class="a">+SUBPLZ_WEB_FREE_CREDITS_ANONYMOUS=1</span>
+<span class="a">+SUBPLZ_WEB_FREE_CREDITS_SIGNED_IN=10</span>
+ # Where customers write to. Shown on /terms.html.
+ SUBPLZ_WEB_CONTACT_EMAIL=
+ # How long the server keeps a visitor&#x27;s files (see backend/retention.py).
+diff --git a/README.md b/README.md
+index e53249a..5a817d0 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -342,10 +342,19 @@ A job in the browser costs the server nothing, so it is never counted and never</span>
+ refused. A server job takes its credit at the start. A job that fails or is
+ cancelled gets the credit back.
+ 
+<span class="d">-The page offers the server job on the confirm screen (&quot;Convert on our server&quot;):</span>
+<span class="d">-the files are uploaded, the job runs on the server, and the result waits in the</span>
+<span class="d">-list of conversions, so the visitor can close the tab. The page asks for the</span>
+<span class="d">-credit before the upload, not after it.</span>
+<span class="a">+**Free credits.** While `SUBPLZ_WEB_CLOUD_ENABLED` is true, a visitor without</span>
+<span class="a">+an account gets one free credit (`SUBPLZ_WEB_FREE_CREDITS_ANONYMOUS`), and an</span>
+<span class="a">+account gets ten in all (`SUBPLZ_WEB_FREE_CREDITS_SIGNED_IN`). A free credit</span>
+<span class="a">+that a device used before sign-in counts toward the ten, and a second device</span>
+<span class="a">+adds no free credits. A server job spends the free credits first. The account</span>
+<span class="a">+counts the free credits apart from the bought ones (`free_credits_used`), so</span>
+<span class="a">+a refund of bought credits never pays out a free one.</span>
+<span class="a">+</span>
+<span class="a">+A switch above the drop zone says where the work is done. Each visit starts</span>
+<span class="a">+with it on (&quot;Convert in this browser (JavaScript)&quot;), before a file is chosen.</span>
+<span class="a">+Off: the files are uploaded, the job runs on the server, and the result waits</span>
+<span class="a">+in the list of conversions, so the visitor can close the tab. The page asks</span>
+<span class="a">+for the credit before the upload, not after it.</span>
+ 
+ The server does not keep a visitor&#x27;s files past their use
+ (`backend/retention.py`, once an hour): uploads go when the job succeeds, or
+diff --git a/backend/accounts.py b/backend/accounts.py
+index 7b31fe8..e3e389c 100644
+--- a/backend/accounts.py
++++ b/backend/accounts.py
+<span class="h">@@ -66,6 +66,10 @@ def merge(session: Session, src: Account, dst: Account) -&gt; None:</span>
+     )
+     dst.purchased_credits += src.purchased_credits
+     src.purchased_credits = 0
+<span class="a">+    # Add the free credits used, not the free credits left: a second device</span>
+<span class="a">+    # must not bring a second set of free credits into one account.</span>
+<span class="a">+    dst.free_credits_used += src.free_credits_used</span>
+<span class="a">+    src.free_credits_used = 0</span>
+     if src.stripe_customer_id and not dst.stripe_customer_id:
+         dst.stripe_customer_id = src.stripe_customer_id
+     if src.subscription_id and not dst.subscription_id:
+diff --git a/backend/api.py b/backend/api.py
+index 553ac1e..8d31b72 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -174,7 +174,12 @@ class AccountOut(BaseModel):</span>
+     free_tier_summary: str
+     # The cloud tier: conversions on this server&#x27;s hardware.
+     cloud_available: bool
+<span class="a">+    # Bought and free credits together.</span>
+     credits: int
+<span class="a">+    # The part of `credits` that is free.</span>
+<span class="a">+    free_credits: int</span>
+<span class="a">+    # The free credits this visitor has after a sign-in. Zero when signed in.</span>
+<span class="a">+    free_credits_with_account: int</span>
+     subscribed: bool
+     subscription_ends: str | None
+     cloud_allowed: bool
+<span class="h">@@ -295,6 +300,11 @@ def _account_out(session: Session, account: Account) -&gt; AccountOut:</span>
+         email_sign_in_available=settings.sign_in_available,
+         free_tier_summary=pricing.free_tier_summary(),
+         credits=ent.credits,
+<span class="a">+        free_credits=ent.free_credits,</span>
+<span class="a">+        free_credits_with_account=(</span>
+<span class="a">+            0 if account.signed_in</span>
+<span class="a">+            else billing.free_credits_left(account, signed_in=True)</span>
+<span class="a">+        ),</span>
+         subscribed=ent.subscribed,
+         subscription_ends=(
+             ent.subscription_ends.isoformat() if ent.subscription_ends else None
+diff --git a/backend/billing.py b/backend/billing.py
+index 1f4dcf7..088e1f3 100644
+--- a/backend/billing.py
++++ b/backend/billing.py
+<span class="h">@@ -7,7 +7,9 @@ The line between free and paid is where the work is done, not what comes out:</span>
+           gives each output: subtitles, videos, the read-along book.
+   cloud   The job runs on this server&#x27;s hardware: a large speech model on a
+           GPU, minutes and not hours, from any device. One credit for a book,
+<span class="d">-          or nothing on a recurring plan if the operator sells one.</span>
+<span class="a">+          or nothing on a recurring plan if the operator sells one. Each</span>
+<span class="a">+          visitor gets some free credits (settings.free_credits_*); a job</span>
+<span class="a">+          spends those before the bought ones.</span>
+ 
+ All of the code is public and anyone may host it. What is sold is the use of
+ this operator&#x27;s machines.
+<span class="h">@@ -50,7 +52,10 @@ def _aware(when: datetime | None) -&gt; datetime | None:</span>
+ 
+ @dataclass(frozen=True)
+ class Entitlement:
+<span class="a">+    # Every credit the account can spend now: the bought and the free ones.</span>
+     credits: int
+<span class="a">+    # The part of `credits` that is free.</span>
+<span class="a">+    free_credits: int</span>
+     subscribed: bool
+     subscription_ends: datetime | None
+ 
+<span class="h">@@ -66,14 +71,53 @@ def is_subscribed(account: Account) -&gt; bool:</span>
+     return ends is None or ends + _GRACE &gt; utcnow()
+ 
+ 
+<span class="a">+def free_allowance(signed_in: bool) -&gt; int:</span>
+<span class="a">+    &quot;&quot;&quot;The free credits that an account gets in all.</span>
+<span class="a">+</span>
+<span class="a">+    Zero while this server takes no conversions: a free credit must not</span>
+<span class="a">+    promise a job that cannot run.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if not settings.cloud_enabled:</span>
+<span class="a">+        return 0</span>
+<span class="a">+    if signed_in:</span>
+<span class="a">+        return settings.free_credits_signed_in</span>
+<span class="a">+    return settings.free_credits_anonymous</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def free_credits_left(account: Account, signed_in: bool | None = None) -&gt; int:</span>
+<span class="a">+    &quot;&quot;&quot;The free credits that `account` can spend now.</span>
+<span class="a">+</span>
+<span class="a">+    Give `signed_in=True` to get the number after a sign-in.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if signed_in is None:</span>
+<span class="a">+        signed_in = account.signed_in</span>
+<span class="a">+    return max(0, free_allowance(signed_in) - account.free_credits_used)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def check(account: Account) -&gt; Entitlement:
+<span class="a">+    free = free_credits_left(account)</span>
+     return Entitlement(
+<span class="d">-        credits=account.purchased_credits,</span>
+<span class="a">+        credits=account.purchased_credits + free,</span>
+<span class="a">+        free_credits=free,</span>
+         subscribed=is_subscribed(account),
+         subscription_ends=_aware(account.subscription_period_end),
+     )
+ 
+ 
+<span class="a">+def _spend_free_credit(session: Session, account: Account) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Take one free credit, atomically. False if there was none to take.&quot;&quot;&quot;</span>
+<span class="a">+    taken = session.execute(</span>
+<span class="a">+        update(Account)</span>
+<span class="a">+        .where(</span>
+<span class="a">+            Account.id == account.id,</span>
+<span class="a">+            Account.free_credits_used &lt; free_allowance(account.signed_in),</span>
+<span class="a">+        )</span>
+<span class="a">+        .values(free_credits_used=Account.free_credits_used + 1)</span>
+<span class="a">+    ).rowcount</span>
+<span class="a">+    session.refresh(account)</span>
+<span class="a">+    return bool(taken)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def _spend_credit(session: Session, account: Account) -&gt; bool:
+     &quot;&quot;&quot;Take one credit, atomically. False if there was none to take.&quot;&quot;&quot;
+     taken = session.execute(
+<span class="h">@@ -89,12 +133,15 @@ def authorize_start(session: Session, account: Account, job: Job) -&gt; None:</span>
+     &quot;&quot;&quot;Charge what starting `job` costs, or raise PaymentRequired.
+ 
+     Where the job runs sets its tier: a browser job is free, a server job is
+<span class="d">-    a cloud job.</span>
+<span class="a">+    a cloud job. A cloud job spends a free credit first, then a bought one.</span>
+     &quot;&quot;&quot;
+     job.tier = FREE if job.local else CLOUD
+<span class="d">-    job.billed, job.credit_spent = 0, 0</span>
+<span class="a">+    job.billed, job.credit_spent, job.free_credit_spent = 0, 0, 0</span>
+     if job.local or not settings.billing_enabled or is_subscribed(account):
+         return
+<span class="a">+    if _spend_free_credit(session, account):</span>
+<span class="a">+        job.free_credit_spent = 1</span>
+<span class="a">+        return</span>
+     if not _spend_credit(session, account):
+         raise PaymentRequired(
+             &quot;A conversion on our servers takes one credit. &quot;
+<span class="h">@@ -113,6 +160,13 @@ def refund(session: Session, job: Job) -&gt; None:</span>
+             .values(purchased_credits=Account.purchased_credits + 1)
+         )
+         job.credit_spent = 0
+<span class="a">+    if job.free_credit_spent:</span>
+<span class="a">+        session.execute(</span>
+<span class="a">+            update(Account)</span>
+<span class="a">+            .where(Account.id == job.account_id, Account.free_credits_used &gt; 0)</span>
+<span class="a">+            .values(free_credits_used=Account.free_credits_used - 1)</span>
+<span class="a">+        )</span>
+<span class="a">+        job.free_credit_spent = 0</span>
+     session.add(job)
+ 
+ 
+diff --git a/backend/db.py b/backend/db.py
+index ada87d8..6d94f64 100644
+--- a/backend/db.py
++++ b/backend/db.py
+<span class="h">@@ -75,6 +75,12 @@ class Account(Base):</span>
+     )
+     # Paid conversions in hand. One credit = one book with every output.
+     purchased_credits: Mapped[int] = mapped_column(Integer, default=0)
+<span class="a">+    # Free credits spent so far. The free credits left are the allowance</span>
+<span class="a">+    # (billing.free_allowance) minus this count. Thus a sign-in raises the</span>
+<span class="a">+    # allowance, and a merge adds the two counts together.</span>
+<span class="a">+    free_credits_used: Mapped[int] = mapped_column(</span>
+<span class="a">+        Integer, default=0, server_default=text(&quot;0&quot;)</span>
+<span class="a">+    )</span>
+ 
+     # The unlimited plan. Status is Stripe&#x27;s own word for it (active, past_due,
+     # canceled...); period_end is when the paid-for time runs out.
+<span class="h">@@ -146,10 +152,15 @@ class Job(Base):</span>
+     # 1 when the work happens in the visitor&#x27;s browser and the server only
+     # keeps the books: nothing to queue, nothing to resume after a restart.
+     local: Mapped[int] = mapped_column(Integer, default=0, server_default=text(&quot;0&quot;))
+<span class="d">-    # 1 if a credit was spent on this job, so a failed run can hand it back.</span>
+<span class="a">+    # 1 if a bought credit was spent on this job, so a failed run can hand it back.</span>
+     credit_spent: Mapped[int] = mapped_column(
+         Integer, default=0, server_default=text(&quot;0&quot;)
+     )
+<span class="a">+    # 1 if a free credit was spent on this job. A failed run gives it back to</span>
+<span class="a">+    # the free credits, not to the bought ones.</span>
+<span class="a">+    free_credit_spent: Mapped[int] = mapped_column(</span>
+<span class="a">+        Integer, default=0, server_default=text(&quot;0&quot;)</span>
+<span class="a">+    )</span>
+ 
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True), default=utcnow
+diff --git a/backend/settings.py b/backend/settings.py
+index 9ba471c..d41129f 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -73,6 +73,13 @@ class Settings(BaseSettings):</span>
+     contact_email: str = &quot;&quot;
+     # Off on localhost so nothing blocks you; flip on for the public release.
+     billing_enabled: bool = False
+<span class="a">+    # Free credits for conversions on this server. They exist only while</span>
+<span class="a">+    # cloud_enabled is on. A visitor without an account gets</span>
+<span class="a">+    # free_credits_anonymous. An account gets free_credits_signed_in in all:</span>
+<span class="a">+    # a free credit that one of its devices used before sign-in counts toward</span>
+<span class="a">+    # it. See billing.py.</span>
+<span class="a">+    free_credits_anonymous: int = 1</span>
+<span class="a">+    free_credits_signed_in: int = 10</span>
+ 
+     # --- accounts &amp; payments -----------------------------------------------
+     # What customers see on the Stripe page and in the sign-in email.
+diff --git a/frontend/app.js b/frontend/app.js
+index 36d2418..553b39d 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+<span class="h">@@ -9,7 +9,7 @@ const el = {</span>
+   confirm: $(&#x27;confirm&#x27;), cAudio: $(&#x27;c-audio&#x27;), cText: $(&#x27;c-text&#x27;),
+   language: $(&#x27;language&#x27;), detected: $(&#x27;detected&#x27;), splitnote: $(&#x27;splitnote&#x27;),
+   start: $(&#x27;start&#x27;), discard: $(&#x27;discard&#x27;), eta: $(&#x27;eta&#x27;),
+<span class="d">-  inBrowser: $(&#x27;in-browser&#x27;),</span>
+<span class="a">+  inBrowser: $(&#x27;in-browser&#x27;), modeNote: $(&#x27;mode-note&#x27;),</span>
+   jobsSection: $(&#x27;jobs-section&#x27;), jobs: $(&#x27;jobs&#x27;), quota: $(&#x27;quota&#x27;),
+   freetier: $(&#x27;freetier&#x27;), staged: $(&#x27;staged&#x27;), dzTitle: $(&#x27;dz-title&#x27;),
+   match: $(&#x27;match&#x27;), matchBadge: $(&#x27;match-badge&#x27;),
+<span class="h">@@ -20,6 +20,7 @@ const el = {</span>
+   signinEmail: $(&#x27;signin-email&#x27;), signinSend: $(&#x27;signin-send&#x27;),
+   signinNote: $(&#x27;signin-note&#x27;),
+   pricingDialog: $(&#x27;pricing-dialog&#x27;), pricingWhy: $(&#x27;pricing-why&#x27;),
+<span class="a">+  pricingSignin: $(&#x27;pricing-signin&#x27;), pricingSigninBtn: $(&#x27;pricing-signin-btn&#x27;),</span>
+   plans: $(&#x27;plans&#x27;), toast: $(&#x27;toast&#x27;),
+   working: $(&#x27;working&#x27;), workTitle: $(&#x27;work-title&#x27;), workBar: $(&#x27;work-bar&#x27;),
+   workMeta: $(&#x27;work-meta&#x27;), stop: $(&#x27;stop&#x27;), results: $(&#x27;results&#x27;),
+<span class="h">@@ -126,6 +127,9 @@ function renderAccount() {</span>
+   el.who.textContent = signedIn ? a.email : &#x27;&#x27;;
+   el.signoutBtn.hidden = !signedIn;
+   el.signinBtn.hidden = signedIn || !a.email_sign_in_available;
+<span class="a">+  const offer = signInOffer();</span>
+<span class="a">+  el.signinBtn.textContent = offer</span>
+<span class="a">+    ? `Sign in for ${offer} free credit${offer === 1 ? &#x27;&#x27; : &#x27;s&#x27;}` : &#x27;Sign in&#x27;;</span>
+ 
+   // What is sold is conversion on this server&#x27;s hardware. Nothing is for sale
+   // until that is connected; in this tab each output is free.
+<span class="h">@@ -134,9 +138,20 @@ function renderAccount() {</span>
+   el.portalBtn.hidden = !(selling &amp;&amp; a.subscribed);
+   el.quota.hidden = !selling;
+   if (selling) {
+<span class="a">+    // Say &quot;free&quot; while each credit in hand is a free one.</span>
+<span class="a">+    const free = a.credits &gt; 0 &amp;&amp; a.free_credits === a.credits ? &#x27;free &#x27; : &#x27;&#x27;;</span>
+     el.quota.textContent = a.subscribed ? &#x27;Cloud plan&#x27;
+<span class="d">-      : `${a.credits} cloud credit${a.credits === 1 ? &#x27;&#x27; : &#x27;s&#x27;}`;</span>
+<span class="a">+      : `${a.credits} ${free}cloud credit${a.credits === 1 ? &#x27;&#x27; : &#x27;s&#x27;}`;</span>
+   }
+<span class="a">+  renderMode();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* The free credits that a sign-in gives this visitor. Zero when there is</span>
+<span class="a">+   nothing to offer: signed in already, no sign-in email, or billing off. */</span>
+<span class="a">+function signInOffer() {</span>
+<span class="a">+  const a = account;</span>
+<span class="a">+  if (!a || signedIn || !a.email_sign_in_available || !a.billing_enabled) return 0;</span>
+<span class="a">+  return a.free_credits_with_account || 0;</span>
+ }
+ 
+ let toastTimer = null;
+<span class="h">@@ -334,40 +349,47 @@ el.discard.addEventListener(&#x27;click&#x27;, () =&gt; { clearError(); resetToDrop(); });</span>
+ /* ---------------- where the work is done ---------------- */
+ 
+ /* In this browser (JavaScript, free, nothing uploaded) is the default. The
+<span class="d">-   switch turns that off and sends the job to the server instead: for a phone,</span>
+<span class="d">-   an old computer, or a tab that has to close. The choice is kept. */</span>
+<span class="d">-const MODE_KEY = &#x27;subread-mode&#x27;;</span>
+<span class="a">+   switch is above the drop zone, so the choice shows before a file is chosen,</span>
+<span class="a">+   and each visit starts with the switch on. Off sends the job to the server:</span>
+<span class="a">+   for a phone, an old computer, or a tab that has to close. */</span>
+ let browserPlan = { note: &#x27;&#x27;, label: &#x27;Start&#x27; };
+ 
+ function serverOffered() { return !!account?.cloud_available; }
+ 
+ function inBrowser() { return !serverOffered() || el.inBrowser.checked; }
+ 
+<span class="a">+/* What a job on the server costs this visitor, as a sentence. */</span>
+<span class="a">+function serverPrice() {</span>
+<span class="a">+  const a = account;</span>
+<span class="a">+  if (!a?.billing_enabled) return &#x27;&#x27;;</span>
+<span class="a">+  if (a.subscribed) return &#x27; Included in your plan.&#x27;;</span>
+<span class="a">+  if (a.credits &gt; 0) {</span>
+<span class="a">+    const free = a.free_credits === a.credits ? &#x27; free&#x27; : &#x27;&#x27;;</span>
+<span class="a">+    return ` One credit a book; you have ${a.credits}${free}.`;</span>
+<span class="a">+  }</span>
+<span class="a">+  return &#x27; One credit a book.&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ function renderMode() {
+   const offered = serverOffered();
+   el.inBrowser.disabled = !offered;
+<span class="d">-  el.inBrowser.checked = !offered || localStorage.getItem(MODE_KEY) !== &#x27;server&#x27;;</span>
+<span class="a">+  if (!offered) el.inBrowser.checked = true;</span>
+   if (inBrowser()) {
+<span class="a">+    el.modeNote.textContent = &#x27;Free, without limit, and your files are not uploaded.&#x27; +</span>
+<span class="a">+      (offered ? &#x27; Turn this off to have our server do the work.&#x27; + serverPrice() : &#x27;&#x27;);</span>
+     el.start.textContent = browserPlan.label;
+     el.eta.textContent = browserPlan.note +
+       (offered ? &#x27;&#x27; : &#x27; Our server is not taking conversions at the moment, so this is the one way.&#x27;);
+     return;
+   }
+<span class="d">-  const a = account;</span>
+<span class="d">-  const price = !a.billing_enabled ? &#x27;&#x27;</span>
+<span class="d">-    : a.subscribed ? &#x27; Included in your plan.&#x27;</span>
+<span class="d">-    : a.credits &gt; 0 ? ` One credit; you have ${a.credits}.`</span>
+<span class="d">-    : &#x27; One credit.&#x27;;</span>
+<span class="a">+  el.modeNote.textContent = &#x27;Off: your files are uploaded, and our server does the work.&#x27; + serverPrice();</span>
+   el.start.textContent = &#x27;Upload and convert on our server&#x27;;
+   el.eta.textContent =
+     &#x27;The files are uploaded, the work is done on our server, and the result waits for you on this page, &#x27; +
+<span class="d">-    &#x27;so you can close this tab. The files are deleted after the job.&#x27; + price;</span>
+<span class="a">+    &#x27;so you can close this tab. The files are deleted after the job.&#x27; + serverPrice();</span>
+ }
+ 
+<span class="d">-el.inBrowser.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+<span class="d">-  try { localStorage.setItem(MODE_KEY, el.inBrowser.checked ? &#x27;browser&#x27; : &#x27;server&#x27;); } catch { /* private window */ }</span>
+<span class="d">-  renderMode();</span>
+<span class="d">-});</span>
+<span class="a">+el.inBrowser.addEventListener(&#x27;change&#x27;, renderMode);</span>
+ 
+ function startOnServer() {
+   if (!draft || running) return;
+<span class="h">@@ -516,8 +538,10 @@ function renderWorking(st) {</span>
+ function showResults(r) {
+   // The ask goes to people who got a book for nothing, at the moment it worked.
+   // Not to a customer: someone who pays for credits has done their part.
+<span class="a">+  // Free credits do not make a customer, so count the bought ones only.</span>
+   const chipIn = document.getElementById(&#x27;chip-in&#x27;);
+<span class="d">-  if (chipIn) chipIn.hidden = Boolean(account?.credits &gt; 0 || account?.subscribed);</span>
+<span class="a">+  const bought = (account?.credits ?? 0) - (account?.free_credits ?? 0);</span>
+<span class="a">+  if (chipIn) chipIn.hidden = Boolean(bought &gt; 0 || account?.subscribed);</span>
+   el.stop.hidden = true;
+   el.stop.disabled = false;
+   el.results.hidden = false;
+<span class="h">@@ -861,6 +885,10 @@ el.picker.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+ async function openPricing(why) {
+   el.pricingWhy.textContent = why ||
+     &#x27;In this tab a conversion is free, without limit. A credit converts a book on our server: from any device, and you can close the tab.&#x27;;
+<span class="a">+  const offer = signInOffer();</span>
+<span class="a">+  el.pricingSignin.hidden = !offer;</span>
+<span class="a">+  el.pricingSigninBtn.textContent =</span>
+<span class="a">+    `Or sign in with your email and get ${offer} free credit${offer === 1 ? &#x27;&#x27; : &#x27;s&#x27;}.`;</span>
+   el.plans.innerHTML = &#x27;&lt;p class=&quot;muted&quot;&gt;Loading…&lt;/p&gt;&#x27;;
+   if (!el.pricingDialog.open) el.pricingDialog.showModal();
+ 
+<span class="h">@@ -926,11 +954,14 @@ el.portalBtn.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+ 
+ /* ---------------- sign in ---------------- */
+ 
+<span class="d">-el.signinBtn.addEventListener(&#x27;click&#x27;, () =&gt; {</span>
+<span class="a">+function openSignIn() {</span>
+   el.signinNote.hidden = true;
+   el.signinDialog.showModal();
+   el.signinEmail.focus();
+<span class="d">-});</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+el.signinBtn.addEventListener(&#x27;click&#x27;, openSignIn);</span>
+<span class="a">+el.pricingSigninBtn.addEventListener(&#x27;click&#x27;, () =&gt; { el.pricingDialog.close(); openSignIn(); });</span>
+ 
+ el.signinForm.addEventListener(&#x27;submit&#x27;, async (e) =&gt; {
+   e.preventDefault();
+diff --git a/frontend/index.html b/frontend/index.html
+index 0ce1cff..88f7d20 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+<span class="h">@@ -12,7 +12,7 @@</span>
+ &lt;meta property=&quot;og:url&quot; content=&quot;https://subread.space/&quot;&gt;
+ &lt;meta name=&quot;twitter:card&quot; content=&quot;summary&quot;&gt;
+ &lt;meta name=&quot;theme-color&quot; content=&quot;#4f46e5&quot;&gt;
+<span class="d">-&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=12&quot;&gt;</span>
+<span class="a">+&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=13&quot;&gt;</span>
+ &lt;link rel=&quot;icon&quot; href=&quot;data:image/svg+xml,&lt;svg xmlns=&#x27;http://www.w3.org/2000/svg&#x27; viewBox=&#x27;0 0 100 100&#x27;&gt;&lt;text y=&#x27;.9em&#x27; font-size=&#x27;90&#x27;&gt;🎧&lt;/text&gt;&lt;/svg&gt;&quot;&gt;
+ &lt;/head&gt;
+ &lt;body&gt;
+<span class="h">@@ -56,6 +56,16 @@</span>
+     &lt;p class=&quot;muted small&quot; id=&quot;freetier&quot;&gt;Free in your browser, without limit.&lt;/p&gt;
+   &lt;/section&gt;
+ 
+<span class="a">+  &lt;!-- where the work is done: in this tab unless the visitor turns it off --&gt;</span>
+<span class="a">+  &lt;section id=&quot;mode&quot; class=&quot;mode&quot;&gt;</span>
+<span class="a">+    &lt;label class=&quot;switch&quot;&gt;</span>
+<span class="a">+      &lt;input type=&quot;checkbox&quot; id=&quot;in-browser&quot; checked autocomplete=&quot;off&quot;&gt;</span>
+<span class="a">+      &lt;span&gt;&lt;strong&gt;Convert in this browser (JavaScript)&lt;/strong&gt;</span>
+<span class="a">+        &lt;span class=&quot;tag free&quot;&gt;free&lt;/span&gt;&lt;/span&gt;</span>
+<span class="a">+    &lt;/label&gt;</span>
+<span class="a">+    &lt;p class=&quot;muted small&quot; id=&quot;mode-note&quot;&gt;Free, without limit, and your files are not uploaded.&lt;/p&gt;</span>
+<span class="a">+  &lt;/section&gt;</span>
+<span class="a">+</span>
+   &lt;!-- step 1: drop --&gt;
+   &lt;section id=&quot;dropzone&quot; class=&quot;dropzone&quot; tabindex=&quot;0&quot; role=&quot;button&quot;
+            aria-label=&quot;Drop an audio file and an ebook, or click to choose files&quot;&gt;
+<span class="h">@@ -142,13 +152,6 @@</span>
+       &lt;ul id=&quot;match-warnings&quot; class=&quot;match-warnings&quot;&gt;&lt;/ul&gt;
+     &lt;/div&gt;
+ 
+<span class="d">-    &lt;div class=&quot;mode&quot;&gt;</span>
+<span class="d">-      &lt;label class=&quot;switch&quot;&gt;</span>
+<span class="d">-        &lt;input type=&quot;checkbox&quot; id=&quot;in-browser&quot; checked&gt;</span>
+<span class="d">-        &lt;span&gt;Convert in this browser (JavaScript). Off: our server does it.&lt;/span&gt;</span>
+<span class="d">-      &lt;/label&gt;</span>
+<span class="d">-    &lt;/div&gt;</span>
+<span class="d">-</span>
+     &lt;div class=&quot;actions&quot;&gt;
+       &lt;button id=&quot;start&quot; class=&quot;primary&quot;&gt;Start alignment&lt;/button&gt;
+       &lt;button id=&quot;discard&quot; class=&quot;ghost&quot;&gt;Discard&lt;/button&gt;
+<span class="h">@@ -232,6 +235,7 @@</span>
+   &lt;form method=&quot;dialog&quot;&gt;&lt;button class=&quot;modal-x&quot; aria-label=&quot;Close&quot;&gt;×&lt;/button&gt;&lt;/form&gt;
+   &lt;h2&gt;Credits for our server&lt;/h2&gt;
+   &lt;p id=&quot;pricing-why&quot; class=&quot;muted&quot;&gt;&lt;/p&gt;
+<span class="a">+  &lt;p id=&quot;pricing-signin&quot; hidden&gt;&lt;button type=&quot;button&quot; id=&quot;pricing-signin-btn&quot; class=&quot;linkbtn&quot;&gt;&lt;/button&gt;&lt;/p&gt;</span>
+   &lt;div id=&quot;plans&quot; class=&quot;plans&quot;&gt;&lt;/div&gt;
+   &lt;p class=&quot;muted small&quot; id=&quot;pricing-foot&quot;&gt;
+     Paid through Stripe; we never see your card. One credit converts one book
+<span class="h">@@ -243,6 +247,6 @@</span>
+ 
+ &lt;div id=&quot;toast&quot; class=&quot;toast&quot; hidden role=&quot;status&quot;&gt;&lt;/div&gt;
+ 
+<span class="d">-&lt;script type=&quot;module&quot; src=&quot;/app.js?v=12&quot;&gt;&lt;/script&gt;</span>
+<span class="a">+&lt;script type=&quot;module&quot; src=&quot;/app.js?v=13&quot;&gt;&lt;/script&gt;</span>
+ &lt;/body&gt;
+ &lt;/html&gt;
+diff --git a/frontend/style.css b/frontend/style.css
+index 78f482a..0180dbb 100644
+--- a/frontend/style.css
++++ b/frontend/style.css
+<span class="h">@@ -300,10 +300,18 @@ button.compact { padding: 6px 12px; font-size: 13px; }</span>
+ }
+ .tag.free { background: var(--ok-soft); color: var(--ok); }
+ 
+<span class="d">-.mode { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 14px; }</span>
+<span class="d">-.switch { display: flex; align-items: center; gap: 10px; cursor: pointer; }</span>
+<span class="a">+/* ---------- where the work is done ---------- */</span>
+<span class="a">+.mode {</span>
+<span class="a">+  margin: 0 0 14px; padding: 14px 18px;</span>
+<span class="a">+  border: 1px solid var(--line); border-radius: var(--radius);</span>
+<span class="a">+  background: var(--panel);</span>
+<span class="a">+}</span>
+<span class="a">+/* Green while the work stays in this tab: the free path must be easy to see. */</span>
+<span class="a">+.mode:has(input:checked) { border-color: var(--ok); background: var(--ok-soft); }</span>
+<span class="a">+.mode p { margin: 4px 0 0 30px; }</span>
+<span class="a">+.switch { display: flex; align-items: center; gap: 12px; cursor: pointer; font-size: 16px; }</span>
+<span class="a">+.switch:has(input:disabled) { cursor: default; }</span>
+ .switch input { width: 18px; height: 18px; margin: 0; accent-color: var(--ok); flex: none; }
+<span class="d">-.switch input:disabled + span { color: var(--muted); }</span>
+ 
+ .share-form { display: grid; gap: 6px; margin: 14px 0 8px; }
+ .share-form label { font-size: 13px; font-weight: 600; margin-top: 6px; }
+diff --git a/frontend/terms.html b/frontend/terms.html
+index 3dec461..a6054f7 100644
+--- a/frontend/terms.html
++++ b/frontend/terms.html
+<span class="h">@@ -24,8 +24,8 @@</span>
+     &lt;li&gt;&lt;strong&gt;In your browser (free):&lt;/strong&gt; the work is done on your machine. Your audio and
+       your book are not uploaded. The server gets the names and sizes of the files and the
+       finished subtitles, so that this page can list your conversions.&lt;/li&gt;
+<span class="d">-    &lt;li&gt;&lt;strong&gt;On our server (paid):&lt;/strong&gt; you upload the audio and the book, and the server</span>
+<span class="d">-      does the work. One credit converts one book.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;&lt;strong&gt;On our server (credits):&lt;/strong&gt; you upload the audio and the book, and the server</span>
+<span class="a">+      does the work. One credit converts one book. New visitors get some free credits to try it.&lt;/li&gt;</span>
+   &lt;/ul&gt;
+ 
+   &lt;h2&gt;Your files&lt;/h2&gt;
+<span class="h">@@ -44,6 +44,7 @@</span>
+   &lt;ul&gt;
+     &lt;li&gt;Payments are taken by Stripe. We never see your card.&lt;/li&gt;
+     &lt;li&gt;Credits do not expire.&lt;/li&gt;
+<span class="a">+    &lt;li&gt;Free credits have no cash value. We do not refund them.&lt;/li&gt;</span>
+     &lt;li&gt;A job that fails or that you cancel gives its credit back by itself.&lt;/li&gt;
+     &lt;li&gt;If a result is not usable (for example the subtitles do not match the book), write to us
+       within 14 days and we return the credit or the money, as you choose. Try the free
+diff --git a/tests/test_free_credits.py b/tests/test_free_credits.py
+new file mode 100644
+index 0000000..c5431bf
+--- /dev/null
++++ b/tests/test_free_credits.py
+<span class="h">@@ -0,0 +1,150 @@</span>
+<span class="a">+&quot;&quot;&quot;Free credits for conversions on the server.</span>
+<span class="a">+</span>
+<span class="a">+The rules under test:</span>
+<span class="a">+</span>
+<span class="a">+  anonymous  one free credit, while the server takes conversions</span>
+<span class="a">+  account    ten free credits in all: a free credit that a device used before</span>
+<span class="a">+             sign-in counts toward the ten</span>
+<span class="a">+  order      a server job spends a free credit first, then a bought one</span>
+<span class="a">+  refund     a failed job gives its free credit back to the free credits</span>
+<span class="a">+  merge      a second device that signs in adds no free credits</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import time</span>
+<span class="a">+from urllib.parse import parse_qs, urlparse</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+</span>
+<span class="a">+from backend import runner</span>
+<span class="a">+from backend.settings import Settings, settings</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import (</span>
+<span class="a">+    account_id, checkout_event, get_account_row, get_job_row, make_job,</span>
+<span class="a">+    post_webhook,</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+BOOK = {</span>
+<span class="a">+    &quot;audio_filename&quot;: &quot;free.m4b&quot;, &quot;audio_bytes&quot;: 4321,</span>
+<span class="a">+    &quot;text_filename&quot;: &quot;free.epub&quot;, &quot;language&quot;: &quot;en&quot;,</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def cloud(monkeypatch):</span>
+<span class="a">+    &quot;&quot;&quot;The server takes conversions, and sign-in links come back in the response.&quot;&quot;&quot;</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;cloud_enabled&quot;, True)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;dev_login_links&quot;, True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def unique(name: str) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;An email for one test only: an email joins accounts across tests.&quot;&quot;&quot;</span>
+<span class="a">+    return f&quot;{name}-{time.time_ns()}@example.com&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def sign_in(client, email: str) -&gt; None:</span>
+<span class="a">+    link = client.post(&quot;/api/auth/request&quot;, json={&quot;email&quot;: email}).json()[&quot;dev_link&quot;]</span>
+<span class="a">+    token = parse_qs(urlparse(link).query)[&quot;login&quot;][0]</span>
+<span class="a">+    assert client.post(&quot;/api/auth/verify&quot;, json={&quot;token&quot;: token}).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def buy(client, plan: str, email: str) -&gt; None:</span>
+<span class="a">+    event = checkout_event(f&quot;cs_{time.time_ns()}&quot;, account_id(client), plan, email=email)</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def start(client, job_id: str):</span>
+<span class="a">+    return client.post(f&quot;/api/jobs/{job_id}/start&quot;, json={&quot;language&quot;: &quot;en&quot;})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def account(client) -&gt; dict:</span>
+<span class="a">+    return client.get(&quot;/api/account&quot;).json()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_defaults_are_one_free_credit_and_ten_with_an_account():</span>
+<span class="a">+    assert Settings.model_fields[&quot;free_credits_anonymous&quot;].default == 1</span>
+<span class="a">+    assert Settings.model_fields[&quot;free_credits_signed_in&quot;].default == 10</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_new_visitor_has_one_free_credit(client, cloud):</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;signed_in&quot;] is False</span>
+<span class="a">+    assert a[&quot;credits&quot;] == 1 and a[&quot;free_credits&quot;] == 1</span>
+<span class="a">+    assert a[&quot;cloud_allowed&quot;] is True</span>
+<span class="a">+    assert a[&quot;free_credits_with_account&quot;] == 10</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_free_credit_pays_for_one_server_job(client, cloud):</span>
+<span class="a">+    job_id = make_job(client)</span>
+<span class="a">+    assert start(client, job_id).status_code == 200</span>
+<span class="a">+    job = get_job_row(job_id)</span>
+<span class="a">+    assert job.free_credit_spent == 1 and job.credit_spent == 0</span>
+<span class="a">+</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;credits&quot;] == 0 and a[&quot;cloud_allowed&quot;] is False</span>
+<span class="a">+    assert start(client, make_job(client)).status_code == 402</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_signing_in_raises_the_free_credits_to_ten_in_all(client, cloud):</span>
+<span class="a">+    assert start(client, make_job(client)).status_code == 200  # the anonymous credit</span>
+<span class="a">+    assert account(client)[&quot;free_credits_with_account&quot;] == 9</span>
+<span class="a">+</span>
+<span class="a">+    sign_in(client, unique(&quot;topup&quot;))</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;signed_in&quot;] is True</span>
+<span class="a">+    assert a[&quot;credits&quot;] == 9 and a[&quot;free_credits&quot;] == 9</span>
+<span class="a">+    assert a[&quot;free_credits_with_account&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_free_credits_are_spent_before_bought_ones(client, cloud):</span>
+<span class="a">+    buy(client, &quot;single&quot;, unique(&quot;order&quot;))</span>
+<span class="a">+    assert account(client)[&quot;credits&quot;] == 11  # 1 bought, 10 free</span>
+<span class="a">+</span>
+<span class="a">+    job_id = make_job(client)</span>
+<span class="a">+    assert start(client, job_id).status_code == 200</span>
+<span class="a">+    assert get_job_row(job_id).free_credit_spent == 1</span>
+<span class="a">+    row = get_account_row(account_id(client))</span>
+<span class="a">+    assert row.purchased_credits == 1 and row.free_credits_used == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_failed_job_gives_the_free_credit_back(client, cloud):</span>
+<span class="a">+    job_id = make_job(client)</span>
+<span class="a">+    assert start(client, job_id).status_code == 200</span>
+<span class="a">+    runner.run_job(job_id)  # fails: nothing was staged</span>
+<span class="a">+</span>
+<span class="a">+    assert account(client)[&quot;free_credits&quot;] == 1</span>
+<span class="a">+    assert get_job_row(job_id).free_credit_spent == 0</span>
+<span class="a">+    assert get_account_row(account_id(client)).purchased_credits == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_second_device_adds_no_free_credits(client, second_client, cloud):</span>
+<span class="a">+    email = unique(&quot;merge&quot;)</span>
+<span class="a">+    sign_in(client, email)</span>
+<span class="a">+    assert account(client)[&quot;free_credits&quot;] == 10</span>
+<span class="a">+</span>
+<span class="a">+    # The second device spends its anonymous credit, then signs in as the same person.</span>
+<span class="a">+    assert start(second_client, make_job(second_client)).status_code == 200</span>
+<span class="a">+    sign_in(second_client, email)</span>
+<span class="a">+    assert account(second_client)[&quot;free_credits&quot;] == 9</span>
+<span class="a">+    assert account(client)[&quot;free_credits&quot;] == 9</span>
+<span class="a">+</span>
+<span class="a">+    # A new cookie that signs in again brings no free credit along either.</span>
+<span class="a">+    client.post(&quot;/api/auth/signout&quot;)</span>
+<span class="a">+    assert account(client)[&quot;free_credits&quot;] == 1</span>
+<span class="a">+    sign_in(client, email)</span>
+<span class="a">+    assert account(client)[&quot;free_credits&quot;] == 9</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_no_free_credits_while_the_server_takes_no_conversions(client):</span>
+<span class="a">+    # conftest leaves SUBPLZ_WEB_CLOUD_ENABLED off.</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;credits&quot;] == 0 and a[&quot;free_credits&quot;] == 0</span>
+<span class="a">+    assert a[&quot;free_credits_with_account&quot;] == 0</span>
+<span class="a">+    assert start(client, make_job(client)).status_code == 402</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_browser_jobs_leave_the_free_credit_alone(client, cloud):</span>
+<span class="a">+    r = client.post(&quot;/api/local/jobs&quot;, json=BOOK)</span>
+<span class="a">+    assert r.status_code == 200 and r.json()[&quot;tier&quot;] == &quot;free&quot;</span>
+<span class="a">+    assert account(client)[&quot;free_credits&quot;] == 1</span>
+diff --git a/tests/test_migration.py b/tests/test_migration.py
+index d705860..150e4ad 100644
+--- a/tests/test_migration.py
++++ b/tests/test_migration.py
+<span class="h">@@ -49,7 +49,8 @@ init_db(); init_db()  # twice: a restart must be a no-op</span>
+ with SessionLocal() as s:
+     job = s.get(Job, &quot;job_old&quot;)
+     acct = s.get(Account, &quot;acct_old&quot;)
+<span class="d">-    print(job.tier, job.credit_spent, job.status.value, acct.merged_into, acct.signed_in)</span>
+<span class="a">+    print(job.tier, job.credit_spent, job.status.value, acct.merged_into, acct.signed_in,</span>
+<span class="a">+          job.free_credit_spent, acct.free_credits_used)</span>
+ &quot;&quot;&quot;
+ 
+ 
+<span class="h">@@ -66,13 +67,13 @@ def test_old_database_is_upgraded_in_place(tmp_path):</span>
+                          capture_output=True, text=True, timeout=120)
+     assert out.returncode == 0, out.stderr
+     # Old rows read back with the new columns defaulted, nothing lost.
+<span class="d">-    assert out.stdout.split() == [&quot;free&quot;, &quot;0&quot;, &quot;succeeded&quot;, &quot;None&quot;, &quot;False&quot;]</span>
+<span class="a">+    assert out.stdout.split() == [&quot;free&quot;, &quot;0&quot;, &quot;succeeded&quot;, &quot;None&quot;, &quot;False&quot;, &quot;0&quot;, &quot;0&quot;]</span>
+ 
+     con = sqlite3.connect(db)
+     cols = lambda t: {r[1] for r in con.execute(f&quot;PRAGMA table_info({t})&quot;)}  # noqa: E731
+<span class="d">-    assert {&quot;tier&quot;, &quot;credit_spent&quot;} &lt;= cols(&quot;jobs&quot;)</span>
+<span class="a">+    assert {&quot;tier&quot;, &quot;credit_spent&quot;, &quot;free_credit_spent&quot;} &lt;= cols(&quot;jobs&quot;)</span>
+     assert {&quot;merged_into&quot;, &quot;subscription_id&quot;, &quot;subscription_status&quot;,
+<span class="d">-            &quot;subscription_period_end&quot;} &lt;= cols(&quot;accounts&quot;)</span>
+<span class="a">+            &quot;subscription_period_end&quot;, &quot;free_credits_used&quot;} &lt;= cols(&quot;accounts&quot;)</span>
+     tables = {r[0] for r in con.execute(&quot;SELECT name FROM sqlite_master WHERE type=&#x27;table&#x27;&quot;)}
+     assert {&quot;login_tokens&quot;, &quot;purchases&quot;} &lt;= tables
+     # The unique email index has to exist, or two accounts could share one.
+diff --git a/tests/test_page.py b/tests/test_page.py
+new file mode 100644
+index 0000000..16d77b1
+--- /dev/null
++++ b/tests/test_page.py
+<span class="h">@@ -0,0 +1,20 @@</span>
+<span class="a">+&quot;&quot;&quot;The first screen: what a visitor sees before choosing a file.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import re</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_javascript_switch_is_on_the_first_screen_and_on(client):</span>
+<span class="a">+    page = client.get(&quot;/&quot;).text</span>
+<span class="a">+    switch = re.search(r&#x27;&lt;input[^&gt;]*\bid=&quot;in-browser&quot;[^&gt;]*&gt;&#x27;, page)</span>
+<span class="a">+    assert switch, &quot;the page has no in-browser switch&quot;</span>
+<span class="a">+    tag = switch.group(0)</span>
+<span class="a">+    # On when the page opens. autocomplete=&quot;off&quot; stops a browser from</span>
+<span class="a">+    # bringing back an &quot;off&quot; from an earlier visit.</span>
+<span class="a">+    assert re.search(r&quot;\schecked\b&quot;, tag) and &#x27;autocomplete=&quot;off&quot;&#x27; in tag</span>
+<span class="a">+</span>
+<span class="a">+    # Above the drop zone, so that it shows before a file is chosen.</span>
+<span class="a">+    dropzone = page.index(&#x27;id=&quot;dropzone&quot;&#x27;)</span>
+<span class="a">+    assert switch.start() &lt; dropzone</span>
+<span class="a">+    assert &quot;JavaScript&quot; in page[switch.start():dropzone]</span></pre>
+</div></body></html>

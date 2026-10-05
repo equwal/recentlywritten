@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread/src/hit-test.ts - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../../scan-subread/index.html">Log</a> | <a href="../../../scan-subread/files.html">Files</a> | <a href="../../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/hit-test.ts (5403 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Tap on the page. Pure: no DOM.
+<a id="l2" href="#l2">2</a> //
+<a id="l3" href="#l3">3</a> // 1. `tokenAt` finds the token under a tap.
+<a id="l4" href="#l4">4</a> // 2. `scanText` reads that token and the ones after it on the same line.
+<a id="l5" href="#l5">5</a> // 3. `lookupText` is the text that goes to the dictionary app.
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> import type { OcrToken } from &#x27;./align&#x27;;
+<a id="l8" href="#l8">8</a> import { isCjk, joinWords } from &#x27;./book-text&#x27;;
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> /** Longest scan string, in characters. */
+<a id="l11" href="#l11">11</a> export const SCAN_LENGTH = 16;
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> /** Longest lookup text, in characters. */
+<a id="l14" href="#l14">14</a> export const LOOKUP_LENGTH = 40;
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> /**
+<a id="l17" href="#l17">17</a>  * When the line ends within this many characters, the next line is added,
+<a id="l18" href="#l18">18</a>  * unless the line ends a sentence.
+<a id="l19" href="#l19">19</a>  */
+<a id="l20" href="#l20">20</a> export const LOOKUP_SHORT_LINE = 4;
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> /** A token of punctuation or symbols only. A lookup does not start with one. */
+<a id="l23" href="#l23">23</a> const PUNCTUATION = /^[\p{P}\p{S}]+$/u;
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> /** Text that ends a sentence. No next line follows it in a lookup. */
+<a id="l26" href="#l26">26</a> const SENTENCE_END = /[。．！？.!?」』]$/u;
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> /** How far from a character a tap may land, in CSS pixels: about the size of a finger. */
+<a id="l29" href="#l29">29</a> export const TAP_CSS = 24;
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> /**
+<a id="l32" href="#l32">32</a>  * The tap tolerance in page pixels. The page is `pageWidth` pixels wide
+<a id="l33" href="#l33">33</a>  * and shows `shownWidth` CSS pixels wide. A pinch zoom of `zoom` makes a
+<a id="l34" href="#l34">34</a>  * CSS pixel bigger on the screen, so the finger covers fewer of them.
+<a id="l35" href="#l35">35</a>  */
+<a id="l36" href="#l36">36</a> export function tapTolerance(pageWidth: number, shownWidth: number, zoom = 1): number {
+<a id="l37" href="#l37">37</a>   return (TAP_CSS * pageWidth) / (shownWidth * Math.max(1, zoom));
+<a id="l38" href="#l38">38</a> }
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a> /** Distance from a point to a box. Zero inside the box. */
+<a id="l41" href="#l41">41</a> function boxDistance(box: OcrToken[&#x27;bbox&#x27;], x: number, y: number): number {
+<a id="l42" href="#l42">42</a>   const dx = Math.max(box.x0 - x, 0, x - box.x1);
+<a id="l43" href="#l43">43</a>   const dy = Math.max(box.y0 - y, 0, y - box.y1);
+<a id="l44" href="#l44">44</a>   return Math.hypot(dx, dy);
+<a id="l45" href="#l45">45</a> }
+<a id="l46" href="#l46">46</a> 
+<a id="l47" href="#l47">47</a> /** Distance from a point to the center of a box. */
+<a id="l48" href="#l48">48</a> function centerDistance(box: OcrToken[&#x27;bbox&#x27;], x: number, y: number): number {
+<a id="l49" href="#l49">49</a>   return Math.hypot((box.x0 + box.x1) / 2 - x, (box.y0 + box.y1) / 2 - y);
+<a id="l50" href="#l50">50</a> }
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> /**
+<a id="l53" href="#l53">53</a>  * Index of the token on `page` nearest to (x, y), or -1 when none is
+<a id="l54" href="#l54">54</a>  * within `tolerance` pixels. Coordinates are in page pixels. OCR boxes
+<a id="l55" href="#l55">55</a>  * overlap, so among boxes at the same distance the one with the nearest
+<a id="l56" href="#l56">56</a>  * center wins.
+<a id="l57" href="#l57">57</a>  */
+<a id="l58" href="#l58">58</a> export function tokenAt(
+<a id="l59" href="#l59">59</a>   tokens: readonly OcrToken[],
+<a id="l60" href="#l60">60</a>   page: number,
+<a id="l61" href="#l61">61</a>   x: number,
+<a id="l62" href="#l62">62</a>   y: number,
+<a id="l63" href="#l63">63</a>   tolerance: number,
+<a id="l64" href="#l64">64</a> ): number {
+<a id="l65" href="#l65">65</a>   let best = -1;
+<a id="l66" href="#l66">66</a>   let bestDist = tolerance;
+<a id="l67" href="#l67">67</a>   let bestCenter = Infinity;
+<a id="l68" href="#l68">68</a>   tokens.forEach((t, i) =&gt; {
+<a id="l69" href="#l69">69</a>     if (t.page !== page) return;
+<a id="l70" href="#l70">70</a>     const d = boxDistance(t.bbox, x, y);
+<a id="l71" href="#l71">71</a>     if (d &gt; bestDist) return;
+<a id="l72" href="#l72">72</a>     const c = centerDistance(t.bbox, x, y);
+<a id="l73" href="#l73">73</a>     if (d &lt; bestDist || c &lt; bestCenter) {
+<a id="l74" href="#l74">74</a>       best = i;
+<a id="l75" href="#l75">75</a>       bestDist = d;
+<a id="l76" href="#l76">76</a>       bestCenter = c;
+<a id="l77" href="#l77">77</a>     }
+<a id="l78" href="#l78">78</a>   });
+<a id="l79" href="#l79">79</a>   return best;
+<a id="l80" href="#l80">80</a> }
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> /**
+<a id="l83" href="#l83">83</a>  * Text of token `start` and the following tokens on its line, up to `max`
+<a id="l84" href="#l84">84</a>  * characters. Spaces are not tokens: a space goes between two words,
+<a id="l85" href="#l85">85</a>  * except between two CJK words, and does not count toward `max`.
+<a id="l86" href="#l86">86</a>  */
+<a id="l87" href="#l87">87</a> export function scanText(tokens: readonly OcrToken[], start: number, max = SCAN_LENGTH): string {
+<a id="l88" href="#l88">88</a>   const first = tokens[start];
+<a id="l89" href="#l89">89</a>   if (!first) return &#x27;&#x27;;
+<a id="l90" href="#l90">90</a>   const words: string[] = [];
+<a id="l91" href="#l91">91</a>   let word = &#x27;&#x27;;
+<a id="l92" href="#l92">92</a>   let wordId = first.word;
+<a id="l93" href="#l93">93</a>   let length = 0;
+<a id="l94" href="#l94">94</a>   for (let i = start; i &lt; tokens.length &amp;&amp; tokens[i]!.line === first.line; i++) {
+<a id="l95" href="#l95">95</a>     const t = tokens[i]!;
+<a id="l96" href="#l96">96</a>     if (length + t.text.length &gt; max) break;
+<a id="l97" href="#l97">97</a>     if (t.word !== wordId) {
+<a id="l98" href="#l98">98</a>       words.push(word);
+<a id="l99" href="#l99">99</a>       word = &#x27;&#x27;;
+<a id="l100" href="#l100">100</a>       wordId = t.word;
+<a id="l101" href="#l101">101</a>     }
+<a id="l102" href="#l102">102</a>     word += t.text;
+<a id="l103" href="#l103">103</a>     length += t.text.length;
+<a id="l104" href="#l104">104</a>   }
+<a id="l105" href="#l105">105</a>   words.push(word);
+<a id="l106" href="#l106">106</a>   return joinWords(words);
+<a id="l107" href="#l107">107</a> }
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a> /** Index of the first token after the line of token `start`, or -1 at the end. */
+<a id="l110" href="#l110">110</a> function nextLine(tokens: readonly OcrToken[], start: number): number {
+<a id="l111" href="#l111">111</a>   const line = tokens[start]!.line;
+<a id="l112" href="#l112">112</a>   let i = start;
+<a id="l113" href="#l113">113</a>   while (i &lt; tokens.length &amp;&amp; tokens[i]!.line === line) i++;
+<a id="l114" href="#l114">114</a>   return i &lt; tokens.length ? i : -1;
+<a id="l115" href="#l115">115</a> }
+<a id="l116" href="#l116">116</a> 
+<a id="l117" href="#l117">117</a> /**
+<a id="l118" href="#l118">118</a>  * Index of the first token of the word of token `i`: the same word id on
+<a id="l119" href="#l119">119</a>  * the same line. The search stops at a CJK token, because Japanese OCR can
+<a id="l120" href="#l120">120</a>  * give one word for a whole line.
+<a id="l121" href="#l121">121</a>  */
+<a id="l122" href="#l122">122</a> function wordStart(tokens: readonly OcrToken[], i: number): number {
+<a id="l123" href="#l123">123</a>   const { line, word } = tokens[i]!;
+<a id="l124" href="#l124">124</a>   while (i &gt; 0) {
+<a id="l125" href="#l125">125</a>     const prev = tokens[i - 1]!;
+<a id="l126" href="#l126">126</a>     if (prev.line !== line || prev.word !== word || isCjk(prev.text)) break;
+<a id="l127" href="#l127">127</a>     i--;
+<a id="l128" href="#l128">128</a>   }
+<a id="l129" href="#l129">129</a>   return i;
+<a id="l130" href="#l130">130</a> }
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a> /**
+<a id="l133" href="#l133">133</a>  * The text for a dictionary lookup, to the end of the line. A CJK
+<a id="l134" href="#l134">134</a>  * character starts it where the tap lands, because a dictionary app scans
+<a id="l135" href="#l135">135</a>  * from there. Another character starts it at the first letter of its
+<a id="l136" href="#l136">136</a>  * word. Punctuation and symbols at the start are skipped. When only they
+<a id="l137" href="#l137">137</a>  * are left on the line, the text is empty. When the line ends within
+<a id="l138" href="#l138">138</a>  * `LOOKUP_SHORT_LINE` characters and does not end a sentence, the next
+<a id="l139" href="#l139">139</a>  * line of the same page follows, so a word that wraps is whole.
+<a id="l140" href="#l140">140</a>  */
+<a id="l141" href="#l141">141</a> export function lookupText(tokens: readonly OcrToken[], tapped: number): string {
+<a id="l142" href="#l142">142</a>   const first = tokens[tapped];
+<a id="l143" href="#l143">143</a>   if (!first) return &#x27;&#x27;;
+<a id="l144" href="#l144">144</a>   let start = isCjk(first.text) ? tapped : wordStart(tokens, tapped);
+<a id="l145" href="#l145">145</a>   while (tokens[start]?.line === first.line &amp;&amp; PUNCTUATION.test(tokens[start]!.text)) start++;
+<a id="l146" href="#l146">146</a>   if (tokens[start]?.line !== first.line) return &#x27;&#x27;;
+<a id="l147" href="#l147">147</a>   const text = scanText(tokens, start, LOOKUP_LENGTH);
+<a id="l148" href="#l148">148</a>   const length = [...text.replace(/ /g, &#x27;&#x27;)].length;
+<a id="l149" href="#l149">149</a>   if (length &gt; LOOKUP_SHORT_LINE || SENTENCE_END.test(text)) return text;
+<a id="l150" href="#l150">150</a>   const next = nextLine(tokens, start);
+<a id="l151" href="#l151">151</a>   if (next &lt; 0 || tokens[next]!.page !== first.page) return text;
+<a id="l152" href="#l152">152</a>   return joinWords([text, scanText(tokens, next, LOOKUP_LENGTH - length)]);
+<a id="l153" href="#l153">153</a> }</pre>
+</div></body></html>

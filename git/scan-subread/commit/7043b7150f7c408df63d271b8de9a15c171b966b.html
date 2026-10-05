@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 7043b715 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 7043b7150f7c408df63d271b8de9a15c171b966b
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:30:02 -0700
+
+Serve the OCR worker and core from the app
+
+tesseract.js loaded its worker script and its WebAssembly core from
+jsDelivr at each start. With no network, OCR failed also when the
+language data was in the cache: &quot;Uncaught NetworkError: Failed to
+execute &#x27;importScripts&#x27; ... failed to load.&quot;
+
+createOcr now gives workerPath and corePath from Vite &quot;?url&quot; imports:
+tesseract.js/dist/worker.min.js and
+tesseract.js-core/tesseract-core-simd-lstm.wasm.js. The core file holds
+the WebAssembly, and the app uses OEM 1 (LSTM only), so one core is
+sufficient. The language data still comes from jsDelivr at the first run
+of each language. The build grows by 4.0 MB.
+
+tesseract.js-core is now a dependency, because the app imports its file.
+
+createOcr rejects with OcrStartError when the worker, the core or the
+language data does not load, so the UI can tell this error from other
+errors. When the language data does not load, tesseract.js calls
+errorHandler and its promise does not settle. So the first error of
+errorHandler also rejects the start. Before, the start waited forever.
+
+</pre><pre> package-lock.json |   3 +-
+ package.json      |   3 +-
+ src/ocr.ts        |  69 +++++++++++++++++++++++++++++++------
+ test/ocr.test.ts  | 100 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 162 insertions(+), 13 deletions(-)
+</pre><pre>diff --git a/package-lock.json b/package-lock.json
+index 9276eb6..71577dd 100644
+--- a/package-lock.json
++++ b/package-lock.json
+<span class="h">@@ -13,7 +13,8 @@</span>
+         &quot;fast-diff&quot;: &quot;^1.3.0&quot;,
+         &quot;idb&quot;: &quot;^8.0.3&quot;,
+         &quot;pdfjs-dist&quot;: &quot;^6.3.289&quot;,
+<span class="d">-        &quot;tesseract.js&quot;: &quot;^7.0.0&quot;</span>
+<span class="a">+        &quot;tesseract.js&quot;: &quot;^7.0.0&quot;,</span>
+<span class="a">+        &quot;tesseract.js-core&quot;: &quot;^7.0.0&quot;</span>
+       },
+       &quot;devDependencies&quot;: {
+         &quot;@capacitor/cli&quot;: &quot;^8.5.2&quot;,
+diff --git a/package.json b/package.json
+index 8b911f8..4525023 100644
+--- a/package.json
++++ b/package.json
+<span class="h">@@ -22,7 +22,8 @@</span>
+     &quot;fast-diff&quot;: &quot;^1.3.0&quot;,
+     &quot;idb&quot;: &quot;^8.0.3&quot;,
+     &quot;pdfjs-dist&quot;: &quot;^6.3.289&quot;,
+<span class="d">-    &quot;tesseract.js&quot;: &quot;^7.0.0&quot;</span>
+<span class="a">+    &quot;tesseract.js&quot;: &quot;^7.0.0&quot;,</span>
+<span class="a">+    &quot;tesseract.js-core&quot;: &quot;^7.0.0&quot;</span>
+   },
+   &quot;devDependencies&quot;: {
+     &quot;@capacitor/cli&quot;: &quot;^8.5.2&quot;,
+diff --git a/src/ocr.ts b/src/ocr.ts
+index 09c3f85..dd427ff 100644
+--- a/src/ocr.ts
++++ b/src/ocr.ts
+<span class="h">@@ -1,10 +1,17 @@</span>
+ // tesseract.js wrapper for the browser.
+ //
+<span class="d">-// tesseract.js loads its worker script, its WebAssembly core and the</span>
+<span class="d">-// language data from jsDelivr by default, so the first OCR run needs</span>
+<span class="d">-// network access. Language data is cached in IndexedDB after that.</span>
+<span class="a">+// The app serves the worker script of tesseract.js and its WebAssembly core</span>
+<span class="a">+// from its own files, so the code of OCR needs no network. The language data</span>
+<span class="a">+// comes from jsDelivr at the first OCR run of each language. tesseract.js</span>
+<span class="a">+// keeps it in IndexedDB after that.</span>
+ 
+<span class="d">-import { createWorker, PSM } from &#x27;tesseract.js&#x27;;</span>
+<span class="a">+import { createWorker, PSM, type Worker as TesseractWorker } from &#x27;tesseract.js&#x27;;</span>
+<span class="a">+// Vite copies the two files into the build and gives their URLs.</span>
+<span class="a">+import workerPath from &#x27;tesseract.js/dist/worker.min.js?url&#x27;;</span>
+<span class="a">+// One core file that holds the WebAssembly, so the worker makes one request.</span>
+<span class="a">+// The app uses OEM 1 (LSTM only). Android WebView 91 and later and all</span>
+<span class="a">+// current browsers have WebAssembly SIMD.</span>
+<span class="a">+import corePath from &#x27;tesseract.js-core/tesseract-core-simd-lstm.wasm.js?url&#x27;;</span>
+ import type { OcrToken } from &#x27;./align&#x27;;
+ import { pageToTokens } from &#x27;./ocr-tokens&#x27;;
+ 
+<span class="h">@@ -13,18 +20,37 @@ export interface Ocr {</span>
+   terminate(): Promise&lt;void&gt;;
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * OCR could not start: the worker script, the core or the language data did</span>
+<span class="a">+ * not load. `cause` holds the error of tesseract.js. The first OCR run of a</span>
+<span class="a">+ * language needs the network to download the language data.</span>
+<span class="a">+ */</span>
+<span class="a">+export class OcrStartError extends Error {</span>
+<span class="a">+  constructor(cause: unknown) {</span>
+<span class="a">+    super(`OCR could not start: ${String(cause)}`, { cause });</span>
+<span class="a">+    this.name = &#x27;OcrStartError&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /**
+  * Start an OCR worker for `lang` (&quot;eng&quot;, &quot;jpn&quot;, &quot;jpn_vert&quot;, &quot;jpn+eng&quot;, ...).
+<span class="d">- * `onProgress` gets values in [0, 1] while a page is recognized.</span>
+<span class="a">+ * `onProgress` gets values in [0, 1] while a page is recognized. Rejects with</span>
+<span class="a">+ * OcrStartError when the worker cannot start.</span>
+  */
+ export async function createOcr(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;Ocr&gt; {
+<span class="d">-  const worker = await createWorker(lang, 1, {</span>
+<span class="d">-    logger: (m) =&gt; {</span>
+<span class="d">-      if (m.status === &#x27;recognizing text&#x27;) onProgress(m.progress);</span>
+<span class="d">-    },</span>
+<span class="d">-  });</span>
+<span class="a">+  let worker: TesseractWorker;</span>
+<span class="a">+  try {</span>
+<span class="a">+    worker = await startWorker(lang, onProgress);</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    throw new OcrStartError(err);</span>
+<span class="a">+  }</span>
+   if (lang.includes(&#x27;vert&#x27;)) {
+<span class="d">-    await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK_VERT_TEXT });</span>
+<span class="a">+    try {</span>
+<span class="a">+      await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK_VERT_TEXT });</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      await worker.terminate().catch(() =&gt; undefined);</span>
+<span class="a">+      throw new OcrStartError(err);</span>
+<span class="a">+    }</span>
+   }
+   return {
+     async recognize(image, pageIndex) {
+<span class="h">@@ -36,3 +62,24 @@ export async function createOcr(lang: string, onProgress: (p: number) =&gt; void):</span>
+     },
+   };
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Starts the worker of tesseract.js. When the language data does not load,</span>
+<span class="a">+ * tesseract.js gives the error to errorHandler, and the promise of</span>
+<span class="a">+ * createWorker does not settle. So the first error rejects the start. That</span>
+<span class="a">+ * worker cannot be stopped: tesseract.js gives no handle to it.</span>
+<span class="a">+ */</span>
+<span class="a">+function startWorker(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;TesseractWorker&gt; {</span>
+<span class="a">+  return new Promise((resolve, reject) =&gt; {</span>
+<span class="a">+    createWorker(lang, 1, {</span>
+<span class="a">+      workerPath,</span>
+<span class="a">+      corePath,</span>
+<span class="a">+      logger: (m) =&gt; {</span>
+<span class="a">+        if (m.status === &#x27;recognizing text&#x27;) onProgress(m.progress);</span>
+<span class="a">+      },</span>
+<span class="a">+      // Also after the start: without an errorHandler, tesseract.js throws</span>
+<span class="a">+      // each error of a job in the message handler of the worker.</span>
+<span class="a">+      errorHandler: reject,</span>
+<span class="a">+    }).then(resolve, reject);</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+diff --git a/test/ocr.test.ts b/test/ocr.test.ts
+new file mode 100644
+index 0000000..1e3db9d
+--- /dev/null
++++ b/test/ocr.test.ts
+<span class="h">@@ -0,0 +1,100 @@</span>
+<span class="a">+import { afterEach, describe, expect, it, vi } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { createOcr, OcrStartError } from &#x27;../src/ocr&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const { createWorker } = vi.hoisted(() =&gt; ({ createWorker: vi.fn() }));</span>
+<span class="a">+vi.mock(&#x27;tesseract.js&#x27;, () =&gt; ({ createWorker, PSM: { SINGLE_BLOCK_VERT_TEXT: &#x27;5&#x27; } }));</span>
+<span class="a">+</span>
+<span class="a">+/** The options that createOcr gave to createWorker. */</span>
+<span class="a">+interface Options {</span>
+<span class="a">+  workerPath?: string;</span>
+<span class="a">+  corePath?: string;</span>
+<span class="a">+  langPath?: string;</span>
+<span class="a">+  logger?: (m: { status: string; progress: number }) =&gt; void;</span>
+<span class="a">+  errorHandler?: (error: unknown) =&gt; void;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function options(): Options {</span>
+<span class="a">+  return createWorker.mock.calls[0]?.[2] as Options;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function fakeWorker() {</span>
+<span class="a">+  return {</span>
+<span class="a">+    setParameters: vi.fn(() =&gt; Promise.resolve({})),</span>
+<span class="a">+    recognize: vi.fn(() =&gt; Promise.reject(new Error(&#x27;The image is empty.&#x27;))),</span>
+<span class="a">+    terminate: vi.fn(() =&gt; Promise.resolve({})),</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A path on the origin of the app, for example &quot;/assets/worker.min-abc.js&quot;. */</span>
+<span class="a">+const LOCAL = /^\/(?!\/)/;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;createOcr&#x27;, () =&gt; {</span>
+<span class="a">+  afterEach(() =&gt; {</span>
+<span class="a">+    createWorker.mockReset();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;loads the worker script and the core from the app, not from jsDelivr&#x27;, async () =&gt; {</span>
+<span class="a">+    createWorker.mockResolvedValue(fakeWorker());</span>
+<span class="a">+    const progress: number[] = [];</span>
+<span class="a">+    await createOcr(&#x27;jpn&#x27;, (p) =&gt; progress.push(p));</span>
+<span class="a">+</span>
+<span class="a">+    expect(createWorker).toHaveBeenCalledTimes(1);</span>
+<span class="a">+    expect(createWorker.mock.calls[0]?.slice(0, 2)).toEqual([&#x27;jpn&#x27;, 1]);</span>
+<span class="a">+    const { workerPath, corePath, langPath, logger } = options();</span>
+<span class="a">+    expect(workerPath).toMatch(LOCAL);</span>
+<span class="a">+    expect(workerPath).toMatch(/\/worker\.min\.js$/);</span>
+<span class="a">+    expect(corePath).toMatch(LOCAL);</span>
+<span class="a">+    expect(corePath).toMatch(/\/tesseract-core-simd-lstm\.wasm\.js$/);</span>
+<span class="a">+    expect(`${workerPath} ${corePath}`).not.toContain(&#x27;jsdelivr&#x27;);</span>
+<span class="a">+    // The language data still comes from the default place of tesseract.js.</span>
+<span class="a">+    expect(langPath).toBeUndefined();</span>
+<span class="a">+</span>
+<span class="a">+    logger?.({ status: &#x27;loading language traineddata&#x27;, progress: 0.5 });</span>
+<span class="a">+    logger?.({ status: &#x27;recognizing text&#x27;, progress: 0.25 });</span>
+<span class="a">+    expect(progress).toEqual([0.25]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;sets the page mode of a vertical language&#x27;, async () =&gt; {</span>
+<span class="a">+    const worker = fakeWorker();</span>
+<span class="a">+    createWorker.mockResolvedValue(worker);</span>
+<span class="a">+    await createOcr(&#x27;jpn_vert&#x27;, () =&gt; undefined);</span>
+<span class="a">+    expect(worker.setParameters).toHaveBeenCalledWith({ tessedit_pageseg_mode: &#x27;5&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives OcrStartError when the worker script does not load&#x27;, async () =&gt; {</span>
+<span class="a">+    const cause =</span>
+<span class="a">+      &quot;Uncaught NetworkError: Failed to execute &#x27;importScripts&#x27; on &#x27;WorkerGlobalScope&#x27;: failed to load.&quot;;</span>
+<span class="a">+    createWorker.mockRejectedValue(cause);</span>
+<span class="a">+    const error = await createOcr(&#x27;eng&#x27;, () =&gt; undefined).catch((e: unknown) =&gt; e);</span>
+<span class="a">+    expect(error).toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect((error as OcrStartError).cause).toBe(cause);</span>
+<span class="a">+    expect((error as OcrStartError).message).toContain(cause);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives OcrStartError when the language data does not load&#x27;, async () =&gt; {</span>
+<span class="a">+    // tesseract.js gives the error to errorHandler, and its promise does not settle.</span>
+<span class="a">+    createWorker.mockImplementation((_lang: string, _oem: number, opts: Options) =&gt; {</span>
+<span class="a">+      opts.errorHandler?.(&#x27;TypeError: Failed to fetch&#x27;);</span>
+<span class="a">+      return new Promise(() =&gt; undefined);</span>
+<span class="a">+    });</span>
+<span class="a">+    const error = await createOcr(&#x27;jpn&#x27;, () =&gt; undefined).catch((e: unknown) =&gt; e);</span>
+<span class="a">+    expect(error).toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect((error as OcrStartError).cause).toBe(&#x27;TypeError: Failed to fetch&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives OcrStartError and stops the worker when the page mode cannot be set&#x27;, async () =&gt; {</span>
+<span class="a">+    const worker = fakeWorker();</span>
+<span class="a">+    worker.setParameters.mockRejectedValue(&#x27;The worker stopped.&#x27;);</span>
+<span class="a">+    createWorker.mockResolvedValue(worker);</span>
+<span class="a">+    await expect(createOcr(&#x27;jpn_vert&#x27;, () =&gt; undefined)).rejects.toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect(worker.terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the error of a page as it is, not as OcrStartError&#x27;, async () =&gt; {</span>
+<span class="a">+    createWorker.mockResolvedValue(fakeWorker());</span>
+<span class="a">+    const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);</span>
+<span class="a">+    const error = await ocr.recognize({} as HTMLCanvasElement, 0).catch((e: unknown) =&gt; e);</span>
+<span class="a">+    expect(error).toEqual(new Error(&#x27;The image is empty.&#x27;));</span>
+<span class="a">+    expect(error).not.toBeInstanceOf(OcrStartError);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

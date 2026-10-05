@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread cc3467c5 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit cc3467c56967867422ac0d8a7a88d539a4584441
+truex &lt;truex@equwal.com&gt;
+2026-09-26 23:11:53 -0700
+
+Give the start of OCR a time limit
+
+A download of the language data that stalls, for example behind the
+login page of a public Wi-Fi, does not end by itself. The page time
+limit did not cover the start, so await ocr.start() in readPage waited
+for ever: the strip kept &quot;Reading 0/40 · page 1&quot; and showed no Retry.
+
+createOcrJob (ocr-job.ts) now gives the start a time limit,
+START_LIMIT_MS, the same 120 s as a page. After the limit the start
+rejects with OcrStartError, each page gets that error, and the strip
+shows &quot;OCR could not start&quot; with Retry. The job gives the start an
+AbortSignal. It aborts the signal at the limit and when the job stops
+during a start. createOcr (ocr.ts) then fails the start and stops the
+Web Worker that it kept. A worker that starts after the limit stops.
+
+</pre><pre> README.md            | 16 ++++++++----
+ src/main.ts          | 11 +++++----
+ src/ocr-job.ts       | 61 +++++++++++++++++++++++++++++++++++++++++++---
+ src/ocr.ts           | 28 ++++++++++++++++-----
+ test/ocr-job.test.ts | 69 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ test/ocr.test.ts     | 24 ++++++++++++++++++
+ 6 files changed, 190 insertions(+), 19 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index c586655..5bd0343 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -101,8 +101,9 @@ The strip under the top bar shows three things:</span>
+   It goes away when all pages are read. A page that cannot be read does
+   not stop the others: at the end the strip says &quot;2 pages could not be
+   read.&quot; with Retry, which reads only those pages. When OCR cannot
+<span class="d">-  start, for example with no network on the first run, the strip says</span>
+<span class="d">-  so, with Retry. &quot;Force OCR is on&quot; shows while it is on for the book.</span>
+<span class="a">+  start, for example with no network on the first run, or its start</span>
+<span class="a">+  takes more than 2 minutes, the strip says so, with Retry. &quot;Force OCR</span>
+<span class="a">+  is on&quot; shows while it is on for the book.</span>
+ - The last event, for example a lookup or an error. It fades after 6
+   seconds. Screen readers read this part.
+ 
+<span class="h">@@ -179,7 +180,11 @@ starts a new worker, so one bad page does not stop the reading.</span>
+ 
+ When the OCR worker cannot start, for example because the language data
+ does not load, the app stops that worker too. tesseract.js does not stop
+<span class="d">-it, so without this each Retry left one more worker in memory.</span>
+<span class="a">+it, so without this each Retry left one more worker in memory. The start</span>
+<span class="a">+also has a time limit of 2 minutes: a download of the language data that</span>
+<span class="a">+stalls, for example behind the login page of a public Wi-Fi, does not</span>
+<span class="a">+end by itself. After the limit the strip says that OCR could not start,</span>
+<span class="a">+with Retry.</span>
+ 
+ Both give the same tokens: one box per character with a line id and a
+ word id. The alignment, the mark, the page turn and the lookup work the
+<span class="h">@@ -474,8 +479,9 @@ in a browser bundle.</span>
+ - `src/token-cache.ts`: IndexedDB store for the page tokens, the copy of
+   the last book and the meta data of each book (thin).
+ - `src/ocr.ts`, `src/pdf.ts`: thin browser wrappers around the libraries.
+<span class="d">-  `src/ocr-job.ts`: the start error, the time limit of a page, the new</span>
+<span class="d">-  worker after a failed page and the stop of OCR, without tesseract.js.</span>
+<span class="a">+  `src/ocr-job.ts`: the start error, the time limits of the start and of</span>
+<span class="a">+  a page, the new worker after a failed page and the stop of OCR, without</span>
+<span class="a">+  tesseract.js.</span>
+ - `src/view.ts`: the page view: render to fit the width, draw the mark,
+   scroll to it, render again on a resize.
+ - `src/nav.ts`: page turns by the user: the arrows, the keys, the swipe
+diff --git a/src/main.ts b/src/main.ts
+index 4cb13e2..cdacad6 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -524,8 +524,8 @@ function watchDb(): void {</span>
+ /**
+  * The tokens of one page: from the cache, else the text layer, else OCR.
+  * `force` skips the text layer. Rejects with OcrStartError when the page
+<span class="d">- * needs OCR and OCR cannot start, and with OcrTimeoutError when the OCR of</span>
+<span class="d">- * the page takes too long.</span>
+<span class="a">+ * needs OCR and OCR cannot start or its start takes too long, and with</span>
+<span class="a">+ * OcrTimeoutError when the OCR of the page takes too long.</span>
+  */
+ async function readPage(
+   pdf: PdfDoc,
+<span class="h">@@ -605,10 +605,11 @@ async function readBook(retry = false): Promise&lt;void&gt; {</span>
+   };
+   // The OCR worker, and tesseract.js itself, load on the first page that
+   // needs them. After a page that fails or takes too long, the job stops
+<span class="d">-  // the worker, and the next page starts a new one.</span>
+<span class="d">-  const ocr = createOcrJob&lt;HTMLCanvasElement&gt;(() =&gt;</span>
+<span class="a">+  // the worker, and the next page starts a new one. A start that takes too</span>
+<span class="a">+  // long gives each page the start error, and the strip shows Retry.</span>
+<span class="a">+  const ocr = createOcrJob&lt;HTMLCanvasElement&gt;((signal) =&gt;</span>
+     import(&#x27;./ocr&#x27;).then(
+<span class="d">-      ({ createOcr }) =&gt; createOcr(lang, onOcrProgress),</span>
+<span class="a">+      ({ createOcr }) =&gt; createOcr(lang, onOcrProgress, signal),</span>
+       (err: unknown) =&gt; {
+         throw new OcrStartError(err);
+       },
+diff --git a/src/ocr-job.ts b/src/ocr-job.ts
+index 11f42c8..929f21c 100644
+--- a/src/ocr-job.ts
++++ b/src/ocr-job.ts
+<span class="h">@@ -40,6 +40,14 @@ export function pageTimeLimit(pixels: number): number {</span>
+   return PAGE_LIMIT_MS * Math.max(1, pixels / PAGE_LIMIT_PIXELS);
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * The time limit of the start of OCR: the worker and its core load from the</span>
+<span class="a">+ * app, and at the first run of a language its data loads from the network</span>
+<span class="a">+ * (a few MB). A download that stalls, for example behind the login page of a</span>
+<span class="a">+ * public Wi-Fi, does not end by itself. The limit is the same as for a page.</span>
+<span class="a">+ */</span>
+<span class="a">+export const START_LIMIT_MS = PAGE_LIMIT_MS;</span>
+<span class="a">+</span>
+ /** An OCR worker. In the app, it is tesseract.js (src/ocr.ts). */
+ export interface OcrWorker&lt;Image&gt; {
+   /** Rejects when the worker stops or fails before the page is read. */
+<span class="h">@@ -49,7 +57,10 @@ export interface OcrWorker&lt;Image&gt; {</span>
+ 
+ /** The OCR of one reading of the book. */
+ export interface OcrJob&lt;Image&gt; {
+<span class="d">-  /** Starts a worker when no worker runs. Rejects with the start error. */</span>
+<span class="a">+  /**</span>
+<span class="a">+   * Starts a worker when no worker runs. Rejects with the start error, also</span>
+<span class="a">+   * with OcrStartError when the start takes longer than its time limit.</span>
+<span class="a">+   */</span>
+   start(): Promise&lt;void&gt;;
+   /**
+    * Reads one page. When the page fails or takes longer than `limitMs`, the
+<span class="h">@@ -66,13 +77,56 @@ export interface OcrJob&lt;Image&gt; {</span>
+  * settle the page of a worker that crashed, so the time limit ends such a page,
+  * and the reading goes on. A worker that did not start is not started again:
+  * each page gets the same start error.
+<span class="a">+ *</span>
+<span class="a">+ * A start that takes longer than `startLimitMs` rejects with OcrStartError.</span>
+<span class="a">+ * The signal that `startWorker` gets then aborts, with that error as its</span>
+<span class="a">+ * reason, so that the start can stop its worker. A stop of the job during a</span>
+<span class="a">+ * start aborts the signal too. A worker that starts after the limit stops.</span>
+  */
+<span class="d">-export function createOcrJob&lt;Image&gt;(startWorker: () =&gt; Promise&lt;OcrWorker&lt;Image&gt;&gt;): OcrJob&lt;Image&gt; {</span>
+<span class="a">+export function createOcrJob&lt;Image&gt;(</span>
+<span class="a">+  startWorker: (signal: AbortSignal) =&gt; Promise&lt;OcrWorker&lt;Image&gt;&gt;,</span>
+<span class="a">+  startLimitMs = START_LIMIT_MS,</span>
+<span class="a">+): OcrJob&lt;Image&gt; {</span>
+   let running: Promise&lt;OcrWorker&lt;Image&gt;&gt; | undefined;
+<span class="a">+  /** The control of the start that runs now, if any. */</span>
+<span class="a">+  let starting: AbortController | undefined;</span>
+   let stopped = false;
+<span class="a">+</span>
+<span class="a">+  function startInTime(): Promise&lt;OcrWorker&lt;Image&gt;&gt; {</span>
+<span class="a">+    const control = new AbortController();</span>
+<span class="a">+    starting = control;</span>
+<span class="a">+    const started = startWorker(control.signal);</span>
+<span class="a">+    let timer: ReturnType&lt;typeof setTimeout&gt; | undefined;</span>
+<span class="a">+    const cut = new Promise&lt;never&gt;((_resolve, reject) =&gt; {</span>
+<span class="a">+      control.signal.addEventListener(&#x27;abort&#x27;, () =&gt; reject(control.signal.reason), {</span>
+<span class="a">+        once: true,</span>
+<span class="a">+      });</span>
+<span class="a">+      timer = setTimeout(() =&gt; {</span>
+<span class="a">+        const s = Math.round(startLimitMs / 1000);</span>
+<span class="a">+        control.abort(new OcrStartError(new Error(`The start took more than ${s} s.`)));</span>
+<span class="a">+      }, startLimitMs);</span>
+<span class="a">+    });</span>
+<span class="a">+    const end = (): void =&gt; {</span>
+<span class="a">+      clearTimeout(timer);</span>
+<span class="a">+      if (starting === control) starting = undefined;</span>
+<span class="a">+    };</span>
+<span class="a">+    return Promise.race([started, cut]).then(</span>
+<span class="a">+      (ocr) =&gt; {</span>
+<span class="a">+        end();</span>
+<span class="a">+        return ocr;</span>
+<span class="a">+      },</span>
+<span class="a">+      (err: unknown) =&gt; {</span>
+<span class="a">+        end();</span>
+<span class="a">+        // A worker that starts after the cut stops at once.</span>
+<span class="a">+        stopOcr(started);</span>
+<span class="a">+        throw err;</span>
+<span class="a">+      },</span>
+<span class="a">+    );</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+   const worker = (): Promise&lt;OcrWorker&lt;Image&gt;&gt; =&gt; {
+     if (stopped) return Promise.reject(new Error(&#x27;OCR stopped.&#x27;));
+<span class="d">-    running ??= startWorker();</span>
+<span class="a">+    running ??= startInTime();</span>
+     return running;
+   };
+   return {
+<span class="h">@@ -102,6 +156,7 @@ export function createOcrJob&lt;Image&gt;(startWorker: () =&gt; Promise&lt;OcrWorker&lt;Image&gt;&gt;</span>
+     },
+     stop() {
+       stopped = true;
+<span class="a">+      starting?.abort(new Error(&#x27;OCR stopped.&#x27;));</span>
+       stopOcr(running);
+       running = undefined;
+     },
+diff --git a/src/ocr.ts b/src/ocr.ts
+index 3411341..7a51b86 100644
+--- a/src/ocr.ts
++++ b/src/ocr.ts
+<span class="h">@@ -28,14 +28,20 @@ export interface Ocr {</span>
+ /**
+  * Start an OCR worker for `lang` (&quot;eng&quot;, &quot;jpn&quot;, &quot;jpn_vert&quot;, &quot;jpn+eng&quot;, ...).
+  * `onProgress` gets values in [0, 1] while a page is recognized. Rejects with
+<span class="d">- * OcrStartError when the worker cannot start, and then the worker stops.</span>
+<span class="a">+ * OcrStartError when the worker cannot start, and then the worker stops. An</span>
+<span class="a">+ * abort of `signal` before the worker started stops the start in the same</span>
+<span class="a">+ * way: see createOcrJob.</span>
+  */
+<span class="d">-export async function createOcr(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;Ocr&gt; {</span>
+<span class="a">+export async function createOcr(</span>
+<span class="a">+  lang: string,</span>
+<span class="a">+  onProgress: (p: number) =&gt; void,</span>
+<span class="a">+  signal?: AbortSignal,</span>
+<span class="a">+): Promise&lt;Ocr&gt; {</span>
+   let worker: TesseractWorker;
+   try {
+<span class="d">-    worker = await startWorker(lang, onProgress);</span>
+<span class="a">+    worker = await startWorker(lang, onProgress, signal);</span>
+   } catch (err) {
+<span class="d">-    throw new OcrStartError(err);</span>
+<span class="a">+    throw err instanceof OcrStartError ? err : new OcrStartError(err);</span>
+   }
+   if (lang.includes(&#x27;vert&#x27;)) {
+     try {
+<span class="h">@@ -110,10 +116,19 @@ function ppmOf(canvas: HTMLCanvasElement): ImageLike {</span>
+  * gives the app the worker only after the start. So the start keeps the Web
+  * Worker (see spawnedBy) and stops it when the start fails. Without this,
+  * each Retry, book or setting change left one more worker, each with the
+<span class="d">- * WebAssembly core in its memory.</span>
+<span class="a">+ * WebAssembly core in its memory. An abort of `signal` during the start</span>
+<span class="a">+ * fails the start with the reason of the abort.</span>
+  */
+<span class="d">-function startWorker(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;TesseractWorker&gt; {</span>
+<span class="a">+function startWorker(</span>
+<span class="a">+  lang: string,</span>
+<span class="a">+  onProgress: (p: number) =&gt; void,</span>
+<span class="a">+  signal?: AbortSignal,</span>
+<span class="a">+): Promise&lt;TesseractWorker&gt; {</span>
+   return new Promise((resolve, reject) =&gt; {
+<span class="a">+    if (signal?.aborted) {</span>
+<span class="a">+      reject(signal.reason);</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+     let settled = false;
+     let spawned: Worker | undefined;
+     const fail = (err: unknown): void =&gt; {
+<span class="h">@@ -136,6 +151,7 @@ function startWorker(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;Tes</span>
+       }),
+     );
+     spawned = made.worker;
+<span class="a">+    signal?.addEventListener(&#x27;abort&#x27;, () =&gt; fail(signal.reason), { once: true });</span>
+     made.result.then((worker) =&gt; {
+       settled = true;
+       resolve(worker);
+diff --git a/test/ocr-job.test.ts b/test/ocr-job.test.ts
+index 1fea666..750b6b8 100644
+--- a/test/ocr-job.test.ts
++++ b/test/ocr-job.test.ts
+<span class="h">@@ -5,6 +5,7 @@ import {</span>
+   OcrStartError,
+   OcrTimeoutError,
+   pageTimeLimit,
+<span class="a">+  START_LIMIT_MS,</span>
+   stopOcr,
+   type OcrWorker,
+ } from &#x27;../src/ocr-job&#x27;;
+<span class="h">@@ -168,6 +169,74 @@ describe(&#x27;createOcrJob&#x27;, () =&gt; {</span>
+     expect(start).toHaveBeenCalledTimes(1);
+   });
+ 
+<span class="a">+  /** A start that never ends, as a stalled download. It keeps the signal of each start. */</span>
+<span class="a">+  function stalledStart() {</span>
+<span class="a">+    const signals: AbortSignal[] = [];</span>
+<span class="a">+    const start = vi.fn((signal: AbortSignal) =&gt; {</span>
+<span class="a">+      signals.push(signal);</span>
+<span class="a">+      return new Promise&lt;OcrWorker&lt;string&gt;&gt;(() =&gt; undefined);</span>
+<span class="a">+    });</span>
+<span class="a">+    return { start, signals };</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the start error when the start takes longer than its limit, and stops the start&#x27;, async () =&gt; {</span>
+<span class="a">+    // The finding: a download of the language data that stalls (a captive</span>
+<span class="a">+    // portal) held the start, and so the reading, for ever, with no Retry.</span>
+<span class="a">+    const { start, signals } = stalledStart();</span>
+<span class="a">+    const job = createOcrJob(start, 1000);</span>
+<span class="a">+    let settled = false;</span>
+<span class="a">+    const started = job</span>
+<span class="a">+      .start()</span>
+<span class="a">+      .catch((e: unknown) =&gt; e)</span>
+<span class="a">+      .finally(() =&gt; {</span>
+<span class="a">+        settled = true;</span>
+<span class="a">+      });</span>
+<span class="a">+    await vi.advanceTimersByTimeAsync(999);</span>
+<span class="a">+    expect(settled).toBe(false);</span>
+<span class="a">+    await vi.advanceTimersByTimeAsync(1);</span>
+<span class="a">+    expect(settled).toBe(true);</span>
+<span class="a">+    const error = await started;</span>
+<span class="a">+    expect(error).toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect((error as Error).message).toBe(</span>
+<span class="a">+      &#x27;OCR could not start: Error: The start took more than 1 s.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+    // The start of the worker gets the stop, so that it can stop its worker.</span>
+<span class="a">+    expect(signals[0]?.aborted).toBe(true);</span>
+<span class="a">+    expect(signals[0]?.reason).toBe(error);</span>
+<span class="a">+    // Each page gets the same start error. No new start runs.</span>
+<span class="a">+    await expect(job.recognize(&#x27;page 1&#x27;, 0, 1000)).rejects.toBe(error);</span>
+<span class="a">+    expect(start).toHaveBeenCalledTimes(1);</span>
+<span class="a">+    expect(vi.getTimerCount()).toBe(0);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;stops a worker that starts after the start limit&#x27;, async () =&gt; {</span>
+<span class="a">+    const worker = fakeWorker(readPage);</span>
+<span class="a">+    const start = vi.fn(</span>
+<span class="a">+      () =&gt; new Promise&lt;OcrWorker&lt;string&gt;&gt;((resolve) =&gt; setTimeout(() =&gt; resolve(worker), 2000)),</span>
+<span class="a">+    );</span>
+<span class="a">+    const job = createOcrJob(start, 1000);</span>
+<span class="a">+    const started = job.start().catch((e: unknown) =&gt; e);</span>
+<span class="a">+    await vi.advanceTimersByTimeAsync(1000);</span>
+<span class="a">+    expect(await started).toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect(worker.terminate).not.toHaveBeenCalled();</span>
+<span class="a">+    await vi.advanceTimersByTimeAsync(1000);</span>
+<span class="a">+    expect(worker.terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;stops a start that runs when the job stops&#x27;, async () =&gt; {</span>
+<span class="a">+    const { start, signals } = stalledStart();</span>
+<span class="a">+    const job = createOcrJob(start, 1000);</span>
+<span class="a">+    const started = job.start().catch((e: unknown) =&gt; e);</span>
+<span class="a">+    job.stop();</span>
+<span class="a">+    expect(signals[0]?.aborted).toBe(true);</span>
+<span class="a">+    expect(await started).toEqual(new Error(&#x27;OCR stopped.&#x27;));</span>
+<span class="a">+    expect(vi.getTimerCount()).toBe(0);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the start the limit of a page by default&#x27;, () =&gt; {</span>
+<span class="a">+    expect(START_LIMIT_MS).toBe(pageTimeLimit(0));</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;rejects the page that runs on stop, stops the worker once, and starts no new worker&#x27;, async () =&gt; {
+     const worker = stoppableWorker();
+     const start = vi.fn(() =&gt; Promise.resolve(worker));
+diff --git a/test/ocr.test.ts b/test/ocr.test.ts
+index 7235a02..f2c0b49 100644
+--- a/test/ocr.test.ts
++++ b/test/ocr.test.ts
+<span class="h">@@ -145,6 +145,30 @@ describe(&#x27;createOcr&#x27;, () =&gt; {</span>
+     expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);
+   });
+ 
+<span class="a">+  it(&#x27;stops the Web Worker when the start is cut off&#x27;, async () =&gt; {</span>
+<span class="a">+    // OcrJob cuts off a start that takes too long, for example a download</span>
+<span class="a">+    // of the language data that stalls.</span>
+<span class="a">+    vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);</span>
+<span class="a">+    createWorker.mockImplementation(spawningCreateWorker(() =&gt; new Promise(() =&gt; undefined)));</span>
+<span class="a">+    const controller = new AbortController();</span>
+<span class="a">+    const start = createOcr(&#x27;jpn&#x27;, () =&gt; undefined, controller.signal);</span>
+<span class="a">+    const reason = new OcrStartError(new Error(&#x27;The start took more than 120 s.&#x27;));</span>
+<span class="a">+    controller.abort(reason);</span>
+<span class="a">+    await expect(start).rejects.toBe(reason);</span>
+<span class="a">+    expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  }, 1000);</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;starts no worker when the start is cut off before it begins&#x27;, async () =&gt; {</span>
+<span class="a">+    const controller = new AbortController();</span>
+<span class="a">+    controller.abort(new Error(&#x27;OCR stopped.&#x27;));</span>
+<span class="a">+    const error = await createOcr(&#x27;eng&#x27;, () =&gt; undefined, controller.signal).catch(</span>
+<span class="a">+      (e: unknown) =&gt; e,</span>
+<span class="a">+    );</span>
+<span class="a">+    expect(error).toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect((error as OcrStartError).cause).toEqual(new Error(&#x27;OCR stopped.&#x27;));</span>
+<span class="a">+    expect(createWorker).not.toHaveBeenCalled();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;does not stop the Web Worker for an error after the start&#x27;, async () =&gt; {
+     // After the start, an error belongs to a page. OcrJob stops the worker then.
+     vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);</pre>
+</div></body></html>

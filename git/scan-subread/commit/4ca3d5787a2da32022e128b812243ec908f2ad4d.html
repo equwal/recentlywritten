@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 4ca3d578 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 4ca3d5787a2da32022e128b812243ec908f2ad4d
+truex &lt;truex@equwal.com&gt;
+2026-09-26 13:47:47 -0700
+
+Wait for a dictionary in its own task to close
+
+A dictionary whose PROCESS_TEXT activity opens in a new task gives
+RESULT_CANCELED at once, while it stays on the screen. The lookup then
+resolved at once, and the reader started the player again while the
+dictionary was open.
+
+ReturnWatch follows handleOnPause and handleOnResume of the plugin. A
+result that comes after a pause of the reader ends the lookup at once.
+An immediate result waits for the next resume that follows a pause,
+that is, until the user is back. When no pause comes in 1500 ms, the
+dictionary did not open, and the lookup ends.
+
+Android pauses and resumes a resumed activity around each result that
+it gives, in one message of the main thread. ReturnWatch records each
+pause one message later, so that this pause does not count. JVM tests
+put the calls in the order that Android gives them.
+
+</pre><pre> .../java/com/equwal/scansubread/ReturnWatch.java   | 108 +++++++++++++++++
+ .../java/com/equwal/scansubread/SubReadPlugin.java |  29 ++++-
+ .../com/equwal/scansubread/ReturnWatchTest.java    | 130 +++++++++++++++++++++
+ src/subread.ts                                     |   7 +-
+ 4 files changed, 269 insertions(+), 5 deletions(-)
+</pre><pre>diff --git a/android/app/src/main/java/com/equwal/scansubread/ReturnWatch.java b/android/app/src/main/java/com/equwal/scansubread/ReturnWatch.java
+new file mode 100644
+index 0000000..55b5d19
+--- /dev/null
++++ b/android/app/src/main/java/com/equwal/scansubread/ReturnWatch.java
+<span class="h">@@ -0,0 +1,108 @@</span>
+<span class="a">+package com.equwal.scansubread;</span>
+<span class="a">+</span>
+<span class="a">+import android.os.Handler;</span>
+<span class="a">+import android.os.Looper;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Tells when an app that the plugin started for a result is closed.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Android gives the activity result when the other app closes. But an app</span>
+<span class="a">+ * that opens in a new task (launchMode singleTask or singleInstance, or</span>
+<span class="a">+ * FLAG_ACTIVITY_NEW_TASK) gives RESULT_CANCELED at once, while it stays on</span>
+<span class="a">+ * the screen. The reader must not start the player again at that time.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The other app covers the reader, so the reader pauses. A result that</span>
+<span class="a">+ * comes after such a pause is final: the watch runs its finish at once. For</span>
+<span class="a">+ * an immediate result, the watch keeps the finish and runs it at the next</span>
+<span class="a">+ * resume that follows a pause: then the user is back. When no pause comes</span>
+<span class="a">+ * in {@link #OPEN_MS}, the other app did not open, and the watch runs the</span>
+<span class="a">+ * finish.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Android also pauses a resumed activity to give it a result, and resumes</span>
+<span class="a">+ * it after. That pause and the result come in one message of the main</span>
+<span class="a">+ * thread. The watch records each pause one message later, so that such a</span>
+<span class="a">+ * pause is not a pause after the launch.</span>
+<span class="a">+ *</span>
+<span class="a">+ * All methods run on the main thread, except {@link #launched()}, which the</span>
+<span class="a">+ * plugin calls on its own thread.</span>
+<span class="a">+ */</span>
+<span class="a">+final class ReturnWatch {</span>
+<span class="a">+</span>
+<span class="a">+    /** Runs code later on the main thread. A test gives its own clock. */</span>
+<span class="a">+    interface Later {</span>
+<span class="a">+        void run(Runnable code, long delayMs);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The time that the other app has to open after an immediate result. */</span>
+<span class="a">+    static final long OPEN_MS = 1500;</span>
+<span class="a">+</span>
+<span class="a">+    private final Later later;</span>
+<span class="a">+</span>
+<span class="a">+    /** True when the activity paused after the last launch. */</span>
+<span class="a">+    private boolean pausedSinceLaunch;</span>
+<span class="a">+</span>
+<span class="a">+    /** The finish of a result that came at once. Null when no result waits. */</span>
+<span class="a">+    private Runnable waiting;</span>
+<span class="a">+</span>
+<span class="a">+    /** True when the activity paused after the result that waits. */</span>
+<span class="a">+    private boolean pausedSinceResult;</span>
+<span class="a">+</span>
+<span class="a">+    /** A watch that runs its later code on the main thread. */</span>
+<span class="a">+    ReturnWatch() {</span>
+<span class="a">+        this(new Handler(Looper.getMainLooper())::postDelayed);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    ReturnWatch(Later later) {</span>
+<span class="a">+        this.later = later;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The plugin calls this before it starts an activity for a result. */</span>
+<span class="a">+    synchronized void launched() {</span>
+<span class="a">+        // A new launch ends the wait for the result before it.</span>
+<span class="a">+        finishWaiting();</span>
+<span class="a">+        pausedSinceLaunch = false;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The plugin calls this from handleOnPause. */</span>
+<span class="a">+    synchronized void paused() {</span>
+<span class="a">+        if (waiting != null) pausedSinceResult = true;</span>
+<span class="a">+        later.run(this::markPaused, 0);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private synchronized void markPaused() {</span>
+<span class="a">+        pausedSinceLaunch = true;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The plugin calls this from handleOnResume. */</span>
+<span class="a">+    synchronized void resumed() {</span>
+<span class="a">+        if (pausedSinceResult) finishWaiting();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The plugin calls this from its activity callback, with the code that</span>
+<span class="a">+     * ends the call. The watch runs `finish` now when the other app is</span>
+<span class="a">+     * closed, else when the user is back.</span>
+<span class="a">+     */</span>
+<span class="a">+    synchronized void result(Runnable finish) {</span>
+<span class="a">+        finishWaiting();</span>
+<span class="a">+        if (pausedSinceLaunch) {</span>
+<span class="a">+            finish.run();</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        waiting = finish;</span>
+<span class="a">+        pausedSinceResult = false;</span>
+<span class="a">+        later.run(() -&gt; notOpened(finish), OPEN_MS);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** No pause came after the immediate result: the other app did not open. */</span>
+<span class="a">+    private synchronized void notOpened(Runnable finish) {</span>
+<span class="a">+        if (waiting == finish &amp;&amp; !pausedSinceResult) finishWaiting();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private void finishWaiting() {</span>
+<span class="a">+        Runnable finish = waiting;</span>
+<span class="a">+        waiting = null;</span>
+<span class="a">+        pausedSinceResult = false;</span>
+<span class="a">+        if (finish != null) finish.run();</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+index d472b4a..0fbe0a6 100644
+--- a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
++++ b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+<span class="h">@@ -75,6 +75,19 @@ public class SubReadPlugin extends Plugin {</span>
+     /** The authority that answered last. It is tried first. */
+     private String authority;
+ 
+<span class="a">+    /** Tells when the dictionary is closed. */</span>
+<span class="a">+    private final ReturnWatch returns = new ReturnWatch();</span>
+<span class="a">+</span>
+<span class="a">+    @Override</span>
+<span class="a">+    protected void handleOnPause() {</span>
+<span class="a">+        returns.paused();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Override</span>
+<span class="a">+    protected void handleOnResume() {</span>
+<span class="a">+        returns.resumed();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     // --- The player, through SubRead Overlay ---
+ 
+     private List&lt;String&gt; candidates() {
+<span class="h">@@ -206,6 +219,7 @@ public class SubReadPlugin extends Plugin {</span>
+         ComponentName component = chosen.isEmpty() ? null : ComponentName.unflattenFromString(chosen);
+         if (component != null) {
+             try {
+<span class="a">+                returns.launched();</span>
+                 startActivityForResult(call, new Intent(send).setComponent(component), &quot;lookupResult&quot;);
+                 return;
+             } catch (ActivityNotFoundException e) {
+<span class="h">@@ -213,16 +227,23 @@ public class SubReadPlugin extends Plugin {</span>
+                 prefs().edit().remove(PREF_DICTIONARY).apply();
+             }
+         }
+<span class="a">+        returns.launched();</span>
+         startActivityForResult(call, Intent.createChooser(send, null), &quot;lookupResult&quot;);
+     }
+ 
+<span class="d">-    /** The dictionary closed: the lookup is over. */</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The dictionary gave its result. The lookup is over when the dictionary</span>
+<span class="a">+     * is closed. A dictionary in a new task gives its result at once, so the</span>
+<span class="a">+     * watch can hold the call until the user is back.</span>
+<span class="a">+     */</span>
+     @ActivityCallback
+     private void lookupResult(PluginCall call, ActivityResult result) {
+         if (call == null) return;
+<span class="d">-        JSObject ret = new JSObject();</span>
+<span class="d">-        ret.put(&quot;closed&quot;, true);</span>
+<span class="d">-        call.resolve(ret);</span>
+<span class="a">+        returns.result(() -&gt; {</span>
+<span class="a">+            JSObject ret = new JSObject();</span>
+<span class="a">+            ret.put(&quot;closed&quot;, true);</span>
+<span class="a">+            call.resolve(ret);</span>
+<span class="a">+        });</span>
+     }
+ 
+     @PluginMethod
+diff --git a/android/app/src/test/java/com/equwal/scansubread/ReturnWatchTest.java b/android/app/src/test/java/com/equwal/scansubread/ReturnWatchTest.java
+new file mode 100644
+index 0000000..dc0c4c0
+--- /dev/null
++++ b/android/app/src/test/java/com/equwal/scansubread/ReturnWatchTest.java
+<span class="h">@@ -0,0 +1,130 @@</span>
+<span class="a">+package com.equwal.scansubread;</span>
+<span class="a">+</span>
+<span class="a">+import static org.junit.Assert.assertEquals;</span>
+<span class="a">+</span>
+<span class="a">+import java.util.ArrayList;</span>
+<span class="a">+import java.util.List;</span>
+<span class="a">+import org.junit.Test;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The order of the pauses, the resumes and the result, as Android gives</span>
+<span class="a">+ * them. Each block of calls with no `main.advance` between them is one</span>
+<span class="a">+ * message of the main thread.</span>
+<span class="a">+ */</span>
+<span class="a">+public class ReturnWatchTest {</span>
+<span class="a">+</span>
+<span class="a">+    /** A main thread for the test: posted code runs when the test moves the clock. */</span>
+<span class="a">+    private static final class FakeMain implements ReturnWatch.Later {</span>
+<span class="a">+</span>
+<span class="a">+        private static final class Task {</span>
+<span class="a">+</span>
+<span class="a">+            final long at;</span>
+<span class="a">+            final Runnable code;</span>
+<span class="a">+</span>
+<span class="a">+            Task(long at, Runnable code) {</span>
+<span class="a">+                this.at = at;</span>
+<span class="a">+                this.code = code;</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        private final List&lt;Task&gt; tasks = new ArrayList&lt;&gt;();</span>
+<span class="a">+        private long now;</span>
+<span class="a">+</span>
+<span class="a">+        @Override</span>
+<span class="a">+        public void run(Runnable code, long delayMs) {</span>
+<span class="a">+            tasks.add(new Task(now + delayMs, code));</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+        /** Moves the clock and runs the code that is due, the earliest first. */</span>
+<span class="a">+        void advance(long ms) {</span>
+<span class="a">+            now += ms;</span>
+<span class="a">+            while (true) {</span>
+<span class="a">+                Task next = null;</span>
+<span class="a">+                for (Task t : tasks) if (t.at &lt;= now &amp;&amp; (next == null || t.at &lt; next.at)) next = t;</span>
+<span class="a">+                if (next == null) return;</span>
+<span class="a">+                tasks.remove(next);</span>
+<span class="a">+                next.code.run();</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private final FakeMain main = new FakeMain();</span>
+<span class="a">+    private final ReturnWatch watch = new ReturnWatch(main);</span>
+<span class="a">+    private int finished;</span>
+<span class="a">+    private final Runnable finish = () -&gt; finished++;</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void aResultAfterThePauseForTheOtherAppIsFinal() {</span>
+<span class="a">+        watch.launched();</span>
+<span class="a">+        // The dictionary covers the reader.</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        main.advance(0);</span>
+<span class="a">+        // The user closes the dictionary. Android gives the result before the resume.</span>
+<span class="a">+        watch.result(finish);</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        main.advance(ReturnWatch.OPEN_MS);</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void anImmediateResultWaitsUntilTheUserIsBack() {</span>
+<span class="a">+        watch.launched();</span>
+<span class="a">+        // The dictionary opens in a new task. Android pauses the reader, gives</span>
+<span class="a">+        // RESULT_CANCELED and resumes the reader, in one message.</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        watch.result(finish);</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        main.advance(0);</span>
+<span class="a">+        assertEquals(0, finished);</span>
+<span class="a">+        // Then the dictionary covers the reader.</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        main.advance(ReturnWatch.OPEN_MS);</span>
+<span class="a">+        assertEquals(0, finished);</span>
+<span class="a">+        // The user comes back.</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+        main.advance(ReturnWatch.OPEN_MS);</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void anImmediateResultWithNoPauseAfterItEndsAfterTheOpenTime() {</span>
+<span class="a">+        watch.launched();</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        watch.result(finish);</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        main.advance(ReturnWatch.OPEN_MS - 1);</span>
+<span class="a">+        assertEquals(0, finished);</span>
+<span class="a">+        main.advance(1);</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void aNewLaunchEndsTheWaitOfTheResultBeforeIt() {</span>
+<span class="a">+        watch.launched();</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        watch.result(finish);</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        main.advance(0);</span>
+<span class="a">+        watch.launched();</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+        main.advance(ReturnWatch.OPEN_MS);</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    public void aPauseBeforeTheLaunchDoesNotCount() {</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        main.advance(0);</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        watch.launched();</span>
+<span class="a">+        watch.paused();</span>
+<span class="a">+        watch.result(finish);</span>
+<span class="a">+        watch.resumed();</span>
+<span class="a">+        main.advance(0);</span>
+<span class="a">+        assertEquals(0, finished);</span>
+<span class="a">+        main.advance(ReturnWatch.OPEN_MS);</span>
+<span class="a">+        assertEquals(1, finished);</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/src/subread.ts b/src/subread.ts
+index f3b4f9a..89e7884 100644
+--- a/src/subread.ts
++++ b/src/subread.ts
+<span class="h">@@ -39,7 +39,12 @@ export interface SubReadPlugin {</span>
+    * a screen wake lock where the browser has one; errors are ignored.
+    */
+   keepAwake(options: { on: boolean }): Promise&lt;void&gt;;
+<span class="d">-  /** Opens the dictionary with the text. Resolves when the dictionary closes. */</span>
+<span class="a">+  /**</span>
+<span class="a">+   * Opens the dictionary with the text. Resolves when the dictionary closes.</span>
+<span class="a">+   * A dictionary that opens in its own task answers at once, so for such an</span>
+<span class="a">+   * answer the call waits until the user is back in the reader, or 1.5 s</span>
+<span class="a">+   * when the dictionary did not open.</span>
+<span class="a">+   */</span>
+   lookup(options: { text: string }): Promise&lt;{ closed: boolean }&gt;;
+   dictionaries(): Promise&lt;{ apps: DictionaryApp[]; chosen: string }&gt;;
+   /** An empty component means: ask each time. */</pre>
+</div></body></html>

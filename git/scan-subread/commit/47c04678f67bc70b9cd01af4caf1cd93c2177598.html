@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 47c04678 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 47c04678f67bc70b9cd01af4caf1cd93c2177598
+truex &lt;truex@equwal.com&gt;
+2026-09-26 13:40:01 -0700
+
+Reject a player command that the player did not do
+
+OverlayClock.play, pause and seek resolved when the player answered an error line (error=no_player, error=no_overlay, error=no_notification_access). The UI then said &quot;Audio moved to 00:17.&quot; when the audio did not move. The clock now sets the error state and then rejects with a PlayerError. The reason field and the message hold the reason, for example &quot;no_player&quot;.
+
+LocalAudioClock.play and seek now reject with PlayerError(&quot;no_player&quot;) when no audio is loaded. Before, seek resolved and play failed with the error of the audio element.
+
+</pre><pre> src/clock-source.ts       | 45 ++++++++++++++++++++-------
+ test/clock-source.test.ts | 79 +++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 112 insertions(+), 12 deletions(-)
+</pre><pre>diff --git a/src/clock-source.ts b/src/clock-source.ts
+index 9e92349..a8dc1f7 100644
+--- a/src/clock-source.ts
++++ b/src/clock-source.ts
+<span class="h">@@ -26,6 +26,18 @@ export interface ClockSource {</span>
+   seek(ms: number): Promise&lt;void&gt;;
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * The player did not do a command. The message is the reason, the same</span>
+<span class="a">+ * word as in `ClockState.error`: `no_player`, `no_overlay`,</span>
+<span class="a">+ * `no_notification_access`.</span>
+<span class="a">+ */</span>
+<span class="a">+export class PlayerError extends Error {</span>
+<span class="a">+  constructor(readonly reason: string) {</span>
+<span class="a">+    super(reason);</span>
+<span class="a">+    this.name = &#x27;PlayerError&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The part of the SubRead plugin that the overlay clock uses. */
+ export interface PlayerBridge {
+   playerState(): Promise&lt;StateLine&gt;;
+<span class="h">@@ -161,30 +173,37 @@ export class OverlayClock implements ClockSource {</span>
+     this.emit(positionMs !== undefined);
+   }
+ 
+<span class="d">-  private async send(command: Promise&lt;StateLine&gt;): Promise&lt;string&gt; {</span>
+<span class="a">+  /**</span>
+<span class="a">+   * Waits for the answer to a command. An error line sets the error state,</span>
+<span class="a">+   * and the promise rejects with a PlayerError for the reason.</span>
+<span class="a">+   */</span>
+<span class="a">+  private async send(command: Promise&lt;StateLine&gt;): Promise&lt;void&gt; {</span>
+<span class="a">+    let line: string;</span>
+     try {
+<span class="d">-      return (await command).line;</span>
+<span class="a">+      ({ line } = await command);</span>
+     } catch {
+<span class="d">-      return &#x27;error=no_overlay&#x27;;</span>
+<span class="a">+      line = &#x27;error=no_overlay&#x27;;</span>
+<span class="a">+    }</span>
+<span class="a">+    const parsed = parseState(line);</span>
+<span class="a">+    if (isPlayerError(parsed)) {</span>
+<span class="a">+      this.apply(line, this.now());</span>
+<span class="a">+      throw new PlayerError(parsed.error);</span>
+     }
+   }
+ 
+   async play(): Promise&lt;void&gt; {
+<span class="d">-    const line = await this.send(this.bridge.play());</span>
+<span class="d">-    if (isPlayerError(parseState(line))) this.apply(line, this.now());</span>
+<span class="d">-    else this.local(true);</span>
+<span class="a">+    await this.send(this.bridge.play());</span>
+<span class="a">+    this.local(true);</span>
+   }
+ 
+   async pause(): Promise&lt;void&gt; {
+<span class="d">-    const line = await this.send(this.bridge.pause());</span>
+<span class="d">-    if (isPlayerError(parseState(line))) this.apply(line, this.now());</span>
+<span class="d">-    else this.local(false);</span>
+<span class="a">+    await this.send(this.bridge.pause());</span>
+<span class="a">+    this.local(false);</span>
+   }
+ 
+   async seek(ms: number): Promise&lt;void&gt; {
+<span class="d">-    const line = await this.send(this.bridge.seek({ ms: Math.max(0, Math.round(ms)) }));</span>
+<span class="d">-    if (isPlayerError(parseState(line))) this.apply(line, this.now());</span>
+<span class="d">-    else this.local(this.clock?.playing ?? false, ms);</span>
+<span class="a">+    await this.send(this.bridge.seek({ ms: Math.max(0, Math.round(ms)) }));</span>
+<span class="a">+    this.local(this.clock?.playing ?? false, ms);</span>
+   }
+ }
+ 
+<span class="h">@@ -222,6 +241,7 @@ export class LocalAudioClock implements ClockSource {</span>
+   }
+ 
+   async play(): Promise&lt;void&gt; {
+<span class="a">+    if (!this.audio.src) throw new PlayerError(&#x27;no_player&#x27;);</span>
+     await this.audio.play();
+   }
+ 
+<span class="h">@@ -231,6 +251,7 @@ export class LocalAudioClock implements ClockSource {</span>
+   }
+ 
+   seek(ms: number): Promise&lt;void&gt; {
+<span class="a">+    if (!this.audio.src) return Promise.reject(new PlayerError(&#x27;no_player&#x27;));</span>
+     this.audio.currentTime = Math.max(0, ms) / 1000;
+     return Promise.resolve();
+   }
+diff --git a/test/clock-source.test.ts b/test/clock-source.test.ts
+index bdf54ac..a3f5775 100644
+--- a/test/clock-source.test.ts
++++ b/test/clock-source.test.ts
+<span class="h">@@ -1,7 +1,9 @@</span>
+ import { afterEach, beforeEach, describe, expect, it, vi } from &#x27;vitest&#x27;;
+ import {
+   JUMP_MS,
+<span class="a">+  LocalAudioClock,</span>
+   OverlayClock,
+<span class="a">+  PlayerError,</span>
+   POLL_ERROR_MS,
+   POLL_MS,
+   TICK_MS,
+<span class="h">@@ -9,6 +11,12 @@ import {</span>
+   type PlayerBridge,
+ } from &#x27;../src/clock-source&#x27;;
+ 
+<span class="a">+/** Expects `promise` to reject with a PlayerError for `reason`. */</span>
+<span class="a">+async function expectPlayerError(promise: Promise&lt;void&gt;, reason: string): Promise&lt;void&gt; {</span>
+<span class="a">+  await expect(promise).rejects.toMatchObject({ name: &#x27;PlayerError&#x27;, reason, message: reason });</span>
+<span class="a">+  await expect(promise).rejects.toBeInstanceOf(PlayerError);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** A fake SubRead Overlay: answers the line set in `line`, counts the calls. */
+ function fakeBridge(line: string) {
+   const calls: string[] = [];
+<span class="h">@@ -132,4 +140,75 @@ describe(&#x27;OverlayClock&#x27;, () =&gt; {</span>
+     expect(states.at(-1)!.playing).toBe(false);
+     clock.stop();
+   });
+<span class="a">+</span>
+<span class="a">+  it(&#x27;rejects play, pause and seek when the player answers an error, and keeps the place&#x27;, async () =&gt; {</span>
+<span class="a">+    const bridge = fakeBridge(&#x27;playing=1;position=5000;speed=1;package=p&#x27;);</span>
+<span class="a">+    const states: ClockState[] = [];</span>
+<span class="a">+    const clock = new OverlayClock(bridge, now);</span>
+<span class="a">+    clock.start((s) =&gt; states.push(s));</span>
+<span class="a">+    await vi.advanceTimersByTimeAsync(0);</span>
+<span class="a">+    bridge.line = &#x27;error=no_player&#x27;;</span>
+<span class="a">+    await expectPlayerError(clock.seek(17000), &#x27;no_player&#x27;);</span>
+<span class="a">+    expect(bridge.calls.at(-1)).toBe(&#x27;seek 17000&#x27;);</span>
+<span class="a">+    expect(states.at(-1)).toEqual({</span>
+<span class="a">+      positionMs: 5000,</span>
+<span class="a">+      playing: false,</span>
+<span class="a">+      seeked: false,</span>
+<span class="a">+      error: &#x27;no_player&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    await expectPlayerError(clock.play(), &#x27;no_player&#x27;);</span>
+<span class="a">+    expect(states.at(-1)!.playing).toBe(false);</span>
+<span class="a">+    await expectPlayerError(clock.pause(), &#x27;no_player&#x27;);</span>
+<span class="a">+    bridge.line = &#x27;error=no_notification_access&#x27;;</span>
+<span class="a">+    await expectPlayerError(clock.play(), &#x27;no_notification_access&#x27;);</span>
+<span class="a">+    clock.stop();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;rejects with no_overlay when the bridge fails&#x27;, async () =&gt; {</span>
+<span class="a">+    const bridge = fakeBridge(&#x27;playing=0;position=1000;speed=1;package=p&#x27;);</span>
+<span class="a">+    bridge.play = () =&gt; Promise.reject(new Error(&#x27;no plugin&#x27;));</span>
+<span class="a">+    const states: ClockState[] = [];</span>
+<span class="a">+    const clock = new OverlayClock(bridge, now);</span>
+<span class="a">+    clock.start((s) =&gt; states.push(s));</span>
+<span class="a">+    await vi.advanceTimersByTimeAsync(0);</span>
+<span class="a">+    await expectPlayerError(clock.play(), &#x27;no_overlay&#x27;);</span>
+<span class="a">+    expect(states.at(-1)!.error).toBe(&#x27;no_overlay&#x27;);</span>
+<span class="a">+    clock.stop();</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;LocalAudioClock&#x27;, () =&gt; {</span>
+<span class="a">+  /** A fake audio element. Like a browser, it cannot play without a source. */</span>
+<span class="a">+  function fakeAudio() {</span>
+<span class="a">+    const audio = {</span>
+<span class="a">+      src: &#x27;&#x27;,</span>
+<span class="a">+      currentTime: 0,</span>
+<span class="a">+      paused: true,</span>
+<span class="a">+      play: () =&gt;</span>
+<span class="a">+        audio.src</span>
+<span class="a">+          ? Promise.resolve()</span>
+<span class="a">+          : Promise.reject(new DOMException(&#x27;No supported sources.&#x27;, &#x27;NotSupportedError&#x27;)),</span>
+<span class="a">+      pause: () =&gt; undefined,</span>
+<span class="a">+      addEventListener: () =&gt; undefined,</span>
+<span class="a">+      removeEventListener: () =&gt; undefined,</span>
+<span class="a">+    };</span>
+<span class="a">+    return audio;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;rejects play and seek with no_player when no audio is loaded&#x27;, async () =&gt; {</span>
+<span class="a">+    const audio = fakeAudio();</span>
+<span class="a">+    const clock = new LocalAudioClock(audio as unknown as HTMLAudioElement);</span>
+<span class="a">+    await expectPlayerError(clock.play(), &#x27;no_player&#x27;);</span>
+<span class="a">+    await expectPlayerError(clock.seek(17000), &#x27;no_player&#x27;);</span>
+<span class="a">+    expect(audio.currentTime).toBe(0);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;plays and seeks when audio is loaded&#x27;, async () =&gt; {</span>
+<span class="a">+    const audio = fakeAudio();</span>
+<span class="a">+    audio.src = &#x27;blob:audio&#x27;;</span>
+<span class="a">+    const clock = new LocalAudioClock(audio as unknown as HTMLAudioElement);</span>
+<span class="a">+    await clock.play();</span>
+<span class="a">+    await clock.seek(17000);</span>
+<span class="a">+    expect(audio.currentTime).toBe(17);</span>
+<span class="a">+  });</span>
+ });</pre>
+</div></body></html>

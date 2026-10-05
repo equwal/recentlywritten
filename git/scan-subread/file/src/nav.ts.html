@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread/src/nav.ts - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../../scan-subread/index.html">Log</a> | <a href="../../../scan-subread/files.html">Files</a> | <a href="../../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/nav.ts (8080 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Page turns by the user: the arrows of the top bar, the keys, a swipe on
+<a id="l2" href="#l2">2</a> // the viewer, and the page jump of the page label. Also the long press on
+<a id="l3" href="#l3">3</a> // the viewer, because it shares the pointer events of the swipe. The
+<a id="l4" href="#l4">4</a> // decisions are in paging.ts.
+<a id="l5" href="#l5">5</a> 
+<a id="l6" href="#l6">6</a> import {
+<a id="l7" href="#l7">7</a>   arrowsOff,
+<a id="l8" href="#l8">8</a>   arrowStep,
+<a id="l9" href="#l9">9</a>   keyStep,
+<a id="l10" href="#l10">10</a>   LONG_PRESS_MS,
+<a id="l11" href="#l11">11</a>   movedTooFar,
+<a id="l12" href="#l12">12</a>   parsePage,
+<a id="l13" href="#l13">13</a>   swipeStep,
+<a id="l14" href="#l14">14</a>   type Step,
+<a id="l15" href="#l15">15</a> } from &#x27;./paging&#x27;;
+<a id="l16" href="#l16">16</a> import { say } from &#x27;./status&#x27;;
+<a id="l17" href="#l17">17</a> 
+<a id="l18" href="#l18">18</a> /** A click this soon after the end of a swipe or a long press comes from it, and does no lookup. */
+<a id="l19" href="#l19">19</a> const CLICK_AFTER_SWIPE_MS = 400;
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> /** A click this soon after the tap that cancels the page jump comes from that tap. */
+<a id="l22" href="#l22">22</a> const CLICK_AFTER_CANCEL_MS = 1000;
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> /** A page zoomed in more than this is zoomed. */
+<a id="l25" href="#l25">25</a> const ZOOMED = 1.01;
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> export interface NavElements {
+<a id="l28" href="#l28">28</a>   viewer: HTMLElement;
+<a id="l29" href="#l29">29</a>   pageLeft: HTMLButtonElement;
+<a id="l30" href="#l30">30</a>   pageRight: HTMLButtonElement;
+<a id="l31" href="#l31">31</a>   pageLabel: HTMLButtonElement;
+<a id="l32" href="#l32">32</a>   pageInput: HTMLInputElement;
+<a id="l33" href="#l33">33</a> }
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> export interface NavState {
+<a id="l36" href="#l36">36</a>   /** The count of pages, or 0 with no PDF. */
+<a id="l37" href="#l37">37</a>   pages(): number;
+<a id="l38" href="#l38">38</a>   /** The index of the page shown. */
+<a id="l39" href="#l39">39</a>   current(): number;
+<a id="l40" href="#l40">40</a>   /** True when the pages turn right to left. */
+<a id="l41" href="#l41">41</a>   rtl(): boolean;
+<a id="l42" href="#l42">42</a>   /** True while the drawer covers the page. */
+<a id="l43" href="#l43">43</a>   drawerOpen(): boolean;
+<a id="l44" href="#l44">44</a> }
+<a id="l45" href="#l45">45</a> 
+<a id="l46" href="#l46">46</a> export interface Nav {
+<a id="l47" href="#l47">47</a>   /** Shows the page label, and the state and the names of the arrows. */
+<a id="l48" href="#l48">48</a>   update(): void;
+<a id="l49" href="#l49">49</a>   /** True while the page jump is open. */
+<a id="l50" href="#l50">50</a>   jumpOpen(): boolean;
+<a id="l51" href="#l51">51</a>   /** Closes the page jump. */
+<a id="l52" href="#l52">52</a>   closeJump(): void;
+<a id="l53" href="#l53">53</a> }
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> function zoomed(): boolean {
+<a id="l56" href="#l56">56</a>   return (window.visualViewport?.scale ?? 1) &gt; ZOOMED;
+<a id="l57" href="#l57">57</a> }
+<a id="l58" href="#l58">58</a> 
+<a id="l59" href="#l59">59</a> /**
+<a id="l60" href="#l60">60</a>  * `turnTo(index)` shows the page that the user asked for. `longPress(x, y)`
+<a id="l61" href="#l61">61</a>  * gets a long press on the viewer, in client pixels, and gives true when
+<a id="l62" href="#l62">62</a>  * it used it. Then the click that follows does nothing.
+<a id="l63" href="#l63">63</a>  */
+<a id="l64" href="#l64">64</a> export function setupNav(
+<a id="l65" href="#l65">65</a>   ui: NavElements,
+<a id="l66" href="#l66">66</a>   s: NavState,
+<a id="l67" href="#l67">67</a>   turnTo: (index: number) =&gt; void,
+<a id="l68" href="#l68">68</a>   longPress: (x: number, y: number) =&gt; boolean,
+<a id="l69" href="#l69">69</a> ): Nav {
+<a id="l70" href="#l70">70</a>   function go(step: Step): void {
+<a id="l71" href="#l71">71</a>     const to = s.current() + step;
+<a id="l72" href="#l72">72</a>     if (to &gt;= 0 &amp;&amp; to &lt; s.pages()) turnTo(to);
+<a id="l73" href="#l73">73</a>   }
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a>   // --- The arrows ---
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a>   ui.pageLeft.addEventListener(&#x27;click&#x27;, () =&gt; go(arrowStep(&#x27;left&#x27;, s.rtl())));
+<a id="l78" href="#l78">78</a>   ui.pageRight.addEventListener(&#x27;click&#x27;, () =&gt; go(arrowStep(&#x27;right&#x27;, s.rtl())));
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a>   function name(button: HTMLButtonElement, step: Step): void {
+<a id="l81" href="#l81">81</a>     const text = step &gt; 0 ? &#x27;Next page&#x27; : &#x27;Previous page&#x27;;
+<a id="l82" href="#l82">82</a>     if (button.title === text) return;
+<a id="l83" href="#l83">83</a>     button.title = text;
+<a id="l84" href="#l84">84</a>     button.setAttribute(&#x27;aria-label&#x27;, text);
+<a id="l85" href="#l85">85</a>   }
+<a id="l86" href="#l86">86</a> 
+<a id="l87" href="#l87">87</a>   // --- The keys ---
+<a id="l88" href="#l88">88</a> 
+<a id="l89" href="#l89">89</a>   document.addEventListener(&#x27;keydown&#x27;, (e) =&gt; {
+<a id="l90" href="#l90">90</a>     if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || s.drawerOpen()) return;
+<a id="l91" href="#l91">91</a>     const target = e.target;
+<a id="l92" href="#l92">92</a>     if (
+<a id="l93" href="#l93">93</a>       target instanceof HTMLElement &amp;&amp;
+<a id="l94" href="#l94">94</a>       (target.closest(&#x27;input, select, textarea&#x27;) || target.isContentEditable)
+<a id="l95" href="#l95">95</a>     ) {
+<a id="l96" href="#l96">96</a>       return;
+<a id="l97" href="#l97">97</a>     }
+<a id="l98" href="#l98">98</a>     const step = keyStep(e.key, s.rtl());
+<a id="l99" href="#l99">99</a>     if (step === 0) return;
+<a id="l100" href="#l100">100</a>     e.preventDefault();
+<a id="l101" href="#l101">101</a>     go(step);
+<a id="l102" href="#l102">102</a>   });
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a>   // --- The swipe ---
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a>   // The browser pans the page only vertically, so a sideways move stays
+<a id="l107" href="#l107">107</a>   // with the swipe. A zoomed page pans in each direction.
+<a id="l108" href="#l108">108</a>   const markZoom = (): void =&gt; {
+<a id="l109" href="#l109">109</a>     document.body.classList.toggle(&#x27;zoomed&#x27;, zoomed());
+<a id="l110" href="#l110">110</a>   };
+<a id="l111" href="#l111">111</a>   window.visualViewport?.addEventListener(&#x27;resize&#x27;, markZoom);
+<a id="l112" href="#l112">112</a>   markZoom();
+<a id="l113" href="#l113">113</a> 
+<a id="l114" href="#l114">114</a>   // One finger on the viewer gives a tap, a swipe or a long press, never
+<a id="l115" href="#l115">115</a>   // two of them. A move of more than LONG_PRESS_MOVE stops the long press,
+<a id="l116" href="#l116">116</a>   // and a long press is no swipe.
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a>   /** The finger on the viewer: where it went down, and true after its long press. */
+<a id="l119" href="#l119">119</a>   let start: { id: number; x: number; y: number; pressed: boolean } | null = null;
+<a id="l120" href="#l120">120</a>   let pressTimer: ReturnType&lt;typeof setTimeout&gt; | undefined;
+<a id="l121" href="#l121">121</a>   let swipedAt = -Infinity;
+<a id="l122" href="#l122">122</a>   ui.viewer.addEventListener(&#x27;pointerdown&#x27;, (e) =&gt; {
+<a id="l123" href="#l123">123</a>     clearTimeout(pressTimer);
+<a id="l124" href="#l124">124</a>     // A second finger makes a pinch. The right mouse button opens the menu of the browser.
+<a id="l125" href="#l125">125</a>     if (!e.isPrimary || e.button !== 0) {
+<a id="l126" href="#l126">126</a>       start = null;
+<a id="l127" href="#l127">127</a>       return;
+<a id="l128" href="#l128">128</a>     }
+<a id="l129" href="#l129">129</a>     const finger = { id: e.pointerId, x: e.clientX, y: e.clientY, pressed: false };
+<a id="l130" href="#l130">130</a>     start = finger;
+<a id="l131" href="#l131">131</a>     pressTimer = setTimeout(() =&gt; {
+<a id="l132" href="#l132">132</a>       if (start !== finger || s.drawerOpen()) return;
+<a id="l133" href="#l133">133</a>       finger.pressed = longPress(finger.x, finger.y);
+<a id="l134" href="#l134">134</a>     }, LONG_PRESS_MS);
+<a id="l135" href="#l135">135</a>   });
+<a id="l136" href="#l136">136</a>   ui.viewer.addEventListener(&#x27;pointermove&#x27;, (e) =&gt; {
+<a id="l137" href="#l137">137</a>     if (
+<a id="l138" href="#l138">138</a>       start &amp;&amp;
+<a id="l139" href="#l139">139</a>       e.pointerId === start.id &amp;&amp;
+<a id="l140" href="#l140">140</a>       movedTooFar(e.clientX - start.x, e.clientY - start.y)
+<a id="l141" href="#l141">141</a>     ) {
+<a id="l142" href="#l142">142</a>       clearTimeout(pressTimer);
+<a id="l143" href="#l143">143</a>     }
+<a id="l144" href="#l144">144</a>   });
+<a id="l145" href="#l145">145</a>   ui.viewer.addEventListener(&#x27;pointercancel&#x27;, () =&gt; {
+<a id="l146" href="#l146">146</a>     clearTimeout(pressTimer);
+<a id="l147" href="#l147">147</a>     start = null;
+<a id="l148" href="#l148">148</a>   });
+<a id="l149" href="#l149">149</a>   // Android shows a menu for a long press on the page. The long press makes a card instead.
+<a id="l150" href="#l150">150</a>   ui.viewer.addEventListener(&#x27;contextmenu&#x27;, (e) =&gt; {
+<a id="l151" href="#l151">151</a>     if (start) e.preventDefault();
+<a id="l152" href="#l152">152</a>   });
+<a id="l153" href="#l153">153</a>   ui.viewer.addEventListener(&#x27;pointerup&#x27;, (e) =&gt; {
+<a id="l154" href="#l154">154</a>     if (!start || e.pointerId !== start.id) return;
+<a id="l155" href="#l155">155</a>     clearTimeout(pressTimer);
+<a id="l156" href="#l156">156</a>     const dx = e.clientX - start.x;
+<a id="l157" href="#l157">157</a>     const dy = e.clientY - start.y;
+<a id="l158" href="#l158">158</a>     const pressed = start.pressed;
+<a id="l159" href="#l159">159</a>     start = null;
+<a id="l160" href="#l160">160</a>     // The click after a long press is not a tap on a word.
+<a id="l161" href="#l161">161</a>     if (pressed) {
+<a id="l162" href="#l162">162</a>       swipedAt = e.timeStamp;
+<a id="l163" href="#l163">163</a>       return;
+<a id="l164" href="#l164">164</a>     }
+<a id="l165" href="#l165">165</a>     if (s.drawerOpen()) return;
+<a id="l166" href="#l166">166</a>     const v = ui.viewer;
+<a id="l167" href="#l167">167</a>     const step = swipeStep(
+<a id="l168" href="#l168">168</a>       { dx, dy, zoomed: zoomed(), wide: v.scrollWidth &gt; v.clientWidth + 1 },
+<a id="l169" href="#l169">169</a>       s.rtl(),
+<a id="l170" href="#l170">170</a>     );
+<a id="l171" href="#l171">171</a>     if (step === 0) return;
+<a id="l172" href="#l172">172</a>     swipedAt = e.timeStamp;
+<a id="l173" href="#l173">173</a>     go(step);
+<a id="l174" href="#l174">174</a>   });
+<a id="l175" href="#l175">175</a>   // The click after a swipe is not a tap on a word.
+<a id="l176" href="#l176">176</a>   ui.viewer.addEventListener(
+<a id="l177" href="#l177">177</a>     &#x27;click&#x27;,
+<a id="l178" href="#l178">178</a>     (e) =&gt; {
+<a id="l179" href="#l179">179</a>       if (e.timeStamp - swipedAt &lt; CLICK_AFTER_SWIPE_MS) {
+<a id="l180" href="#l180">180</a>         swipedAt = -Infinity;
+<a id="l181" href="#l181">181</a>         e.stopPropagation();
+<a id="l182" href="#l182">182</a>         e.preventDefault();
+<a id="l183" href="#l183">183</a>       }
+<a id="l184" href="#l184">184</a>     },
+<a id="l185" href="#l185">185</a>     true,
+<a id="l186" href="#l186">186</a>   );
+<a id="l187" href="#l187">187</a> 
+<a id="l188" href="#l188">188</a>   // --- The page jump ---
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a>   function openJump(): void {
+<a id="l191" href="#l191">191</a>     if (s.pages() === 0) return;
+<a id="l192" href="#l192">192</a>     ui.pageInput.value = String(s.current() + 1);
+<a id="l193" href="#l193">193</a>     ui.pageInput.placeholder = `1-${s.pages()}`;
+<a id="l194" href="#l194">194</a>     ui.pageLabel.hidden = true;
+<a id="l195" href="#l195">195</a>     ui.pageInput.hidden = false;
+<a id="l196" href="#l196">196</a>     ui.pageInput.focus();
+<a id="l197" href="#l197">197</a>     ui.pageInput.select();
+<a id="l198" href="#l198">198</a>   }
+<a id="l199" href="#l199">199</a> 
+<a id="l200" href="#l200">200</a>   function closeJump(): void {
+<a id="l201" href="#l201">201</a>     if (ui.pageInput.hidden) return;
+<a id="l202" href="#l202">202</a>     ui.pageInput.hidden = true;
+<a id="l203" href="#l203">203</a>     ui.pageLabel.hidden = false;
+<a id="l204" href="#l204">204</a>   }
+<a id="l205" href="#l205">205</a> 
+<a id="l206" href="#l206">206</a>   ui.pageLabel.addEventListener(&#x27;click&#x27;, openJump);
+<a id="l207" href="#l207">207</a>   ui.pageInput.addEventListener(&#x27;keydown&#x27;, (e) =&gt; {
+<a id="l208" href="#l208">208</a>     if (e.key === &#x27;Escape&#x27;) {
+<a id="l209" href="#l209">209</a>       e.preventDefault();
+<a id="l210" href="#l210">210</a>       closeJump();
+<a id="l211" href="#l211">211</a>       ui.pageLabel.focus();
+<a id="l212" href="#l212">212</a>     } else if (e.key === &#x27;Enter&#x27;) {
+<a id="l213" href="#l213">213</a>       e.preventDefault();
+<a id="l214" href="#l214">214</a>       const index = parsePage(ui.pageInput.value, s.pages());
+<a id="l215" href="#l215">215</a>       if (index === null) {
+<a id="l216" href="#l216">216</a>         say(`Type a page number from 1 to ${s.pages()}.`);
+<a id="l217" href="#l217">217</a>         return;
+<a id="l218" href="#l218">218</a>       }
+<a id="l219" href="#l219">219</a>       closeJump();
+<a id="l220" href="#l220">220</a>       ui.pageLabel.focus();
+<a id="l221" href="#l221">221</a>       if (index !== s.current()) turnTo(index);
+<a id="l222" href="#l222">222</a>     }
+<a id="l223" href="#l223">223</a>   });
+<a id="l224" href="#l224">224</a>   // Tab or another focus change cancels the jump.
+<a id="l225" href="#l225">225</a>   ui.pageInput.addEventListener(&#x27;blur&#x27;, closeJump);
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a>   // A tap outside the open page jump only cancels it: the click that
+<a id="l228" href="#l228">228</a>   // follows does nothing else.
+<a id="l229" href="#l229">229</a>   let cancelledAt = -Infinity;
+<a id="l230" href="#l230">230</a>   document.addEventListener(
+<a id="l231" href="#l231">231</a>     &#x27;pointerdown&#x27;,
+<a id="l232" href="#l232">232</a>     (e) =&gt; {
+<a id="l233" href="#l233">233</a>       if (ui.pageInput.hidden || e.target === ui.pageInput) return;
+<a id="l234" href="#l234">234</a>       closeJump();
+<a id="l235" href="#l235">235</a>       cancelledAt = e.timeStamp;
+<a id="l236" href="#l236">236</a>     },
+<a id="l237" href="#l237">237</a>     true,
+<a id="l238" href="#l238">238</a>   );
+<a id="l239" href="#l239">239</a>   document.addEventListener(
+<a id="l240" href="#l240">240</a>     &#x27;click&#x27;,
+<a id="l241" href="#l241">241</a>     (e) =&gt; {
+<a id="l242" href="#l242">242</a>       if (e.timeStamp - cancelledAt &lt; CLICK_AFTER_CANCEL_MS) {
+<a id="l243" href="#l243">243</a>         cancelledAt = -Infinity;
+<a id="l244" href="#l244">244</a>         e.stopPropagation();
+<a id="l245" href="#l245">245</a>         e.preventDefault();
+<a id="l246" href="#l246">246</a>       }
+<a id="l247" href="#l247">247</a>     },
+<a id="l248" href="#l248">248</a>     true,
+<a id="l249" href="#l249">249</a>   );
+<a id="l250" href="#l250">250</a> 
+<a id="l251" href="#l251">251</a>   return {
+<a id="l252" href="#l252">252</a>     update() {
+<a id="l253" href="#l253">253</a>       const pages = s.pages();
+<a id="l254" href="#l254">254</a>       const page = s.current();
+<a id="l255" href="#l255">255</a>       const rtl = s.rtl();
+<a id="l256" href="#l256">256</a>       ui.pageLabel.disabled = pages === 0;
+<a id="l257" href="#l257">257</a>       ui.pageLabel.textContent = pages &gt; 0 ? `${page + 1} / ${pages}` : &#x27;No PDF&#x27;;
+<a id="l258" href="#l258">258</a>       ui.pageLabel.setAttribute(
+<a id="l259" href="#l259">259</a>         &#x27;aria-label&#x27;,
+<a id="l260" href="#l260">260</a>         pages &gt; 0 ? `Page ${page + 1} of ${pages}. Go to a page.` : &#x27;No PDF&#x27;,
+<a id="l261" href="#l261">261</a>       );
+<a id="l262" href="#l262">262</a>       const off = arrowsOff(page, pages, rtl);
+<a id="l263" href="#l263">263</a>       ui.pageLeft.disabled = off.left;
+<a id="l264" href="#l264">264</a>       ui.pageRight.disabled = off.right;
+<a id="l265" href="#l265">265</a>       name(ui.pageLeft, arrowStep(&#x27;left&#x27;, rtl));
+<a id="l266" href="#l266">266</a>       name(ui.pageRight, arrowStep(&#x27;right&#x27;, rtl));
+<a id="l267" href="#l267">267</a>       if (pages === 0) closeJump();
+<a id="l268" href="#l268">268</a>     },
+<a id="l269" href="#l269">269</a>     jumpOpen: () =&gt; !ui.pageInput.hidden,
+<a id="l270" href="#l270">270</a>     closeJump,
+<a id="l271" href="#l271">271</a>   };
+<a id="l272" href="#l272">272</a> }</pre>
+</div></body></html>

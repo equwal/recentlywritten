@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync 86f331ce - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 86f331ce8400642a39426246f31c219b43716250
+equwal &lt;truex@equwal.com&gt;
+2026-09-25 02:53:09 -0700
+
+Default feeds for new accounts, and the daily email on by default
+
+SBM_DEFAULT_FEEDS names the feeds that an account follows until it
+unfollows them: an account without a feeds.txt has these, and its own
+file counts as soon as it changes the list, also when the file is empty.
+On sbmsync.com the default is the feed of recentlywritten.com.
+
+The daily email is now on for every account that the server can send
+email to. The account gave its address at sign-up. The setting is
+NoMail, so the accounts from before this change get the email too. A
+save of the settings without the email box, on a server that sends no
+email, keeps the choice. The first run for an account still sends
+nothing: it only notes the items of that day.
+
+</pre><pre> README.md       | 12 ++++++---
+ feed.go         | 51 ++++++++++++++++++++++++++++++---------
+ feed_test.go    | 75 ++++++++++++++++++++++++++++++++++++++++++++++++++++-----
+ feedjob.go      | 10 ++++----
+ feedjob_test.go | 21 +++++++++-------
+ main.go         |  3 +++
+ pages.html      |  4 +--
+ store.go        | 16 +++++++-----
+ 8 files changed, 149 insertions(+), 43 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 4e6aae1..a22e842 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -76,15 +76,19 @@ It uses [sfeed](https://codemadness.org/sfeed.html) on the server:</span>
+ 
+ - Follow a feed: type its address and a name. The list is one plain file,
+   `feeds.txt`, with one feed on each line: the URL, a tab and the name.
+<span class="a">+  A new account starts with the default feeds of the server</span>
+<span class="a">+  (`SBM_DEFAULT_FEEDS`; on sbmsync.com, the feed of recentlywritten.com).</span>
+<span class="a">+  You can unfollow them like any other feed.</span>
+ - The server fetches the feeds every 30 minutes with `sfeed_update` and
+   shows the items newest first, with the feed, the time and the author. A
+   setting opens the links in a new tab.
+ - Explore: turn it on, and the server looks through your bookmarked pages
+   for feeds with `sfeed_web`, 20 pages with each update, and offers what it
+   finds.
+<span class="d">-- Digest: turn it on, and the server sends you the new items by email once</span>
+<span class="d">-  a day, in the form of `sfeed_plain`. The first day after you turn it on</span>
+<span class="d">-  sends nothing, so that you do not get the whole history.</span>
+<span class="a">+- Digest: the server sends you the new items by email once a day, in the</span>
+<span class="a">+  form of `sfeed_plain`, unless you turn that off in the settings of the</span>
+<span class="a">+  page. The first day sends nothing, so that you do not get the whole</span>
+<span class="a">+  history. A server without an SMTP server sends no digest.</span>
+ 
+ Read the feed in a terminal with the token of a device (`bm-sync login`
+ keeps one in `~/.config/sbm/sync`):
+<span class="h">@@ -212,6 +216,8 @@ All settings come from the environment. With Docker, put them in `.env`.</span>
+     SBM_SMTP_PASSWORD  password on the SMTP server
+     SBM_MAIL_FROM   sender, as &quot;sbm Sync &lt;sync@example.org&gt;&quot; (default
+                     SBM_SMTP_USER)
+<span class="a">+    SBM_DEFAULT_FEEDS  feed URLs, with spaces between them, that a new</span>
+<span class="a">+                    account follows until it unfollows them (optional)</span>
+ 
+ Without `SBM_SMTP_HOST`, the server sends no email, and accounts need no
+ email check. With it, each new account gets an email with a link. The
+diff --git a/feed.go b/feed.go
+index 3d8d537..d2da8f1 100644
+--- a/feed.go
++++ b/feed.go
+<span class="h">@@ -23,6 +23,7 @@ package main</span>
+ 
+ import (
+ 	&quot;errors&quot;
+<span class="a">+	&quot;fmt&quot;</span>
+ 	&quot;io&quot;
+ 	&quot;io/fs&quot;
+ 	&quot;net/http&quot;
+<span class="h">@@ -52,10 +53,11 @@ var (</span>
+ 	notFile      = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+ )
+ 
+<span class="d">-// feedSettings are the feed choices of an account.</span>
+<span class="a">+// feedSettings are the feed choices of an account. The daily email is on</span>
+<span class="a">+// by default: the account gave its address at sign-up.</span>
+ type feedSettings struct {
+ 	NewTab  bool `json:&quot;newtab,omitempty&quot;`  // the feed page opens links in a new tab
+<span class="d">-	Mail    bool `json:&quot;mail,omitempty&quot;`    // an email with the new items, once a day</span>
+<span class="a">+	NoMail  bool `json:&quot;nomail,omitempty&quot;`  // no email with the new items once a day</span>
+ 	Explore bool `json:&quot;explore,omitempty&quot;` // the job looks through the bookmarks for feeds
+ }
+ 
+<span class="h">@@ -219,18 +221,39 @@ func (s *Store) feedDir(id string) string {</span>
+ 	return filepath.Join(s.dir, &quot;feeds&quot;, id)
+ }
+ 
+<span class="d">-// readFeeds gives feeds.txt of the account. A missing file is empty.</span>
+<span class="d">-func (s *Store) readFeeds(a *Account) (string, error) {</span>
+<span class="d">-	m := s.lock(a.ID)</span>
+<span class="d">-	m.Lock()</span>
+<span class="d">-	defer m.Unlock()</span>
+<span class="a">+// defaultFeeds gives the feeds.txt of a new account from the setting</span>
+<span class="a">+// SBM_DEFAULT_FEEDS: feed URLs with spaces between them. The host of each</span>
+<span class="a">+// URL is its name.</span>
+<span class="a">+func defaultFeeds(setting string) (string, error) {</span>
+<span class="a">+	var ls []string</span>
+<span class="a">+	for _, u := range strings.Fields(setting) {</span>
+<span class="a">+		u, err := feedURL(u)</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			return &quot;&quot;, fmt.Errorf(&quot;SBM_DEFAULT_FEEDS: %q: %v&quot;, u, err)</span>
+<span class="a">+		}</span>
+<span class="a">+		ls = append(ls, u+&quot;\t&quot;+feedName(&quot;&quot;, u))</span>
+<span class="a">+	}</span>
+<span class="a">+	return join(ls), nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feedsText gives feeds.txt of the account. The caller holds the lock of</span>
+<span class="a">+// the account. An account without the file has the default feeds.</span>
+<span class="a">+func (s *Store) feedsText(a *Account) (string, error) {</span>
+ 	b, err := os.ReadFile(filepath.Join(s.feedDir(a.ID), &quot;feeds.txt&quot;))
+ 	if errors.Is(err, fs.ErrNotExist) {
+<span class="d">-		return &quot;&quot;, nil</span>
+<span class="a">+		return s.defaultFeeds, nil</span>
+ 	}
+ 	return string(b), err
+ }
+ 
+<span class="a">+// readFeeds gives feeds.txt of the account.</span>
+<span class="a">+func (s *Store) readFeeds(a *Account) (string, error) {</span>
+<span class="a">+	m := s.lock(a.ID)</span>
+<span class="a">+	m.Lock()</span>
+<span class="a">+	defer m.Unlock()</span>
+<span class="a">+	return s.feedsText(a)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // changeFeeds gives feeds.txt to f and writes what f gives back. No other
+ // change to the file comes between the two.
+ func (s *Store) changeFeeds(a *Account, f func(text string) (string, error)) error {
+<span class="h">@@ -238,11 +261,11 @@ func (s *Store) changeFeeds(a *Account, f func(text string) (string, error)) err</span>
+ 	m.Lock()
+ 	defer m.Unlock()
+ 	dir := s.feedDir(a.ID)
+<span class="d">-	b, err := os.ReadFile(filepath.Join(dir, &quot;feeds.txt&quot;))</span>
+<span class="d">-	if err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+	old, err := s.feedsText(a)</span>
+<span class="a">+	if err != nil {</span>
+ 		return err
+ 	}
+<span class="d">-	text, err := f(string(b))</span>
+<span class="a">+	text, err := f(old)</span>
+ 	if err != nil {
+ 		return err
+ 	}
+<span class="h">@@ -498,9 +521,13 @@ func (s *server) saveFeedSettings(w http.ResponseWriter, r *http.Request) {</span>
+ 	r.Body = http.MaxBytesReader(w, r.Body, maxForm)
+ 	f := feedSettings{
+ 		NewTab:  r.PostFormValue(&quot;newtab&quot;) != &quot;&quot;,
+<span class="d">-		Mail:    s.mail != nil &amp;&amp; r.PostFormValue(&quot;mail&quot;) != &quot;&quot;,</span>
+<span class="a">+		NoMail:  s.store.view(u).Feed.NoMail,</span>
+ 		Explore: r.PostFormValue(&quot;explore&quot;) != &quot;&quot;,
+ 	}
+<span class="a">+	// The form has the email box only when the server sends email.</span>
+<span class="a">+	if s.mail != nil {</span>
+<span class="a">+		f.NoMail = r.PostFormValue(&quot;mail&quot;) == &quot;&quot;</span>
+<span class="a">+	}</span>
+ 	if err := s.store.setFeed(u, f); err != nil {
+ 		s.fail(w, err)
+ 		return
+diff --git a/feed_test.go b/feed_test.go
+index f28caf5..174af58 100644
+--- a/feed_test.go
++++ b/feed_test.go
+<span class="h">@@ -10,6 +10,7 @@ import (</span>
+ 	&quot;slices&quot;
+ 	&quot;strings&quot;
+ 	&quot;testing&quot;
+<span class="a">+	&quot;time&quot;</span>
+ 
+ 	&quot;pgregory.net/rapid&quot;
+ )
+<span class="h">@@ -127,6 +128,59 @@ func TestFollowAndUnfollow(t *testing.T) {</span>
+ 	}
+ }
+ 
+<span class="a">+// A new account follows the default feeds of the server. It can unfollow</span>
+<span class="a">+// them, and they do not come back.</span>
+<span class="a">+func TestDefaultFeeds(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.s.store.defaultFeeds = &quot;https://recentlywritten.com/rss.xml\trecentlywritten.com\n&quot;</span>
+<span class="a">+	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	a := e.s.store.byTok(tok)</span>
+<span class="a">+	if got := e.feedsOf(tok); got != e.s.store.defaultFeeds {</span>
+<span class="a">+		t.Fatalf(&quot;feeds of a new account: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/feed&quot;), `&lt;a href=&quot;/feed?feed=recentlywritten.com&quot;&gt;recentlywritten.com&lt;/a&gt;`) {</span>
+<span class="a">+		t.Error(&quot;the page does not show the default feed&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	// The job fetches the default feed of an account that never opened the page.</span>
+<span class="a">+	f := &amp;fakeTools{items: map[string]string{&quot;https://recentlywritten.com/rss.xml&quot;: oneItem}, now: time.Now()}</span>
+<span class="a">+	e.s.feeds = f.tools()</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if !strings.Contains(e.feedFile(a, &quot;sfeedrc&quot;), &quot;&#x27;https://recentlywritten.com/rss.xml&#x27;&quot;) {</span>
+<span class="a">+		t.Error(&quot;the job does not fetch the default feed&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/add&quot;, url.Values{&quot;url&quot;: {&quot;https://a.org/rss.xml&quot;}, &quot;name&quot;: {&quot;A&quot;}})</span>
+<span class="a">+	if got := e.feedsOf(tok); got != e.s.store.defaultFeeds+&quot;https://a.org/rss.xml\tA\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;after a follow: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/delete&quot;, url.Values{&quot;url&quot;: {&quot;https://recentlywritten.com/rss.xml&quot;}})</span>
+<span class="a">+	if got := e.feedsOf(tok); got != &quot;https://a.org/rss.xml\tA\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;after the unfollow of the default feed: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/delete&quot;, url.Values{&quot;url&quot;: {&quot;https://a.org/rss.xml&quot;}})</span>
+<span class="a">+	if got := e.feedsOf(tok); got != &quot;&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;after the unfollow of all feeds, the default is back: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if got := e.feedsOf(tok); got != &quot;&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;the job brought the default feed back: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestDefaultFeedsSetting(t *testing.T) {</span>
+<span class="a">+	got, err := defaultFeeds(&quot; https://recentlywritten.com/rss.xml\nhttp://a.org/feed &quot;)</span>
+<span class="a">+	if err != nil || got != &quot;https://recentlywritten.com/rss.xml\trecentlywritten.com\nhttp://a.org/feed\ta.org\n&quot; {</span>
+<span class="a">+		t.Errorf(&quot;defaultFeeds = %q, %v&quot;, got, err)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got, err := defaultFeeds(&quot;&quot;); err != nil || got != &quot;&quot; {</span>
+<span class="a">+		t.Errorf(&quot;empty setting: %q, %v&quot;, got, err)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, bad := range []string{&quot;ftp://a.org/feed&quot;, &quot;https://a.org/it&#x27;s&quot;, &quot;a.org/feed&quot;} {</span>
+<span class="a">+		if _, err := defaultFeeds(bad); err == nil {</span>
+<span class="a">+			t.Errorf(&quot;defaultFeeds(%q) gave no error&quot;, bad)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func TestFeedLimit(t *testing.T) {
+ 	e := newEnv(t, false)
+ 	c, tok, _ := e.account(&quot;&quot;)
+<span class="h">@@ -211,6 +265,8 @@ func TestFeedPages(t *testing.T) {</span>
+ 	}
+ }
+ 
+<span class="a">+// The daily email is on by default. The page offers the box only when the</span>
+<span class="a">+// server sends email, and a save without the box keeps the choice.</span>
+ func TestFeedMailSettingNeedsAnSMTPServer(t *testing.T) {
+ 	e := newEnv(t, false)
+ 	c, tok, _ := e.account(&quot;&quot;)
+<span class="h">@@ -218,17 +274,24 @@ func TestFeedMailSettingNeedsAnSMTPServer(t *testing.T) {</span>
+ 	if strings.Contains(e.body(c, &quot;/feed&quot;), `name=&quot;mail&quot;`) {
+ 		t.Error(&quot;the page offers the digest without an SMTP server&quot;)
+ 	}
+<span class="d">-	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}, &quot;explore&quot;: {&quot;on&quot;}})</span>
+<span class="d">-	if f := e.s.store.view(a).Feed; f.Mail || !f.Explore {</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;explore&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	if f := e.s.store.view(a).Feed; f.NoMail || !f.Explore {</span>
+ 		t.Errorf(&quot;settings without an SMTP server: %+v&quot;, f)
+ 	}
+ 	e.withMail()
+<span class="d">-	if !strings.Contains(e.body(c, &quot;/feed&quot;), `name=&quot;mail&quot;`) {</span>
+<span class="d">-		t.Error(&quot;the page does not offer the digest&quot;)</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/feed&quot;), `&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;mail&quot; checked&gt;`) {</span>
+<span class="a">+		t.Error(&quot;the page does not offer the digest, on&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{})</span>
+<span class="a">+	if f := e.s.store.view(a).Feed; !f.NoMail || f.Explore {</span>
+<span class="a">+		t.Errorf(&quot;settings with the box cleared: %+v&quot;, f)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/feed&quot;), `&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;mail&quot;&gt;`) {</span>
+<span class="a">+		t.Error(&quot;the page shows the digest on&quot;)</span>
+ 	}
+ 	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})
+<span class="d">-	if f := e.s.store.view(a).Feed; !f.Mail || f.Explore {</span>
+<span class="d">-		t.Errorf(&quot;settings with an SMTP server: %+v&quot;, f)</span>
+<span class="a">+	if f := e.s.store.view(a).Feed; f.NoMail {</span>
+<span class="a">+		t.Errorf(&quot;settings with the box ticked: %+v&quot;, f)</span>
+ 	}
+ }
+ 
+diff --git a/feedjob.go b/feedjob.go
+index 2f991fe..61b4fdf 100644
+--- a/feedjob.go
++++ b/feedjob.go
+<span class="h">@@ -7,8 +7,8 @@ package main</span>
+ //     each feed and merges the new items into items/&lt;file&gt;;
+ //  2. when the account asked for it, looks through the bookmarks of the
+ //     account for feeds with sfeed_web, and keeps what it found in explore;
+<span class="d">-//  3. when the account asked for it, sends the items that are new since the</span>
+<span class="d">-//     last digest by email, once a day, in the form of sfeed_plain.</span>
+<span class="a">+//  3. unless the account turned it off, sends the items that are new since</span>
+<span class="a">+//     the last digest by email, once a day, in the form of sfeed_plain.</span>
+ //
+ // The job writes only its own files under feeds/&lt;account&gt;/. The web server
+ // writes only feeds.txt and accounts.json. So the two never write the same
+<span class="h">@@ -183,7 +183,7 @@ func (s *server) feedAccount(p *Account) error {</span>
+ 		}
+ 		feeds = append(feeds, f)
+ 	}
+<span class="d">-	if len(feeds) == 0 &amp;&amp; !a.Feed.Explore &amp;&amp; !a.Feed.Mail {</span>
+<span class="a">+	if len(feeds) == 0 &amp;&amp; !a.Feed.Explore {</span>
+ 		if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+ 			return nil // the account never used feeds
+ 		}
+<span class="h">@@ -224,7 +224,7 @@ func (s *server) feedAccount(p *Account) error {</span>
+ 			log.Printf(&quot;account %s: explore: %v&quot;, a.ID, err)
+ 		}
+ 	}
+<span class="d">-	if !a.Feed.Mail {</span>
+<span class="a">+	if a.Feed.NoMail {</span>
+ 		os.Remove(filepath.Join(dir, &quot;mailed&quot;))
+ 		os.Remove(filepath.Join(dir, &quot;digest&quot;))
+ 	} else if s.mail != nil &amp;&amp; s.verified(a) &amp;&amp; s.active(a) {
+<span class="h">@@ -294,7 +294,7 @@ func (s *server) explore(p *Account, dir string, cache map[string]bool) error {</span>
+ }
+ 
+ // digest sends the items that came in since the last digest, once a day.
+<span class="d">-// The first run after the opt-in sends nothing: it only notes the items of</span>
+<span class="a">+// The first run for an account sends nothing: it only notes the items of</span>
+ // that day, so that nobody gets the whole history.
+ func (s *server) digest(a Account, dir string, feeds []Feed) error {
+ 	mailedPath, digestPath := filepath.Join(dir, &quot;mailed&quot;), filepath.Join(dir, &quot;digest&quot;)
+diff --git a/feedjob_test.go b/feedjob_test.go
+index c109207..ee645df 100644
+--- a/feedjob_test.go
++++ b/feedjob_test.go
+<span class="h">@@ -151,12 +151,8 @@ func TestJobSendsADailyDigest(t *testing.T) {</span>
+ 	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: oneItem}, now: start}
+ 	e.s.feeds = f.tools()
+ 
+<span class="d">-	e.s.runFeeds()</span>
+<span class="d">-	if e.sent() != 0 || e.feedFile(a, &quot;mailed&quot;) != &quot;&quot; {</span>
+<span class="d">-		t.Fatal(&quot;the job mails without the opt-in&quot;)</span>
+<span class="d">-	}</span>
+<span class="d">-	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})</span>
+<span class="d">-	// The first run after the opt-in notes the items and sends nothing.</span>
+<span class="a">+	// The email is on by default. The first run notes the items and sends</span>
+<span class="a">+	// nothing.</span>
+ 	e.s.runFeeds()
+ 	if e.sent() != 0 || e.feedFile(a, &quot;mailed&quot;) != &quot;Alpha\tid1\n&quot; || strings.TrimSpace(e.feedFile(a, &quot;digest&quot;)) != &quot;1800000000&quot; {
+ 		t.Fatalf(&quot;first run: %d emails, mailed %q, digest %q&quot;, e.sent(), e.feedFile(a, &quot;mailed&quot;), e.feedFile(a, &quot;digest&quot;))
+<span class="h">@@ -201,21 +197,29 @@ func TestJobSendsADailyDigest(t *testing.T) {</span>
+ 	if e.feedFile(a, &quot;mailed&quot;) != &quot;&quot; || e.feedFile(a, &quot;digest&quot;) != &quot;&quot; {
+ 		t.Error(&quot;the opt-out kept the digest files&quot;)
+ 	}
+<span class="a">+	f.items[&quot;https://a.org/rss.xml&quot;] = &quot;1700010800\tFour\thttps://a.org/4\t\t\tid4\t\t\t\n&quot; + f.items[&quot;https://a.org/rss.xml&quot;]</span>
+<span class="a">+	f.now = start.Add(80 * time.Hour)</span>
+<span class="a">+	e.s.runFeeds()</span>
+ 	if e.sent() != 2 {
+ 		t.Error(&quot;a digest went out after the opt-out&quot;)
+ 	}
+<span class="a">+	// The opt-in starts fresh: the first run notes the items only.</span>
+<span class="a">+	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})</span>
+<span class="a">+	e.s.runFeeds()</span>
+<span class="a">+	if e.sent() != 2 || e.feedFile(a, &quot;mailed&quot;) == &quot;&quot; {</span>
+<span class="a">+		t.Errorf(&quot;after the opt-in: %d emails, mailed %q&quot;, e.sent(), e.feedFile(a, &quot;mailed&quot;))</span>
+<span class="a">+	}</span>
+ }
+ 
+ // A digest that does not go out is sent again with the next run.
+ func TestJobKeepsTheItemsOfAFailedDigest(t *testing.T) {
+ 	e := newEnv(t, false)
+<span class="d">-	c, tok, _ := e.account(&quot;&quot;)</span>
+<span class="a">+	_, tok, _ := e.account(&quot;&quot;)</span>
+ 	e.withMail()
+ 	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)
+ 	start := time.Unix(1_800_000_000, 0)
+ 	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: &quot;&quot;}, now: start}
+ 	e.s.feeds = f.tools()
+<span class="d">-	e.send(c, &quot;/feed/settings&quot;, url.Values{&quot;mail&quot;: {&quot;on&quot;}})</span>
+ 	e.s.runFeeds()
+ 	f.items[&quot;https://a.org/rss.xml&quot;] = oneItem
+ 	f.now = start.Add(25 * time.Hour)
+<span class="h">@@ -237,7 +241,6 @@ func TestJobMailsOnlyConfirmedAccounts(t *testing.T) {</span>
+ 	e.signup(&quot;me@example.org&quot;)
+ 	tok := e.token(&quot;me@example.org&quot;)
+ 	a := e.setFeeds(tok, &quot;https://a.org/rss.xml\tAlpha\n&quot;)
+<span class="d">-	e.s.store.setFeed(a, feedSettings{Mail: true})</span>
+ 	f := &amp;fakeTools{items: map[string]string{&quot;https://a.org/rss.xml&quot;: oneItem}, now: time.Now()}
+ 	e.s.feeds = f.tools()
+ 	e.s.runFeeds()
+diff --git a/main.go b/main.go
+index a0bc4ab..1783724 100644
+--- a/main.go
++++ b/main.go
+<span class="h">@@ -75,6 +75,9 @@ func main() {</span>
+ 	if err != nil {
+ 		log.Fatal(err)
+ 	}
+<span class="a">+	if store.defaultFeeds, err = defaultFeeds(os.Getenv(&quot;SBM_DEFAULT_FEEDS&quot;)); err != nil {</span>
+<span class="a">+		log.Fatal(err)</span>
+<span class="a">+	}</span>
+ 	s := &amp;server{
+ 		store:      store,
+ 		site:       site,
+diff --git a/pages.html b/pages.html
+index 3288acd..0f9b86e 100644
+--- a/pages.html
++++ b/pages.html
+<span class="h">@@ -167,7 +167,7 @@ bookmarks for feeds. The server fetches new items every 30 minutes.&lt;/p&gt;{{end}}</span>
+ &lt;details&gt;&lt;summary&gt;Settings&lt;/summary&gt;
+ &lt;form method=&quot;post&quot; action=&quot;/feed/settings&quot;&gt;
+ &lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;newtab&quot;{{if .Settings.NewTab}} checked{{end}}&gt;Open links in a new tab&lt;/label&gt;
+<span class="d">-{{if .HasMail}}&lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;mail&quot;{{if .Settings.Mail}} checked{{end}}&gt;Send me the new items by email, once a day&lt;/label&gt;{{end}}</span>
+<span class="a">+{{if .HasMail}}&lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;mail&quot;{{if not .Settings.NoMail}} checked{{end}}&gt;Send me the new items by email, once a day&lt;/label&gt;{{end}}</span>
+ &lt;label&gt;&lt;input type=&quot;checkbox&quot; class=&quot;check&quot; name=&quot;explore&quot;{{if .Settings.Explore}} checked{{end}}&gt;Explore: look through my bookmarks for feeds&lt;/label&gt;
+ &lt;button&gt;Save&lt;/button&gt;
+ &lt;/form&gt;&lt;/details&gt;
+<span class="h">@@ -338,7 +338,7 @@ When this server checks email addresses, it also sends you an email with a link</span>
+ &lt;li&gt;When you subscribe: your Stripe customer ID and the state of your subscription: to bill you.&lt;/li&gt;
+ &lt;li&gt;When you follow feeds: the addresses of the feeds, the items that the server fetched from them, and
+ the addresses of the feeds that the server found on your bookmarked pages when you asked it to look:
+<span class="d">-to show you the items, and to send them to you by email once a day when you asked for that.&lt;/li&gt;</span>
+<span class="a">+to show you the items, and to send you the new ones by email once a day, unless you turn that off on the feed page.&lt;/li&gt;</span>
+ &lt;/ul&gt;
+ &lt;p&gt;The server does not sell or share this data, and does not use it for ads.
+ There are no analytics and no trackers. The only cookie keeps you signed in.&lt;/p&gt;
+diff --git a/store.go b/store.go
+index 478b3ac..67f6fb3 100644
+--- a/store.go
++++ b/store.go
+<span class="h">@@ -52,12 +52,16 @@ type Account struct {</span>
+ // of each bookmark file in files/&lt;account ID&gt;/&lt;SHA-256 of the text&gt;. The file
+ // HEAD beside the versions names the current one.
+ type Store struct {
+<span class="d">-	dir      string</span>
+<span class="d">-	mu       sync.Mutex // for the maps, the accounts and accounts.json</span>
+<span class="d">-	accounts map[string]*Account</span>
+<span class="d">-	byEmail  map[string]*Account</span>
+<span class="d">-	byToken  map[string]*Account</span>
+<span class="d">-	locks    map[string]*sync.Mutex // one for the files of each account</span>
+<span class="a">+	dir string</span>
+<span class="a">+	// defaultFeeds is the feeds.txt of an account that has none yet, see</span>
+<span class="a">+	// feed.go. Once the account changes its feeds, its own file counts,</span>
+<span class="a">+	// also when it is empty.</span>
+<span class="a">+	defaultFeeds string</span>
+<span class="a">+	mu           sync.Mutex // for the maps, the accounts and accounts.json</span>
+<span class="a">+	accounts     map[string]*Account</span>
+<span class="a">+	byEmail      map[string]*Account</span>
+<span class="a">+	byToken      map[string]*Account</span>
+<span class="a">+	locks        map[string]*sync.Mutex // one for the files of each account</span>
+ }
+ 
+ func openStore(dir string) (*Store, error) {</pre>
+</div></body></html>

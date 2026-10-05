@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 8ce9ea01 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 8ce9ea01516fc5abf4bf4bcb9d06a348bd98c7b8
+truex &lt;truex@equwal.com&gt;
+2026-09-24 11:49:45 -0700
+
+Add the LocalAudio Capacitor plugin
+
+The plugin reads a Yomitan local-audio android.db with the Android
+SQLite API. The file is many GB, so it does not go through the WebView.
+
+Methods: status, importDb, remove, lookup, audio. The db is found at
+the external files dir (manual copy) or the private files dir (the
+imported copy). importDb opens the system document picker and streams
+the file in 1 MB chunks on a background thread, with progress events.
+It refuses to copy when the free space is smaller than the file.
+
+</pre><pre> .../com/equwal/scansubread/LocalAudioPlugin.java   | 288 +++++++++++++++++++++
+ .../java/com/equwal/scansubread/MainActivity.java  |  11 +-
+ 2 files changed, 298 insertions(+), 1 deletion(-)
+</pre><pre>diff --git a/android/app/src/main/java/com/equwal/scansubread/LocalAudioPlugin.java b/android/app/src/main/java/com/equwal/scansubread/LocalAudioPlugin.java
+new file mode 100644
+index 0000000..b410004
+--- /dev/null
++++ b/android/app/src/main/java/com/equwal/scansubread/LocalAudioPlugin.java
+<span class="h">@@ -0,0 +1,288 @@</span>
+<span class="a">+package com.equwal.scansubread;</span>
+<span class="a">+</span>
+<span class="a">+import android.app.Activity;</span>
+<span class="a">+import android.content.Intent;</span>
+<span class="a">+import android.database.Cursor;</span>
+<span class="a">+import android.database.sqlite.SQLiteDatabase;</span>
+<span class="a">+import android.net.Uri;</span>
+<span class="a">+import android.os.ParcelFileDescriptor;</span>
+<span class="a">+import android.util.Base64;</span>
+<span class="a">+import androidx.activity.result.ActivityResult;</span>
+<span class="a">+import com.getcapacitor.JSArray;</span>
+<span class="a">+import com.getcapacitor.JSObject;</span>
+<span class="a">+import com.getcapacitor.Plugin;</span>
+<span class="a">+import com.getcapacitor.PluginCall;</span>
+<span class="a">+import com.getcapacitor.PluginMethod;</span>
+<span class="a">+import com.getcapacitor.annotation.ActivityCallback;</span>
+<span class="a">+import com.getcapacitor.annotation.CapacitorPlugin;</span>
+<span class="a">+import java.io.File;</span>
+<span class="a">+import java.io.FileOutputStream;</span>
+<span class="a">+import java.io.IOException;</span>
+<span class="a">+import java.io.InputStream;</span>
+<span class="a">+import java.io.OutputStream;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Word pronunciations from a Yomitan local-audio `android.db` (SQLite).</span>
+<span class="a">+ *</span>
+<span class="a">+ * The file is many GB, so it never goes through the WebView. The plugin</span>
+<span class="a">+ * finds it at one of two paths, queries it with the Android SQLite API</span>
+<span class="a">+ * and returns one audio clip at a time as base64.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Search order: the external files dir (the user copies the file there by</span>
+<span class="a">+ * hand), then the app&#x27;s private files dir (the imported copy).</span>
+<span class="a">+ */</span>
+<span class="a">+@CapacitorPlugin(name = &quot;LocalAudio&quot;)</span>
+<span class="a">+public class LocalAudioPlugin extends Plugin {</span>
+<span class="a">+</span>
+<span class="a">+    private static final String DB_NAME = &quot;android.db&quot;;</span>
+<span class="a">+    private static final int CHUNK = 1024 * 1024;</span>
+<span class="a">+    /** Progress events are sent after this many bytes, and at the end. */</span>
+<span class="a">+    private static final long PROGRESS_STEP = 16L * CHUNK;</span>
+<span class="a">+</span>
+<span class="a">+    private final Object lock = new Object();</span>
+<span class="a">+    private SQLiteDatabase db;</span>
+<span class="a">+    private File openFile;</span>
+<span class="a">+</span>
+<span class="a">+    // --- Paths ---</span>
+<span class="a">+</span>
+<span class="a">+    private File externalDb() {</span>
+<span class="a">+        File dir = getContext().getExternalFilesDir(null);</span>
+<span class="a">+        return dir == null ? null : new File(dir, DB_NAME);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private File importedDb() {</span>
+<span class="a">+        return new File(getContext().getFilesDir(), DB_NAME);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The db file in use, or null when none exists. */</span>
+<span class="a">+    private File findDb() {</span>
+<span class="a">+        File external = externalDb();</span>
+<span class="a">+        if (external != null &amp;&amp; external.isFile()) return external;</span>
+<span class="a">+        File imported = importedDb();</span>
+<span class="a">+        return imported.isFile() ? imported : null;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private JSObject statusObject() {</span>
+<span class="a">+        File file = findDb();</span>
+<span class="a">+        JSObject ret = new JSObject();</span>
+<span class="a">+        ret.put(&quot;available&quot;, file != null);</span>
+<span class="a">+        ret.put(&quot;path&quot;, file == null ? JSObject.NULL : file.getAbsolutePath());</span>
+<span class="a">+        ret.put(&quot;sizeBytes&quot;, file == null ? 0 : file.length());</span>
+<span class="a">+        return ret;</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // --- Database ---</span>
+<span class="a">+</span>
+<span class="a">+    /** Open the db when needed. Reopen when the file in use changed. */</span>
+<span class="a">+    private SQLiteDatabase openDb() {</span>
+<span class="a">+        synchronized (lock) {</span>
+<span class="a">+            File file = findDb();</span>
+<span class="a">+            if (file == null) {</span>
+<span class="a">+                closeDb();</span>
+<span class="a">+                return null;</span>
+<span class="a">+            }</span>
+<span class="a">+            if (db != null &amp;&amp; file.equals(openFile)) return db;</span>
+<span class="a">+            closeDb();</span>
+<span class="a">+            db = SQLiteDatabase.openDatabase(file.getAbsolutePath(), null, SQLiteDatabase.OPEN_READONLY);</span>
+<span class="a">+            openFile = file;</span>
+<span class="a">+            return db;</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private void closeDb() {</span>
+<span class="a">+        synchronized (lock) {</span>
+<span class="a">+            if (db != null) db.close();</span>
+<span class="a">+            db = null;</span>
+<span class="a">+            openFile = null;</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Override</span>
+<span class="a">+    protected void handleOnDestroy() {</span>
+<span class="a">+        closeDb();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    // --- Plugin methods ---</span>
+<span class="a">+</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void status(PluginCall call) {</span>
+<span class="a">+        call.resolve(statusObject());</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void importDb(PluginCall call) {</span>
+<span class="a">+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);</span>
+<span class="a">+        intent.addCategory(Intent.CATEGORY_OPENABLE);</span>
+<span class="a">+        intent.setType(&quot;*/*&quot;);</span>
+<span class="a">+        startActivityForResult(call, intent, &quot;importResult&quot;);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @ActivityCallback</span>
+<span class="a">+    private void importResult(PluginCall call, ActivityResult result) {</span>
+<span class="a">+        if (call == null) return;</span>
+<span class="a">+        Intent data = result.getData();</span>
+<span class="a">+        Uri uri = data == null ? null : data.getData();</span>
+<span class="a">+        if (result.getResultCode() != Activity.RESULT_OK || uri == null) {</span>
+<span class="a">+            call.reject(&quot;Import cancelled.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        // The copy takes minutes for a large file. Keep it off the UI thread.</span>
+<span class="a">+        new Thread(() -&gt; copyToImported(call, uri), &quot;LocalAudioImport&quot;).start();</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Stream the picked document to filesDir/android.db in 1 MB chunks. */</span>
+<span class="a">+    private void copyToImported(PluginCall call, Uri uri) {</span>
+<span class="a">+        File target = importedDb();</span>
+<span class="a">+        File part = new File(target.getParentFile(), DB_NAME + &quot;.part&quot;);</span>
+<span class="a">+        try (ParcelFileDescriptor pfd = getContext().getContentResolver().openFileDescriptor(uri, &quot;r&quot;)) {</span>
+<span class="a">+            if (pfd == null) {</span>
+<span class="a">+                call.reject(&quot;Cannot open the picked file.&quot;);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            long total = pfd.getStatSize();</span>
+<span class="a">+            // The old copy is replaced, so its space counts as free.</span>
+<span class="a">+            long free = target.getParentFile().getUsableSpace() + (target.isFile() ? target.length() : 0);</span>
+<span class="a">+            if (total &gt; 0 &amp;&amp; free &lt; total) {</span>
+<span class="a">+                call.reject(</span>
+<span class="a">+                    &quot;Not enough free space: the file is &quot; + mb(total) + &quot; MB, free space is &quot; + mb(free) + &quot; MB.&quot;</span>
+<span class="a">+                );</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            closeDb();</span>
+<span class="a">+            if (part.exists() &amp;&amp; !part.delete()) {</span>
+<span class="a">+                call.reject(&quot;Cannot delete the old partial copy.&quot;);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            try (</span>
+<span class="a">+                InputStream in = new ParcelFileDescriptor.AutoCloseInputStream(pfd.dup());</span>
+<span class="a">+                OutputStream out = new FileOutputStream(part)</span>
+<span class="a">+            ) {</span>
+<span class="a">+                byte[] buf = new byte[CHUNK];</span>
+<span class="a">+                long copied = 0;</span>
+<span class="a">+                long lastReport = 0;</span>
+<span class="a">+                int n;</span>
+<span class="a">+                while ((n = in.read(buf)) &gt; 0) {</span>
+<span class="a">+                    out.write(buf, 0, n);</span>
+<span class="a">+                    copied += n;</span>
+<span class="a">+                    if (copied - lastReport &gt;= PROGRESS_STEP) {</span>
+<span class="a">+                        lastReport = copied;</span>
+<span class="a">+                        notifyProgress(copied, total);</span>
+<span class="a">+                    }</span>
+<span class="a">+                }</span>
+<span class="a">+                notifyProgress(copied, total);</span>
+<span class="a">+            }</span>
+<span class="a">+            if (target.exists() &amp;&amp; !target.delete()) {</span>
+<span class="a">+                call.reject(&quot;Cannot replace the old copy.&quot;);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            if (!part.renameTo(target)) {</span>
+<span class="a">+                call.reject(&quot;Cannot move the copy into place.&quot;);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            call.resolve(statusObject());</span>
+<span class="a">+        } catch (IOException | RuntimeException e) {</span>
+<span class="a">+            part.delete();</span>
+<span class="a">+            call.reject(&quot;Import failed: &quot; + e.getMessage(), e);</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private void notifyProgress(long copied, long total) {</span>
+<span class="a">+        JSObject data = new JSObject();</span>
+<span class="a">+        data.put(&quot;copied&quot;, copied);</span>
+<span class="a">+        data.put(&quot;total&quot;, total);</span>
+<span class="a">+        notifyListeners(&quot;importProgress&quot;, data);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private static long mb(long bytes) {</span>
+<span class="a">+        return bytes / (1024 * 1024);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void remove(PluginCall call) {</span>
+<span class="a">+        closeDb();</span>
+<span class="a">+        File file = importedDb();</span>
+<span class="a">+        if (file.exists() &amp;&amp; !file.delete()) {</span>
+<span class="a">+            call.reject(&quot;Cannot delete &quot; + file.getAbsolutePath());</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        call.resolve(statusObject());</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void lookup(PluginCall call) {</span>
+<span class="a">+        String expression = call.getString(&quot;expression&quot;);</span>
+<span class="a">+        String reading = call.getString(&quot;reading&quot;);</span>
+<span class="a">+        if (expression == null) {</span>
+<span class="a">+            call.reject(&quot;expression is required.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        JSArray entries = new JSArray();</span>
+<span class="a">+        try {</span>
+<span class="a">+            SQLiteDatabase d = openDb();</span>
+<span class="a">+            if (d == null) {</span>
+<span class="a">+                call.reject(&quot;No android.db.&quot;);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            String sql;</span>
+<span class="a">+            String[] args;</span>
+<span class="a">+            if (reading == null || reading.isEmpty()) {</span>
+<span class="a">+                sql = &quot;SELECT source, speaker, display, file FROM entries WHERE expression = ? ORDER BY id&quot;;</span>
+<span class="a">+                args = new String[] { expression };</span>
+<span class="a">+            } else {</span>
+<span class="a">+                sql =</span>
+<span class="a">+                    &quot;SELECT source, speaker, display, file FROM entries&quot; +</span>
+<span class="a">+                    &quot; WHERE expression = ? AND (reading = ? OR reading IS NULL) ORDER BY id&quot;;</span>
+<span class="a">+                args = new String[] { expression, reading };</span>
+<span class="a">+            }</span>
+<span class="a">+            try (Cursor c = d.rawQuery(sql, args)) {</span>
+<span class="a">+                while (c.moveToNext()) {</span>
+<span class="a">+                    JSObject row = new JSObject();</span>
+<span class="a">+                    row.put(&quot;source&quot;, c.getString(0));</span>
+<span class="a">+                    row.put(&quot;speaker&quot;, c.isNull(1) ? JSObject.NULL : c.getString(1));</span>
+<span class="a">+                    row.put(&quot;display&quot;, c.isNull(2) ? JSObject.NULL : c.getString(2));</span>
+<span class="a">+                    row.put(&quot;file&quot;, c.getString(3));</span>
+<span class="a">+                    entries.put(row);</span>
+<span class="a">+                }</span>
+<span class="a">+            }</span>
+<span class="a">+        } catch (RuntimeException e) {</span>
+<span class="a">+            call.reject(&quot;Lookup failed: &quot; + e.getMessage(), e);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        JSObject ret = new JSObject();</span>
+<span class="a">+        ret.put(&quot;entries&quot;, entries);</span>
+<span class="a">+        call.resolve(ret);</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @PluginMethod</span>
+<span class="a">+    public void audio(PluginCall call) {</span>
+<span class="a">+        String file = call.getString(&quot;file&quot;);</span>
+<span class="a">+        String source = call.getString(&quot;source&quot;);</span>
+<span class="a">+        if (file == null || source == null) {</span>
+<span class="a">+            call.reject(&quot;file and source are required.&quot;);</span>
+<span class="a">+            return;</span>
+<span class="a">+        }</span>
+<span class="a">+        try {</span>
+<span class="a">+            SQLiteDatabase d = openDb();</span>
+<span class="a">+            if (d == null) {</span>
+<span class="a">+                call.reject(&quot;No android.db.&quot;);</span>
+<span class="a">+                return;</span>
+<span class="a">+            }</span>
+<span class="a">+            try (</span>
+<span class="a">+                Cursor c = d.rawQuery(</span>
+<span class="a">+                    &quot;SELECT data FROM android WHERE file = ? AND source = ? LIMIT 1&quot;,</span>
+<span class="a">+                    new String[] { file, source }</span>
+<span class="a">+                )</span>
+<span class="a">+            ) {</span>
+<span class="a">+                if (!c.moveToFirst()) {</span>
+<span class="a">+                    call.reject(&quot;No audio for &quot; + source + &quot;/&quot; + file);</span>
+<span class="a">+                    return;</span>
+<span class="a">+                }</span>
+<span class="a">+                JSObject ret = new JSObject();</span>
+<span class="a">+                ret.put(&quot;data&quot;, Base64.encodeToString(c.getBlob(0), Base64.NO_WRAP));</span>
+<span class="a">+                call.resolve(ret);</span>
+<span class="a">+            }</span>
+<span class="a">+        } catch (RuntimeException e) {</span>
+<span class="a">+            call.reject(&quot;Audio failed: &quot; + e.getMessage(), e);</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/android/app/src/main/java/com/equwal/scansubread/MainActivity.java b/android/app/src/main/java/com/equwal/scansubread/MainActivity.java
+index 075f8ca..350356d 100644
+--- a/android/app/src/main/java/com/equwal/scansubread/MainActivity.java
++++ b/android/app/src/main/java/com/equwal/scansubread/MainActivity.java
+<span class="h">@@ -1,5 +1,14 @@</span>
+ package com.equwal.scansubread;
+ 
+<span class="a">+import android.os.Bundle;</span>
+ import com.getcapacitor.BridgeActivity;
+ 
+<span class="d">-public class MainActivity extends BridgeActivity {}</span>
+<span class="a">+public class MainActivity extends BridgeActivity {</span>
+<span class="a">+</span>
+<span class="a">+    @Override</span>
+<span class="a">+    public void onCreate(Bundle savedInstanceState) {</span>
+<span class="a">+        // Local plugins register before the bridge is built.</span>
+<span class="a">+        registerPlugin(LocalAudioPlugin.class);</span>
+<span class="a">+        super.onCreate(savedInstanceState);</span>
+<span class="a">+    }</span>
+<span class="a">+}</span></pre>
+</div></body></html>

@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 9bf68a57 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9bf68a57c48ffbd6c19134e39e43b44235f064b5
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:25:59 -0700
+
+Fit the page to the width, and keep the mark in view
+
+In landscape on a phone the page fitted the viewer height and used 27%
+of the width. The page now fits the viewer width in each orientation,
+up to 1000 CSS pixels on a wide screen.
+
+The new module view.ts renders the page, draws the mark and scrolls the
+viewer. After a page turn the viewer scrolls to the mark on the new
+page, else to the top. When a new mark is out of view, the viewer
+scrolls smoothly and puts the mark in the upper third, but not in the
+3 seconds after the user scrolled. The pure function scrollTarget
+(scroll.ts) finds the position.
+
+A ResizeObserver on the viewer renders the page again when the width
+changes, so the canvas keeps the resolution of the device after a
+rotation.
+
+</pre><pre> src/main.ts         |  54 ++++++----------
+ src/scroll.ts       |  28 ++++++++
+ src/style.css       |  22 +++----
+ src/view.ts         | 183 ++++++++++++++++++++++++++++++++++++++++++++++++++++
+ test/scroll.test.ts |  80 +++++++++++++++++++++++
+ 5 files changed, 319 insertions(+), 48 deletions(-)
+</pre><pre>diff --git a/src/main.ts b/src/main.ts
+index 49eab49..71b3f64 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -23,6 +23,7 @@ import { nextPage } from &#x27;./read-order&#x27;;</span>
+ import { say, showPlayer, showReading } from &#x27;./status&#x27;;
+ import { isAndroid, SubRead } from &#x27;./subread&#x27;;
+ import { cueIndexAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+<span class="a">+import { createPageView, type Marks } from &#x27;./view&#x27;;</span>
+ import {
+   bookKey,
+   clearPages,
+<span class="h">@@ -37,9 +38,6 @@ import {</span>
+ /** Page width in pixels for OCR and the text layer. Boxes are stored in this scale. */
+ const OCR_WIDTH = 1600;
+ 
+<span class="d">-/** The space around a box of the mark, in CSS pixels. */</span>
+<span class="d">-const BOX_PAD = 2;</span>
+<span class="d">-</span>
+ /** Milliseconds to wait after a page is read before the cues are aligned again. */
+ const ALIGN_DEBOUNCE = 300;
+ 
+<span class="h">@@ -106,7 +104,6 @@ const state = {</span>
+   /** The cue whose box is drawn on the page, or -1. */
+   markedCue: -1,
+   clock: null as ClockState | null,
+<span class="d">-  renderSeq: 0,</span>
+   readSeq: 0,
+   alignTimer: null as ReturnType&lt;typeof setTimeout&gt; | null,
+   srt: null as string | null,
+<span class="h">@@ -114,6 +111,8 @@ const state = {</span>
+   lookupPaused: false,
+ };
+ 
+<span class="a">+const view = createPageView(ui, marks);</span>
+<span class="a">+</span>
+ // --- Settings ---
+ 
+ const settings = {
+<span class="h">@@ -144,7 +143,7 @@ function loadSettings(): void {</span>
+ ui.follow.addEventListener(&#x27;change&#x27;, () =&gt; {
+   settings.set(&#x27;follow&#x27;, followMode());
+   state.markedCue = -1;
+<span class="d">-  drawBoxes();</span>
+<span class="a">+  view.mark();</span>
+   if (state.clock) applyClock({ ...state.clock, seeked: true });
+ });
+ ui.pauseLookup.addEventListener(&#x27;change&#x27;, () =&gt;
+<span class="h">@@ -293,7 +292,7 @@ async function readBook(): Promise&lt;void&gt; {</span>
+       state.tokens.splice(at, 0, ...entry.tokens);
+       const how = entry.source === &#x27;text&#x27; ? &#x27;text layer&#x27; : &#x27;OCR&#x27;;
+       showReading(readingText(read(), total, `page ${page + 1}: ${how}`));
+<span class="d">-      if (page === state.currentPage) drawBoxes();</span>
+<span class="a">+      if (page === state.currentPage) view.mark();</span>
+       scheduleAlign();
+     }
+     const matched = align();
+<span class="h">@@ -500,7 +499,7 @@ function applyClock(s: ClockState): void {</span>
+   if (!changed || followMode() === &#x27;off&#x27;) return;
+   state.markedCue = out.highlightCue ?? -1;
+   if (out.turnToPage !== null) void showPage(out.turnToPage);
+<span class="d">-  else drawBoxes();</span>
+<span class="a">+  else view.mark();</span>
+ }
+ 
+ const clock: ClockSource = isAndroid ? new OverlayClock(SubRead) : new LocalAudioClock(ui.audio);
+<span class="h">@@ -539,39 +538,24 @@ function updateNav(): void {</span>
+   ui.pageRight.disabled = !pdf || page &gt;= pdf.numPages - 1;
+ }
+ 
+<span class="a">+/** The mark of page `index`: one box per text line of the marked cue. */</span>
+<span class="a">+function marks(index: number): Marks | null {</span>
+<span class="a">+  const entry = state.pages[index];</span>
+<span class="a">+  const span = state.spans[state.markedCue];</span>
+<span class="a">+  if (!entry || !span) return null;</span>
+<span class="a">+  return {</span>
+<span class="a">+    width: entry.width,</span>
+<span class="a">+    height: entry.height,</span>
+<span class="a">+    boxes: (pad) =&gt; lineBoxes(state.tokens, span, index, pad),</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ async function showPage(index: number): Promise&lt;void&gt; {
+   const pdf = state.pdf;
+   if (!pdf || index &lt; 0 || index &gt;= pdf.numPages) return;
+<span class="d">-  const seq = ++state.renderSeq;</span>
+   state.currentPage = index;
+   updateNav();
+<span class="d">-  // Render at device resolution, up to the OCR width, so zoom stays sharp.</span>
+<span class="d">-  const dpr = window.devicePixelRatio || 1;</span>
+<span class="d">-  const width = Math.round(Math.min(OCR_WIDTH, Math.max(300, ui.viewer.clientWidth - 16) * dpr));</span>
+<span class="d">-  const canvas = await pdf.renderPage(index, width);</span>
+<span class="d">-  if (seq !== state.renderSeq) return; // A newer render replaced this one.</span>
+<span class="d">-  ui.page.querySelector(&#x27;canvas&#x27;)?.remove();</span>
+<span class="d">-  ui.page.prepend(canvas);</span>
+<span class="d">-  drawBoxes();</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-/** Draw one box per text line for the marked cue on the current page. */</span>
+<span class="d">-function drawBoxes(): void {</span>
+<span class="d">-  ui.overlay.replaceChildren();</span>
+<span class="d">-  const span = state.spans[state.markedCue];</span>
+<span class="d">-  const size = state.pages[state.currentPage];</span>
+<span class="d">-  const shown = ui.page.querySelector(&#x27;canvas&#x27;)?.getBoundingClientRect().width;</span>
+<span class="d">-  if (!span || !size || !shown) return;</span>
+<span class="d">-  const pad = (BOX_PAD * size.width) / shown;</span>
+<span class="d">-  for (const box of lineBoxes(state.tokens, span, state.currentPage, pad)) {</span>
+<span class="d">-    const div = document.createElement(&#x27;div&#x27;);</span>
+<span class="d">-    div.className = &#x27;box&#x27;;</span>
+<span class="d">-    div.style.left = `${(100 * box.x0) / size.width}%`;</span>
+<span class="d">-    div.style.top = `${(100 * box.y0) / size.height}%`;</span>
+<span class="d">-    div.style.width = `${(100 * (box.x1 - box.x0)) / size.width}%`;</span>
+<span class="d">-    div.style.height = `${(100 * (box.y1 - box.y0)) / size.height}%`;</span>
+<span class="d">-    ui.overlay.append(div);</span>
+<span class="d">-  }</span>
+<span class="a">+  await view.show(pdf, index);</span>
+ }
+ 
+ ui.pageLeft.addEventListener(&#x27;click&#x27;, () =&gt; void showPage(state.currentPage - 1));
+diff --git a/src/scroll.ts b/src/scroll.ts
+new file mode 100644
+index 0000000..948772a
+--- /dev/null
++++ b/src/scroll.ts
+<span class="h">@@ -0,0 +1,28 @@</span>
+<span class="a">+// Where a scroll box scrolls to show a mark. Pure: no DOM.</span>
+<span class="a">+</span>
+<span class="a">+/** The share of the view height above the mark after a scroll. The mark lands in the upper third. */</span>
+<span class="a">+export const LEAD = 0.25;</span>
+<span class="a">+</span>
+<span class="a">+/** A vertical extent, in the scroll space of the box: 0 is the top of its content. */</span>
+<span class="a">+export interface Extent {</span>
+<span class="a">+  top: number;</span>
+<span class="a">+  bottom: number;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The scroll position that shows `mark`, or null when the mark is in view</span>
+<span class="a">+ * already. The view shows `height` pixels from the scroll position `top`.</span>
+<span class="a">+ * `max` is the largest scroll position. The mark goes LEAD of the height</span>
+<span class="a">+ * below the top of the view, so the lines after it show too. With</span>
+<span class="a">+ * `always`, there is a position also for a mark in view.</span>
+<span class="a">+ */</span>
+<span class="a">+export function scrollTarget(</span>
+<span class="a">+  mark: Extent,</span>
+<span class="a">+  view: { top: number; height: number },</span>
+<span class="a">+  max: number,</span>
+<span class="a">+  always = false,</span>
+<span class="a">+): number | null {</span>
+<span class="a">+  const inView = mark.top &gt;= view.top &amp;&amp; mark.bottom &lt;= view.top + view.height;</span>
+<span class="a">+  if (inView &amp;&amp; !always) return null;</span>
+<span class="a">+  return Math.round(Math.min(Math.max(0, mark.top - view.height * LEAD), Math.max(0, max)));</span>
+<span class="a">+}</span>
+diff --git a/src/style.css b/src/style.css
+index 8c4e291..0a0a3b9 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -283,6 +283,8 @@ body.menu-open #panel {</span>
+   flex: 1;
+   min-height: 0;
+   overflow: auto;
+<span class="a">+  /* A scroll bar that comes and goes does not change the width of the page. */</span>
+<span class="a">+  scrollbar-gutter: stable;</span>
+   padding: 0.5rem;
+ }
+ 
+<span class="h">@@ -325,30 +327,24 @@ body.menu-open #panel {</span>
+   display: none;
+ }
+ 
+<span class="a">+/*</span>
+<span class="a">+ * The page fits the viewer width in each orientation, up to 1000 CSS</span>
+<span class="a">+ * pixels on a wide screen. The viewer scrolls vertically.</span>
+<span class="a">+ */</span>
+ #page {
+   position: relative;
+   margin: 0 auto;
+<span class="d">-  width: fit-content;</span>
+<span class="d">-  max-width: 100%;</span>
+<span class="a">+  width: 100%;</span>
+<span class="a">+  max-width: 1000px;</span>
+ }
+ 
+<span class="d">-/* The page fits the viewer width. The viewer scrolls vertically. */</span>
+ #page canvas {
+   display: block;
+<span class="d">-  max-width: 100%;</span>
+<span class="d">-  width: auto;</span>
+<span class="a">+  width: 100%;</span>
+   height: auto;
+   box-shadow: 0 0 6px #0006;
+ }
+ 
+<span class="d">-/* Landscape phone: the page fits the viewer height instead. */</span>
+<span class="d">-@media (orientation: landscape) and (max-width: 899px) {</span>
+<span class="d">-  #page canvas {</span>
+<span class="d">-    max-height: calc(100vh - var(--topbar) - 1rem);</span>
+<span class="d">-    max-height: calc(100dvh - var(--topbar) - 1rem);</span>
+<span class="d">-  }</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+ /* The padding of a box can go past the edge of the page. The page clips it. */
+ #overlay {
+   position: absolute;
+diff --git a/src/view.ts b/src/view.ts
+new file mode 100644
+index 0000000..46e4f87
+--- /dev/null
++++ b/src/view.ts
+<span class="h">@@ -0,0 +1,183 @@</span>
+<span class="a">+// The page view. It renders a page to fit the width of the viewer, draws</span>
+<span class="a">+// the boxes of the mark, keeps the mark in view, and renders the page</span>
+<span class="a">+// again when the width of the viewer changes.</span>
+<span class="a">+</span>
+<span class="a">+import type { Box } from &#x27;./line-boxes&#x27;;</span>
+<span class="a">+import type { PdfDoc } from &#x27;./pdf&#x27;;</span>
+<span class="a">+import { scrollTarget, type Extent } from &#x27;./scroll&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The widest canvas, in device pixels. It limits the memory of one page. */</span>
+<span class="a">+const MAX_RENDER = 2048;</span>
+<span class="a">+</span>
+<span class="a">+/** The space around a box of the mark, in CSS pixels. */</span>
+<span class="a">+const BOX_PAD = 2;</span>
+<span class="a">+</span>
+<span class="a">+/** After the user scrolls the viewer, the view does not scroll by itself for this many milliseconds. */</span>
+<span class="a">+export const USER_SCROLL_MS = 3000;</span>
+<span class="a">+</span>
+<span class="a">+/** Milliseconds after the last resize before the page renders again. */</span>
+<span class="a">+const RESIZE_MS = 200;</span>
+<span class="a">+</span>
+<span class="a">+/** Scroll events for this many milliseconds after a scroll by the view come from the view. */</span>
+<span class="a">+const AUTO_SCROLL_MS = 1000;</span>
+<span class="a">+</span>
+<span class="a">+/** The mark of a page: the size of the page, and its boxes, in page pixels. */</span>
+<span class="a">+export interface Marks {</span>
+<span class="a">+  width: number;</span>
+<span class="a">+  height: number;</span>
+<span class="a">+  /** The boxes, with `pad` page pixels of padding. */</span>
+<span class="a">+  boxes(pad: number): Box[];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface PageViewElements {</span>
+<span class="a">+  viewer: HTMLElement;</span>
+<span class="a">+  page: HTMLElement;</span>
+<span class="a">+  overlay: HTMLElement;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface PageView {</span>
+<span class="a">+  /** Renders page `index`, draws its mark, and scrolls to the mark, else to the top. */</span>
+<span class="a">+  show(pdf: PdfDoc, index: number): Promise&lt;void&gt;;</span>
+<span class="a">+  /**</span>
+<span class="a">+   * Draws the mark of the page again. When the mark left the view, and the</span>
+<span class="a">+   * user did not scroll lately, the viewer scrolls to it.</span>
+<span class="a">+   */</span>
+<span class="a">+  mark(): void;</span>
+<span class="a">+  /** The canvas of the page, or null before the first render. */</span>
+<span class="a">+  canvas(): HTMLCanvasElement | null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** `marks(index)` gives the mark of page `index`, or null when it has none. */</span>
+<span class="a">+export function createPageView(</span>
+<span class="a">+  ui: PageViewElements,</span>
+<span class="a">+  marks: (index: number) =&gt; Marks | null,</span>
+<span class="a">+): PageView {</span>
+<span class="a">+  let pdf: PdfDoc | null = null;</span>
+<span class="a">+  /** The page to show. */</span>
+<span class="a">+  let index = -1;</span>
+<span class="a">+  /** The page on the canvas, and the size that it was rendered for. */</span>
+<span class="a">+  let shown = { pdf: null as PdfDoc | null, index: -1, cssWidth: 0, dpr: 0 };</span>
+<span class="a">+  let seq = 0;</span>
+<span class="a">+  let autoUntil = 0;</span>
+<span class="a">+  let userAt = -Infinity;</span>
+<span class="a">+</span>
+<span class="a">+  const canvas = (): HTMLCanvasElement | null =&gt; ui.page.querySelector(&#x27;canvas&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+  /** Draws the boxes of the mark. Gives their extent in the scroll space of the viewer, or null. */</span>
+<span class="a">+  function draw(): Extent | null {</span>
+<span class="a">+    ui.overlay.replaceChildren();</span>
+<span class="a">+    const c = canvas();</span>
+<span class="a">+    const m = shown.index === index ? marks(index) : null;</span>
+<span class="a">+    if (!c || !m) return null;</span>
+<span class="a">+    const rect = c.getBoundingClientRect();</span>
+<span class="a">+    if (rect.width === 0) return null;</span>
+<span class="a">+    const boxes = m.boxes((BOX_PAD * m.width) / rect.width);</span>
+<span class="a">+    if (boxes.length === 0) return null;</span>
+<span class="a">+    for (const box of boxes) {</span>
+<span class="a">+      const div = document.createElement(&#x27;div&#x27;);</span>
+<span class="a">+      div.className = &#x27;box&#x27;;</span>
+<span class="a">+      div.style.left = `${(100 * box.x0) / m.width}%`;</span>
+<span class="a">+      div.style.top = `${(100 * box.y0) / m.height}%`;</span>
+<span class="a">+      div.style.width = `${(100 * (box.x1 - box.x0)) / m.width}%`;</span>
+<span class="a">+      div.style.height = `${(100 * (box.y1 - box.y0)) / m.height}%`;</span>
+<span class="a">+      ui.overlay.append(div);</span>
+<span class="a">+    }</span>
+<span class="a">+    const top = Math.min(...boxes.map((b) =&gt; b.y0));</span>
+<span class="a">+    const bottom = Math.max(...boxes.map((b) =&gt; b.y1));</span>
+<span class="a">+    const offset = rect.top - ui.viewer.getBoundingClientRect().top + ui.viewer.scrollTop;</span>
+<span class="a">+    const scale = rect.height / m.height;</span>
+<span class="a">+    return { top: offset + top * scale, bottom: offset + bottom * scale };</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function scrollTo(top: number | null, smooth: boolean): void {</span>
+<span class="a">+    const v = ui.viewer;</span>
+<span class="a">+    if (top === null || Math.abs(v.scrollTop - top) &lt; 1) return;</span>
+<span class="a">+    autoUntil = performance.now() + AUTO_SCROLL_MS;</span>
+<span class="a">+    v.scrollTo({ top, behavior: smooth ? &#x27;smooth&#x27; : &#x27;auto&#x27; });</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /** Scrolls to the mark when it is out of view, unless the user scrolled lately. */</span>
+<span class="a">+  function keepInView(extent: Extent | null, smooth: boolean): void {</span>
+<span class="a">+    if (!extent || performance.now() - userAt &lt; USER_SCROLL_MS) return;</span>
+<span class="a">+    const v = ui.viewer;</span>
+<span class="a">+    const view = { top: v.scrollTop, height: v.clientHeight };</span>
+<span class="a">+    scrollTo(scrollTarget(extent, view, v.scrollHeight - v.clientHeight), smooth);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  /** Renders the page. `turn`: a new page, so scroll to its mark or to its top. */</span>
+<span class="a">+  async function render(turn: boolean): Promise&lt;void&gt; {</span>
+<span class="a">+    const doc = pdf;</span>
+<span class="a">+    if (!doc || index &lt; 0) return;</span>
+<span class="a">+    const my = ++seq;</span>
+<span class="a">+    const at = index;</span>
+<span class="a">+    const cssWidth = ui.page.clientWidth;</span>
+<span class="a">+    const dpr = window.devicePixelRatio || 1;</span>
+<span class="a">+    const width = Math.round(Math.min(MAX_RENDER, Math.max(300, cssWidth * dpr)));</span>
+<span class="a">+    const c = await doc.renderPage(at, width);</span>
+<span class="a">+    if (my !== seq) return; // A newer render replaced this one.</span>
+<span class="a">+    // A new canvas can change the height of the content, and the browser</span>
+<span class="a">+    // then moves the scroll position. That scroll does not come from the user.</span>
+<span class="a">+    autoUntil = performance.now() + AUTO_SCROLL_MS;</span>
+<span class="a">+    canvas()?.remove();</span>
+<span class="a">+    ui.page.prepend(c);</span>
+<span class="a">+    shown = { pdf: doc, index: at, cssWidth, dpr };</span>
+<span class="a">+    const extent = draw();</span>
+<span class="a">+    const v = ui.viewer;</span>
+<span class="a">+    if (turn) {</span>
+<span class="a">+      const view = { top: v.scrollTop, height: v.clientHeight };</span>
+<span class="a">+      const max = v.scrollHeight - v.clientHeight;</span>
+<span class="a">+      scrollTo(extent ? scrollTarget(extent, view, max, true) : 0, false);</span>
+<span class="a">+    } else {</span>
+<span class="a">+      keepInView(extent, false);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // A scroll event that the view did not cause comes from the user.</span>
+<span class="a">+  ui.viewer.addEventListener(</span>
+<span class="a">+    &#x27;scroll&#x27;,</span>
+<span class="a">+    () =&gt; {</span>
+<span class="a">+      if (performance.now() &gt; autoUntil) userAt = performance.now();</span>
+<span class="a">+    },</span>
+<span class="a">+    { passive: true },</span>
+<span class="a">+  );</span>
+<span class="a">+  ui.viewer.addEventListener(&#x27;scrollend&#x27;, () =&gt; {</span>
+<span class="a">+    autoUntil = 0;</span>
+<span class="a">+  });</span>
+<span class="a">+  for (const type of [&#x27;wheel&#x27;, &#x27;touchmove&#x27;]) {</span>
+<span class="a">+    ui.viewer.addEventListener(</span>
+<span class="a">+      type,</span>
+<span class="a">+      () =&gt; {</span>
+<span class="a">+        userAt = performance.now();</span>
+<span class="a">+        autoUntil = 0;</span>
+<span class="a">+      },</span>
+<span class="a">+      { passive: true },</span>
+<span class="a">+    );</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // Render again when the width of the page changes, for example after a</span>
+<span class="a">+  // rotation. The canvas stretches at once; the new render makes it sharp.</span>
+<span class="a">+  let resizeTimer: ReturnType&lt;typeof setTimeout&gt; | undefined;</span>
+<span class="a">+  new ResizeObserver(() =&gt; {</span>
+<span class="a">+    clearTimeout(resizeTimer);</span>
+<span class="a">+    resizeTimer = setTimeout(() =&gt; {</span>
+<span class="a">+      const dpr = window.devicePixelRatio || 1;</span>
+<span class="a">+      const width = ui.page.clientWidth;</span>
+<span class="a">+      if (width &gt; 0 &amp;&amp; (Math.abs(width - shown.cssWidth) &gt;= 1 || dpr !== shown.dpr)) {</span>
+<span class="a">+        void render(false);</span>
+<span class="a">+      }</span>
+<span class="a">+    }, RESIZE_MS);</span>
+<span class="a">+  }).observe(ui.viewer);</span>
+<span class="a">+</span>
+<span class="a">+  return {</span>
+<span class="a">+    show(doc, i) {</span>
+<span class="a">+      const turn = doc !== shown.pdf || i !== shown.index;</span>
+<span class="a">+      pdf = doc;</span>
+<span class="a">+      index = i;</span>
+<span class="a">+      return render(turn);</span>
+<span class="a">+    },</span>
+<span class="a">+    mark() {</span>
+<span class="a">+      keepInView(draw(), true);</span>
+<span class="a">+    },</span>
+<span class="a">+    canvas,</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+diff --git a/test/scroll.test.ts b/test/scroll.test.ts
+new file mode 100644
+index 0000000..2dd3192
+--- /dev/null
++++ b/test/scroll.test.ts
+<span class="h">@@ -0,0 +1,80 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { LEAD, scrollTarget } from &#x27;../src/scroll&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;scrollTarget&#x27;, () =&gt; {</span>
+<span class="a">+  const view = { top: 500, height: 800 };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null for a mark in view&#x27;, () =&gt; {</span>
+<span class="a">+    expect(scrollTarget({ top: 600, bottom: 640 }, view, 2000)).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;brings a mark above or below the view to the upper third&#x27;, () =&gt; {</span>
+<span class="a">+    // The follower turned to page 2: the view stayed at 500, the mark was at -220.</span>
+<span class="a">+    expect(scrollTarget({ top: 280, bottom: 320 }, view, 2000)).toBe(280 - 800 * LEAD);</span>
+<span class="a">+    expect(scrollTarget({ top: 1400, bottom: 1440 }, view, 2000)).toBe(1400 - 800 * LEAD);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;scrolls for a mark that is only partly in view&#x27;, () =&gt; {</span>
+<span class="a">+    expect(scrollTarget({ top: 1280, bottom: 1330 }, view, 2000)).toBe(1280 - 800 * LEAD);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;stays inside the content&#x27;, () =&gt; {</span>
+<span class="a">+    expect(scrollTarget({ top: 50, bottom: 90 }, view, 2000)).toBe(0);</span>
+<span class="a">+    expect(scrollTarget({ top: 2700, bottom: 2740 }, view, 2000)).toBe(2000);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives a position for a mark in view when asked&#x27;, () =&gt; {</span>
+<span class="a">+    expect(scrollTarget({ top: 600, bottom: 640 }, view, 2000, true)).toBe(400);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  const input = fc</span>
+<span class="a">+    .record({ height: fc.integer({ min: 100, max: 2000 }), max: fc.nat({ max: 5000 }) })</span>
+<span class="a">+    .chain(({ height, max }) =&gt;</span>
+<span class="a">+      fc.record({</span>
+<span class="a">+        height: fc.constant(height),</span>
+<span class="a">+        max: fc.constant(max),</span>
+<span class="a">+        viewTop: fc.integer({ min: 0, max }),</span>
+<span class="a">+        // A mark inside the content, which is max + height high.</span>
+<span class="a">+        top: fc.integer({ min: 0, max: max + height }),</span>
+<span class="a">+        size: fc.nat({ max: 200 }),</span>
+<span class="a">+        always: fc.boolean(),</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null only for a mark in view, and a position inside the content&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ({ height, max, viewTop, top, size, always }) =&gt; {</span>
+<span class="a">+        const mark = { top, bottom: top + size };</span>
+<span class="a">+        const view = { top: viewTop, height };</span>
+<span class="a">+        const target = scrollTarget(mark, view, max, always);</span>
+<span class="a">+        const inView = mark.top &gt;= viewTop &amp;&amp; mark.bottom &lt;= viewTop + height;</span>
+<span class="a">+        expect(target === null).toBe(inView &amp;&amp; !always);</span>
+<span class="a">+        if (target !== null) {</span>
+<span class="a">+          expect(target).toBeGreaterThanOrEqual(0);</span>
+<span class="a">+          expect(target).toBeLessThanOrEqual(max);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;shows the top of the mark after the scroll, in the upper third when it can&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ({ height, max, viewTop, top, size, always }) =&gt; {</span>
+<span class="a">+        const target = scrollTarget(</span>
+<span class="a">+          { top, bottom: top + size },</span>
+<span class="a">+          { top: viewTop, height },</span>
+<span class="a">+          max,</span>
+<span class="a">+          always,</span>
+<span class="a">+        );</span>
+<span class="a">+        if (target === null) return;</span>
+<span class="a">+        expect(top).toBeGreaterThanOrEqual(target);</span>
+<span class="a">+        expect(top).toBeLessThanOrEqual(target + height);</span>
+<span class="a">+        if (target &gt; 0 &amp;&amp; target &lt; max) {</span>
+<span class="a">+          expect(Math.abs(top - target - height * LEAD)).toBeLessThanOrEqual(0.5);</span>
+<span class="a">+          expect(top - target).toBeLessThanOrEqual(height / 3);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

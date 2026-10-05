@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread a5e8fc44 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit a5e8fc4480460ae26adb1ef2b980f6280a6fd31d
+truex &lt;truex@equwal.com&gt;
+2026-09-26 18:53:42 -0700
+
+Handle Back, the app state, the screen and player problems on Android
+
+- Back destroyed the activity, and the reader lost the book. Back now
+  closes the page jump, else the drawer, else puts the reader in the
+  background (App.minimizeApp). It never finishes the activity
+  (backStep). On the web the browser handles Back.
+- In the background the clock stops, so no poll of the overlay runs,
+  and the page goes to the meta data at once. Back in front, the clock
+  reads the player at once, and the reader checks for a SubRead result
+  and for the apps of the suite.
+- The screen stays on while a book is open, the player plays and the
+  follow is not off (keepScreenOn). The plugin gets a call only when
+  the value changes.
+- With SubRead Overlay installed but no notification access, play and
+  &quot;audio to page&quot; stayed on, and the strip showed
+  &quot;PlayerError: no_notification_access&quot;. playerCommandsOff now turns
+  both off for no_overlay, no_notification_access and, on the web,
+  no_player. The strip gives an &quot;Open SubRead Overlay&quot; button for no
+  notification access, and for an installed overlay that does not
+  answer. Without the overlay, the link to its releases stays.
+
+</pre><pre> src/app-state.ts       |  33 +++++++++++++++
+ src/main.ts            | 106 +++++++++++++++++++++++++++++++++++++++++++++----
+ src/messages.ts        |  56 +++++++++++++++++++++-----
+ src/nav.ts             |   6 +++
+ test/app-state.test.ts |  45 +++++++++++++++++++++
+ test/messages.test.ts  |  34 ++++++++++++++++
+ 6 files changed, 262 insertions(+), 18 deletions(-)
+</pre><pre>diff --git a/src/app-state.ts b/src/app-state.ts
+new file mode 100644
+index 0000000..b597355
+--- /dev/null
++++ b/src/app-state.ts
+<span class="h">@@ -0,0 +1,33 @@</span>
+<span class="a">+// What the Android Back button does, and when the screen stays on. Pure: no DOM.</span>
+<span class="a">+</span>
+<span class="a">+import type { FollowMode } from &#x27;./follower&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The step of the Back button: close the page jump, close the drawer, or</span>
+<span class="a">+ * put the reader in the background.</span>
+<span class="a">+ */</span>
+<span class="a">+export type BackStep = &#x27;close-jump&#x27; | &#x27;close-drawer&#x27; | &#x27;minimize&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The step of the Back button. The reader never finishes its activity:</span>
+<span class="a">+ * Android then destroys the WebView, and the reader loses its state.</span>
+<span class="a">+ */</span>
+<span class="a">+export function backStep(open: { jump: boolean; drawer: boolean }): BackStep {</span>
+<span class="a">+  if (open.jump) return &#x27;close-jump&#x27;;</span>
+<span class="a">+  if (open.drawer) return &#x27;close-drawer&#x27;;</span>
+<span class="a">+  return &#x27;minimize&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * True when the screen stays on: while the app shows, a book is open, the</span>
+<span class="a">+ * player plays and the follow is not off. During read-along the user does</span>
+<span class="a">+ * not touch the screen, so without this the screen turns off.</span>
+<span class="a">+ */</span>
+<span class="a">+export function keepScreenOn(s: {</span>
+<span class="a">+  active: boolean;</span>
+<span class="a">+  book: boolean;</span>
+<span class="a">+  playing: boolean;</span>
+<span class="a">+  mode: FollowMode;</span>
+<span class="a">+}): boolean {</span>
+<span class="a">+  return s.active &amp;&amp; s.book &amp;&amp; s.playing &amp;&amp; s.mode !== &#x27;off&#x27;;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index 38b71eb..d3057d7 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -5,7 +5,9 @@</span>
+ // are in drawer.ts (the menu), nav.ts (page turns by the user), status.ts
+ // (the strip) and view.ts (the page).
+ 
+<span class="a">+import { App } from &#x27;@capacitor/app&#x27;;</span>
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+<span class="a">+import { backStep, keepScreenOn } from &#x27;./app-state&#x27;;</span>
+ import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+<span class="h">@@ -27,6 +29,7 @@ import {</span>
+   pagesReadText,
+   pdfLoadedText,
+   pdfOpenText,
+<span class="a">+  playerCommandsOff,</span>
+   playerMessage,
+   readingEndMessage,
+   readingText,
+<span class="h">@@ -47,7 +50,7 @@ import type { PdfDoc } from &#x27;./pdf&#x27;;</span>
+ import { nextPage } from &#x27;./read-order&#x27;;
+ import { scrollTarget } from &#x27;./scroll&#x27;;
+ import { fill, onAction, say, showPlayer, showReading } from &#x27;./status&#x27;;
+<span class="d">-import { isAndroid, SubRead, type SubtitlesResult } from &#x27;./subread&#x27;;</span>
+<span class="a">+import { isAndroid, SubRead, type SubtitlesResult, type SuiteApps } from &#x27;./subread&#x27;;</span>
+ import { decodeSubtitles, lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+ import {
+   bookKey,
+<span class="h">@@ -168,6 +171,12 @@ const state = {</span>
+   making: null as string | null,
+   /** True while the player waits for a dictionary lookup that this app paused. */
+   lookupPaused: false,
+<span class="a">+  /** False while the app is in the background. */</span>
+<span class="a">+  active: true,</span>
+<span class="a">+  /** True while the plugin keeps the screen on. */</span>
+<span class="a">+  awake: false,</span>
+<span class="a">+  /** The apps of the SubRead suite on the device, or null before the first answer. */</span>
+<span class="a">+  suite: null as SuiteApps | null,</span>
+   /** True while a page turn by the user holds the follow. */
+   held: false,
+ };
+<span class="h">@@ -230,10 +239,11 @@ ui.rtl.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+   nav.update();
+ });
+ 
+<span class="d">-// A new follow mode follows the audio at once.</span>
+<span class="a">+// A new follow mode follows the audio at once. &quot;Off&quot; lets the screen turn off.</span>
+ ui.follow.addEventListener(&#x27;change&#x27;, () =&gt; {
+   settings.set(&#x27;follow&#x27;, followMode());
+   runFollow(&#x27;follow&#x27;);
+<span class="a">+  updateAwake();</span>
+ });
+ ui.pauseLookup.addEventListener(&#x27;change&#x27;, () =&gt;
+   settings.set(&#x27;pauseLookup&#x27;, ui.pauseLookup.checked ? &#x27;1&#x27; : &#x27;0&#x27;),
+<span class="h">@@ -263,7 +273,7 @@ function setForceOcr(on: boolean): void {</span>
+ 
+ /** Shows a command that failed in the strip. */
+ function sayError(err: unknown): void {
+<span class="d">-  say(errorMessage(err, isAndroid));</span>
+<span class="a">+  say(errorMessage(err, isAndroid, overlayInstalled()));</span>
+ }
+ 
+ // --- The PDF ---
+<span class="h">@@ -986,7 +996,7 @@ function scrollCueList(i: number): void {</span>
+ // --- The follow ---
+ 
+ function showPlayerStatus(s: ClockState): void {
+<span class="d">-  ui.play.disabled = s.error === &#x27;no_overlay&#x27; || (!isAndroid &amp;&amp; s.error === &#x27;no_player&#x27;);</span>
+<span class="a">+  ui.play.disabled = playerCommandsOff(s.error, isAndroid);</span>
+   ui.play.classList.toggle(&#x27;playing&#x27;, s.playing);
+   const action = s.playing ? &#x27;Pause&#x27; : &#x27;Play&#x27;;
+   if (ui.play.title !== action) {
+<span class="h">@@ -994,11 +1004,20 @@ function showPlayerStatus(s: ClockState): void {</span>
+     ui.play.setAttribute(&#x27;aria-label&#x27;, action);
+   }
+   // Before a PDF is open, the start card tells what to do first.
+<span class="d">-  showPlayer(state.pdf ? playerMessage(s, isAndroid) : null);</span>
+<span class="a">+  showPlayer(state.pdf ? playerMessage(s, isAndroid, overlayInstalled()) : null);</span>
+   updateSyncPage();
+<span class="a">+  updateAwake();</span>
+ }
+ 
+<span class="d">-/** &quot;Move the audio to this page&quot; needs cues and a player with a position. */</span>
+<span class="a">+/** True when SubRead Overlay, the release or the debug build, is on the device. */</span>
+<span class="a">+function overlayInstalled(): boolean {</span>
+<span class="a">+  return state.suite !== null &amp;&amp; (state.suite.overlay || state.suite.overlayDebug);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * &quot;Move the audio to this page&quot; needs cues and a player with a position.</span>
+<span class="a">+ * A player with a problem has no position that counts.</span>
+<span class="a">+ */</span>
+ function updateSyncPage(): void {
+   const s = state.clock;
+   ui.syncPage.disabled = state.cues.length === 0 || !s || s.positionMs === null || s.error !== null;
+<span class="h">@@ -1067,6 +1086,73 @@ function seek(ms: number): void {</span>
+ const clock: ClockSource = isAndroid ? new OverlayClock(SubRead) : new LocalAudioClock(ui.audio);
+ clock.start(applyClock);
+ 
+<span class="a">+// --- The screen and the app state ---</span>
+<span class="a">+</span>
+<span class="a">+/** Keeps the screen on during read-along (keepScreenOn). Calls the plugin only on a change. */</span>
+<span class="a">+function updateAwake(): void {</span>
+<span class="a">+  const on = keepScreenOn({</span>
+<span class="a">+    active: state.active,</span>
+<span class="a">+    book: state.pdf !== null,</span>
+<span class="a">+    playing: state.clock?.playing === true,</span>
+<span class="a">+    mode: followMode(),</span>
+<span class="a">+  });</span>
+<span class="a">+  if (on === state.awake) return;</span>
+<span class="a">+  state.awake = on;</span>
+<span class="a">+  SubRead.keepAwake({ on }).catch(() =&gt; undefined);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The app goes to the background or comes back. In the background the</span>
+<span class="a">+ * clock stops, so no poll of the overlay runs, and the screen may turn</span>
+<span class="a">+ * off. Back in front, the clock reads the player at once.</span>
+<span class="a">+ */</span>
+<span class="a">+function setActive(active: boolean): void {</span>
+<span class="a">+  if (active === state.active) return;</span>
+<span class="a">+  state.active = active;</span>
+<span class="a">+  if (active) {</span>
+<span class="a">+    clock.start(applyClock);</span>
+<span class="a">+    if (isAndroid) {</span>
+<span class="a">+      void checkPendingSubtitles();</span>
+<span class="a">+      void refreshSuite();</span>
+<span class="a">+    }</span>
+<span class="a">+  } else {</span>
+<span class="a">+    clock.stop();</span>
+<span class="a">+    // Android can stop the reader in the background.</span>
+<span class="a">+    flushPageSave();</span>
+<span class="a">+  }</span>
+<span class="a">+  updateAwake();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void App.addListener(&#x27;appStateChange&#x27;, ({ isActive }) =&gt; setActive(isActive));</span>
+<span class="a">+</span>
+<span class="a">+// Back never finishes the activity: that destroyed the WebView and the</span>
+<span class="a">+// reader lost the book. On the web the browser handles Back.</span>
+<span class="a">+if (isAndroid) {</span>
+<span class="a">+  void App.addListener(&#x27;backButton&#x27;, () =&gt; {</span>
+<span class="a">+    switch (backStep({ jump: nav.jumpOpen(), drawer: drawer.covers() })) {</span>
+<span class="a">+      case &#x27;close-jump&#x27;:</span>
+<span class="a">+        nav.closeJump();</span>
+<span class="a">+        break;</span>
+<span class="a">+      case &#x27;close-drawer&#x27;:</span>
+<span class="a">+        drawer.set(false);</span>
+<span class="a">+        break;</span>
+<span class="a">+      case &#x27;minimize&#x27;:</span>
+<span class="a">+        void App.minimizeApp();</span>
+<span class="a">+        break;</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Asks which apps of the SubRead suite are installed. */</span>
+<span class="a">+async function refreshSuite(): Promise&lt;void&gt; {</span>
+<span class="a">+  try {</span>
+<span class="a">+    state.suite = await SubRead.suite();</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  if (state.clock) showPlayerStatus(state.clock);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ ui.play.addEventListener(&#x27;click&#x27;, () =&gt; {
+   const action = state.clock?.playing ? clock.pause() : clock.play();
+   action.catch(sayError);
+<span class="h">@@ -1217,6 +1303,9 @@ onAction((id) =&gt; {</span>
+     case &#x27;retry-reading&#x27;:
+       void readBook(true);
+       break;
+<span class="a">+    case &#x27;open-overlay&#x27;:</span>
+<span class="a">+      SubRead.openOverlay().catch(sayError);</span>
+<span class="a">+      break;</span>
+   }
+ });
+ 
+<span class="h">@@ -1231,6 +1320,9 @@ ui.audioRow.hidden = isAndroid;</span>
+ // The web copies a lookup at once: there is no dictionary app to choose or to wait for.
+ ui.dictRow.hidden = !isAndroid;
+ ui.pauseRow.hidden = !isAndroid;
+<span class="d">-if (isAndroid) void loadDictionaries().catch(sayError);</span>
+<span class="a">+if (isAndroid) {</span>
+<span class="a">+  void loadDictionaries().catch(sayError);</span>
+<span class="a">+  void refreshSuite();</span>
+<span class="a">+}</span>
+ watchDb();
+ void restoreLastBook();
+diff --git a/src/messages.ts b/src/messages.ts
+index 60a4a91..fec7795 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -3,7 +3,7 @@</span>
+ import { PlayerError, type ClockState } from &#x27;./clock-source&#x27;;
+ 
+ /** The actions of the buttons in the strip. main.ts runs them. */
+<span class="d">-export type ActionId = &#x27;retry-reading&#x27;;</span>
+<span class="a">+export type ActionId = &#x27;retry-reading&#x27; | &#x27;open-overlay&#x27;;</span>
+ 
+ /** A text, and a link or a button after it. */
+ export interface Message {
+<span class="h">@@ -28,11 +28,19 @@ export function clockText(ms: number): string {</span>
+   return `${h &gt; 0 ? `${h}:` : &#x27;&#x27;}${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+ }
+ 
+<span class="a">+export const OPEN_OVERLAY = { id: &#x27;open-overlay&#x27;, text: &#x27;Open SubRead Overlay&#x27; } as const;</span>
+<span class="a">+</span>
+ /**
+  * What is wrong with the player, and what to do, for a reason of
+  * `PlayerError` or `ClockState.error`. Null for another reason.
+<span class="a">+ * `overlayInstalled` is true when SubRead Overlay is on the device: then a</span>
+<span class="a">+ * button opens it, so that the user can give it notification access.</span>
+  */
+<span class="d">-export function playerProblem(reason: string, android: boolean): Message | null {</span>
+<span class="a">+export function playerProblem(</span>
+<span class="a">+  reason: string,</span>
+<span class="a">+  android: boolean,</span>
+<span class="a">+  overlayInstalled = false,</span>
+<span class="a">+): Message | null {</span>
+   switch (reason) {
+     case &#x27;no_player&#x27;:
+       return {
+<span class="h">@@ -41,31 +49,57 @@ export function playerProblem(reason: string, android: boolean): Message | null</span>
+           : &#x27;Load the audio file first.&#x27;,
+       };
+     case &#x27;no_overlay&#x27;:
+<span class="d">-      return {</span>
+<span class="d">-        text: &#x27;SubRead Overlay is not installed.&#x27;,</span>
+<span class="d">-        link: { href: OVERLAY_RELEASES, text: &#x27;Get it&#x27; },</span>
+<span class="d">-      };</span>
+<span class="a">+      return overlayInstalled</span>
+<span class="a">+        ? { text: &#x27;SubRead Overlay does not answer.&#x27;, action: OPEN_OVERLAY }</span>
+<span class="a">+        : {</span>
+<span class="a">+            text: &#x27;SubRead Overlay is not installed.&#x27;,</span>
+<span class="a">+            link: { href: OVERLAY_RELEASES, text: &#x27;Get it&#x27; },</span>
+<span class="a">+          };</span>
+     case &#x27;no_notification_access&#x27;:
+<span class="d">-      return { text: &#x27;Allow notification access in SubRead Overlay.&#x27; };</span>
+<span class="a">+      return { text: &#x27;Allow notification access in SubRead Overlay.&#x27;, action: OPEN_OVERLAY };</span>
+     default:
+       return null;
+   }
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * True when play and &quot;audio to page&quot; cannot work: no SubRead Overlay, no</span>
+<span class="a">+ * notification access, or on the web no audio file.</span>
+<span class="a">+ */</span>
+<span class="a">+export function playerCommandsOff(error: string | null, android: boolean): boolean {</span>
+<span class="a">+  return (</span>
+<span class="a">+    error === &#x27;no_overlay&#x27; ||</span>
+<span class="a">+    error === &#x27;no_notification_access&#x27; ||</span>
+<span class="a">+    (!android &amp;&amp; error === &#x27;no_player&#x27;)</span>
+<span class="a">+  );</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The text for a command that failed. A PlayerError gets the text of its reason. */
+<span class="d">-export function errorMessage(err: unknown, android: boolean): Message {</span>
+<span class="a">+export function errorMessage(err: unknown, android: boolean, overlayInstalled = false): Message {</span>
+   if (err instanceof PlayerError) {
+<span class="d">-    return playerProblem(err.reason, android) ?? { text: `The player failed: ${err.reason}.` };</span>
+<span class="a">+    return (</span>
+<span class="a">+      playerProblem(err.reason, android, overlayInstalled) ?? {</span>
+<span class="a">+        text: `The player failed: ${err.reason}.`,</span>
+<span class="a">+      }</span>
+<span class="a">+    );</span>
+   }
+   return { text: String(err) };
+ }
+ 
+ /** The player part of the strip: the time and the play state, or the problem. */
+<span class="d">-export function playerMessage(s: ClockState | null, android: boolean): Message {</span>
+<span class="a">+export function playerMessage(</span>
+<span class="a">+  s: ClockState | null,</span>
+<span class="a">+  android: boolean,</span>
+<span class="a">+  overlayInstalled = false,</span>
+<span class="a">+): Message {</span>
+   const name = android ? &#x27;Player&#x27; : &#x27;Audio&#x27;;
+   if (!s) return { text: `${name}: not read yet.` };
+   if (s.error !== null) {
+<span class="d">-    return playerProblem(s.error, android) ?? { text: `${name}: cannot read it (${s.error}).` };</span>
+<span class="a">+    return (</span>
+<span class="a">+      playerProblem(s.error, android, overlayInstalled) ?? {</span>
+<span class="a">+        text: `${name}: cannot read it (${s.error}).`,</span>
+<span class="a">+      }</span>
+<span class="a">+    );</span>
+   }
+   if (s.positionMs === null) return { text: `${name}: no position.` };
+   return { text: `${name} ${clockText(s.positionMs)}, ${s.playing ? &#x27;playing&#x27; : &#x27;paused&#x27;}` };
+diff --git a/src/nav.ts b/src/nav.ts
+index 0659027..48f6c88 100644
+--- a/src/nav.ts
++++ b/src/nav.ts
+<span class="h">@@ -36,6 +36,10 @@ export interface NavState {</span>
+ export interface Nav {
+   /** Shows the page label, and the state and the names of the arrows. */
+   update(): void;
+<span class="a">+  /** True while the page jump is open. */</span>
+<span class="a">+  jumpOpen(): boolean;</span>
+<span class="a">+  /** Closes the page jump. */</span>
+<span class="a">+  closeJump(): void;</span>
+ }
+ 
+ function zoomed(): boolean {
+<span class="h">@@ -206,5 +210,7 @@ export function setupNav(ui: NavElements, s: NavState, turnTo: (index: number) =</span>
+       name(ui.pageRight, arrowStep(&#x27;right&#x27;, rtl));
+       if (pages === 0) closeJump();
+     },
+<span class="a">+    jumpOpen: () =&gt; !ui.pageInput.hidden,</span>
+<span class="a">+    closeJump,</span>
+   };
+ }
+diff --git a/test/app-state.test.ts b/test/app-state.test.ts
+new file mode 100644
+index 0000000..0f6062b
+--- /dev/null
++++ b/test/app-state.test.ts
+<span class="h">@@ -0,0 +1,45 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { backStep, keepScreenOn } from &#x27;../src/app-state&#x27;;</span>
+<span class="a">+import type { FollowMode } from &#x27;../src/follower&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;backStep&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;closes the page jump first, then the drawer&#x27;, () =&gt; {</span>
+<span class="a">+    expect(backStep({ jump: true, drawer: true })).toBe(&#x27;close-jump&#x27;);</span>
+<span class="a">+    expect(backStep({ jump: true, drawer: false })).toBe(&#x27;close-jump&#x27;);</span>
+<span class="a">+    expect(backStep({ jump: false, drawer: true })).toBe(&#x27;close-drawer&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;puts the reader in the background, and never finishes it&#x27;, () =&gt; {</span>
+<span class="a">+    // The phone finding: Back destroyed the activity, and the book was lost.</span>
+<span class="a">+    expect(backStep({ jump: false, drawer: false })).toBe(&#x27;minimize&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;keepScreenOn&#x27;, () =&gt; {</span>
+<span class="a">+  const on = { active: true, book: true, playing: true, mode: &#x27;highlight&#x27; as FollowMode };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the screen on during read-along, also in &quot;Turn pages only&quot;&#x27;, () =&gt; {</span>
+<span class="a">+    expect(keepScreenOn(on)).toBe(true);</span>
+<span class="a">+    expect(keepScreenOn({ ...on, mode: &#x27;pages&#x27; })).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;lets the screen turn off when one condition is missing&#x27;, () =&gt; {</span>
+<span class="a">+    const cases = fc.record({</span>
+<span class="a">+      active: fc.boolean(),</span>
+<span class="a">+      book: fc.boolean(),</span>
+<span class="a">+      playing: fc.boolean(),</span>
+<span class="a">+      mode: fc.constantFrom&lt;FollowMode&gt;(&#x27;highlight&#x27;, &#x27;pages&#x27;, &#x27;off&#x27;),</span>
+<span class="a">+    });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(cases, (s) =&gt; {</span>
+<span class="a">+        const all = s.active &amp;&amp; s.book &amp;&amp; s.playing &amp;&amp; s.mode !== &#x27;off&#x27;;</span>
+<span class="a">+        expect(keepScreenOn(s)).toBe(all);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+    expect(keepScreenOn({ ...on, active: false })).toBe(false);</span>
+<span class="a">+    expect(keepScreenOn({ ...on, book: false })).toBe(false);</span>
+<span class="a">+    expect(keepScreenOn({ ...on, playing: false })).toBe(false);</span>
+<span class="a">+    expect(keepScreenOn({ ...on, mode: &#x27;off&#x27; })).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index b9c0410..54bb67e 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -14,6 +14,7 @@ import {</span>
+   pagesReadText,
+   pdfLoadedText,
+   pdfOpenText,
+<span class="a">+  playerCommandsOff,</span>
+   playerMessage,
+   playerProblem,
+   readingEndMessage,
+<span class="h">@@ -48,9 +49,27 @@ describe(&#x27;playerProblem&#x27;, () =&gt; {</span>
+       text: &#x27;SubRead Overlay is not installed.&#x27;,
+       link: { href: OVERLAY_RELEASES, text: &#x27;Get it&#x27; },
+     });
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives a button that opens SubRead Overlay when it has no notification access&#x27;, () =&gt; {</span>
+<span class="a">+    // The phone finding: the strip showed &quot;PlayerError: no_notification_access&quot;.</span>
+     expect(playerProblem(&#x27;no_notification_access&#x27;, true)).toEqual({
+       text: &#x27;Allow notification access in SubRead Overlay.&#x27;,
+<span class="a">+      action: { id: &#x27;open-overlay&#x27;, text: &#x27;Open SubRead Overlay&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the button, not the link, when SubRead Overlay is installed but does not answer&#x27;, () =&gt; {</span>
+<span class="a">+    expect(playerProblem(&#x27;no_overlay&#x27;, true, true)).toEqual({</span>
+<span class="a">+      text: &#x27;SubRead Overlay does not answer.&#x27;,</span>
+<span class="a">+      action: { id: &#x27;open-overlay&#x27;, text: &#x27;Open SubRead Overlay&#x27; },</span>
+     });
+<span class="a">+    expect(playerMessage(state({ positionMs: null, error: &#x27;no_overlay&#x27; }), true, true)).toEqual(</span>
+<span class="a">+      playerProblem(&#x27;no_overlay&#x27;, true, true),</span>
+<span class="a">+    );</span>
+<span class="a">+    expect(errorMessage(new PlayerError(&#x27;no_overlay&#x27;), true, true)).toEqual(</span>
+<span class="a">+      playerProblem(&#x27;no_overlay&#x27;, true, true),</span>
+<span class="a">+    );</span>
+   });
+ 
+   it(&#x27;gives null for another reason&#x27;, () =&gt; {
+<span class="h">@@ -58,6 +77,21 @@ describe(&#x27;playerProblem&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="a">+describe(&#x27;playerCommandsOff&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;turns off play and &quot;audio to page&quot; without notification access&#x27;, () =&gt; {</span>
+<span class="a">+    // The phone finding: with no notification access, play stayed on.</span>
+<span class="a">+    expect(playerCommandsOff(&#x27;no_notification_access&#x27;, true)).toBe(true);</span>
+<span class="a">+    expect(playerCommandsOff(&#x27;no_overlay&#x27;, true)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;turns them off on the web without an audio file only&#x27;, () =&gt; {</span>
+<span class="a">+    expect(playerCommandsOff(&#x27;no_player&#x27;, false)).toBe(true);</span>
+<span class="a">+    expect(playerCommandsOff(&#x27;no_player&#x27;, true)).toBe(false);</span>
+<span class="a">+    expect(playerCommandsOff(null, true)).toBe(false);</span>
+<span class="a">+    expect(playerCommandsOff(null, false)).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;errorMessage&#x27;, () =&gt; {
+   it(&#x27;gives the text of the reason for a PlayerError&#x27;, () =&gt; {
+     expect(errorMessage(new PlayerError(&#x27;no_player&#x27;), false)).toEqual({</pre>
+</div></body></html>

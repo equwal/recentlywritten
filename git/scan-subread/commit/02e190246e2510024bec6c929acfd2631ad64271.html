@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 02e19024 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 02e190246e2510024bec6c929acfd2631ad64271
+truex &lt;truex@equwal.com&gt;
+2026-09-26 23:23:50 -0700
+
+Do not let late meta data undo a change of the user
+
+The meta data of a book can come many seconds after the open: getMeta
+waits behind the database upgrade. Two changes of the user were lost:
+
+- The user opens B and ticks Force OCR before the meta data of B comes.
+  applyMeta then set Force OCR back and started the reading again
+  without it, while the store said on.
+- The user opens B. Page 1 shows, and a save of page 1 waits. The user
+  opens C before the meta data of B comes: the save of page 1 went over
+  the saved page of B, and the meta data of B never applied.
+
+state.changed now notes a page turn (by the user or by the follow) and
+a change of Force OCR after the open. lateMeta (book-open.ts) gives the
+fields of the meta data that apply: each field that did not change.
+The first page of an open is the saved page or a placeholder, and the
+page of the meta data is the saved page, so showPage does not save
+them. Only a page turn saves the page.
+
+</pre><pre> README.md              |  3 +++
+ src/book-open.ts       | 27 ++++++++++++++++++++++++++-
+ src/main.ts            | 41 +++++++++++++++++++++++++++++------------
+ test/book-open.test.ts | 40 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 98 insertions(+), 13 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 67905fc..ae5297d 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -71,6 +71,9 @@ second after it changes.</span>
+ The first start after an upgrade from a build with the old dictionary
+ can take long: the upgrade deletes about 86 MB of dictionary data. The
+ strip then says &quot;Updating the page cache...&quot;, and the start card shows.
+<span class="a">+A book that you open in that time shows at once, and its meta data</span>
+<span class="a">+applies when it comes. A page turn or a change of &quot;Force OCR&quot; that you</span>
+<span class="a">+make before then stays.</span>
+ 
+ ### Android: Back, the screen and the suite
+ 
+diff --git a/src/book-open.ts b/src/book-open.ts
+index a16297e..d8b8c14 100644
+--- a/src/book-open.ts
++++ b/src/book-open.ts
+<span class="h">@@ -1,5 +1,8 @@</span>
+ // The open of a book: the open attempts, the owner of subtitles that load
+<span class="d">-// during an open, and the restore of the last book. Pure: no DOM.</span>
+<span class="a">+// during an open, the restore of the last book, the error of a failed</span>
+<span class="a">+// attempt, and the meta data that comes after the open. Pure: no DOM.</span>
+<span class="a">+</span>
+<span class="a">+import type { BookMeta } from &#x27;./token-cache&#x27;;</span>
+ 
+ /**
+  * The open attempts of books. Each attempt gets the next number: 1, 2, 3 ...
+<span class="h">@@ -82,3 +85,25 @@ export function userOpened(o: Opens, since: number): boolean {</span>
+ export function failureShows(o: Opens, attempt: number, since?: number): boolean {
+   return attempt &gt; o.shown &amp;&amp; (since === undefined || !userOpened(o, since));
+ }
+<span class="a">+</span>
+<span class="a">+/** What changed after the open of a book, before its meta data came. */</span>
+<span class="a">+export interface Changes {</span>
+<span class="a">+  /** A page turn: by the user, or by the follow of the audio. */</span>
+<span class="a">+  page: boolean;</span>
+<span class="a">+  /** A change of &quot;Force OCR&quot; by the user. */</span>
+<span class="a">+  forceOcr: boolean;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The fields of the meta data of a book that apply when the meta data comes</span>
+<span class="a">+ * after the open: each field that did not change after the open. A field</span>
+<span class="a">+ * that is not in the result does not apply. Without a saved setting, &quot;Force</span>
+<span class="a">+ * OCR&quot; is off. The upgrade of the database can hold the meta data for many</span>
+<span class="a">+ * seconds, and before, it set &quot;Force OCR&quot; back after the user ticked it.</span>
+<span class="a">+ */</span>
+<span class="a">+export function lateMeta(meta: BookMeta, changed: Changes): { page?: number; forceOcr?: boolean } {</span>
+<span class="a">+  const late: { page?: number; forceOcr?: boolean } = {};</span>
+<span class="a">+  if (!changed.page &amp;&amp; meta.page !== undefined) late.page = meta.page;</span>
+<span class="a">+  if (!changed.forceOcr) late.forceOcr = meta.forceOcr ?? false;</span>
+<span class="a">+  return late;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index 8817e2d..3fb0ff4 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -14,8 +14,10 @@ import {</span>
+   createOpens,
+   endOpen,
+   failureShows,
+<span class="a">+  lateMeta,</span>
+   subtitlesOwner,
+   userOpened,
+<span class="a">+  type Changes,</span>
+ } from &#x27;./book-open&#x27;;
+ import {
+   keepMakeStatus,
+<span class="h">@@ -186,6 +188,8 @@ const state = {</span>
+   dbSlow: false,
+   /** &quot;Force OCR&quot; of the open book: the reading skips the text layer. */
+   forceOcr: false,
+<span class="a">+  /** What changed after the open of the book. Its meta data does not undo it (lateMeta). */</span>
+<span class="a">+  changed: { page: false, forceOcr: false } as Changes,</span>
+   /** A SubRead job that waits until all pages of its book are read. */
+   makeWait: null as { audio: { uri: string; name: string }; book: string } | null,
+   /** The book of the SubRead job that runs, or null. */
+<span class="h">@@ -283,6 +287,8 @@ ui.lang.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+ ui.forceOcr.addEventListener(&#x27;change&#x27;, () =&gt; {
+   const book = state.book;
+   if (book === null) return;
+<span class="a">+  // Meta data of the book that comes later does not undo this (lateMeta).</span>
+<span class="a">+  state.changed.forceOcr = true;</span>
+   setForceOcr(ui.forceOcr.checked);
+   void putMeta(book, { forceOcr: state.forceOcr });
+   void readBook();
+<span class="h">@@ -384,6 +390,7 @@ async function openBook(file: File, restore?: Restore): Promise&lt;boolean&gt; {</span>
+   state.activeCue = -1;
+   state.markedCue = -1;
+   state.held = false;
+<span class="a">+  state.changed = { page: false, forceOcr: false };</span>
+   // The subtitles of another book go at once. Subtitles of no book, loaded
+   // while no book was open or while this book loaded, are for this book.
+   if (state.subtitles &amp;&amp; state.subtitlesBook !== null &amp;&amp; state.subtitlesBook !== key) {
+<span class="h">@@ -407,7 +414,9 @@ async function openBook(file: File, restore?: Restore): Promise&lt;boolean&gt; {</span>
+   if (state.clock) showPlayerStatus(state.clock);
+   say(pdfLoadedText(pdf.numPages));
+   // showPage sets the current page at once, so the reading starts there.
+<span class="d">-  void showPage(validPage(meta?.page, pdf.numPages) ?? 0);</span>
+<span class="a">+  // This page is the saved page, or page 1 until the meta data comes: no</span>
+<span class="a">+  // save, so page 1 does not go over the saved page of the book.</span>
+<span class="a">+  void showPage(validPage(meta?.page, pdf.numPages) ?? 0, false);</span>
+   // readBook stops the reading of the old book before its document closes.
+   void readBook();
+   void old?.destroy();
+<span class="h">@@ -431,20 +440,19 @@ function validPage(page: number | undefined, pages: number): number | undefined</span>
+ /**
+  * Applies the meta data of the book that open attempt `attempt` opened.
+  * `subtitlesSeq` is the count of subtitle loads at the open: subtitles
+<span class="d">- * that the user loaded after the open stay. The page applies only while</span>
+<span class="d">- * the first page shows, so a page turn after the open stays.</span>
+<span class="a">+ * that the user loaded after the open stay. A page turn and a change of</span>
+<span class="a">+ * &quot;Force OCR&quot; after the open stay too (lateMeta).</span>
+  */
+ function applyMeta(meta: BookMeta, attempt: number, subtitlesSeq: number): void {
+   const key = state.book;
+   const pdf = state.pdf;
+   if (attempt !== opens.shown || key === null || !pdf) return;
+<span class="d">-  const page = validPage(meta.page, pdf.numPages);</span>
+<span class="d">-  if (page !== undefined &amp;&amp; page !== state.currentPage &amp;&amp; state.currentPage === 0) {</span>
+<span class="d">-    void showPage(page);</span>
+<span class="d">-  }</span>
+<span class="d">-  const forceOcr = meta.forceOcr ?? false;</span>
+<span class="d">-  if (forceOcr !== state.forceOcr) {</span>
+<span class="d">-    setForceOcr(forceOcr);</span>
+<span class="a">+  const late = lateMeta(meta, state.changed);</span>
+<span class="a">+  const page = validPage(late.page, pdf.numPages);</span>
+<span class="a">+  // The saved page needs no new save.</span>
+<span class="a">+  if (page !== undefined &amp;&amp; page !== state.currentPage) void showPage(page, false);</span>
+<span class="a">+  if (late.forceOcr !== undefined &amp;&amp; late.forceOcr !== state.forceOcr) {</span>
+<span class="a">+    setForceOcr(late.forceOcr);</span>
+     void readBook();
+   }
+   if (state.subtitlesSeq === subtitlesSeq) {
+<span class="h">@@ -1287,12 +1295,21 @@ function marks(index: number): Marks | null {</span>
+   };
+ }
+ 
+<span class="d">-async function showPage(index: number): Promise&lt;void&gt; {</span>
+<span class="a">+/**</span>
+<span class="a">+ * Shows page `index`. `save` is true for a page turn by the user or by the</span>
+<span class="a">+ * follow: the page goes to the meta data of the book soon, and the meta</span>
+<span class="a">+ * data that comes later does not turn the page back (lateMeta). The page</span>
+<span class="a">+ * of the open and the saved page need no save.</span>
+<span class="a">+ */</span>
+<span class="a">+async function showPage(index: number, save = true): Promise&lt;void&gt; {</span>
+   const pdf = state.pdf;
+   if (!pdf || index &lt; 0 || index &gt;= pdf.numPages) return;
+   state.currentPage = index;
+   nav.update();
+<span class="d">-  savePageSoon();</span>
+<span class="a">+  if (save) {</span>
+<span class="a">+    state.changed.page = true;</span>
+<span class="a">+    savePageSoon();</span>
+<span class="a">+  }</span>
+   try {
+     await view.show(pdf, index);
+   } catch (err) {
+diff --git a/test/book-open.test.ts b/test/book-open.test.ts
+index 83e161b..7b41e38 100644
+--- a/test/book-open.test.ts
++++ b/test/book-open.test.ts
+<span class="h">@@ -5,12 +5,52 @@ import {</span>
+   createOpens,
+   endOpen,
+   failureShows,
+<span class="a">+  lateMeta,</span>
+   opening,
+   subtitlesOwner,
+   userOpened,
+   type Opens,
+ } from &#x27;../src/book-open&#x27;;
+ 
+<span class="a">+describe(&#x27;lateMeta&#x27;, () =&gt; {</span>
+<span class="a">+  const none = { page: false, forceOcr: false };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not undo &quot;Force OCR&quot; that the user set before the meta data came&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: the user opens B and ticks Force OCR before the meta data</span>
+<span class="a">+    // of B comes. The meta data set Force OCR back, and the reading started</span>
+<span class="a">+    // again without it, while the store said on.</span>
+<span class="a">+    expect(lateMeta({}, { page: false, forceOcr: true })).toEqual({});</span>
+<span class="a">+    expect(lateMeta({ forceOcr: false }, { page: false, forceOcr: true })).toEqual({});</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not go to the saved page after a page turn&#x27;, () =&gt; {</span>
+<span class="a">+    expect(lateMeta({ page: 57 }, { page: true, forceOcr: false })).toEqual({ forceOcr: false });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;applies each field that did not change&#x27;, () =&gt; {</span>
+<span class="a">+    expect(lateMeta({ page: 57, forceOcr: true }, none)).toEqual({ page: 57, forceOcr: true });</span>
+<span class="a">+    // Without a saved setting, Force OCR is off. Without a saved page, the page stays.</span>
+<span class="a">+    expect(lateMeta({}, none)).toEqual({ forceOcr: false });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives exactly the fields that did not change, with their saved values&#x27;, () =&gt; {</span>
+<span class="a">+    const meta = fc.record(</span>
+<span class="a">+      { page: fc.nat({ max: 500 }), forceOcr: fc.boolean() },</span>
+<span class="a">+      { requiredKeys: [] },</span>
+<span class="a">+    );</span>
+<span class="a">+    const changes = fc.record({ page: fc.boolean(), forceOcr: fc.boolean() });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(meta, changes, (m, changed) =&gt; {</span>
+<span class="a">+        const late = lateMeta(m, changed);</span>
+<span class="a">+        expect(&#x27;page&#x27; in late).toBe(!changed.page &amp;&amp; m.page !== undefined);</span>
+<span class="a">+        if (&#x27;page&#x27; in late) expect(late.page).toBe(m.page);</span>
+<span class="a">+        expect(&#x27;forceOcr&#x27; in late).toBe(!changed.forceOcr);</span>
+<span class="a">+        if (&#x27;forceOcr&#x27; in late) expect(late.forceOcr).toBe(m.forceOcr ?? false);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;failureShows&#x27;, () =&gt; {
+   it(&#x27;does not say the error of an older pick over the book that shows&#x27;, () =&gt; {
+     // The finding: the user picks a large file A that is no PDF, then B. B</pre>
+</div></body></html>

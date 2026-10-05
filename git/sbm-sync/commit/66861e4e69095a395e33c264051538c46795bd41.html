@@ -1,0 +1,1774 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync 66861e4e - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 66861e4e69095a395e33c264051538c46795bd41
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 18:28:26 -0700
+
+Add the bookmarks of an account to the web site
+
+Signed-in users can now use their bookmarks at /bookmarks, in any
+browser and on a phone. The pages do what bm does:
+
+- Search with the search of the add-on, filter by tag, and sort by
+  date, URL, description or tag. Text that no bookmark matches opens
+  as an address or as a web search.
+- Add, edit and delete a bookmark. A URL that is a bookmark already
+  is refused.
+- Edit the whole file, as bm -e does.
+- Import the HTML file that a browser exports, as bm-import and
+  bm --merge do. A file of bookmark lines works too.
+- Download the file.
+
+Each change goes through Store.sync, so the changes that devices made
+since a page opened stay. The pages obey the rules of sync. The
+download works also when sync is paused. Sign-in now opens the
+bookmarks. Sign-up still opens the account page.
+
+</pre><pre> README.md         |  23 ++
+ bookmarks.go      | 737 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ bookmarks_test.go | 234 +++++++++++++++++
+ main.go           |  26 +-
+ pages.html        |  94 ++++++-
+ store.go          |  42 +++-
+ web_test.go       | 434 ++++++++++++++++++++++++++++++++
+ 7 files changed, 1571 insertions(+), 19 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 64ec000..bf2dade 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -36,6 +36,29 @@ The merge compares whole lines:</span>
+ When the server does not know the last version of a device (for its first
+ sync), nothing is removed: the result is the union of both files.
+ 
+<span class="a">+## Bookmarks on the web</span>
+<span class="a">+</span>
+<span class="a">+After you sign in, the page **/bookmarks** shows your bookmarks in any</span>
+<span class="a">+browser, also on a phone. It does what bm does:</span>
+<span class="a">+</span>
+<span class="a">+- Search as fzf does, with the search of the add-on. Pick a tag. Sort by</span>
+<span class="a">+  date, URL, description or tag. Text that no bookmark matches opens as an</span>
+<span class="a">+  address, or as a web search.</span>
+<span class="a">+- Add a bookmark. A URL that is a bookmark already is refused.</span>
+<span class="a">+- Edit or delete a bookmark.</span>
+<span class="a">+- Edit the whole file, as `bm -e` does.</span>
+<span class="a">+- Import the HTML file that a browser exports, as</span>
+<span class="a">+  `bm-import bookmarks.html | bm --merge` does: folders become tags, and</span>
+<span class="a">+  known URLs are skipped. A file of bookmark lines works too.</span>
+<span class="a">+- Download the file.</span>
+<span class="a">+</span>
+<span class="a">+Each change goes through the same merge as a sync, so the changes that your</span>
+<span class="a">+devices made since the page opened stay. The pages have no script.</span>
+<span class="a">+</span>
+<span class="a">+The pages obey the rules of sync: the email address must be confirmed, and</span>
+<span class="a">+with billing on, the account needs its trial or a subscription. The</span>
+<span class="a">+download always works, because the bookmarks belong to their owner.</span>
+<span class="a">+</span>
+ ## Protocol
+ 
+ Plain HTTP, for any client with curl.
+diff --git a/bookmarks.go b/bookmarks.go
+new file mode 100644
+index 0000000..c5834b9
+--- /dev/null
++++ b/bookmarks.go
+<span class="h">@@ -0,0 +1,737 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+// The web pages for the bookmarks of an account. Each change goes through</span>
+<span class="a">+// Store.sync, as the file of a device does, so the changes that other</span>
+<span class="a">+// devices made since a page opened stay.</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;errors&quot;</span>
+<span class="a">+	&quot;fmt&quot;</span>
+<span class="a">+	&quot;html&quot;</span>
+<span class="a">+	&quot;io&quot;</span>
+<span class="a">+	&quot;io/fs&quot;</span>
+<span class="a">+	&quot;net/http&quot;</span>
+<span class="a">+	&quot;net/url&quot;</span>
+<span class="a">+	&quot;regexp&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strconv&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;unicode&quot;</span>
+<span class="a">+	&quot;unicode/utf8&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+const (</span>
+<span class="a">+	maxRows   = 1000     // bookmarks on one page</span>
+<span class="a">+	maxForm   = 64 &lt;&lt; 10 // bytes in the form of one bookmark</span>
+<span class="a">+	maxImport = 32 &lt;&lt; 20 // bytes in an imported file: browsers put icons in it</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+var (</span>
+<span class="a">+	errNoURL   = errors.New(&quot;type the URL of the bookmark&quot;)</span>
+<span class="a">+	errHashURL = errors.New(&quot;a URL cannot start with #, because bm reads the line as a comment&quot;)</span>
+<span class="a">+	// errChanged tells that a page shows a line that the file does not have</span>
+<span class="a">+	// now.</span>
+<span class="a">+	errChanged = errors.New(&quot;the bookmark changed on another device&quot;)</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// sentence gives the text of an error as a sentence for a page.</span>
+<span class="a">+func sentence(err error) string {</span>
+<span class="a">+	return strings.ToUpper(err.Error()[:1]) + err.Error()[1:] + &quot;.&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- the bookmark file ----</span>
+<span class="a">+</span>
+<span class="a">+// Bookmark is one bookmark line of the file:</span>
+<span class="a">+//</span>
+<span class="a">+//	URL&lt;tab&gt;description&lt;tab&gt;tag tag tag</span>
+<span class="a">+type Bookmark struct {</span>
+<span class="a">+	URL, Desc string</span>
+<span class="a">+	Tags      []string</span>
+<span class="a">+	N         int // the index of the line in the file</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Title gives the text of the link to the bookmark.</span>
+<span class="a">+func (b Bookmark) Title() string {</span>
+<span class="a">+	if strings.TrimSpace(b.Desc) == &quot;&quot; {</span>
+<span class="a">+		return b.URL</span>
+<span class="a">+	}</span>
+<span class="a">+	return b.Desc</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Host gives the host of the URL, to show under the title.</span>
+<span class="a">+func (b Bookmark) Host() string {</span>
+<span class="a">+	u := scheme.ReplaceAllString(b.URL, &quot;&quot;)</span>
+<span class="a">+	if i := strings.IndexAny(u, &quot;/?#&quot;); i &gt;= 0 {</span>
+<span class="a">+		u = u[:i]</span>
+<span class="a">+	}</span>
+<span class="a">+	return u</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Link gives the address of the link to the bookmark. Only http and https</span>
+<span class="a">+// links are made, so that a line of the file cannot run script in the page.</span>
+<span class="a">+// An address without a scheme gets https. Other schemes give &quot;&quot;: the page</span>
+<span class="a">+// shows them as text.</span>
+<span class="a">+func (b Bookmark) Link() string {</span>
+<span class="a">+	l := strings.ToLower(b.URL)</span>
+<span class="a">+	switch {</span>
+<span class="a">+	case strings.HasPrefix(l, &quot;https://&quot;) || strings.HasPrefix(l, &quot;http://&quot;):</span>
+<span class="a">+		return b.URL</span>
+<span class="a">+	case !strings.Contains(b.URL, &quot;:&quot;):</span>
+<span class="a">+		return &quot;https://&quot; + b.URL</span>
+<span class="a">+	}</span>
+<span class="a">+	return &quot;&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// parseLine gives the bookmark of a line, and false for a comment or an</span>
+<span class="a">+// empty line. A line without a tab has the old format &quot;URL description |</span>
+<span class="a">+// tags&quot;. Until bm-migrate converts it, its first word is the URL, as in the</span>
+<span class="a">+// add-on.</span>
+<span class="a">+func parseLine(line string) (Bookmark, bool) {</span>
+<span class="a">+	if strings.TrimSpace(line) == &quot;&quot; || strings.HasPrefix(line, &quot;#&quot;) {</span>
+<span class="a">+		return Bookmark{}, false</span>
+<span class="a">+	}</span>
+<span class="a">+	fields := strings.Split(line, &quot;\t&quot;)</span>
+<span class="a">+	if len(fields) == 1 {</span>
+<span class="a">+		words := strings.Fields(line)</span>
+<span class="a">+		return Bookmark{URL: words[0], Desc: strings.Join(words[1:], &quot; &quot;)}, true</span>
+<span class="a">+	}</span>
+<span class="a">+	b := Bookmark{URL: strings.TrimSpace(fields[0]), Desc: fields[1]}</span>
+<span class="a">+	if len(fields) &gt; 2 {</span>
+<span class="a">+		b.Tags = strings.FieldsFunc(fields[2], func(r rune) bool { return r == &#x27; &#x27; })</span>
+<span class="a">+	}</span>
+<span class="a">+	return b, b.URL != &quot;&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// parse gives the bookmarks of a file, in the order of the file.</span>
+<span class="a">+func parse(text string) []Bookmark {</span>
+<span class="a">+	var out []Bookmark</span>
+<span class="a">+	for i, l := range lines(text) {</span>
+<span class="a">+		if b, ok := parseLine(l); ok {</span>
+<span class="a">+			b.N = i</span>
+<span class="a">+			out = append(out, b)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// entry is the text in the fields of a bookmark form.</span>
+<span class="a">+type entry struct{ URL, Desc, Tags string }</span>
+<span class="a">+</span>
+<span class="a">+// line gives the line of the bookmark, as bm and the add-on write it: the URL</span>
+<span class="a">+// without white space, the description without tabs and line breaks, and the</span>
+<span class="a">+// tags with one space between them.</span>
+<span class="a">+func (e entry) line() (string, error) {</span>
+<span class="a">+	u := strings.Join(strings.Fields(e.URL), &quot;&quot;)</span>
+<span class="a">+	switch {</span>
+<span class="a">+	case u == &quot;&quot;:</span>
+<span class="a">+		return &quot;&quot;, errNoURL</span>
+<span class="a">+	case strings.HasPrefix(u, &quot;#&quot;):</span>
+<span class="a">+		return &quot;&quot;, errHashURL</span>
+<span class="a">+	}</span>
+<span class="a">+	desc := strings.TrimSpace(strings.NewReplacer(&quot;\t&quot;, &quot; &quot;, &quot;\r&quot;, &quot; &quot;, &quot;\n&quot;, &quot; &quot;).Replace(e.Desc))</span>
+<span class="a">+	return u + &quot;\t&quot; + desc + &quot;\t&quot; + strings.Join(strings.Fields(e.Tags), &quot; &quot;), nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- search ----</span>
+<span class="a">+</span>
+<span class="a">+// score gives the score of query in text, higher for a better match, or -1</span>
+<span class="a">+// when a word of the query does not occur in text. This is the search of the</span>
+<span class="a">+// add-on (lib/fuzzy.js), as in fzf: each word of the query must occur in the</span>
+<span class="a">+// text, with its letters in order but not always together. Case does not</span>
+<span class="a">+// matter.</span>
+<span class="a">+func score(query, text string) int {</span>
+<span class="a">+	hay := strings.ToLower(text)</span>
+<span class="a">+	total := 0</span>
+<span class="a">+	for _, word := range strings.FieldsFunc(strings.ToLower(query), func(r rune) bool { return r == &#x27; &#x27; || r == &#x27;\t&#x27; }) {</span>
+<span class="a">+		s := scoreWord(word, hay)</span>
+<span class="a">+		if s &lt; 0 {</span>
+<span class="a">+			return -1</span>
+<span class="a">+		}</span>
+<span class="a">+		total += s</span>
+<span class="a">+	}</span>
+<span class="a">+	return total</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// scoreWord gives the score of one word in hay. The whole word in one place</span>
+<span class="a">+// scores highest, most at the start of a word.</span>
+<span class="a">+func scoreWord(word, hay string) int {</span>
+<span class="a">+	if at := strings.Index(hay, word); at &gt;= 0 {</span>
+<span class="a">+		s := 100 + utf8.RuneCountInString(word)</span>
+<span class="a">+		if startsWord(hay, at) {</span>
+<span class="a">+			s += 20</span>
+<span class="a">+		}</span>
+<span class="a">+		return s</span>
+<span class="a">+	}</span>
+<span class="a">+	s, end := 0, -1 // end: the byte after the last letter found</span>
+<span class="a">+	for _, c := range word {</span>
+<span class="a">+		from := max(end, 0)</span>
+<span class="a">+		i := strings.IndexRune(hay[from:], c)</span>
+<span class="a">+		if i &lt; 0 {</span>
+<span class="a">+			return -1</span>
+<span class="a">+		}</span>
+<span class="a">+		i += from</span>
+<span class="a">+		s++</span>
+<span class="a">+		if i == end {</span>
+<span class="a">+			s += 5</span>
+<span class="a">+		}</span>
+<span class="a">+		if startsWord(hay, i) {</span>
+<span class="a">+			s += 3</span>
+<span class="a">+		}</span>
+<span class="a">+		_, n := utf8.DecodeRuneInString(hay[i:])</span>
+<span class="a">+		end = i + n</span>
+<span class="a">+	}</span>
+<span class="a">+	return s</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// startsWord tells if the letter at byte i of hay starts a word: no letter</span>
+<span class="a">+// or digit is before it.</span>
+<span class="a">+func startsWord(hay string, i int) bool {</span>
+<span class="a">+	if i == 0 {</span>
+<span class="a">+		return true</span>
+<span class="a">+	}</span>
+<span class="a">+	r, _ := utf8.DecodeLastRuneInString(hay[:i])</span>
+<span class="a">+	return !unicode.IsLetter(r) &amp;&amp; !unicode.IsNumber(r)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// search gives the bookmarks that match query, best first. Bookmarks with the</span>
+<span class="a">+// same score keep their order.</span>
+<span class="a">+func search(bs []Bookmark, query string) []Bookmark {</span>
+<span class="a">+	type hit struct {</span>
+<span class="a">+		b     Bookmark</span>
+<span class="a">+		score int</span>
+<span class="a">+	}</span>
+<span class="a">+	var hits []hit</span>
+<span class="a">+	for _, b := range bs {</span>
+<span class="a">+		if s := score(query, b.Desc+&quot; &quot;+strings.Join(b.Tags, &quot; &quot;)+&quot; &quot;+b.URL); s &gt;= 0 {</span>
+<span class="a">+			hits = append(hits, hit{b, s})</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	slices.SortStableFunc(hits, func(x, y hit) int { return y.score - x.score })</span>
+<span class="a">+	out := make([]Bookmark, len(hits))</span>
+<span class="a">+	for i, h := range hits {</span>
+<span class="a">+		out[i] = h.b</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// orders are the sort orders of the list page. bm also has &quot;used&quot;, but the</span>
+<span class="a">+// counts of use stay on each device.</span>
+<span class="a">+var orders = map[string]func(x, y Bookmark) int{</span>
+<span class="a">+	&quot;recent&quot;: func(x, y Bookmark) int { return y.N - x.N },</span>
+<span class="a">+	&quot;url&quot;:    func(x, y Bookmark) int { return strings.Compare(norm(x.URL), norm(y.URL)) },</span>
+<span class="a">+	&quot;desc&quot;: func(x, y Bookmark) int {</span>
+<span class="a">+		return strings.Compare(strings.ToLower(x.Title()), strings.ToLower(y.Title()))</span>
+<span class="a">+	},</span>
+<span class="a">+	&quot;tag&quot;: func(x, y Bookmark) int { return strings.Compare(strings.Join(x.Tags, &quot; &quot;), strings.Join(y.Tags, &quot; &quot;)) },</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// target gives the address for text that no bookmark matches, as bm does: one</span>
+<span class="a">+// word with &quot;://&quot; or a dot is an address, and other text is a web search.</span>
+<span class="a">+func target(text string) string {</span>
+<span class="a">+	t := strings.TrimSpace(text)</span>
+<span class="a">+	if !strings.Contains(t, &quot; &quot;) {</span>
+<span class="a">+		if strings.Contains(t, &quot;://&quot;) {</span>
+<span class="a">+			return t</span>
+<span class="a">+		}</span>
+<span class="a">+		if strings.Contains(t, &quot;.&quot;) {</span>
+<span class="a">+			return &quot;https://&quot; + t</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return &quot;https://duckduckgo.com/?q=&quot; + url.QueryEscape(t)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- import ----</span>
+<span class="a">+</span>
+<span class="a">+var (</span>
+<span class="a">+	notTag   = regexp.MustCompile(`[^a-z0-9]+`)</span>
+<span class="a">+	imported = regexp.MustCompile(`^(https?|ftp|file)://`)</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// importRows gives the bookmark lines of an imported file: the Netscape HTML</span>
+<span class="a">+// that browsers export, or a file of bookmark lines.</span>
+<span class="a">+func importRows(text string) []string {</span>
+<span class="a">+	text = strings.TrimPrefix(text, string(rune(0xFEFF)))</span>
+<span class="a">+	if strings.HasPrefix(strings.TrimSpace(text), &quot;&lt;&quot;) {</span>
+<span class="a">+		return fromHTML(text)</span>
+<span class="a">+	}</span>
+<span class="a">+	return lines(text)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// fromHTML gives the bookmark lines of the Netscape HTML that browsers</span>
+<span class="a">+// export, as bm-import does: &lt;H3&gt; opens a folder, &lt;/DL&gt; closes it, and the</span>
+<span class="a">+// folders of a bookmark become its tags. Only http, https, ftp and file URLs</span>
+<span class="a">+// stay.</span>
+<span class="a">+func fromHTML(text string) []string {</span>
+<span class="a">+	var folders, out []string</span>
+<span class="a">+	for _, line := range lines(text) {</span>
+<span class="a">+		upper := upperASCII(line)</span>
+<span class="a">+		if at := strings.Index(upper, &quot;&lt;H3&quot;); at &gt;= 0 {</span>
+<span class="a">+			name := line[at:]</span>
+<span class="a">+			name = name[strings.IndexByte(name, &#x27;&gt;&#x27;)+1:]</span>
+<span class="a">+			if end := strings.Index(upperASCII(name), &quot;&lt;/H3&quot;); end &gt;= 0 {</span>
+<span class="a">+				name = name[:end]</span>
+<span class="a">+			}</span>
+<span class="a">+			folders = append(folders, folderTag(htmlText(name)))</span>
+<span class="a">+		}</span>
+<span class="a">+		if at := strings.Index(upper, `HREF=&quot;`); at &gt;= 0 {</span>
+<span class="a">+			u, rest, ok := strings.Cut(line[at+len(`HREF=&quot;`):], `&quot;`)</span>
+<span class="a">+			name := rest[strings.IndexByte(rest, &#x27;&gt;&#x27;)+1:]</span>
+<span class="a">+			if end := strings.Index(upperASCII(name), &quot;&lt;/A&quot;); end &gt;= 0 {</span>
+<span class="a">+				name = name[:end]</span>
+<span class="a">+			}</span>
+<span class="a">+			var tags []string</span>
+<span class="a">+			for _, f := range folders {</span>
+<span class="a">+				if f != &quot;&quot; &amp;&amp; !slices.Contains(tags, f) {</span>
+<span class="a">+					tags = append(tags, f)</span>
+<span class="a">+				}</span>
+<span class="a">+			}</span>
+<span class="a">+			if u = htmlText(u); ok &amp;&amp; imported.MatchString(u) {</span>
+<span class="a">+				out = append(out, u+&quot;\t&quot;+htmlText(name)+&quot;\t&quot;+strings.Join(tags, &quot; &quot;))</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		if strings.Contains(upper, &quot;&lt;/DL&gt;&quot;) &amp;&amp; len(folders) &gt; 0 {</span>
+<span class="a">+			folders = folders[:len(folders)-1]</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// upperASCII gives s with the letters a to z in upper case. Each byte keeps</span>
+<span class="a">+// its index, so an index in the result is an index in s.</span>
+<span class="a">+func upperASCII(s string) string {</span>
+<span class="a">+	b := []byte(s)</span>
+<span class="a">+	for i, c := range b {</span>
+<span class="a">+		if &#x27;a&#x27; &lt;= c &amp;&amp; c &lt;= &#x27;z&#x27; {</span>
+<span class="a">+			b[i] = c - &#x27;a&#x27; + &#x27;A&#x27;</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return string(b)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// htmlText gives the text of HTML without its entities, with one space in</span>
+<span class="a">+// place of each run of white space.</span>
+<span class="a">+func htmlText(s string) string {</span>
+<span class="a">+	return strings.Join(strings.Fields(html.UnescapeString(s)), &quot; &quot;)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// folderTag gives the tag of a folder name, as bm-import makes it: &quot;Dev</span>
+<span class="a">+// Tools&quot; is dev-tools.</span>
+<span class="a">+func folderTag(name string) string {</span>
+<span class="a">+	return strings.Trim(notTag.ReplaceAllString(strings.ToLower(name), &quot;-&quot;), &quot;-&quot;)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// mergeRows gives the rows whose URL is not in text and not in a row before</span>
+<span class="a">+// them, as bm --merge does, with the number of rows that it skipped for that</span>
+<span class="a">+// reason. Empty rows and comments go.</span>
+<span class="a">+func mergeRows(text string, rows []string) ([]string, int) {</span>
+<span class="a">+	seen := map[string]bool{}</span>
+<span class="a">+	for _, l := range lines(text) {</span>
+<span class="a">+		seen[key(l)] = true</span>
+<span class="a">+	}</span>
+<span class="a">+	var add []string</span>
+<span class="a">+	skipped := 0</span>
+<span class="a">+	for _, row := range rows {</span>
+<span class="a">+		k := key(row)</span>
+<span class="a">+		switch {</span>
+<span class="a">+		case k == &quot;&quot;:</span>
+<span class="a">+		case seen[k]:</span>
+<span class="a">+			skipped++</span>
+<span class="a">+		default:</span>
+<span class="a">+			seen[k] = true</span>
+<span class="a">+			f := append(strings.SplitN(row, &quot;\t&quot;, 4), &quot;&quot;, &quot;&quot;)</span>
+<span class="a">+			add = append(add, f[0]+&quot;\t&quot;+f[1]+&quot;\t&quot;+f[2])</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return add, skipped</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// ---- pages ----</span>
+<span class="a">+</span>
+<span class="a">+// bookmarksPage is the data of the pages for the bookmarks of an account.</span>
+<span class="a">+type bookmarksPage struct {</span>
+<span class="a">+	page</span>
+<span class="a">+	Query, Tag, Sort, Done string</span>
+<span class="a">+	Open                   string     // the form of the list page to open: &quot;add&quot; or &quot;import&quot;</span>
+<span class="a">+	Version                string     // the version of the file that the page shows</span>
+<span class="a">+	Rows                   []Bookmark // the bookmarks to show, at most maxRows</span>
+<span class="a">+	Found, Total           int        // the bookmarks that match, and all bookmarks</span>
+<span class="a">+	Tags                   []tagCount</span>
+<span class="a">+	Target                 string // where the query goes when no bookmark matches</span>
+<span class="a">+	Form                   entry  // the fields of the form of a bookmark</span>
+<span class="a">+	N                      int    // the line of the bookmark on the edit page</span>
+<span class="a">+	Text                   string // the whole file, for the file page</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+type tagCount struct {</span>
+<span class="a">+	Name string</span>
+<span class="a">+	N    int</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// done gives the message of the list page after a change.</span>
+<span class="a">+var done = map[string]string{</span>
+<span class="a">+	&quot;added&quot;:   &quot;Bookmark added.&quot;,</span>
+<span class="a">+	&quot;saved&quot;:   &quot;Bookmark saved.&quot;,</span>
+<span class="a">+	&quot;deleted&quot;: &quot;Bookmark deleted.&quot;,</span>
+<span class="a">+	&quot;file&quot;:    &quot;File saved.&quot;,</span>
+<span class="a">+	&quot;merged&quot;:  &quot;File saved, and merged with the changes of your other devices.&quot;,</span>
+<span class="a">+	&quot;changed&quot;: &quot;That bookmark changed on another device. Look at it again.&quot;,</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// owner gives the signed-in account when it can use its bookmarks on this</span>
+<span class="a">+// site: as for sync, its email is confirmed and sync is not paused. Else</span>
+<span class="a">+// owner sends the browser to sign in, or to the account page, which tells</span>
+<span class="a">+// why, and gives nil.</span>
+<span class="a">+func (s *server) owner(w http.ResponseWriter, r *http.Request) *Account {</span>
+<span class="a">+	u := s.user(r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/login&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	if a := s.store.view(u); !s.verified(a) || !s.active(a) {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/account&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+	return u</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// listing gives the list page for the bookmarks in text that match the query</span>
+<span class="a">+// and the tag, in the order.</span>
+<span class="a">+func (s *server) listing(text, version, query, tag, order string) bookmarksPage {</span>
+<span class="a">+	p := bookmarksPage{page: s.page(&quot;Your bookmarks&quot;), Query: query, Tag: tag, Version: version}</span>
+<span class="a">+	all := parse(text)</span>
+<span class="a">+	count := map[string]int{}</span>
+<span class="a">+	var rows []Bookmark</span>
+<span class="a">+	for _, b := range all {</span>
+<span class="a">+		for _, t := range b.Tags {</span>
+<span class="a">+			count[t]++</span>
+<span class="a">+		}</span>
+<span class="a">+		if tag == &quot;&quot; || slices.Contains(b.Tags, tag) {</span>
+<span class="a">+			rows = append(rows, b)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	for name, n := range count {</span>
+<span class="a">+		p.Tags = append(p.Tags, tagCount{name, n})</span>
+<span class="a">+	}</span>
+<span class="a">+	slices.SortFunc(p.Tags, func(x, y tagCount) int { return strings.Compare(x.Name, y.Name) })</span>
+<span class="a">+	if orders[order] == nil {</span>
+<span class="a">+		order = &quot;recent&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Sort = order</span>
+<span class="a">+	slices.SortStableFunc(rows, orders[order])</span>
+<span class="a">+	if strings.TrimSpace(query) != &quot;&quot; {</span>
+<span class="a">+		if rows = search(rows, query); len(rows) == 0 {</span>
+<span class="a">+			p.Target = target(query)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	p.Total, p.Found = len(all), len(rows)</span>
+<span class="a">+	p.Rows = rows[:min(len(rows), maxRows)]</span>
+<span class="a">+	return p</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// bookmarks shows the bookmarks that match the query ?q= and the tag ?tag=,</span>
+<span class="a">+// in the order ?sort=.</span>
+<span class="a">+func (s *server) bookmarks(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, version, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	q := r.URL.Query()</span>
+<span class="a">+	p := s.listing(text, version, q.Get(&quot;q&quot;), q.Get(&quot;tag&quot;), q.Get(&quot;sort&quot;))</span>
+<span class="a">+	p.Done = done[q.Get(&quot;done&quot;)]</span>
+<span class="a">+	if q.Get(&quot;done&quot;) == &quot;imported&quot; {</span>
+<span class="a">+		added, _ := strconv.Atoi(q.Get(&quot;added&quot;))</span>
+<span class="a">+		known, _ := strconv.Atoi(q.Get(&quot;known&quot;))</span>
+<span class="a">+		p.Done = fmt.Sprintf(&quot;Bookmarks imported: %d. Skipped because they are bookmarks already: %d.&quot;, added, known)</span>
+<span class="a">+	}</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;bookmarks&quot;, p)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// refuse shows the list page again, with the problem of its add or import</span>
+<span class="a">+// form.</span>
+<span class="a">+func (s *server) refuse(w http.ResponseWriter, u *Account, status int, form, problem string, e entry) {</span>
+<span class="a">+	text, version, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	p := s.listing(text, version, &quot;&quot;, &quot;&quot;, &quot;&quot;)</span>
+<span class="a">+	p.Error, p.Open, p.Form = problem, form, e</span>
+<span class="a">+	s.render(w, status, &quot;bookmarks&quot;, p)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// addBookmark adds a bookmark at the end of the file, where bm adds them. As</span>
+<span class="a">+// bm does, it refuses a URL that is a bookmark already.</span>
+<span class="a">+func (s *server) addBookmark(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, maxForm)</span>
+<span class="a">+	e := entry{URL: r.PostFormValue(&quot;url&quot;), Desc: r.PostFormValue(&quot;desc&quot;), Tags: r.PostFormValue(&quot;tags&quot;)}</span>
+<span class="a">+	line, err := e.line()</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.refuse(w, u, http.StatusBadRequest, &quot;add&quot;, sentence(err), e)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, version, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, b := range parse(text) {</span>
+<span class="a">+		if norm(b.URL) == key(line) {</span>
+<span class="a">+			s.refuse(w, u, http.StatusConflict, &quot;add&quot;, &quot;This URL is a bookmark already: &quot;+b.Title()+&quot;.&quot;, e)</span>
+<span class="a">+			return</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if _, _, err := s.store.sync(u, version, join(append(lines(text), line))); err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, &quot;/bookmarks?done=added&quot;, http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// lineAt gives line n of version v of the file of the account, and n as a</span>
+<span class="a">+// number. It gives errChanged when the version is gone, or when the line is</span>
+<span class="a">+// not a bookmark.</span>
+<span class="a">+func (s *server) lineAt(u *Account, v, n string) (string, int, error) {</span>
+<span class="a">+	i, err := strconv.Atoi(n)</span>
+<span class="a">+	if err != nil || !hashName.MatchString(v) {</span>
+<span class="a">+		return &quot;&quot;, 0, errChanged</span>
+<span class="a">+	}</span>
+<span class="a">+	text, _, err := s.store.read(u, v)</span>
+<span class="a">+	if errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		return &quot;&quot;, 0, errChanged</span>
+<span class="a">+	} else if err != nil {</span>
+<span class="a">+		return &quot;&quot;, 0, err</span>
+<span class="a">+	}</span>
+<span class="a">+	ls := lines(text)</span>
+<span class="a">+	if i &lt; 0 || i &gt;= len(ls) {</span>
+<span class="a">+		return &quot;&quot;, 0, errChanged</span>
+<span class="a">+	}</span>
+<span class="a">+	if _, ok := parseLine(ls[i]); !ok {</span>
+<span class="a">+		return &quot;&quot;, 0, errChanged</span>
+<span class="a">+	}</span>
+<span class="a">+	return ls[i], i, nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// editBookmark shows the form for line ?n= of version ?v= of the file.</span>
+<span class="a">+func (s *server) editBookmark(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	q := r.URL.Query()</span>
+<span class="a">+	line, n, err := s.lineAt(u, q.Get(&quot;v&quot;), q.Get(&quot;n&quot;))</span>
+<span class="a">+	if errors.Is(err, errChanged) {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/bookmarks?done=changed&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return</span>
+<span class="a">+	} else if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	b, _ := parseLine(line)</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;edit&quot;, bookmarksPage{page: s.page(&quot;Edit a bookmark&quot;), Version: q.Get(&quot;v&quot;), N: n,</span>
+<span class="a">+		Form: entry{URL: b.URL, Desc: b.Desc, Tags: strings.Join(b.Tags, &quot; &quot;)}})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// saveBookmark changes or deletes the bookmark of the edit page in the</span>
+<span class="a">+// current file. When the current file does not have the line of the page,</span>
+<span class="a">+// another device changed it, and nothing changes.</span>
+<span class="a">+func (s *server) saveBookmark(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, maxForm)</span>
+<span class="a">+	v := r.PostFormValue(&quot;v&quot;)</span>
+<span class="a">+	old, n, err := s.lineAt(u, v, r.PostFormValue(&quot;n&quot;))</span>
+<span class="a">+	if errors.Is(err, errChanged) {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/bookmarks?done=changed&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return</span>
+<span class="a">+	} else if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	e := entry{URL: r.PostFormValue(&quot;url&quot;), Desc: r.PostFormValue(&quot;desc&quot;), Tags: r.PostFormValue(&quot;tags&quot;)}</span>
+<span class="a">+	problem := func(status int, text string) {</span>
+<span class="a">+		p := bookmarksPage{page: s.page(&quot;Edit a bookmark&quot;), Version: v, N: n, Form: e}</span>
+<span class="a">+		p.Error = text</span>
+<span class="a">+		s.render(w, status, &quot;edit&quot;, p)</span>
+<span class="a">+	}</span>
+<span class="a">+	line, msg := &quot;&quot;, &quot;deleted&quot;</span>
+<span class="a">+	if r.PostFormValue(&quot;do&quot;) != &quot;delete&quot; {</span>
+<span class="a">+		if line, err = e.line(); err != nil {</span>
+<span class="a">+			problem(http.StatusBadRequest, sentence(err))</span>
+<span class="a">+			return</span>
+<span class="a">+		}</span>
+<span class="a">+		msg = &quot;saved&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	text, version, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if b, _ := parseLine(old); line != &quot;&quot; &amp;&amp; key(line) != norm(b.URL) {</span>
+<span class="a">+		for _, other := range parse(text) {</span>
+<span class="a">+			if norm(other.URL) == key(line) {</span>
+<span class="a">+				problem(http.StatusConflict, &quot;Another bookmark has this URL: &quot;+other.Title()+&quot;.&quot;)</span>
+<span class="a">+				return</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	var out []string</span>
+<span class="a">+	found := false</span>
+<span class="a">+	for _, l := range lines(text) {</span>
+<span class="a">+		if l != old {</span>
+<span class="a">+			out = append(out, l)</span>
+<span class="a">+		} else if !found {</span>
+<span class="a">+			found = true</span>
+<span class="a">+			if line != &quot;&quot; {</span>
+<span class="a">+				out = append(out, line)</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if !found {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/bookmarks?done=changed&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if _, _, err := s.store.sync(u, version, join(out)); err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, &quot;/bookmarks?done=&quot;+msg, http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// bookmarkFile shows the whole file in a text box, as bm -e opens it in an</span>
+<span class="a">+// editor.</span>
+<span class="a">+func (s *server) bookmarkFile(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, version, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;file&quot;, bookmarksPage{page: s.page(&quot;Edit the file&quot;), Version: version, Text: text})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// saveFile takes the whole file of the file page. As for the file of a</span>
+<span class="a">+// device, the server merges the changes since the version that the page</span>
+<span class="a">+// showed.</span>
+<span class="a">+func (s *server) saveFile(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	// A form sends a tab as %09, so the form can be three times as large as</span>
+<span class="a">+	// the file.</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, 3*maxFile+maxForm)</span>
+<span class="a">+	if err := r.ParseForm(); err != nil {</span>
+<span class="a">+		var tooBig *http.MaxBytesError</span>
+<span class="a">+		if errors.As(err, &amp;tooBig) {</span>
+<span class="a">+			http.Error(w, &quot;the bookmark file is too large&quot;, http.StatusRequestEntityTooLarge)</span>
+<span class="a">+		} else {</span>
+<span class="a">+			http.Error(w, &quot;cannot read the form&quot;, http.StatusBadRequest)</span>
+<span class="a">+		}</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	base, text := r.PostFormValue(&quot;base&quot;), join(lines(r.PostFormValue(&quot;text&quot;)))</span>
+<span class="a">+	if base != &quot;&quot; &amp;&amp; !hashName.MatchString(base) {</span>
+<span class="a">+		http.Error(w, &quot;base is not a version name&quot;, http.StatusBadRequest)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(text) &gt; maxFile {</span>
+<span class="a">+		p := bookmarksPage{page: s.page(&quot;Edit the file&quot;), Version: base, Text: text}</span>
+<span class="a">+		p.Error = &quot;The file is larger than 4 MB. Nothing changed.&quot;</span>
+<span class="a">+		s.render(w, http.StatusRequestEntityTooLarge, &quot;file&quot;, p)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	merged, _, err := s.store.sync(u, base, text)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	msg := &quot;file&quot;</span>
+<span class="a">+	if merged != text {</span>
+<span class="a">+		msg = &quot;merged&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, &quot;/bookmarks?done=&quot;+msg, http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// importFile adds the bookmarks of a file, as bm-import and bm --merge do. A</span>
+<span class="a">+// URL that is a bookmark already is skipped.</span>
+<span class="a">+func (s *server) importFile(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	u := s.owner(w, r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	r.Body = http.MaxBytesReader(w, r.Body, maxImport)</span>
+<span class="a">+	f, _, err := r.FormFile(&quot;file&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.refuse(w, u, http.StatusBadRequest, &quot;import&quot;, &quot;Choose a file of 32 MB or less.&quot;, entry{})</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	defer f.Close()</span>
+<span class="a">+	b, err := io.ReadAll(f)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, version, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	add, skipped := mergeRows(text, importRows(string(b)))</span>
+<span class="a">+	merged := join(append(lines(text), add...))</span>
+<span class="a">+	if len(merged) &gt; maxFile {</span>
+<span class="a">+		s.refuse(w, u, http.StatusRequestEntityTooLarge, &quot;import&quot;,</span>
+<span class="a">+			&quot;With these bookmarks, the file would be larger than 4 MB. Nothing changed.&quot;, entry{})</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if len(add) &gt; 0 {</span>
+<span class="a">+		if _, _, err := s.store.sync(u, version, merged); err != nil {</span>
+<span class="a">+			s.fail(w, err)</span>
+<span class="a">+			return</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, fmt.Sprintf(&quot;/bookmarks?done=imported&amp;added=%d&amp;known=%d&quot;, len(add), skipped), http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// download gives the current file. It works also when sync is paused,</span>
+<span class="a">+// because the bookmarks belong to their owner.</span>
+<span class="a">+func (s *server) download(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.user(r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/login&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	text, _, err := s.store.read(u, &quot;&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	w.Header().Set(&quot;Content-Type&quot;, &quot;text/plain; charset=utf-8&quot;)</span>
+<span class="a">+	w.Header().Set(&quot;Content-Disposition&quot;, `attachment; filename=&quot;bookmarks.txt&quot;`)</span>
+<span class="a">+	io.WriteString(w, text)</span>
+<span class="a">+}</span>
+diff --git a/bookmarks_test.go b/bookmarks_test.go
+new file mode 100644
+index 0000000..749dcfa
+--- /dev/null
++++ b/bookmarks_test.go
+<span class="h">@@ -0,0 +1,234 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;testing&quot;</span>
+<span class="a">+</span>
+<span class="a">+	&quot;pgregory.net/rapid&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+func TestParseLine(t *testing.T) {</span>
+<span class="a">+	for line, want := range map[string]Bookmark{</span>
+<span class="a">+		&quot;https://a.org\tA b\tx  y&quot;:        {URL: &quot;https://a.org&quot;, Desc: &quot;A b&quot;, Tags: []string{&quot;x&quot;, &quot;y&quot;}},</span>
+<span class="a">+		&quot; https://a.org \t\t&quot;:             {URL: &quot;https://a.org&quot;},</span>
+<span class="a">+		&quot;https://a.org old format | tags&quot;: {URL: &quot;https://a.org&quot;, Desc: &quot;old format | tags&quot;},</span>
+<span class="a">+		&quot;https://a.org&quot;:                   {URL: &quot;https://a.org&quot;},</span>
+<span class="a">+	} {</span>
+<span class="a">+		got, ok := parseLine(line)</span>
+<span class="a">+		if !ok || got.URL != want.URL || got.Desc != want.Desc || !slices.Equal(got.Tags, want.Tags) {</span>
+<span class="a">+			t.Errorf(&quot;parseLine(%q) = %+v %v, want %+v&quot;, line, got, ok, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, line := range []string{&quot;&quot;, &quot;  &quot;, &quot;# comment&quot;, &quot;\tno URL\t&quot;} {</span>
+<span class="a">+		if b, ok := parseLine(line); ok {</span>
+<span class="a">+			t.Errorf(&quot;parseLine(%q) = %+v, want no bookmark&quot;, line, b)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// A form gives one line, which holds the URL without white space, the words</span>
+<span class="a">+// of the description and the tags.</span>
+<span class="a">+func TestFormGivesOneLine(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		e := entry{rapid.String().Draw(t, &quot;url&quot;), rapid.String().Draw(t, &quot;desc&quot;), rapid.String().Draw(t, &quot;tags&quot;)}</span>
+<span class="a">+		u := strings.Join(strings.Fields(e.URL), &quot;&quot;)</span>
+<span class="a">+		line, err := e.line()</span>
+<span class="a">+		if u == &quot;&quot; || strings.HasPrefix(u, &quot;#&quot;) {</span>
+<span class="a">+			if err == nil {</span>
+<span class="a">+				t.Fatalf(&quot;line of URL %q = %q, want an error&quot;, e.URL, line)</span>
+<span class="a">+			}</span>
+<span class="a">+			return</span>
+<span class="a">+		}</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			t.Fatal(err)</span>
+<span class="a">+		}</span>
+<span class="a">+		if strings.Count(line, &quot;\t&quot;) != 2 || strings.ContainsAny(line, &quot;\r\n&quot;) {</span>
+<span class="a">+			t.Fatalf(&quot;%q is not one line of three fields&quot;, line)</span>
+<span class="a">+		}</span>
+<span class="a">+		b, ok := parseLine(line)</span>
+<span class="a">+		if !ok || b.URL != u || !slices.Equal(strings.Fields(b.Desc), strings.Fields(e.Desc)) ||</span>
+<span class="a">+			!slices.Equal(b.Tags, strings.Fields(e.Tags)) {</span>
+<span class="a">+			t.Fatalf(&quot;parseLine(%q) = %+v %v&quot;, line, b, ok)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestLink(t *testing.T) {</span>
+<span class="a">+	for u, want := range map[string]string{</span>
+<span class="a">+		&quot;https://a.org&quot;:       &quot;https://a.org&quot;,</span>
+<span class="a">+		&quot;HTTP://A.org/x&quot;:      &quot;HTTP://A.org/x&quot;,</span>
+<span class="a">+		&quot;www.a.org/x&quot;:         &quot;https://www.a.org/x&quot;,</span>
+<span class="a">+		&quot;javascript:alert(1)&quot;: &quot;&quot;,</span>
+<span class="a">+		&quot;JavaScript:alert(1)&quot;: &quot;&quot;,</span>
+<span class="a">+		&quot;data:text/html,x&quot;:    &quot;&quot;,</span>
+<span class="a">+		&quot;file:///etc/passwd&quot;:  &quot;&quot;,</span>
+<span class="a">+	} {</span>
+<span class="a">+		if got := (Bookmark{URL: u}).Link(); got != want {</span>
+<span class="a">+			t.Errorf(&quot;link of %q = %q, want %q&quot;, u, got, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// TestScoreAsTheAddOn compares with the scores of lib/fuzzy.js in the add-on.</span>
+<span class="a">+func TestScoreAsTheAddOn(t *testing.T) {</span>
+<span class="a">+	for _, c := range []struct {</span>
+<span class="a">+		query, text string</span>
+<span class="a">+		want        int</span>
+<span class="a">+	}{</span>
+<span class="a">+		{&quot;suck&quot;, &quot;suckless software c tools https://suckless.org&quot;, 124},</span>
+<span class="a">+		{&quot;sls&quot;, &quot;suckless&quot;, 6},</span>
+<span class="a">+		{&quot;jsh&quot;, &quot;Jisho: 日本語の辞書 ja https://jisho.org&quot;, 11},</span>
+<span class="a">+		{&quot;日本&quot;, &quot;Jisho: 日本語&quot;, 122},</span>
+<span class="a">+		{&quot;go doc&quot;, &quot;Go docs dev-tools https://go.dev/doc/&quot;, 245},</span>
+<span class="a">+		{&quot;xyz&quot;, &quot;abc&quot;, -1},</span>
+<span class="a">+		{&quot;&quot;, &quot;anything&quot;, 0},</span>
+<span class="a">+		{&quot;GITHUB&quot;, &quot;https://github.com/equwal/sbm&quot;, 126},</span>
+<span class="a">+		{&quot;eqsbm&quot;, &quot;https://github.com/equwal/sbm&quot;, 26},</span>
+<span class="a">+		{&quot;a b&quot;, &quot;b a&quot;, 242},</span>
+<span class="a">+		{&quot;tools c&quot;, &quot;suckless software c tools&quot;, 226},</span>
+<span class="a">+		{&quot;wiki&quot;, &quot;Wikipedia, the free encyclopedia  https://en.wikipedia.org&quot;, 124},</span>
+<span class="a">+		{&quot;wkp&quot;, &quot;Wikipedia, the free encyclopedia  https://en.wikipedia.org&quot;, 6},</span>
+<span class="a">+		{&quot;é&quot;, &quot;Café crème&quot;, 101},</span>
+<span class="a">+		{&quot;cr&quot;, &quot;Café crème&quot;, 122},</span>
+<span class="a">+	} {</span>
+<span class="a">+		if got := score(c.query, c.text); got != c.want {</span>
+<span class="a">+			t.Errorf(&quot;score(%q, %q) = %d, want %d&quot;, c.query, c.text, got, c.want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// letters draws text from few letters, with case, white space, punctuation</span>
+<span class="a">+// and letters of more than one byte, so that searches often match.</span>
+<span class="a">+var letters = rapid.StringOf(rapid.SampledFrom([]rune(&quot;abcABC xyz.-/:日本éÉ\t&quot;)))</span>
+<span class="a">+</span>
+<span class="a">+// matches is a slow reference for the search: case aside, the letters of</span>
+<span class="a">+// each word of the query occur in the text in their order.</span>
+<span class="a">+func matches(query, text string) bool {</span>
+<span class="a">+	hay := []rune(strings.ToLower(text))</span>
+<span class="a">+	for _, word := range strings.FieldsFunc(strings.ToLower(query), func(r rune) bool { return r == &#x27; &#x27; || r == &#x27;\t&#x27; }) {</span>
+<span class="a">+		w, i := []rune(word), 0</span>
+<span class="a">+		for _, r := range hay {</span>
+<span class="a">+			if i &lt; len(w) &amp;&amp; r == w[i] {</span>
+<span class="a">+				i++</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		if i &lt; len(w) {</span>
+<span class="a">+			return false</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return true</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestScoreMatchesAsTheReference(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		query, text := letters.Draw(t, &quot;query&quot;), letters.Draw(t, &quot;text&quot;)</span>
+<span class="a">+		if s := score(query, text); (s &gt;= 0) != matches(query, text) || s &lt; -1 {</span>
+<span class="a">+			t.Fatalf(&quot;score(%q, %q) = %d, reference match %v&quot;, query, text, s, matches(query, text))</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestScoreFindsEachPartOfTheText(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		text := letters.Draw(t, &quot;text&quot;)</span>
+<span class="a">+		rs := []rune(strings.ToLower(text))</span>
+<span class="a">+		var words []string</span>
+<span class="a">+		for range rapid.IntRange(1, 3).Draw(t, &quot;words&quot;) {</span>
+<span class="a">+			i := rapid.IntRange(0, len(rs)).Draw(t, &quot;i&quot;)</span>
+<span class="a">+			j := rapid.IntRange(i, len(rs)).Draw(t, &quot;j&quot;)</span>
+<span class="a">+			words = append(words, string(rs[i:j]))</span>
+<span class="a">+		}</span>
+<span class="a">+		query := strings.Join(words, &quot; &quot;)</span>
+<span class="a">+		n := len(strings.FieldsFunc(query, func(r rune) bool { return r == &#x27; &#x27; || r == &#x27;\t&#x27; }))</span>
+<span class="a">+		if s := score(query, text); s &lt; 100*n {</span>
+<span class="a">+			t.Fatalf(&quot;score(%q, %q) = %d, want at least %d&quot;, query, text, s, 100*n)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestScoreIgnoresCaseAndWordOrder(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		a, b, text := letters.Draw(t, &quot;a&quot;), letters.Draw(t, &quot;b&quot;), letters.Draw(t, &quot;text&quot;)</span>
+<span class="a">+		s := score(a+&quot; &quot;+b, text)</span>
+<span class="a">+		if got := score(strings.ToUpper(b+&quot; &quot;+a), text); got != s {</span>
+<span class="a">+			t.Fatalf(&quot;score(%q) = %d, but score(%q) = %d&quot;, strings.ToUpper(b+&quot; &quot;+a), got, a+&quot; &quot;+b, s)</span>
+<span class="a">+		}</span>
+<span class="a">+		if got := score(a+&quot; &quot;+b, strings.ToUpper(text)); got != s {</span>
+<span class="a">+			t.Fatalf(&quot;in %q: %d, in %q: %d&quot;, strings.ToUpper(text), got, text, s)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func FuzzScore(f *testing.F) {</span>
+<span class="a">+	f.Add(&quot;sls&quot;, &quot;suckless&quot;)</span>
+<span class="a">+	f.Add(&quot;é&quot;, &quot;Café&quot;)</span>
+<span class="a">+	f.Add(string([]byte{0xff}), &quot;a&quot;+string([]byte{0xff, 0xe6, 0x97})+&quot;b&quot;)</span>
+<span class="a">+	f.Fuzz(func(t *testing.T, query, text string) {</span>
+<span class="a">+		if s := score(query, text); s &lt; -1 {</span>
+<span class="a">+			t.Fatalf(&quot;score(%q, %q) = %d&quot;, query, text, s)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestSearchKeepsTheOrderOfEqualScores(t *testing.T) {</span>
+<span class="a">+	bs := parse(&quot;https://a.org\tgo\t\nhttps://b.org\tgolang\t\nhttps://c.org\tgo\t\nhttps://d.org\tpython\t\n&quot;)</span>
+<span class="a">+	var got []string</span>
+<span class="a">+	for _, b := range search(bs, &quot;go&quot;) {</span>
+<span class="a">+		got = append(got, b.URL)</span>
+<span class="a">+	}</span>
+<span class="a">+	// &quot;go&quot; at the start of a word scores the same in each; b.org has it too.</span>
+<span class="a">+	if want := []string{&quot;https://a.org&quot;, &quot;https://b.org&quot;, &quot;https://c.org&quot;}; !slices.Equal(got, want) {</span>
+<span class="a">+		t.Errorf(&quot;search: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestTarget(t *testing.T) {</span>
+<span class="a">+	for text, want := range map[string]string{</span>
+<span class="a">+		&quot;suckless.org/dwm&quot;: &quot;https://suckless.org/dwm&quot;,</span>
+<span class="a">+		&quot;gemini://x.org&quot;:   &quot;gemini://x.org&quot;,</span>
+<span class="a">+		&quot;posix sh printf&quot;:  &quot;https://duckduckgo.com/?q=posix+sh+printf&quot;,</span>
+<span class="a">+		&quot; word &quot;:           &quot;https://duckduckgo.com/?q=word&quot;,</span>
+<span class="a">+		&quot;c++&quot;:              &quot;https://duckduckgo.com/?q=c%2B%2B&quot;,</span>
+<span class="a">+	} {</span>
+<span class="a">+		if got := target(text); got != want {</span>
+<span class="a">+			t.Errorf(&quot;target(%q) = %q, want %q&quot;, text, got, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Each imported row with a new URL comes in once. The other rows are known,</span>
+<span class="a">+// or are no bookmark.</span>
+<span class="a">+func TestMergeRowsAddsEachURLOnce(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		text, rows := file(t, &quot;file&quot;), lines(file(t, &quot;rows&quot;))</span>
+<span class="a">+		add, skipped := mergeRows(text, rows)</span>
+<span class="a">+		seen := map[string]bool{}</span>
+<span class="a">+		for _, l := range lines(text) {</span>
+<span class="a">+			seen[key(l)] = true</span>
+<span class="a">+		}</span>
+<span class="a">+		for _, a := range add {</span>
+<span class="a">+			if k := key(a); k == &quot;&quot; || seen[k] {</span>
+<span class="a">+				t.Fatalf(&quot;added %q, but its URL is known&quot;, a)</span>
+<span class="a">+			}</span>
+<span class="a">+			seen[key(a)] = true</span>
+<span class="a">+		}</span>
+<span class="a">+		empty := 0</span>
+<span class="a">+		for _, r := range rows {</span>
+<span class="a">+			if key(r) == &quot;&quot; {</span>
+<span class="a">+				empty++</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+		if len(add)+skipped+empty != len(rows) {</span>
+<span class="a">+			t.Fatalf(&quot;%d added, %d skipped and %d empty of %d rows&quot;, len(add), skipped, empty, len(rows))</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestFolderTag(t *testing.T) {</span>
+<span class="a">+	for name, want := range map[string]string{&quot;Dev Tools&quot;: &quot;dev-tools&quot;, &quot; -C++ &amp; Go- &quot;: &quot;c-go&quot;, &quot;日本語&quot;: &quot;&quot;} {</span>
+<span class="a">+		if got := folderTag(name); got != want {</span>
+<span class="a">+			t.Errorf(&quot;folderTag(%q) = %q, want %q&quot;, name, got, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+diff --git a/main.go b/main.go
+index 9f4584d..a7b992f 100644
+--- a/main.go
++++ b/main.go
+<span class="h">@@ -163,6 +163,14 @@ func (s *server) routes() http.Handler {</span>
+ 	m.HandleFunc(&quot;POST /api/login&quot;, s.apiLogin)
+ 	m.HandleFunc(&quot;POST /api/logout&quot;, s.apiLogout)
+ 	m.HandleFunc(&quot;POST /api/sync&quot;, s.sync)
+<span class="a">+	m.HandleFunc(&quot;GET /bookmarks&quot;, s.bookmarks)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /bookmarks/add&quot;, s.addBookmark)</span>
+<span class="a">+	m.HandleFunc(&quot;GET /bookmarks/edit&quot;, s.editBookmark)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /bookmarks/edit&quot;, s.saveBookmark)</span>
+<span class="a">+	m.HandleFunc(&quot;GET /bookmarks/file&quot;, s.bookmarkFile)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /bookmarks/file&quot;, s.saveFile)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /bookmarks/import&quot;, s.importFile)</span>
+<span class="a">+	m.HandleFunc(&quot;GET /bookmarks.txt&quot;, s.download)</span>
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		h := w.Header()
+ 		h.Set(&quot;Content-Security-Policy&quot;, &quot;default-src &#x27;none&#x27;; style-src &#x27;unsafe-inline&#x27;; &quot;+
+<span class="h">@@ -185,6 +193,7 @@ type page struct {</span>
+ 	Month, Year                              string
+ 	TrialDays                                int
+ 	Billing, CanSubscribe, Unconfirmed       bool
+<span class="a">+	Active                                   bool // the account can sync and use its bookmarks here</span>
+ 	Customer                                 string
+ }
+ 
+<span class="h">@@ -194,7 +203,7 @@ func (s *server) page(title string) page {</span>
+ 		Month: s.labels[&quot;month&quot;], Year: s.labels[&quot;year&quot;], TrialDays: int(s.trial.Hours() / 24)}
+ }
+ 
+<span class="d">-func (s *server) render(w http.ResponseWriter, status int, name string, p page) {</span>
+<span class="a">+func (s *server) render(w http.ResponseWriter, status int, name string, p any) {</span>
+ 	w.Header().Set(&quot;Content-Type&quot;, &quot;text/html; charset=utf-8&quot;)
+ 	w.WriteHeader(status)
+ 	if err := pages.ExecuteTemplate(w, name, p); err != nil {
+<span class="h">@@ -204,8 +213,9 @@ func (s *server) render(w http.ResponseWriter, status int, name string, p page)</span>
+ 
+ func (s *server) home(w http.ResponseWriter, r *http.Request) {
+ 	p := s.page(&quot;&quot;)
+<span class="d">-	if a := s.user(r); a != nil {</span>
+<span class="d">-		p.Email = a.Email</span>
+<span class="a">+	if u := s.user(r); u != nil {</span>
+<span class="a">+		a := s.store.view(u)</span>
+<span class="a">+		p.Email, p.Active = a.Email, s.verified(a) &amp;&amp; s.active(a)</span>
+ 	}
+ 	s.render(w, http.StatusOK, &quot;home&quot;, p)
+ }
+<span class="h">@@ -277,7 +287,7 @@ func (s *server) signup(w http.ResponseWriter, r *http.Request) {</span>
+ 			log.Printf(&quot;email check for %s: %v&quot;, a.ID, err)
+ 		}
+ 	}
+<span class="d">-	s.startSession(w, r, a)</span>
+<span class="a">+	s.startSession(w, r, a, &quot;/account&quot;)</span>
+ }
+ 
+ // verified tells if the account can sync: its email is confirmed, or the
+<span class="h">@@ -359,17 +369,18 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {</span>
+ 		s.render(w, http.StatusUnauthorized, &quot;login&quot;, p)
+ 		return
+ 	}
+<span class="d">-	s.startSession(w, r, a)</span>
+<span class="a">+	s.startSession(w, r, a, &quot;/bookmarks&quot;)</span>
+ }
+ 
+<span class="d">-func (s *server) startSession(w http.ResponseWriter, r *http.Request, a *Account) {</span>
+<span class="a">+// startSession signs the browser in and sends it to the page at the path to.</span>
+<span class="a">+func (s *server) startSession(w http.ResponseWriter, r *http.Request, a *Account, to string) {</span>
+ 	token, err := s.store.signIn(a)
+ 	if err != nil {
+ 		s.fail(w, err)
+ 		return
+ 	}
+ 	s.setCookie(w, token, 365*24*3600)
+<span class="d">-	http.Redirect(w, r, &quot;/account&quot;, http.StatusSeeOther)</span>
+<span class="a">+	http.Redirect(w, r, to, http.StatusSeeOther)</span>
+ }
+ 
+ func (s *server) logout(w http.ResponseWriter, r *http.Request) {
+<span class="h">@@ -420,6 +431,7 @@ func (s *server) showAccount(w http.ResponseWriter, status int, a Account, probl</span>
+ 	p := s.page(&quot;Your account&quot;)
+ 	p.Email, p.Error, p.Customer = a.Email, problem, a.Customer
+ 	p.Unconfirmed = !s.verified(a)
+<span class="a">+	p.Active = s.verified(a) &amp;&amp; s.active(a)</span>
+ 	left := s.trialLeft(a)
+ 	switch {
+ 	case s.stripe == nil:
+diff --git a/pages.html b/pages.html
+index 4f83bd2..bdb8f1f 100644
+--- a/pages.html
++++ b/pages.html
+<span class="h">@@ -20,8 +20,12 @@ label { display: block; }</span>
+ input { display: block; width: 100%; box-sizing: border-box; margin: .2em 0 1em; padding: .4em; font: inherit; }
+ button { font: inherit; padding: .4em 1em; margin: .2em .5em .2em 0; }
+ .error { color: #a00; } .note, footer { color: #555; } footer { margin-top: 3em; font-size: .9em; }
+<span class="a">+select { font: inherit; padding: .3em; margin: .2em 0 1em; }</span>
+<span class="a">+textarea { display: block; width: 100%; box-sizing: border-box; height: 60vh; margin: .2em 0 1em; font: 13px/1.4 monospace; }</span>
+<span class="a">+details { margin: 1em 0; } summary { cursor: pointer; }</span>
+<span class="a">+.bookmarks { list-style: none; padding: 0; } .bookmarks li { margin: .8em 0; overflow-wrap: anywhere; } .bookmarks small { color: #555; }</span>
+ @media (prefers-color-scheme: dark) {
+<span class="d">-  body { background: #111; color: #ddd; } a { color: #4fb3d9; } .note, footer { color: #999; } .error { color: #f77; }</span>
+<span class="a">+  body { background: #111; color: #ddd; } a { color: #4fb3d9; } .note, footer, .bookmarks small { color: #999; } .error { color: #f77; }</span>
+ }
+ &lt;/style&gt;
+ &lt;/head&gt;
+<span class="h">@@ -47,9 +51,9 @@ button { font: inherit; padding: .4em 1em; margin: .2em .5em .2em 0; }</span>
+ &lt;p&gt;&lt;a href=&quot;https://github.com/equwal/sbm&quot;&gt;sbm&lt;/a&gt; keeps your bookmarks in one plain
+ text file. sbm Sync keeps that file the same on each of your devices: bm on
+ your computers, the sbm app for Android, and the sbm add-on for Firefox and
+<span class="d">-Chrome.&lt;/p&gt;</span>
+<span class="a">+Chrome. You can also use your bookmarks on this site, in any browser.&lt;/p&gt;</span>
+ {{if .Billing}}&lt;p&gt;Free for {{.TrialDays}} days. Then {{.Year}} or {{.Month}}. Cancel at any time.&lt;/p&gt;{{end}}
+<span class="d">-&lt;p&gt;{{if .Email}}&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt;{{else}}&lt;a href=&quot;/signup&quot;&gt;Create an account&lt;/a&gt; or &lt;a href=&quot;/login&quot;&gt;sign in&lt;/a&gt;.{{end}}&lt;/p&gt;</span>
+<span class="a">+&lt;p&gt;{{if .Email}}{{if .Active}}&lt;a href=&quot;/bookmarks&quot;&gt;Your bookmarks&lt;/a&gt; · {{end}}&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt;{{else}}&lt;a href=&quot;/signup&quot;&gt;Create an account&lt;/a&gt; or &lt;a href=&quot;/login&quot;&gt;sign in&lt;/a&gt;.{{end}}&lt;/p&gt;</span>
+ {{with .Teams}}&lt;h2&gt;Teams&lt;/h2&gt;
+ &lt;p&gt;Coming: bookmarks for teams. The members of a team share one bookmark
+ file, and sync it on each of their devices. Pre-order the founding plan: &lt;a href=&quot;{{.}}&quot;&gt;for up to 10 people&lt;/a&gt;{{with $.TeamsLarge}},
+<span class="h">@@ -84,6 +88,7 @@ or &lt;a href=&quot;{{.}}&quot;&gt;for 11 people or more&lt;/a&gt;{{end}}.&lt;/p&gt;{{end}}</span>
+ {{define &quot;account&quot;}}{{template &quot;head&quot; .}}
+ &lt;h1&gt;Your account&lt;/h1&gt;
+ &lt;p&gt;Signed in as {{.Email}}.&lt;/p&gt;
+<span class="a">+{{if .Active}}&lt;p&gt;&lt;a href=&quot;/bookmarks&quot;&gt;&lt;b&gt;Open your bookmarks&lt;/b&gt;&lt;/a&gt;&lt;/p&gt;{{end}}</span>
+ {{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}
+ {{if .Unconfirmed}}&lt;p&gt;&lt;b&gt;Confirm your email address.&lt;/b&gt; Open the link in the
+ email that this server sent to {{.Email}}. Sync starts after that.&lt;/p&gt;
+<span class="h">@@ -116,6 +121,89 @@ their bookmark files.&lt;/p&gt;</span>
+ &lt;/form&gt;
+ {{template &quot;foot&quot; .}}{{end}}
+ 
+<span class="a">+{{define &quot;nav&quot;}}&lt;p class=&quot;note&quot;&gt;&lt;a href=&quot;/bookmarks&quot;&gt;Bookmarks&lt;/a&gt; ·</span>
+<span class="a">+&lt;a href=&quot;/bookmarks/file&quot;&gt;Edit the file&lt;/a&gt; ·</span>
+<span class="a">+&lt;a href=&quot;/bookmarks.txt&quot;&gt;Download&lt;/a&gt; ·</span>
+<span class="a">+&lt;a href=&quot;/account&quot;&gt;Account&lt;/a&gt;&lt;/p&gt;{{end}}</span>
+<span class="a">+</span>
+<span class="a">+{{define &quot;bookmarks&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+{{template &quot;nav&quot;}}</span>
+<span class="a">+&lt;h1&gt;Your bookmarks&lt;/h1&gt;</span>
+<span class="a">+{{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}</span>
+<span class="a">+{{with .Done}}&lt;p&gt;&lt;b&gt;{{.}}&lt;/b&gt;&lt;/p&gt;{{end}}</span>
+<span class="a">+&lt;form method=&quot;get&quot; action=&quot;/bookmarks&quot;&gt;</span>
+<span class="a">+&lt;input type=&quot;search&quot; name=&quot;q&quot; value=&quot;{{.Query}}&quot; placeholder=&quot;Search, or type an address&quot; aria-label=&quot;Search&quot;&gt;</span>
+<span class="a">+{{with .Tag}}&lt;input type=&quot;hidden&quot; name=&quot;tag&quot; value=&quot;{{.}}&quot;&gt;{{end}}</span>
+<span class="a">+&lt;label&gt;Order &lt;select name=&quot;sort&quot;&gt;</span>
+<span class="a">+&lt;option value=&quot;recent&quot;{{if eq .Sort &quot;recent&quot;}} selected{{end}}&gt;newest first&lt;/option&gt;</span>
+<span class="a">+&lt;option value=&quot;url&quot;{{if eq .Sort &quot;url&quot;}} selected{{end}}&gt;URL&lt;/option&gt;</span>
+<span class="a">+&lt;option value=&quot;desc&quot;{{if eq .Sort &quot;desc&quot;}} selected{{end}}&gt;description&lt;/option&gt;</span>
+<span class="a">+&lt;option value=&quot;tag&quot;{{if eq .Sort &quot;tag&quot;}} selected{{end}}&gt;tag&lt;/option&gt;</span>
+<span class="a">+&lt;/select&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;button&gt;Search&lt;/button&gt;</span>
+<span class="a">+&lt;/form&gt;</span>
+<span class="a">+&lt;details{{if eq .Open &quot;add&quot;}} open{{end}}&gt;&lt;summary&gt;Add a bookmark&lt;/summary&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/bookmarks/add&quot;&gt;</span>
+<span class="a">+&lt;label&gt;URL &lt;input name=&quot;url&quot; value=&quot;{{.Form.URL}}&quot; required&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;label&gt;Description &lt;input name=&quot;desc&quot; value=&quot;{{.Form.Desc}}&quot;&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;label&gt;Tags, with spaces between them &lt;input name=&quot;tags&quot; value=&quot;{{.Form.Tags}}&quot; autocomplete=&quot;off&quot;&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;button&gt;Add&lt;/button&gt;</span>
+<span class="a">+&lt;/form&gt;&lt;/details&gt;</span>
+<span class="a">+&lt;details{{if eq .Open &quot;import&quot;}} open{{end}}&gt;&lt;summary&gt;Import bookmarks&lt;/summary&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/bookmarks/import&quot; enctype=&quot;multipart/form-data&quot;&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;Export the bookmarks of your browser to an HTML file, then</span>
+<span class="a">+import that file here. Folders become tags. A file of sbm bookmark lines</span>
+<span class="a">+works too. URLs that are bookmarks already are skipped.&lt;/p&gt;</span>
+<span class="a">+&lt;label&gt;File &lt;input type=&quot;file&quot; name=&quot;file&quot; required&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;button&gt;Import&lt;/button&gt;</span>
+<span class="a">+&lt;/form&gt;&lt;/details&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;{{.Found}} of {{.Total}} bookmarks{{with .Tag}} with the tag &lt;b&gt;{{.}}&lt;/b&gt;{{end}}.{{if gt .Found (len .Rows)}}</span>
+<span class="a">+This page shows the first {{len .Rows}}.{{end}}{{if or .Query .Tag}} &lt;a href=&quot;/bookmarks&quot;&gt;Show all&lt;/a&gt;{{end}}&lt;/p&gt;</span>
+<span class="a">+{{with .Target}}&lt;p&gt;No bookmark matches. Go to &lt;a href=&quot;{{.}}&quot;&gt;{{.}}&lt;/a&gt;&lt;/p&gt;{{end}}</span>
+<span class="a">+&lt;ul class=&quot;bookmarks&quot;&gt;</span>
+<span class="a">+{{range .Rows}}&lt;li&gt;{{if .Link}}&lt;a href=&quot;{{.Link}}&quot;&gt;{{.Title}}&lt;/a&gt;{{else}}{{.Title}}{{end}}&lt;br&gt;</span>
+<span class="a">+&lt;small&gt;{{.Host}}{{range .Tags}} · &lt;a href=&quot;/bookmarks?tag={{.}}&quot;&gt;{{.}}&lt;/a&gt;{{end}} ·</span>
+<span class="a">+&lt;a href=&quot;/bookmarks/edit?v={{$.Version}}&amp;amp;n={{.N}}&quot;&gt;edit&lt;/a&gt;&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+{{end}}&lt;/ul&gt;</span>
+<span class="a">+{{with .Tags}}&lt;h2&gt;Tags&lt;/h2&gt;</span>
+<span class="a">+&lt;p&gt;{{range .}}&lt;a href=&quot;/bookmarks?tag={{.Name}}&quot;&gt;{{.Name}}&lt;/a&gt;&amp;nbsp;({{.N}}) {{end}}&lt;/p&gt;{{end}}</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+<span class="a">+{{define &quot;edit&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+{{template &quot;nav&quot;}}</span>
+<span class="a">+&lt;h1&gt;Edit a bookmark&lt;/h1&gt;</span>
+<span class="a">+{{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/bookmarks/edit&quot;&gt;</span>
+<span class="a">+&lt;input type=&quot;hidden&quot; name=&quot;v&quot; value=&quot;{{.Version}}&quot;&gt;</span>
+<span class="a">+&lt;input type=&quot;hidden&quot; name=&quot;n&quot; value=&quot;{{.N}}&quot;&gt;</span>
+<span class="a">+&lt;label&gt;URL &lt;input name=&quot;url&quot; value=&quot;{{.Form.URL}}&quot; required&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;label&gt;Description &lt;input name=&quot;desc&quot; value=&quot;{{.Form.Desc}}&quot;&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;label&gt;Tags, with spaces between them &lt;input name=&quot;tags&quot; value=&quot;{{.Form.Tags}}&quot; autocomplete=&quot;off&quot;&gt;&lt;/label&gt;</span>
+<span class="a">+&lt;button name=&quot;do&quot; value=&quot;save&quot;&gt;Save&lt;/button&gt;</span>
+<span class="a">+&lt;button name=&quot;do&quot; value=&quot;delete&quot; formnovalidate&gt;Delete&lt;/button&gt;</span>
+<span class="a">+&lt;a href=&quot;/bookmarks&quot;&gt;Cancel&lt;/a&gt;</span>
+<span class="a">+&lt;/form&gt;</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+<span class="a">+{{define &quot;file&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+{{template &quot;nav&quot;}}</span>
+<span class="a">+&lt;h1&gt;Edit the file&lt;/h1&gt;</span>
+<span class="a">+{{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;One bookmark on each line: the URL, a tab, the description, a</span>
+<span class="a">+tab, and the tags with spaces between them. Lines that start with # are</span>
+<span class="a">+comments. A browser does not type a tab in this box: paste one, or use</span>
+<span class="a">+&lt;a href=&quot;/bookmarks&quot;&gt;Add a bookmark&lt;/a&gt;.&lt;/p&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;When you save, the server merges your changes with the</span>
+<span class="a">+changes of your other devices, as a sync does. Lines that you remove go, new</span>
+<span class="a">+lines come at the end, and the other lines keep their order.&lt;/p&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/bookmarks/file&quot;&gt;</span>
+<span class="a">+&lt;input type=&quot;hidden&quot; name=&quot;base&quot; value=&quot;{{.Version}}&quot;&gt;</span>
+<span class="a">+&lt;textarea name=&quot;text&quot; spellcheck=&quot;false&quot; aria-label=&quot;The bookmark file&quot;&gt;</span>
+<span class="a">+{{.Text}}&lt;/textarea&gt;</span>
+<span class="a">+&lt;button&gt;Save&lt;/button&gt; &lt;a href=&quot;/bookmarks&quot;&gt;Cancel&lt;/a&gt;</span>
+<span class="a">+&lt;/form&gt;</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+ {{define &quot;confirmed&quot;}}{{template &quot;head&quot; .}}
+ &lt;h1&gt;{{.Title}}&lt;/h1&gt;
+ {{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{else}}&lt;p&gt;Sync is on for {{.Email}}.&lt;/p&gt;{{end}}
+diff --git a/store.go b/store.go
+index d391200..e66122d 100644
+--- a/store.go
++++ b/store.go
+<span class="h">@@ -370,15 +370,8 @@ func (s *Store) sync(a *Account, base, local string) (string, string, error) {</span>
+ 	if err := os.MkdirAll(dir, 0o700); err != nil {
+ 		return &quot;&quot;, &quot;&quot;, err
+ 	}
+<span class="d">-	remote := &quot;&quot;</span>
+<span class="d">-	head, err := os.ReadFile(filepath.Join(dir, &quot;HEAD&quot;))</span>
+<span class="d">-	if err == nil {</span>
+<span class="d">-		b, err := os.ReadFile(filepath.Join(dir, strings.TrimSpace(string(head))))</span>
+<span class="d">-		if err != nil {</span>
+<span class="d">-			return &quot;&quot;, &quot;&quot;, err</span>
+<span class="d">-		}</span>
+<span class="d">-		remote = string(b)</span>
+<span class="d">-	} else if !errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+	remote, _, err := head(dir)</span>
+<span class="a">+	if err != nil {</span>
+ 		return &quot;&quot;, &quot;&quot;, err
+ 	}
+ 	old := &quot;&quot;
+<span class="h">@@ -405,6 +398,37 @@ func (s *Store) sync(a *Account, base, local string) (string, string, error) {</span>
+ 	return merged, name, prune(dir, name)
+ }
+ 
+<span class="a">+// head gives the current version of the file in dir and its name. Without a</span>
+<span class="a">+// version, both are &quot;&quot;. The caller holds the lock of the account.</span>
+<span class="a">+func head(dir string) (string, string, error) {</span>
+<span class="a">+	b, err := os.ReadFile(filepath.Join(dir, &quot;HEAD&quot;))</span>
+<span class="a">+	if errors.Is(err, fs.ErrNotExist) {</span>
+<span class="a">+		return &quot;&quot;, &quot;&quot;, nil</span>
+<span class="a">+	} else if err != nil {</span>
+<span class="a">+		return &quot;&quot;, &quot;&quot;, err</span>
+<span class="a">+	}</span>
+<span class="a">+	name := strings.TrimSpace(string(b))</span>
+<span class="a">+	text, err := os.ReadFile(filepath.Join(dir, name))</span>
+<span class="a">+	return string(text), name, err</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// read gives the version of the file of the account with the name, or the</span>
+<span class="a">+// current version when name is &quot;&quot;, and the name of the version.</span>
+<span class="a">+func (s *Store) read(a *Account, name string) (string, string, error) {</span>
+<span class="a">+	m := s.lock(a.ID)</span>
+<span class="a">+	m.Lock()</span>
+<span class="a">+	defer m.Unlock()</span>
+<span class="a">+	dir := filepath.Join(s.dir, &quot;files&quot;, a.ID)</span>
+<span class="a">+	if name == &quot;&quot; {</span>
+<span class="a">+		return head(dir)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !hashName.MatchString(name) {</span>
+<span class="a">+		return &quot;&quot;, &quot;&quot;, fs.ErrNotExist</span>
+<span class="a">+	}</span>
+<span class="a">+	b, err := os.ReadFile(filepath.Join(dir, name))</span>
+<span class="a">+	return string(b), name, err</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // prune deletes all but the newest versions in dir, and never keep.
+ func prune(dir, keep string) error {
+ 	entries, err := os.ReadDir(dir)
+diff --git a/web_test.go b/web_test.go
+new file mode 100644
+index 0000000..c8b588f
+--- /dev/null
++++ b/web_test.go
+<span class="h">@@ -0,0 +1,434 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;bytes&quot;</span>
+<span class="a">+	&quot;io&quot;</span>
+<span class="a">+	&quot;mime/multipart&quot;</span>
+<span class="a">+	&quot;net/http&quot;</span>
+<span class="a">+	&quot;net/url&quot;</span>
+<span class="a">+	&quot;regexp&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;testing&quot;</span>
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// get gives the status, the Location header and the body of a page.</span>
+<span class="a">+func (e *harness) get(c *http.Client, path string) (int, string, string) {</span>
+<span class="a">+	resp, err := c.Get(e.web.URL + path)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	defer resp.Body.Close()</span>
+<span class="a">+	b, _ := io.ReadAll(resp.Body)</span>
+<span class="a">+	return resp.StatusCode, resp.Header.Get(&quot;Location&quot;), string(b)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// send posts a form, and gives the status, the Location header and the body.</span>
+<span class="a">+func (e *harness) send(c *http.Client, path string, form url.Values) (int, string, string) {</span>
+<span class="a">+	resp := e.post(c, path, form)</span>
+<span class="a">+	defer resp.Body.Close()</span>
+<span class="a">+	b, _ := io.ReadAll(resp.Body)</span>
+<span class="a">+	return resp.StatusCode, resp.Header.Get(&quot;Location&quot;), string(b)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// upload sends a file with the import form, as a browser does.</span>
+<span class="a">+func (e *harness) upload(c *http.Client, content string) (int, string, string) {</span>
+<span class="a">+	var body bytes.Buffer</span>
+<span class="a">+	m := multipart.NewWriter(&amp;body)</span>
+<span class="a">+	f, _ := m.CreateFormFile(&quot;file&quot;, &quot;bookmarks.html&quot;)</span>
+<span class="a">+	io.WriteString(f, content)</span>
+<span class="a">+	m.Close()</span>
+<span class="a">+	req, _ := http.NewRequest(&quot;POST&quot;, e.web.URL+&quot;/bookmarks/import&quot;, &amp;body)</span>
+<span class="a">+	req.Header.Set(&quot;Content-Type&quot;, m.FormDataContentType())</span>
+<span class="a">+	req.Header.Set(&quot;Origin&quot;, e.web.URL)</span>
+<span class="a">+	resp, err := c.Do(req)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	defer resp.Body.Close()</span>
+<span class="a">+	b, _ := io.ReadAll(resp.Body)</span>
+<span class="a">+	return resp.StatusCode, resp.Header.Get(&quot;Location&quot;), string(b)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// account makes an account whose file is text. It gives a signed-in browser,</span>
+<span class="a">+// the token of a device and the version of the file.</span>
+<span class="a">+func (e *harness) account(text string) (*http.Client, string, string) {</span>
+<span class="a">+	c := e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	tok := e.token(&quot;me@example.org&quot;)</span>
+<span class="a">+	code, _, v := e.sync(tok, &quot;&quot;, text)</span>
+<span class="a">+	if code != http.StatusOK {</span>
+<span class="a">+		e.t.Fatalf(&quot;first sync: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	return c, tok, v</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// fileOf gives the file on the server, as a device without a file gets it.</span>
+<span class="a">+func (e *harness) fileOf(tok string) string {</span>
+<span class="a">+	_, text, _ := e.sync(tok, &quot;&quot;, &quot;&quot;)</span>
+<span class="a">+	return text</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+var editLink = regexp.MustCompile(`href=&quot;/bookmarks/edit\?v=([0-9a-f]{64})&amp;amp;n=([0-9]+)&quot;`)</span>
+<span class="a">+</span>
+<span class="a">+// editForm gives the fields v and n of the edit link of the bookmark with the</span>
+<span class="a">+// title on the page.</span>
+<span class="a">+func editForm(t *testing.T, page, title string) url.Values {</span>
+<span class="a">+	t.Helper()</span>
+<span class="a">+	for _, li := range strings.Split(page, &quot;&lt;li&gt;&quot;) {</span>
+<span class="a">+		if strings.Contains(li, &quot;&gt;&quot;+title+&quot;&lt;/a&gt;&quot;) {</span>
+<span class="a">+			if m := editLink.FindStringSubmatch(li); m != nil {</span>
+<span class="a">+				return url.Values{&quot;v&quot;: {m[1]}, &quot;n&quot;: {m[2]}}</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	t.Fatalf(&quot;no edit link for %q on the page:\n%s&quot;, title, page)</span>
+<span class="a">+	return nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+var rowTitle = regexp.MustCompile(`&lt;li&gt;(?:&lt;a href=&quot;[^&quot;]*&quot;&gt;)?([^&lt;]*)`)</span>
+<span class="a">+</span>
+<span class="a">+// titles gives the titles of the bookmarks on the page, in their order.</span>
+<span class="a">+func titles(page string) []string {</span>
+<span class="a">+	var out []string</span>
+<span class="a">+	for _, m := range rowTitle.FindAllStringSubmatch(page, -1) {</span>
+<span class="a">+		out = append(out, m[1])</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestBookmarkPagesNeedSignIn(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c := e.browser()</span>
+<span class="a">+	for _, path := range []string{&quot;/bookmarks&quot;, &quot;/bookmarks/file&quot;, &quot;/bookmarks.txt&quot;,</span>
+<span class="a">+		&quot;/bookmarks/edit?v=&quot; + strings.Repeat(&quot;0&quot;, 64) + &quot;&amp;n=0&quot;} {</span>
+<span class="a">+		if code, to, _ := e.get(c, path); code != http.StatusSeeOther || to != &quot;/login&quot; {</span>
+<span class="a">+			t.Errorf(&quot;GET %s: %d to %q&quot;, path, code, to)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, path := range []string{&quot;/bookmarks/add&quot;, &quot;/bookmarks/edit&quot;, &quot;/bookmarks/file&quot;, &quot;/bookmarks/import&quot;} {</span>
+<span class="a">+		if code, to, _ := e.send(c, path, url.Values{&quot;url&quot;: {&quot;https://a.org&quot;}}); code != http.StatusSeeOther || to != &quot;/login&quot; {</span>
+<span class="a">+			t.Errorf(&quot;POST %s: %d to %q&quot;, path, code, to)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestSignInOpensTheBookmarks(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	form := url.Values{&quot;email&quot;: {&quot;me@example.org&quot;}, &quot;password&quot;: {&quot;password1&quot;}}</span>
+<span class="a">+	if code, to, _ := e.send(e.browser(), &quot;/signup&quot;, form); code != http.StatusSeeOther || to != &quot;/account&quot; {</span>
+<span class="a">+		t.Errorf(&quot;sign up: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	c := e.browser()</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/login&quot;, form); code != http.StatusSeeOther || to != &quot;/bookmarks&quot; {</span>
+<span class="a">+		t.Errorf(&quot;sign in: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _, page := e.get(c, &quot;/bookmarks&quot;); code != http.StatusOK || !strings.Contains(page, &quot;0 of 0 bookmarks.&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;bookmarks of a new account: %d\n%s&quot;, code, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, path := range []string{&quot;/&quot;, &quot;/account&quot;} {</span>
+<span class="a">+		if !strings.Contains(e.body(c, path), `&lt;a href=&quot;/bookmarks&quot;&gt;`) {</span>
+<span class="a">+			t.Errorf(&quot;%s has no link to the bookmarks&quot;, path)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestWebChangesReachTheDevices(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;https://a.org\tA\tx\nhttps://b.org\tB\t\n&quot;)</span>
+<span class="a">+	if got := titles(e.body(c, &quot;/bookmarks&quot;)); !slices.Equal(got, []string{&quot;B&quot;, &quot;A&quot;}) {</span>
+<span class="a">+		t.Fatalf(&quot;titles: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	code, to, _ := e.send(c, &quot;/bookmarks/add&quot;, url.Values{&quot;url&quot;: {&quot; https://c.org &quot;}, &quot;desc&quot;: {&quot;C\tc&quot;}, &quot;tags&quot;: {&quot; y  z &quot;}})</span>
+<span class="a">+	if code != http.StatusSeeOther || to != &quot;/bookmarks?done=added&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;add: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got, want := e.fileOf(tok), &quot;https://a.org\tA\tx\nhttps://b.org\tB\t\nhttps://c.org\tC c\ty z\n&quot;; got != want {</span>
+<span class="a">+		t.Fatalf(&quot;after the add: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, to), &quot;Bookmark added.&quot;) {</span>
+<span class="a">+		t.Error(&quot;the page does not tell that the bookmark is added&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	form := editForm(t, e.body(c, &quot;/bookmarks&quot;), &quot;A&quot;)</span>
+<span class="a">+	page := e.body(c, &quot;/bookmarks/edit?v=&quot;+form.Get(&quot;v&quot;)+&quot;&amp;n=&quot;+form.Get(&quot;n&quot;))</span>
+<span class="a">+	if !strings.Contains(page, `name=&quot;url&quot; value=&quot;https://a.org&quot;`) || !strings.Contains(page, `name=&quot;tags&quot; value=&quot;x&quot;`) {</span>
+<span class="a">+		t.Fatalf(&quot;edit page:\n%s&quot;, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	form.Set(&quot;url&quot;, &quot;https://a.org&quot;)</span>
+<span class="a">+	form.Set(&quot;desc&quot;, &quot;A, edited&quot;)</span>
+<span class="a">+	form.Set(&quot;tags&quot;, &quot;x w&quot;)</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/edit&quot;, form); code != http.StatusSeeOther || to != &quot;/bookmarks?done=saved&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;save: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	form = editForm(t, e.body(c, &quot;/bookmarks&quot;), &quot;B&quot;)</span>
+<span class="a">+	form.Set(&quot;do&quot;, &quot;delete&quot;)</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/edit&quot;, form); code != http.StatusSeeOther || to != &quot;/bookmarks?done=deleted&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;delete: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got, want := e.fileOf(tok), &quot;https://a.org\tA, edited\tx w\nhttps://c.org\tC c\ty z\n&quot;; got != want {</span>
+<span class="a">+		t.Fatalf(&quot;after the edit and the delete: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestWebEditsKeepTheChangesOfDevices(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, v := e.account(&quot;https://a.org\tA\t\nhttps://b.org\tB\t\n&quot;)</span>
+<span class="a">+	form := editForm(t, e.body(c, &quot;/bookmarks&quot;), &quot;A&quot;)</span>
+<span class="a">+	// A device adds a bookmark while the page is open.</span>
+<span class="a">+	e.sync(tok, v, &quot;https://a.org\tA\t\nhttps://b.org\tB\t\nhttps://d.org\tD\t\n&quot;)</span>
+<span class="a">+	form.Set(&quot;do&quot;, &quot;delete&quot;)</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/edit&quot;, form); code != http.StatusSeeOther || to != &quot;/bookmarks?done=deleted&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;delete: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got, want := e.fileOf(tok), &quot;https://b.org\tB\t\nhttps://d.org\tD\t\n&quot;; got != want {</span>
+<span class="a">+		t.Fatalf(&quot;after the delete: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	// A device edits B while the page is open. The page does not change B.</span>
+<span class="a">+	form = editForm(t, e.body(c, &quot;/bookmarks&quot;), &quot;B&quot;)</span>
+<span class="a">+	_, text, v := e.sync(tok, &quot;&quot;, &quot;&quot;)</span>
+<span class="a">+	e.sync(tok, v, strings.Replace(text, &quot;\tB\t&quot;, &quot;\tB on a device\t&quot;, 1))</span>
+<span class="a">+	form.Set(&quot;url&quot;, &quot;https://b.org&quot;)</span>
+<span class="a">+	form.Set(&quot;desc&quot;, &quot;B on the web&quot;)</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/edit&quot;, form); code != http.StatusSeeOther || to != &quot;/bookmarks?done=changed&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;save of a bookmark that a device changed: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got, want := e.fileOf(tok), &quot;https://b.org\tB on a device\t\nhttps://d.org\tD\t\n&quot;; got != want {</span>
+<span class="a">+		t.Fatalf(&quot;after the refused save: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestAddAndEditRefusals(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;http://a.org/\tA\t\nhttps://b.org\tB\t\n&quot;)</span>
+<span class="a">+	file := e.fileOf(tok)</span>
+<span class="a">+	for _, tc := range []struct {</span>
+<span class="a">+		form url.Values</span>
+<span class="a">+		code int</span>
+<span class="a">+		text string</span>
+<span class="a">+	}{</span>
+<span class="a">+		{url.Values{&quot;url&quot;: {&quot;https://www.A.org&quot;}, &quot;desc&quot;: {&quot;typed&quot;}}, http.StatusConflict, &quot;This URL is a bookmark already: A.&quot;},</span>
+<span class="a">+		{url.Values{&quot;url&quot;: {&quot; &quot;}}, http.StatusBadRequest, &quot;Type the URL of the bookmark.&quot;},</span>
+<span class="a">+		{url.Values{&quot;url&quot;: {&quot;#x&quot;}}, http.StatusBadRequest, &quot;A URL cannot start with #&quot;},</span>
+<span class="a">+	} {</span>
+<span class="a">+		code, _, page := e.send(c, &quot;/bookmarks/add&quot;, tc.form)</span>
+<span class="a">+		if code != tc.code || !strings.Contains(page, tc.text) || !strings.Contains(page, &quot;&lt;details open&gt;&quot;) {</span>
+<span class="a">+			t.Errorf(&quot;add %v: %d, want %d with %q in an open form&quot;, tc.form, code, tc.code, tc.text)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if _, _, page := e.send(c, &quot;/bookmarks/add&quot;, url.Values{&quot;url&quot;: {&quot;https://a.org&quot;}, &quot;desc&quot;: {&quot;typed&quot;}}); !strings.Contains(page, `value=&quot;typed&quot;`) {</span>
+<span class="a">+		t.Error(&quot;the add form lost the text that was typed&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	form := editForm(t, e.body(c, &quot;/bookmarks&quot;), &quot;A&quot;)</span>
+<span class="a">+	form.Set(&quot;url&quot;, &quot;https://b.org/&quot;)</span>
+<span class="a">+	if code, _, page := e.send(c, &quot;/bookmarks/edit&quot;, form); code != http.StatusConflict || !strings.Contains(page, &quot;Another bookmark has this URL: B.&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;edit to the URL of B: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	form.Set(&quot;url&quot;, &quot;&quot;)</span>
+<span class="a">+	if code, _, _ := e.send(c, &quot;/bookmarks/edit&quot;, form); code != http.StatusBadRequest {</span>
+<span class="a">+		t.Errorf(&quot;edit without a URL: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	// A version that is gone, or a line that the version does not have.</span>
+<span class="a">+	if code, to, _ := e.get(c, &quot;/bookmarks/edit?v=&quot;+strings.Repeat(&quot;0&quot;, 64)+&quot;&amp;n=0&quot;); code != http.StatusSeeOther || to != &quot;/bookmarks?done=changed&quot; {</span>
+<span class="a">+		t.Errorf(&quot;edit page of an unknown version: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/edit&quot;, url.Values{&quot;v&quot;: {form.Get(&quot;v&quot;)}, &quot;n&quot;: {&quot;9&quot;}, &quot;url&quot;: {&quot;https://x.org&quot;}}); code != http.StatusSeeOther || to != &quot;/bookmarks?done=changed&quot; {</span>
+<span class="a">+		t.Errorf(&quot;save of an unknown line: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.fileOf(tok); got != file {</span>
+<span class="a">+		t.Errorf(&quot;a refusal changed the file: %q, want %q&quot;, got, file)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestSearchTagsAndOrders(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, _, _ := e.account(&quot;https://b.org\tBee\tx\nhttps://c.org\tAnt\ty\nhttps://a.org\tCat\tz w\n# a comment\nhttps://jisho.org\tJisho: 日本語\tja\n&quot;)</span>
+<span class="a">+	for _, tc := range []struct {</span>
+<span class="a">+		path string</span>
+<span class="a">+		want []string</span>
+<span class="a">+	}{</span>
+<span class="a">+		{&quot;/bookmarks&quot;, []string{&quot;Jisho: 日本語&quot;, &quot;Cat&quot;, &quot;Ant&quot;, &quot;Bee&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?sort=url&quot;, []string{&quot;Cat&quot;, &quot;Bee&quot;, &quot;Ant&quot;, &quot;Jisho: 日本語&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?sort=desc&quot;, []string{&quot;Ant&quot;, &quot;Bee&quot;, &quot;Cat&quot;, &quot;Jisho: 日本語&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?sort=tag&quot;, []string{&quot;Jisho: 日本語&quot;, &quot;Bee&quot;, &quot;Ant&quot;, &quot;Cat&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?sort=nonsense&quot;, []string{&quot;Jisho: 日本語&quot;, &quot;Cat&quot;, &quot;Ant&quot;, &quot;Bee&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?q=jsh&quot;, []string{&quot;Jisho: 日本語&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?q=&quot; + url.QueryEscape(&quot;日本&quot;), []string{&quot;Jisho: 日本語&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?tag=z&quot;, []string{&quot;Cat&quot;}},</span>
+<span class="a">+		{&quot;/bookmarks?tag=z&amp;q=bee&quot;, nil},</span>
+<span class="a">+	} {</span>
+<span class="a">+		if got := titles(e.body(c, tc.path)); !slices.Equal(got, tc.want) {</span>
+<span class="a">+			t.Errorf(&quot;%s: %q, want %q&quot;, tc.path, got, tc.want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	page := e.body(c, &quot;/bookmarks?q=jsh&quot;)</span>
+<span class="a">+	if !strings.Contains(page, &quot;1 of 4 bookmarks.&quot;) || !strings.Contains(page, `&lt;a href=&quot;/bookmarks?tag=ja&quot;&gt;ja&lt;/a&gt;&amp;nbsp;(1)`) {</span>
+<span class="a">+		t.Errorf(&quot;the count or the tags are wrong:\n%s&quot;, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	// Text that no bookmark matches goes to the web, as in bm.</span>
+<span class="a">+	if page := e.body(c, &quot;/bookmarks?q=posix+sh&quot;); !strings.Contains(page, &quot;No bookmark matches.&quot;) || !strings.Contains(page, &quot;https://duckduckgo.com/?q=posix&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;no web search for text that no bookmark matches:\n%s&quot;, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	if page := e.body(c, &quot;/bookmarks?q=example.org/x&quot;); !strings.Contains(page, `Go to &lt;a href=&quot;https://example.org/x&quot;&gt;`) {</span>
+<span class="a">+		t.Errorf(&quot;no link for an address that no bookmark matches:\n%s&quot;, page)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestBookmarkPagesEscapeTheFile(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, _, _ := e.account(&quot;javascript:alert(1)\t&lt;script&gt;alert(2)&lt;/script&gt;\t&lt;marquee&gt;\nwww.example.org\tNo scheme\t\n&quot;)</span>
+<span class="a">+	page := e.body(c, &quot;/bookmarks&quot;)</span>
+<span class="a">+	for _, bad := range []string{`href=&quot;javascript:`, &quot;&lt;script&gt;&quot;, &quot;&lt;marquee&gt;&quot;} {</span>
+<span class="a">+		if strings.Contains(page, bad) {</span>
+<span class="a">+			t.Errorf(&quot;the page has %q&quot;, bad)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(page, &quot;&amp;lt;script&amp;gt;alert(2)&amp;lt;/script&amp;gt;&quot;) {</span>
+<span class="a">+		t.Error(&quot;the page does not show the description as text&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(page, `&lt;a href=&quot;https://www.example.org&quot;&gt;No scheme&lt;/a&gt;`) {</span>
+<span class="a">+		t.Error(&quot;an address without a scheme does not get https&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestBookmarksWaitForTheEmailCheck(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	c := e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	if code, to, _ := e.get(c, &quot;/bookmarks&quot;); code != http.StatusSeeOther || to != &quot;/account&quot; {</span>
+<span class="a">+		t.Errorf(&quot;bookmarks before the check: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/add&quot;, url.Values{&quot;url&quot;: {&quot;https://a.org&quot;}}); code != http.StatusSeeOther || to != &quot;/account&quot; {</span>
+<span class="a">+		t.Errorf(&quot;add before the check: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if strings.Contains(e.body(c, &quot;/account&quot;), `href=&quot;/bookmarks&quot;`) {</span>
+<span class="a">+		t.Error(&quot;the account page links to the bookmarks before the check&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code := e.open(e.link()); code != http.StatusOK {</span>
+<span class="a">+		t.Fatalf(&quot;the link of the email: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _, _ := e.get(c, &quot;/bookmarks&quot;); code != http.StatusOK {</span>
+<span class="a">+		t.Errorf(&quot;bookmarks after the check: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestBookmarksPauseWithSync(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, true)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;https://a.org\tA\t\n&quot;)</span>
+<span class="a">+	e.s.store.byTok(tok).Created = time.Now().Add(-31 * 24 * time.Hour)</span>
+<span class="a">+	if code, to, _ := e.get(c, &quot;/bookmarks&quot;); code != http.StatusSeeOther || to != &quot;/account&quot; {</span>
+<span class="a">+		t.Errorf(&quot;bookmarks after the trial: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	// The download works: the bookmarks belong to their owner.</span>
+<span class="a">+	resp, err := c.Get(e.web.URL + &quot;/bookmarks.txt&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	defer resp.Body.Close()</span>
+<span class="a">+	b, _ := io.ReadAll(resp.Body)</span>
+<span class="a">+	if resp.StatusCode != http.StatusOK || string(b) != &quot;https://a.org\tA\t\n&quot; ||</span>
+<span class="a">+		resp.Header.Get(&quot;Content-Disposition&quot;) != `attachment; filename=&quot;bookmarks.txt&quot;` {</span>
+<span class="a">+		t.Errorf(&quot;download after the trial: %s %q %q&quot;, resp.Status, b, resp.Header.Get(&quot;Content-Disposition&quot;))</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestEditTheWholeFile(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, v := e.account(&quot;https://a.org\tA\t\nhttps://b.org\tB\t\n&quot;)</span>
+<span class="a">+	page := e.body(c, &quot;/bookmarks/file&quot;)</span>
+<span class="a">+	if !strings.Contains(page, `name=&quot;base&quot; value=&quot;`+v+`&quot;`) || !strings.Contains(page, &quot;&gt;\nhttps://a.org\tA\t\nhttps://b.org\tB\t\n&lt;/textarea&gt;&quot;) {</span>
+<span class="a">+		t.Fatalf(&quot;file page:\n%s&quot;, page)</span>
+<span class="a">+	}</span>
+<span class="a">+	// A device adds D while the page is open. The browser sends CRLF, and a</span>
+<span class="a">+	// file without A and with C.</span>
+<span class="a">+	e.sync(tok, v, &quot;https://a.org\tA\t\nhttps://b.org\tB\t\nhttps://d.org\tD\t\n&quot;)</span>
+<span class="a">+	code, to, _ := e.send(c, &quot;/bookmarks/file&quot;, url.Values{&quot;base&quot;: {v}, &quot;text&quot;: {&quot;https://b.org\tB\t\r\nhttps://c.org\tC\t\r\n&quot;}})</span>
+<span class="a">+	if code != http.StatusSeeOther || to != &quot;/bookmarks?done=merged&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;save: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	want := &quot;https://b.org\tB\t\nhttps://d.org\tD\t\nhttps://c.org\tC\t\n&quot;</span>
+<span class="a">+	if got := e.fileOf(tok); got != want {</span>
+<span class="a">+		t.Fatalf(&quot;after the save: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+	// Without changes of other devices, the file is as the page sent it.</span>
+<span class="a">+	_, _, v = e.sync(tok, &quot;&quot;, &quot;&quot;)</span>
+<span class="a">+	if code, to, _ := e.send(c, &quot;/bookmarks/file&quot;, url.Values{&quot;base&quot;: {v}, &quot;text&quot;: {want + &quot;https://e.org\tE\t\n&quot;}}); code != http.StatusSeeOther || to != &quot;/bookmarks?done=file&quot; {</span>
+<span class="a">+		t.Errorf(&quot;save without other changes: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _, _ := e.send(c, &quot;/bookmarks/file&quot;, url.Values{&quot;base&quot;: {&quot;../accounts.json&quot;}, &quot;text&quot;: {&quot;x&quot;}}); code != http.StatusBadRequest {</span>
+<span class="a">+		t.Errorf(&quot;a base that is not a version name: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// browserExport is a file as the browsers export it.</span>
+<span class="a">+const browserExport = `&lt;!DOCTYPE NETSCAPE-Bookmark-file-1&gt;</span>
+<span class="a">+&lt;META HTTP-EQUIV=&quot;Content-Type&quot; CONTENT=&quot;text/html; charset=UTF-8&quot;&gt;</span>
+<span class="a">+&lt;TITLE&gt;Bookmarks&lt;/TITLE&gt;</span>
+<span class="a">+&lt;H1&gt;Bookmarks&lt;/H1&gt;</span>
+<span class="a">+&lt;DL&gt;&lt;p&gt;</span>
+<span class="a">+    &lt;DT&gt;&lt;A HREF=&quot;https://www.a.org/&quot; ADD_DATE=&quot;1&quot; ICON=&quot;data:image/png;base64,AAAA&quot;&gt;A &amp;amp; more&lt;/A&gt;</span>
+<span class="a">+    &lt;DT&gt;&lt;H3 ADD_DATE=&quot;1&quot;&gt;Dev Tools&lt;/H3&gt;</span>
+<span class="a">+    &lt;DL&gt;&lt;p&gt;</span>
+<span class="a">+        &lt;DT&gt;&lt;A HREF=&quot;https://go.dev/doc/&quot;&gt;Go   docs&lt;/A&gt;</span>
+<span class="a">+        &lt;DT&gt;&lt;H3&gt;Go &amp;amp; Co&lt;/H3&gt;</span>
+<span class="a">+        &lt;DL&gt;&lt;p&gt;</span>
+<span class="a">+            &lt;DT&gt;&lt;A HREF=&quot;https://pkg.go.dev/&quot;&gt;Packages&lt;/A&gt;</span>
+<span class="a">+            &lt;DT&gt;&lt;A HREF=&quot;https://go.dev/doc&quot;&gt;Go docs again&lt;/A&gt;</span>
+<span class="a">+        &lt;/DL&gt;&lt;p&gt;</span>
+<span class="a">+        &lt;DT&gt;&lt;A HREF=&quot;javascript:alert(1)&quot;&gt;Bookmarklet&lt;/A&gt;</span>
+<span class="a">+    &lt;/DL&gt;&lt;p&gt;</span>
+<span class="a">+    &lt;DT&gt;&lt;A HREF=&quot;https://news.example/&quot;&gt;News&lt;/A&gt;</span>
+<span class="a">+&lt;/DL&gt;</span>
+<span class="a">+`</span>
+<span class="a">+</span>
+<span class="a">+func TestImportFiles(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;http://a.org\tA\t\n&quot;)</span>
+<span class="a">+	code, to, _ := e.upload(c, browserExport)</span>
+<span class="a">+	if code != http.StatusSeeOther || to != &quot;/bookmarks?done=imported&amp;added=3&amp;known=2&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;import of a browser file: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	want := &quot;http://a.org\tA\t\n&quot; +</span>
+<span class="a">+		&quot;https://go.dev/doc/\tGo docs\tdev-tools\n&quot; +</span>
+<span class="a">+		&quot;https://pkg.go.dev/\tPackages\tdev-tools go-co\n&quot; +</span>
+<span class="a">+		&quot;https://news.example/\tNews\t\n&quot;</span>
+<span class="a">+	if got := e.fileOf(tok); got != want {</span>
+<span class="a">+		t.Fatalf(&quot;after the import: %q, want %q&quot;, got, want)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, to), &quot;Bookmarks imported: 3. Skipped because they are bookmarks already: 2.&quot;) {</span>
+<span class="a">+		t.Error(&quot;the page does not tell what the import did&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	// A file of bookmark lines, as bm --merge takes them.</span>
+<span class="a">+	if code, to, _ := e.upload(c, &quot;https://b.org\tB\tx\n# comment\nhttps://pkg.go.dev\tknown\t\nhttps://c.org\n&quot;); code != http.StatusSeeOther || to != &quot;/bookmarks?done=imported&amp;added=2&amp;known=1&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;import of bookmark lines: %d to %q&quot;, code, to)</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.fileOf(tok); got != want+&quot;https://b.org\tB\tx\nhttps://c.org\t\t\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;after the import of lines: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _, page := e.send(c, &quot;/bookmarks/import&quot;, url.Values{}); code != http.StatusBadRequest || !strings.Contains(page, &quot;Choose a file&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;import without a file: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestOtherSiteCannotChangeBookmarks(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	c, tok, _ := e.account(&quot;https://a.org\tA\t\n&quot;)</span>
+<span class="a">+	for _, path := range []string{&quot;/bookmarks/add&quot;, &quot;/bookmarks/edit&quot;, &quot;/bookmarks/file&quot;, &quot;/bookmarks/import&quot;} {</span>
+<span class="a">+		req, _ := http.NewRequest(&quot;POST&quot;, e.web.URL+path, strings.NewReader(&quot;url=https%3A%2F%2Fevil.example&amp;text=&quot;))</span>
+<span class="a">+		req.Header.Set(&quot;Content-Type&quot;, &quot;application/x-www-form-urlencoded&quot;)</span>
+<span class="a">+		req.Header.Set(&quot;Origin&quot;, &quot;https://evil.example&quot;)</span>
+<span class="a">+		resp, err := c.Do(req)</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			t.Fatal(err)</span>
+<span class="a">+		}</span>
+<span class="a">+		resp.Body.Close()</span>
+<span class="a">+		if resp.StatusCode != http.StatusForbidden {</span>
+<span class="a">+			t.Errorf(&quot;POST %s from another site: %s&quot;, path, resp.Status)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if got := e.fileOf(tok); got != &quot;https://a.org\tA\t\n&quot; {</span>
+<span class="a">+		t.Errorf(&quot;another site changed the file: %q&quot;, got)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span></pre>
+</div></body></html>

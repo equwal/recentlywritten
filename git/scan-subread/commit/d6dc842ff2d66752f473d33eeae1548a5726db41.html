@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread d6dc842f - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit d6dc842ff2d66752f473d33eeae1548a5726db41
+truex &lt;truex@equwal.com&gt;
+2026-09-26 21:35:19 -0700
+
+Keep the spans on their tokens when an earlier page is read
+
+The reader reads the current page first, then the pages after it, then
+the pages before it. Each page before the current page puts its tokens
+in front of the tokens that the spans index. Until the next alignment
+(300 ms after the last page), the spans then pointed at other tokens:
+the mark could show on a wrong line, and a long press could give the
+Anki card the sentence of a wrong cue.
+
+shiftSpans (align.ts) moves each matched span after the new tokens, so
+that it keeps its first and its last token. readBook calls it after it
+puts the tokens of a page in place. A property test checks that each
+span keeps its first and its last token for any insert.
+
+</pre><pre> src/align.ts                | 20 +++++++++++++
+ src/main.ts                 |  7 +++--
+ test/align.property.test.ts | 71 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 96 insertions(+), 2 deletions(-)
+</pre><pre>diff --git a/src/align.ts b/src/align.ts
+index 3809f66..846b9d7 100644
+--- a/src/align.ts
++++ b/src/align.ts
+<span class="h">@@ -356,6 +356,26 @@ export function risingChain(values: ArrayLike&lt;number&gt;): number[] {</span>
+   return chain;
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * The spans after `count` tokens go into the tokens at index `at`: each</span>
+<span class="a">+ * matched span keeps its first and its last token. The reader reads the</span>
+<span class="a">+ * pages after the current page first. A page before it then puts its tokens</span>
+<span class="a">+ * in front of the tokens that the spans index, and without this shift the</span>
+<span class="a">+ * spans point at other tokens until the next alignment. A span across `at`</span>
+<span class="a">+ * also holds the new tokens. An unmatched span stays as it is.</span>
+<span class="a">+ */</span>
+<span class="a">+export function shiftSpans(spans: readonly TokenSpan[], at: number, count: number): TokenSpan[] {</span>
+<span class="a">+  return spans.map((span) =&gt;</span>
+<span class="a">+    span.matched</span>
+<span class="a">+      ? {</span>
+<span class="a">+          start: span.start &lt; at ? span.start : span.start + count,</span>
+<span class="a">+          end: span.end &lt;= at ? span.end : span.end + count,</span>
+<span class="a">+          matched: true,</span>
+<span class="a">+        }</span>
+<span class="a">+      : span,</span>
+<span class="a">+  );</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /**
+  * Align cues to tokens in one call. The tokens must be in page order, the
+  * order that the reader keeps them in. The spans index `tokens`.
+diff --git a/src/main.ts b/src/main.ts
+index 087bb77..4cb13e2 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -6,7 +6,7 @@</span>
+ // (the strip) and view.ts (the page).
+ 
+ import { App } from &#x27;@capacitor/app&#x27;;
+<span class="d">-import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;</span>
+<span class="a">+import { createAligner, shiftSpans, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;</span>
+ import { ankiCard, cardSource } from &#x27;./anki-card&#x27;;
+ import { backStep, keepScreenOn } from &#x27;./app-state&#x27;;
+ import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;
+<span class="h">@@ -638,9 +638,12 @@ async function readBook(retry = false): Promise&lt;void&gt; {</span>
+       if (seq !== state.readSeq) return; // Another book or another setting took over.
+       counts[entry.source]++;
+       state.pages[page] = entry;
+<span class="d">-      // Put the tokens of the page at their place in page order.</span>
+<span class="a">+      // Put the tokens of the page at their place in page order. The spans</span>
+<span class="a">+      // keep their tokens until the next alignment: the mark and the Anki</span>
+<span class="a">+      // card use them.</span>
+       const at = state.pages.slice(0, page).reduce((n, p) =&gt; n + (p?.tokens.length ?? 0), 0);
+       state.tokens.splice(at, 0, ...entry.tokens);
+<span class="a">+      state.spans = shiftSpans(state.spans, at, entry.tokens.length);</span>
+       const how = entry.source === &#x27;text&#x27; ? &#x27;text layer&#x27; : &#x27;OCR&#x27;;
+       setReading(readingText(read(), total, `page ${page + 1}: ${how}`));
+       if (page === state.currentPage) view.mark();
+diff --git a/test/align.property.test.ts b/test/align.property.test.ts
+index 7f51019..42d8717 100644
+--- a/test/align.property.test.ts
++++ b/test/align.property.test.ts
+<span class="h">@@ -5,6 +5,7 @@ import {</span>
+   createAligner,
+   normalizeText,
+   risingChain,
+<span class="a">+  shiftSpans,</span>
+   type TokenSpan,
+ } from &#x27;../src/align&#x27;;
+ import { books, char, grams, pagesOfCue, readPages, word, type Book, type Token } from &#x27;./book&#x27;;
+<span class="h">@@ -247,6 +248,76 @@ describe(&#x27;createAligner properties&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="a">+describe(&#x27;shiftSpans&#x27;, () =&gt; {</span>
+<span class="a">+  const unmatched: TokenSpan = { start: 0, end: 0, matched: false };</span>
+<span class="a">+</span>
+<span class="a">+  /** A span of `n` tokens: matched and inside [0, n], or unmatched. */</span>
+<span class="a">+  function span(n: number): fc.Arbitrary&lt;TokenSpan&gt; {</span>
+<span class="a">+    if (n === 0) return fc.constant(unmatched);</span>
+<span class="a">+    const matched = fc</span>
+<span class="a">+      .nat({ max: n - 1 })</span>
+<span class="a">+      .chain((start) =&gt;</span>
+<span class="a">+        fc.integer({ min: start + 1, max: n }).map((end) =&gt; ({ start, end, matched: true })),</span>
+<span class="a">+      );</span>
+<span class="a">+    return fc.oneof(fc.constant(unmatched), matched);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the first and the last token of each span when tokens go in&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: page 19, read after page 20, put its tokens in front of</span>
+<span class="a">+    // the tokens of page 20, and the spans pointed at other tokens until</span>
+<span class="a">+    // the next alignment.</span>
+<span class="a">+    const input = fc</span>
+<span class="a">+      .nat({ max: 40 })</span>
+<span class="a">+      .chain((n) =&gt;</span>
+<span class="a">+        fc.tuple(fc.constant(n), fc.array(span(n)), fc.nat({ max: n }), fc.nat({ max: 20 })),</span>
+<span class="a">+      );</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ([n, spans, at, count]) =&gt; {</span>
+<span class="a">+        const before = Array.from({ length: n }, (_, i) =&gt; `old ${i}`);</span>
+<span class="a">+        const after = [...before];</span>
+<span class="a">+        after.splice(at, 0, ...Array.from({ length: count }, (_, i) =&gt; `new ${i}`));</span>
+<span class="a">+        const shifted = shiftSpans(spans, at, count);</span>
+<span class="a">+        expect(shifted).toHaveLength(spans.length);</span>
+<span class="a">+        spans.forEach((s, i) =&gt; {</span>
+<span class="a">+          const moved = shifted[i]!;</span>
+<span class="a">+          if (!s.matched) {</span>
+<span class="a">+            expect(moved).toEqual(unmatched);</span>
+<span class="a">+            return;</span>
+<span class="a">+          }</span>
+<span class="a">+          expect(moved.matched).toBe(true);</span>
+<span class="a">+          expect(after[moved.start]).toBe(before[s.start]);</span>
+<span class="a">+          expect(after[moved.end - 1]).toBe(before[s.end - 1]);</span>
+<span class="a">+        });</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;moves the spans of page 20 behind the tokens of page 19&#x27;, () =&gt; {</span>
+<span class="a">+    // Page 20 has 5 tokens and two cues. Page 19 puts 4 tokens in front.</span>
+<span class="a">+    const spans = [</span>
+<span class="a">+      { start: 0, end: 3, matched: true },</span>
+<span class="a">+      { start: 3, end: 5, matched: true },</span>
+<span class="a">+      unmatched,</span>
+<span class="a">+    ];</span>
+<span class="a">+    expect(shiftSpans(spans, 0, 4)).toEqual([</span>
+<span class="a">+      { start: 4, end: 7, matched: true },</span>
+<span class="a">+      { start: 7, end: 9, matched: true },</span>
+<span class="a">+      unmatched,</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps a span before the new tokens, and stretches a span across them&#x27;, () =&gt; {</span>
+<span class="a">+    const spans = [</span>
+<span class="a">+      { start: 0, end: 2, matched: true },</span>
+<span class="a">+      { start: 2, end: 6, matched: true },</span>
+<span class="a">+    ];</span>
+<span class="a">+    expect(shiftSpans(spans, 4, 3)).toEqual([</span>
+<span class="a">+      { start: 0, end: 2, matched: true },</span>
+<span class="a">+      { start: 2, end: 9, matched: true },</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;alignCuesToTokens on one page&#x27;, () =&gt; {
+   it(&#x27;maps exact text to exact spans, for short cues too&#x27;, () =&gt; {
+     fc.assert(</pre>
+</div></body></html>

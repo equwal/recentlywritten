@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread d188fe4a - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit d188fe4a5acd8051e52cdfc324534f19e7016632
+truex &lt;truex@equwal.com&gt;
+2026-09-26 23:40:12 -0700
+
+Offer a SubRead result for a closed book when that book opens
+
+A SubRead result for a book that was no longer open went straight into
+the subtitles of that book: makeSubtitles when the book changed while
+it read the result file, and checkPendingSubtitles when the book
+changed while it waited for the plugin. The result then skipped the
+confirm, and the checks of the language and the match rate, which
+exist because SubRead 0.9.1 gave &quot;km&quot; and a match rate of 1 for audio
+with no speech.
+
+The result now waits in the meta data of its book as a pending result
+(BookMeta.subread, a KeptResult with the .srt, the cues, the language
+and the match rate), not as its subtitles. When the book opens,
+applyMeta offers it with offerSubreadSubtitles, the same confirm and
+checks as for the open book, and removes it. makeSubtitles also reads
+the result file when another book opened during the job, so that the
+result keeps what SubRead told about it for the checks. Before, that
+path left only the .srt in the result file, and a SubRead older than
+0.10 lost the result.
+
+</pre><pre> README.md                |  3 +++
+ src/main.ts              | 36 ++++++++++++++++++++++++++----------
+ src/messages.ts          |  5 +++++
+ src/token-cache.ts       | 18 ++++++++++++++++++
+ test/messages.test.ts    |  7 +++++++
+ test/token-cache.test.ts | 18 ++++++++++++++++++
+ 6 files changed, 77 insertions(+), 10 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index f3d5b20..152e556 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -96,6 +96,9 @@ make before then stays.</span>
+ - Before the subtitles of SubRead load, the app asks when they replace
+   a file that you loaded, when SubRead found another language than the
+   one of the book, and when it found less than 80% of the lines.
+<span class="a">+- A SubRead result for a book that is not open waits in the meta data of</span>
+<span class="a">+  that book. When you open the book, the app offers it with the same</span>
+<span class="a">+  questions.</span>
+ 
+ ### The status strip
+ 
+diff --git a/src/main.ts b/src/main.ts
+index eac2625..f7bd180 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -41,6 +41,7 @@ import {</span>
+   clockText,
+   EMPTY_FILE_TEXT,
+   errorMessage,
+<span class="a">+  keptResultText,</span>
+   LAST_BOOK_GONE_TEXT,
+   matchedText,
+   noCuesText,
+<span class="h">@@ -87,6 +88,7 @@ import {</span>
+   putPage,
+   type BookMeta,
+   type BookSubtitles,
+<span class="a">+  type KeptResult,</span>
+   type PageEntry,
+ } from &#x27;./token-cache&#x27;;
+ import { createPageView, type Marks } from &#x27;./view&#x27;;
+<span class="h">@@ -469,8 +471,14 @@ function applyMeta(meta: BookMeta, attempt: number, subtitlesSeq: number): void</span>
+         break;
+     }
+   }
+<span class="d">-  // After the saved subtitles: a SubRead result for a book with a file of</span>
+<span class="d">-  // the user asks first.</span>
+<span class="a">+  // After the saved subtitles, so that a SubRead result asks first when it</span>
+<span class="a">+  // replaces a file of the user. A result that came while another book was</span>
+<span class="a">+  // open gets the same offer as the result for the open book.</span>
+<span class="a">+  const kept = meta.subread;</span>
+<span class="a">+  if (kept) {</span>
+<span class="a">+    void putMeta(key, { subread: undefined });</span>
+<span class="a">+    if (offerSubreadSubtitles(kept.srt, kept)) ui.makeStatus.textContent = subreadResultText(kept);</span>
+<span class="a">+  }</span>
+   void checkPendingSubtitles();
+ }
+ 
+<span class="h">@@ -928,11 +936,6 @@ async function makeSubtitles(audio: { uri: string; name: string }, book: string)</span>
+     state.making = null;
+     ui.makeSubs.disabled = state.book === null;
+   }
+<span class="d">-  // The result file waits for its book: pendingSubtitles loads it when the book opens.</span>
+<span class="d">-  if (state.book !== book) {</span>
+<span class="d">-    ui.makeStatus.textContent = &#x27;SubRead finished, but another book is open now.&#x27;;</span>
+<span class="d">-    return;</span>
+<span class="d">-  }</span>
+   if (result.error === &#x27;not_installed&#x27;) {
+     fill(ui.makeStatus, SUBREAD_NOT_INSTALLED);
+     return;
+<span class="h">@@ -945,14 +948,27 @@ async function makeSubtitles(audio: { uri: string; name: string }, book: string)</span>
+     ui.makeStatus.textContent = subreadErrorText(result.error ?? &#x27;no file&#x27;);
+     return;
+   }
+<span class="a">+  // Another book opened during the job: the result waits for its book,</span>
+<span class="a">+  // with what SubRead told about it, for the checks of the offer.</span>
+   if (state.book !== book) {
+<span class="d">-    void putMeta(book, { subtitles: subreadSubtitles(book, srt) });</span>
+<span class="a">+    const { cues, matchRate, language } = result;</span>
+<span class="a">+    keepResult(book, { srt, cues, matchRate, language });</span>
+     return;
+   }
+   ui.makeStatus.textContent = subreadResultText(result);
+   offerSubreadSubtitles(srt, result);
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * Keeps a SubRead result for the book `book`, which is not open, in its</span>
+<span class="a">+ * meta data. It is not saved as the subtitles of the book: applyMeta</span>
+<span class="a">+ * offers it when the book opens, with the confirm and the checks.</span>
+<span class="a">+ */</span>
+<span class="a">+function keepResult(book: string, kept: KeptResult): void {</span>
+<span class="a">+  void putMeta(book, { subread: kept });</span>
+<span class="a">+  ui.makeStatus.textContent = keptResultText(bookName(book));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ type PendingSrt = { srt?: string };
+ 
+ /** Subtitles that SubRead made for the book `book`. */
+<span class="h">@@ -1004,9 +1020,9 @@ async function checkPendingSubtitles(): Promise&lt;void&gt; {</span>
+   }
+   const srt = pending.srt;
+   if (srt === undefined) return;
+<span class="d">-  // The call removed the file, so the .srt goes to the meta data of its book.</span>
+<span class="a">+  // The call removed the file, so the .srt waits in the meta data of its book.</span>
+   if (state.book !== book) {
+<span class="d">-    void putMeta(book, { subtitles: subreadSubtitles(book, srt) });</span>
+<span class="a">+    keepResult(book, { srt });</span>
+     return;
+   }
+   if (offerSubreadSubtitles(srt, {})) {
+diff --git a/src/messages.ts b/src/messages.ts
+index 9a8029e..8440df3 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -216,6 +216,11 @@ export function subreadResultText(r: {</span>
+   );
+ }
+ 
+<span class="a">+/** SubRead made the subtitles of the book `name`, which is not open. They wait for that book. */</span>
+<span class="a">+export function keptResultText(name: string): string {</span>
+<span class="a">+  return `SubRead made the subtitles of ${name}. The reader offers them when you open that book.`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** Why SubRead made no subtitles. `cannot_start` means that the read grant of the audio is gone. */
+ export function subreadErrorText(error: string): string {
+   if (error.startsWith(&#x27;cannot_start&#x27;)) {
+diff --git a/src/token-cache.ts b/src/token-cache.ts
+index 659201b..9c45162 100644
+--- a/src/token-cache.ts
++++ b/src/token-cache.ts
+<span class="h">@@ -44,6 +44,22 @@ export interface BookSubtitles {</span>
+   source: &#x27;file&#x27; | &#x27;subread&#x27;;
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * A SubRead result that came while another book was open. It waits in the</span>
+<span class="a">+ * meta data of its book, and the reader offers it, with the confirm and the</span>
+<span class="a">+ * checks, when the book opens (see subreadConcerns).</span>
+<span class="a">+ */</span>
+<span class="a">+export interface KeptResult {</span>
+<span class="a">+  /** The text of the .srt. */</span>
+<span class="a">+  srt: string;</span>
+<span class="a">+  /** The number of cues, when SubRead told it. */</span>
+<span class="a">+  cues?: number;</span>
+<span class="a">+  /** 0 to 1: the share of the lines that SubRead found in the book, when it told it. */</span>
+<span class="a">+  matchRate?: number;</span>
+<span class="a">+  /** The language that SubRead found, when it told it. */</span>
+<span class="a">+  language?: string | null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** What the reader keeps for a book, other than its pages. */
+ export interface BookMeta {
+   /** The page that was open. 0 is the first page. */
+<span class="h">@@ -51,6 +67,8 @@ export interface BookMeta {</span>
+   subtitles?: BookSubtitles;
+   /** The &quot;Force OCR&quot; setting for the book. */
+   forceOcr?: boolean;
+<span class="a">+  /** A SubRead result that waits for the next open of the book. */</span>
+<span class="a">+  subread?: KeptResult;</span>
+ }
+ 
+ /** The record of the last book. */
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index 116ad76..44f0762 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -22,6 +22,7 @@ import {</span>
+   playerProblem,
+   readingEndMessage,
+   readingText,
+<span class="a">+  keptResultText,</span>
+   shownInPlayerPart,
+   subreadErrorText,
+   subreadQuestion,
+<span class="h">@@ -289,6 +290,12 @@ describe(&#x27;SubRead texts&#x27;, () =&gt; {</span>
+     );
+   });
+ 
+<span class="a">+  it(&#x27;tells that the result for a book that is not open waits for that book&#x27;, () =&gt; {</span>
+<span class="a">+    expect(keptResultText(&#x27;neko.pdf&#x27;)).toBe(</span>
+<span class="a">+      &#x27;SubRead made the subtitles of neko.pdf. The reader offers them when you open that book.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;asks the user to choose the audio again when SubRead cannot start&#x27;, () =&gt; {
+     expect(subreadErrorText(&#x27;cannot_start: Permission Denial: opening provider&#x27;)).toBe(
+       &#x27;SubRead cannot read the audio file. Choose the audio again.&#x27;,
+diff --git a/test/token-cache.test.ts b/test/token-cache.test.ts
+index 5e32219..7b04a06 100644
+--- a/test/token-cache.test.ts
++++ b/test/token-cache.test.ts
+<span class="h">@@ -128,6 +128,24 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     expect(await cache.getMeta(&#x27;inu.pdf|20&#x27;)).toEqual({});
+   });
+ 
+<span class="a">+  it(&#x27;keeps a SubRead result for a book apart from its subtitles&#x27;, async () =&gt; {</span>
+<span class="a">+    // The finding: a SubRead result for a book that was not open went into</span>
+<span class="a">+    // its subtitles, without the confirm and the checks of the language and</span>
+<span class="a">+    // the match rate. It now waits as a result, and the subtitles stay.</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    const subtitles: BookSubtitles = { name: &#x27;neko.srt&#x27;, text: srt, source: &#x27;file&#x27; };</span>
+<span class="a">+    const result = { srt: &#x27;1\n00:00:00,000 --&gt; 00:00:01,000\nx\n&#x27;, cues: 23, language: &#x27;km&#x27; };</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { subtitles });</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { subread: { ...result, matchRate: 1 } });</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({</span>
+<span class="a">+      subtitles,</span>
+<span class="a">+      subread: { ...result, matchRate: 1 },</span>
+<span class="a">+    });</span>
+<span class="a">+    // The offer of the result removes it.</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { subread: undefined });</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({ subtitles });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;keeps the fields of two merges at the same time&#x27;, async () =&gt; {
+     const cache = await freshCache();
+     await Promise.all([</pre>
+</div></body></html>

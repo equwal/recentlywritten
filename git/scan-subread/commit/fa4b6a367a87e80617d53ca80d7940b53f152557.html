@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread fa4b6a36 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit fa4b6a367a87e80617d53ca80d7940b53f152557
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:33:24 -0700
+
+Stop the app crash when Android cannot start an activity
+
+startActivityForResult and startActivity throw SecurityException or
+ActivityNotFoundException, for example for an audio Uri whose read grant
+is gone after a restart, or for a dictionary that the user removed.
+Capacitor gave the exception to its plugin thread as a RuntimeException,
+and the app crashed.
+
+The helper startForResult catches the RuntimeException and gives it to
+the caller, which ends the call:
+
+- lookup: the chosen dictionary falls back to the chooser. When the
+  chooser cannot open, the call rejects.
+- makeSubtitles: { error: &#x27;cannot_start: &lt;message&gt;&#x27; }. The write grant
+  of the result file is revoked.
+- ankiAdd: { error: &#x27;cannot_start&#x27; }.
+- pickAudio and openOverlay: the call rejects. shareText already caught
+  the exception.
+
+A start that fails gives no result, so the return watch has nothing to
+end. subread.ts tells the new error values.
+
+</pre><pre> .../java/com/equwal/scansubread/SubReadPlugin.java | 49 +++++++++++++++-------
+ src/subread.ts                                     | 24 +++++++----
+ 2 files changed, 51 insertions(+), 22 deletions(-)
+</pre><pre>diff --git a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+index ec59eee..fae5fdd 100644
+--- a/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
++++ b/android/app/src/main/java/com/equwal/scansubread/SubReadPlugin.java
+<span class="h">@@ -1,7 +1,6 @@</span>
+ package com.equwal.scansubread;
+ 
+ import android.app.Activity;
+<span class="d">-import android.content.ActivityNotFoundException;</span>
+ import android.content.ClipData;
+ import android.content.ComponentName;
+ import android.content.ContentResolver;
+<span class="h">@@ -114,6 +113,24 @@ public class SubReadPlugin extends Plugin {</span>
+         returns.resumed();
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Starts an activity for a result. Returns null when the activity</span>
+<span class="a">+     * started, else the exception of Android: ActivityNotFoundException when</span>
+<span class="a">+     * no app takes the intent, SecurityException when this app may not start</span>
+<span class="a">+     * it, for example when the read grant of an audio Uri is gone after a</span>
+<span class="a">+     * restart. Capacitor gives an exception of a plugin method to its plugin</span>
+<span class="a">+     * thread, and the app stops. So each caller ends the call with an error.</span>
+<span class="a">+     * No result comes, so the return watch has nothing to end.</span>
+<span class="a">+     */</span>
+<span class="a">+    private RuntimeException startForResult(PluginCall call, Intent intent, String callback) {</span>
+<span class="a">+        try {</span>
+<span class="a">+            startActivityForResult(call, intent, callback);</span>
+<span class="a">+            return null;</span>
+<span class="a">+        } catch (RuntimeException e) {</span>
+<span class="a">+            return e;</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     // --- The player, through SubRead Overlay ---
+ 
+     private List&lt;String&gt; candidates() {
+<span class="h">@@ -244,17 +261,14 @@ public class SubReadPlugin extends Plugin {</span>
+         String chosen = prefs().getString(PREF_DICTIONARY, &quot;&quot;);
+         ComponentName component = chosen.isEmpty() ? null : ComponentName.unflattenFromString(chosen);
+         if (component != null) {
+<span class="d">-            try {</span>
+<span class="d">-                returns.launched();</span>
+<span class="d">-                startActivityForResult(call, new Intent(send).setComponent(component), &quot;lookupResult&quot;);</span>
+<span class="d">-                return;</span>
+<span class="d">-            } catch (ActivityNotFoundException e) {</span>
+<span class="d">-                // The chosen app is gone. Ask.</span>
+<span class="d">-                prefs().edit().remove(PREF_DICTIONARY).apply();</span>
+<span class="d">-            }</span>
+<span class="a">+            returns.launched();</span>
+<span class="a">+            if (startForResult(call, new Intent(send).setComponent(component), &quot;lookupResult&quot;) == null) return;</span>
+<span class="a">+            // The chosen app is gone, or it does not let this app start it. Ask.</span>
+<span class="a">+            prefs().edit().remove(PREF_DICTIONARY).apply();</span>
+         }
+         returns.launched();
+<span class="d">-        startActivityForResult(call, Intent.createChooser(send, null), &quot;lookupResult&quot;);</span>
+<span class="a">+        RuntimeException failed = startForResult(call, Intent.createChooser(send, null), &quot;lookupResult&quot;);</span>
+<span class="a">+        if (failed != null) call.reject(&quot;Cannot open the dictionary: &quot; + failed.getMessage(), failed);</span>
+     }
+ 
+     /**
+<span class="h">@@ -327,7 +341,7 @@ public class SubReadPlugin extends Plugin {</span>
+             return;
+         }
+         returns.launched();
+<span class="d">-        startActivityForResult(call, add, &quot;ankiResult&quot;);</span>
+<span class="a">+        if (startForResult(call, add, &quot;ankiResult&quot;) != null) call.resolve(errorObject(&quot;cannot_start&quot;));</span>
+     }
+ 
+     /** SubRead Anki gave its result: the note is in Anki, or the user closed the card. */
+<span class="h">@@ -401,7 +415,8 @@ public class SubReadPlugin extends Plugin {</span>
+         }
+         try {
+             getActivity().startActivity(open);
+<span class="d">-        } catch (ActivityNotFoundException e) {</span>
+<span class="a">+        } catch (RuntimeException e) {</span>
+<span class="a">+            // ActivityNotFoundException or SecurityException: see startForResult.</span>
+             call.reject(&quot;Cannot open the &quot; + opened + &quot;.&quot;, e);
+             return;
+         }
+<span class="h">@@ -528,7 +543,12 @@ public class SubReadPlugin extends Plugin {</span>
+             // only the result file gets write access.
+             getContext().grantUriPermission(SUBREAD_PACKAGE, resultUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+         }
+<span class="d">-        startActivityForResult(call, ask, &quot;subtitlesResult&quot;);</span>
+<span class="a">+        RuntimeException failed = startForResult(call, ask, &quot;subtitlesResult&quot;);</span>
+<span class="a">+        if (failed != null) {</span>
+<span class="a">+            // SubRead did not start, so it needs no write access.</span>
+<span class="a">+            if (resultUri != null) getContext().revokeUriPermission(resultUri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION);</span>
+<span class="a">+            call.resolve(errorObject(&quot;cannot_start: &quot; + failed.getMessage()));</span>
+<span class="a">+        }</span>
+     }
+ 
+     /**
+<span class="h">@@ -614,7 +634,8 @@ public class SubReadPlugin extends Plugin {</span>
+         intent.addCategory(Intent.CATEGORY_OPENABLE);
+         intent.setType(&quot;audio/*&quot;);
+         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+<span class="d">-        startActivityForResult(call, intent, &quot;audioResult&quot;);</span>
+<span class="a">+        RuntimeException failed = startForResult(call, intent, &quot;audioResult&quot;);</span>
+<span class="a">+        if (failed != null) call.reject(&quot;Cannot open the file chooser: &quot; + failed.getMessage(), failed);</span>
+     }
+ 
+     @ActivityCallback
+diff --git a/src/subread.ts b/src/subread.ts
+index 3791d72..92dd2c1 100644
+--- a/src/subread.ts
++++ b/src/subread.ts
+<span class="h">@@ -24,7 +24,10 @@ export interface SubtitlesResult {</span>
+   /** 0 to 1: the share of lines whose words were found in the book. */
+   matchRate?: number;
+   language?: string | null;
+<span class="d">-  /** `not_installed`, `cancelled`, or the reason SubRead gave. */</span>
+<span class="a">+  /**</span>
+<span class="a">+   * `not_installed`, `cancelled`, `cannot_start: &lt;reason&gt;` when Android</span>
+<span class="a">+   * cannot start SubRead, or the reason SubRead gave.</span>
+<span class="a">+   */</span>
+   error?: string;
+ }
+ 
+<span class="h">@@ -49,8 +52,8 @@ export interface AnkiResult {</span>
+   added?: boolean;
+   /** The id of the new note in Anki, when `added` is true. */
+   noteId?: number;
+<span class="d">-  /** SubRead Anki is not on the device. */</span>
+<span class="d">-  error?: &#x27;not_installed&#x27;;</span>
+<span class="a">+  /** SubRead Anki is not on the device, or Android cannot start it. */</span>
+<span class="a">+  error?: &#x27;not_installed&#x27; | &#x27;cannot_start&#x27;;</span>
+ }
+ 
+ /** The apps of the SubRead suite on the device. */
+<span class="h">@@ -82,7 +85,8 @@ export interface SubReadPlugin {</span>
+    * Opens the dictionary with the text. Resolves when the dictionary closes.
+    * A dictionary that opens in its own task answers at once, so for such an
+    * answer the call waits until the user is back in the reader, or 1.5 s
+<span class="d">-   * when the dictionary did not open.</span>
+<span class="a">+   * when the dictionary did not open. Rejects when Android cannot open the</span>
+<span class="a">+   * dictionary or the chooser.</span>
+    */
+   lookup(options: { text: string }): Promise&lt;{ closed: boolean }&gt;;
+   dictionaries(): Promise&lt;{ apps: DictionaryApp[]; chosen: string }&gt;;
+<span class="h">@@ -93,9 +97,10 @@ export interface SubReadPlugin {</span>
+    * fields that are given and not empty go to SubRead Anki; without `word`
+    * and `text` the call rejects. Resolves when SubRead Anki closes, the same
+    * as `lookup`: `{ added: true, noteId }` when the note is in Anki,
+<span class="d">-   * `{ added: false }` when the user closed the card, and</span>
+<span class="d">-   * `{ error: &#x27;not_installed&#x27; }` without SubRead Anki. On the web:</span>
+<span class="d">-   * `{ error: &#x27;not_installed&#x27; }`.</span>
+<span class="a">+   * `{ added: false }` when the user closed the card,</span>
+<span class="a">+   * `{ error: &#x27;not_installed&#x27; }` without SubRead Anki, and</span>
+<span class="a">+   * `{ error: &#x27;cannot_start&#x27; }` when Android cannot start SubRead Anki. On</span>
+<span class="a">+   * the web: `{ error: &#x27;not_installed&#x27; }`.</span>
+    */
+   ankiAdd(options: AnkiCard): Promise&lt;AnkiResult&gt;;
+   /**
+<span class="h">@@ -107,7 +112,8 @@ export interface SubReadPlugin {</span>
+    * Opens SubRead Overlay (the release build, else the debug build), so that
+    * the user can give it notification access. Without SubRead Overlay, opens
+    * the notification access settings of Android. Resolves which one opened.
+<span class="d">-   * On the web: rejects with Error(&#x27;Android only.&#x27;).</span>
+<span class="a">+   * Rejects when Android cannot open it. On the web: rejects with</span>
+<span class="a">+   * Error(&#x27;Android only.&#x27;).</span>
+    */
+   openOverlay(): Promise&lt;{ opened: &#x27;overlay&#x27; | &#x27;settings&#x27; }&gt;;
+   /**
+<span class="h">@@ -138,7 +144,9 @@ export interface SubReadPlugin {</span>
+    * one of the two copies. On the web: `{}`.
+    */
+   pendingSubtitles(options: { resultName: string }): Promise&lt;{ srt?: string }&gt;;
+<span class="a">+  /** Rejects when the user picks no file, or when Android cannot open the file chooser. */</span>
+   pickAudio(): Promise&lt;{ uri: string; name: string }&gt;;
+<span class="a">+  /** Rejects when Android cannot open the share sheet. */</span>
+   shareText(options: { name: string; text: string }): Promise&lt;void&gt;;
+ }
+ </pre>
+</div></body></html>

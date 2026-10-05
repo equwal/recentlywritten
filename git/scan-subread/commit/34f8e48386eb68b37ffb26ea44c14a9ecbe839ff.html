@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 34f8e483 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 34f8e48386eb68b37ffb26ea44c14a9ecbe839ff
+truex &lt;truex@equwal.com&gt;
+2026-09-26 18:49:55 -0700
+
+Make subtitles with SubRead after all pages are read
+
+- SubRead started with the pages read so far, so the subtitles covered
+  part of the book. The job now waits: the menu says &quot;Reading pages
+  N/M first...&quot; and SubRead starts when the last page is read. Another
+  book cancels the job that waits. One job runs at a time.
+- makeSubtitles gets a result file per book: resultName gives
+  &quot;subread-&lt;hash&gt;.srt&quot; from the FNV-1a hash of the book key, because
+  the plugin keeps only [A-Za-z0-9._-] and a Japanese name becomes &quot;_&quot;.
+  After the answer, when a book opens and when the app is active again,
+  pendingSubtitles loads an .srt that SubRead 0.10 and later wrote,
+  also when Android stopped the reader during the job. A result for a
+  book that is not open goes to the meta data of that book.
+- An error that starts with &quot;cannot_start&quot; gives &quot;SubRead cannot read
+  the audio file. Choose the audio again.&quot;
+- SubRead 0.9.1 on an audio file with no speech gave 23 cues cut in the
+  middle of words, the language &quot;km&quot; and a match rate of 1, and the
+  result replaced the subtitles that the user loaded. subreadConcerns
+  now asks with confirm() before a result replaces a file of the user,
+  when the language is not the requested one (with &quot;auto&quot;: the
+  language of the OCR setting), and when the match rate is under 0.8.
+
+</pre><pre> src/book-subtitles.ts       |  68 ++++++++++++++
+ src/main.ts                 | 223 +++++++++++++++++++++++++++++++++-----------
+ src/messages.ts             |  41 ++++++++
+ src/token-cache.ts          |   9 +-
+ test/book-subtitles.test.ts |  87 ++++++++++++++++-
+ test/messages.test.ts       |  37 ++++++++
+ test/token-cache.test.ts    |   9 ++
+ 7 files changed, 415 insertions(+), 59 deletions(-)
+</pre><pre>diff --git a/src/book-subtitles.ts b/src/book-subtitles.ts
+index 906f12d..5db1729 100644
+--- a/src/book-subtitles.ts
++++ b/src/book-subtitles.ts
+<span class="h">@@ -32,3 +32,71 @@ export function subtitlesOnOpen(</span>
+   if (loaded === null || loaded === book) return &#x27;keep&#x27;;
+   return saved ? &#x27;load&#x27; : &#x27;clear&#x27;;
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The name of the result file of SubRead for the book `book` (see bookKey),</span>
+<span class="a">+ * for example &quot;subread-1a2b3c4d.srt&quot;. The plugin keeps only A-Z, a-z, 0-9,</span>
+<span class="a">+ * &quot;.&quot;, &quot;_&quot; and &quot;-&quot; of a name, so a Japanese file name gives only &quot;_&quot;. The</span>
+<span class="a">+ * FNV-1a hash of the key tells two books apart.</span>
+<span class="a">+ */</span>
+<span class="a">+export function resultName(book: string): string {</span>
+<span class="a">+  let hash = 0x811c9dc5;</span>
+<span class="a">+  for (const byte of new TextEncoder().encode(book)) {</span>
+<span class="a">+    hash = Math.imul(hash ^ byte, 0x01000193) &gt;&gt;&gt; 0;</span>
+<span class="a">+  }</span>
+<span class="a">+  return `subread-${hash.toString(16).padStart(8, &#x27;0&#x27;)}.srt`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A SubRead result is suspect when it found less than this share of the lines in the book. */</span>
+<span class="a">+export const LOW_MATCH_RATE = 0.8;</span>
+<span class="a">+</span>
+<span class="a">+/** What the reader knows when SubRead gives subtitles for the open book. */</span>
+<span class="a">+export interface SubreadCheck {</span>
+<span class="a">+  /** The narration language that the user asked SubRead for: &quot;auto&quot;, &quot;ja&quot;, &quot;en&quot;. */</span>
+<span class="a">+  requested: string;</span>
+<span class="a">+  /** The OCR language of the book: &quot;eng&quot;, &quot;jpn&quot;, &quot;jpn_vert&quot;, &quot;jpn+eng&quot;. */</span>
+<span class="a">+  ocrLang: string;</span>
+<span class="a">+  /** The language that SubRead found, when it tells. */</span>
+<span class="a">+  language?: string | null;</span>
+<span class="a">+  /** 0 to 1: the share of the lines that SubRead found in the book, when it tells. */</span>
+<span class="a">+  matchRate?: number;</span>
+<span class="a">+  /** The subtitles that are loaded now, if any. */</span>
+<span class="a">+  loaded?: { name: string; source: &#x27;file&#x27; | &#x27;subread&#x27; } | null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The languages that the narration can have: the requested one, else those of the OCR language. */</span>
+<span class="a">+function expectedLanguages(requested: string, ocrLang: string): string[] {</span>
+<span class="a">+  if (requested !== &#x27;auto&#x27;) return [requested];</span>
+<span class="a">+  const out: string[] = [];</span>
+<span class="a">+  if (ocrLang.includes(&#x27;jpn&#x27;)) out.push(&#x27;ja&#x27;);</span>
+<span class="a">+  if (ocrLang.includes(&#x27;eng&#x27;)) out.push(&#x27;en&#x27;);</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The reasons to ask the user before the subtitles of SubRead load. Empty</span>
+<span class="a">+ * when they can load at once.</span>
+<span class="a">+ *</span>
+<span class="a">+ * SubRead 0.9.1 gave 23 cues cut in the middle of words, the language &quot;km&quot;</span>
+<span class="a">+ * and a match rate of 1 for an audio file with no speech, and the result</span>
+<span class="a">+ * replaced the subtitles that the user loaded. So the reader asks when</span>
+<span class="a">+ * subtitles from a file are loaded, when the language is not the one of</span>
+<span class="a">+ * the book, and when the match rate is low. With the language &quot;auto&quot;, the</span>
+<span class="a">+ * OCR language tells the language of the book.</span>
+<span class="a">+ */</span>
+<span class="a">+export function subreadConcerns(c: SubreadCheck): string[] {</span>
+<span class="a">+  const out: string[] = [];</span>
+<span class="a">+  if (c.loaded?.source === &#x27;file&#x27;) {</span>
+<span class="a">+    out.push(`They replace ${c.loaded.name}, the subtitles that you loaded.`);</span>
+<span class="a">+  }</span>
+<span class="a">+  const want = expectedLanguages(c.requested, c.ocrLang);</span>
+<span class="a">+  // &quot;en-US&quot; and &quot;ja_JP&quot; count as &quot;en&quot; and &quot;ja&quot;.</span>
+<span class="a">+  const found = c.language?.trim().toLowerCase().split(/[-_]/)[0];</span>
+<span class="a">+  if (found &amp;&amp; want.length &gt; 0 &amp;&amp; !want.includes(found)) {</span>
+<span class="a">+    out.push(`SubRead found the language &quot;${c.language}&quot;, not &quot;${want.join(&#x27;&quot; or &quot;&#x27;)}&quot;.`);</span>
+<span class="a">+  }</span>
+<span class="a">+  if (c.matchRate !== undefined &amp;&amp; c.matchRate &gt;= 0 &amp;&amp; c.matchRate &lt; LOW_MATCH_RATE) {</span>
+<span class="a">+    out.push(`SubRead found only ${Math.round(c.matchRate * 100)}% of the lines in the book.`);</span>
+<span class="a">+  }</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index fc21eda..38b71eb 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -6,7 +6,7 @@</span>
+ // (the strip) and view.ts (the page).
+ 
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+<span class="d">-import { srtName, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;</span>
+<span class="a">+import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;</span>
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+ import { audioPage, cueParts, cueProgress, pageStartTime, type CueParts } from &#x27;./cue-pages&#x27;;
+<span class="h">@@ -30,7 +30,12 @@ import {</span>
+   playerMessage,
+   readingEndMessage,
+   readingText,
+<span class="a">+  SUBREAD_NOT_INSTALLED,</span>
+<span class="a">+  subreadErrorText,</span>
+<span class="a">+  subreadQuestion,</span>
+<span class="a">+  subreadResultText,</span>
+   UPDATING_CACHE_TEXT,
+<span class="a">+  waitPagesText,</span>
+   withForceOcr,
+   type Message,
+ } from &#x27;./messages&#x27;;
+<span class="h">@@ -41,11 +46,12 @@ import { defaultRtl } from &#x27;./paging&#x27;;</span>
+ import type { PdfDoc } from &#x27;./pdf&#x27;;
+ import { nextPage } from &#x27;./read-order&#x27;;
+ import { scrollTarget } from &#x27;./scroll&#x27;;
+<span class="d">-import { onAction, say, showPlayer, showReading } from &#x27;./status&#x27;;</span>
+<span class="d">-import { isAndroid, SubRead } from &#x27;./subread&#x27;;</span>
+<span class="a">+import { fill, onAction, say, showPlayer, showReading } from &#x27;./status&#x27;;</span>
+<span class="a">+import { isAndroid, SubRead, type SubtitlesResult } from &#x27;./subread&#x27;;</span>
+ import { decodeSubtitles, lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+ import {
+   bookKey,
+<span class="a">+  bookName,</span>
+   clearLastBook,
+   clearPages,
+   dbReady,
+<span class="h">@@ -74,8 +80,6 @@ const PAGE_SAVE_MS = 1000;</span>
+ /** After this many milliseconds, the strip tells that the database upgrade holds the reading. */
+ const SLOW_DB_MS = 2000;
+ 
+<span class="d">-const SUBREAD_RELEASES = &#x27;https://github.com/equwal/subread-android/releases/latest&#x27;;</span>
+<span class="d">-</span>
+ function el&lt;T extends HTMLElement&gt;(id: string): T {
+   const e = document.getElementById(id);
+   if (!e) throw new Error(`Missing element #${id}`);
+<span class="h">@@ -158,6 +162,10 @@ const state = {</span>
+   dbSlow: false,
+   /** &quot;Force OCR&quot; of the open book: the reading skips the text layer. */
+   forceOcr: false,
+<span class="a">+  /** A SubRead job that waits until all pages of its book are read. */</span>
+<span class="a">+  makeWait: null as { audio: { uri: string; name: string }; book: string } | null,</span>
+<span class="a">+  /** The book of the SubRead job that runs, or null. */</span>
+<span class="a">+  making: null as string | null,</span>
+   /** True while the player waits for a dictionary lookup that this app paused. */
+   lookupPaused: false,
+   /** True while a page turn by the user holds the follow. */
+<span class="h">@@ -333,10 +341,16 @@ async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {</span>
+     clearSubtitles();
+   }
+   const subtitlesSeq = state.subtitlesSeq;
+<span class="a">+  // A SubRead job that waits for the pages of another book does not start.</span>
+<span class="a">+  if (state.makeWait &amp;&amp; state.makeWait.book !== key) {</span>
+<span class="a">+    state.makeWait = null;</span>
+<span class="a">+    ui.makeStatus.textContent = &#x27;&#x27;;</span>
+<span class="a">+  }</span>
+   setForceOcr(meta?.forceOcr ?? false);
+   ui.forceOcr.disabled = false;
+   ui.clearBook.disabled = false;
+<span class="d">-  ui.makeSubs.disabled = false;</span>
+<span class="a">+  // One SubRead job at a time.</span>
+<span class="a">+  ui.makeSubs.disabled = state.making !== null;</span>
+   ui.empty.hidden = true;
+   ui.page.hidden = false;
+   if (state.clock) showPlayerStatus(state.clock);
+<span class="h">@@ -382,22 +396,26 @@ function applyMeta(meta: BookMeta, attempt: number, subtitlesSeq: number): void</span>
+     setForceOcr(forceOcr);
+     void readBook();
+   }
+<span class="d">-  if (state.subtitlesSeq !== subtitlesSeq) return;</span>
+<span class="d">-  const loaded = state.subtitles ? state.subtitlesBook : undefined;</span>
+<span class="d">-  switch (subtitlesOnOpen(loaded, key, meta.subtitles !== undefined)) {</span>
+<span class="d">-    case &#x27;keep&#x27;:</span>
+<span class="d">-      if (state.subtitles) {</span>
+<span class="d">-        state.subtitlesBook = key;</span>
+<span class="d">-        void putMeta(key, { subtitles: state.subtitles });</span>
+<span class="d">-      }</span>
+<span class="d">-      break;</span>
+<span class="d">-    case &#x27;load&#x27;:</span>
+<span class="d">-      if (meta.subtitles) loadSubtitles(meta.subtitles, { save: false });</span>
+<span class="d">-      break;</span>
+<span class="d">-    case &#x27;clear&#x27;:</span>
+<span class="d">-      clearSubtitles();</span>
+<span class="d">-      break;</span>
+<span class="a">+  if (state.subtitlesSeq === subtitlesSeq) {</span>
+<span class="a">+    const loaded = state.subtitles ? state.subtitlesBook : undefined;</span>
+<span class="a">+    switch (subtitlesOnOpen(loaded, key, meta.subtitles !== undefined)) {</span>
+<span class="a">+      case &#x27;keep&#x27;:</span>
+<span class="a">+        if (state.subtitles) {</span>
+<span class="a">+          state.subtitlesBook = key;</span>
+<span class="a">+          void putMeta(key, { subtitles: state.subtitles });</span>
+<span class="a">+        }</span>
+<span class="a">+        break;</span>
+<span class="a">+      case &#x27;load&#x27;:</span>
+<span class="a">+        if (meta.subtitles) loadSubtitles(meta.subtitles, { save: false });</span>
+<span class="a">+        break;</span>
+<span class="a">+      case &#x27;clear&#x27;:</span>
+<span class="a">+        clearSubtitles();</span>
+<span class="a">+        break;</span>
+<span class="a">+    }</span>
+   }
+<span class="a">+  // After the saved subtitles: a SubRead result for a book with a file of</span>
+<span class="a">+  // the user asks first.</span>
+<span class="a">+  void checkPendingSubtitles();</span>
+ }
+ 
+ // --- The page of the book, in its meta data ---
+<span class="h">@@ -601,6 +619,7 @@ async function readBook(retry = false): Promise&lt;void&gt; {</span>
+       setReading(readingText(read(), total, `page ${page + 1}: ${how}`));
+       if (page === state.currentPage) view.mark();
+       scheduleAlign();
+<span class="a">+      startMakeWhenRead();</span>
+     }
+     const matched = align();
+     say(
+<span class="h">@@ -758,52 +777,144 @@ function showSrtRow(): void {</span>
+   };
+ }
+ 
+<span class="a">+// SubRead makes the subtitles from the audio and the text of the book. It</span>
+<span class="a">+// starts when all pages are read: with part of the text, the subtitles</span>
+<span class="a">+// cover only part of the book.</span>
+ ui.makeSubs.addEventListener(&#x27;click&#x27;, async () =&gt; {
+<span class="d">-  const file = state.file;</span>
+<span class="d">-  if (!file) return;</span>
+<span class="d">-  let audio;</span>
+<span class="a">+  const book = state.book;</span>
+<span class="a">+  if (book === null) return;</span>
+<span class="a">+  let audio: { uri: string; name: string };</span>
+   try {
+     audio = await SubRead.pickAudio();
+   } catch {
+     return;
+   }
+<span class="d">-  const read = state.pages.filter((p) =&gt; p).length;</span>
+<span class="d">-  ui.makeStatus.textContent = allPagesRead()</span>
+<span class="d">-    ? `SubRead makes the subtitles for ${audio.name}...`</span>
+<span class="d">-    : `Only ${read} of ${state.pdf?.numPages ?? 0} pages are read. The subtitles cover those pages. SubRead runs...`;</span>
+<span class="d">-  const result = await SubRead.makeSubtitles({</span>
+<span class="d">-    audio: audio.uri,</span>
+<span class="d">-    bookText: bookText(state.tokens),</span>
+<span class="d">-    language: ui.subLang.value,</span>
+<span class="d">-  });</span>
+<span class="d">-  // The subtitles are for the book of the job, not for a book that opened since.</span>
+<span class="d">-  if (state.file !== file) return;</span>
+<span class="a">+  if (state.book !== book) return;</span>
+<span class="a">+  state.makeWait = { audio, book };</span>
+<span class="a">+  startMakeWhenRead();</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Starts the SubRead job that waits, when all pages of its book are read.</span>
+<span class="a">+ * Else tells how far the reading is. readBook calls this after each page.</span>
+<span class="a">+ */</span>
+<span class="a">+function startMakeWhenRead(): void {</span>
+<span class="a">+  const wait = state.makeWait;</span>
+<span class="a">+  const pdf = state.pdf;</span>
+<span class="a">+  if (!wait || !pdf || wait.book !== state.book) return;</span>
+<span class="a">+  if (!allPagesRead()) {</span>
+<span class="a">+    ui.makeStatus.textContent = waitPagesText(state.pages.filter((p) =&gt; p).length, pdf.numPages);</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  state.makeWait = null;</span>
+<span class="a">+  void makeSubtitles(wait.audio, wait.book);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Asks SubRead for the subtitles of the book `book`, and loads them after the checks. */</span>
+<span class="a">+async function makeSubtitles(audio: { uri: string; name: string }, book: string): Promise&lt;void&gt; {</span>
+<span class="a">+  const name = resultName(book);</span>
+<span class="a">+  state.making = book;</span>
+<span class="a">+  ui.makeSubs.disabled = true;</span>
+<span class="a">+  ui.makeStatus.textContent = `SubRead makes the subtitles for ${audio.name}...`;</span>
+<span class="a">+  let result: SubtitlesResult;</span>
+<span class="a">+  try {</span>
+<span class="a">+    result = await SubRead.makeSubtitles({</span>
+<span class="a">+      audio: audio.uri,</span>
+<span class="a">+      bookText: bookText(state.tokens),</span>
+<span class="a">+      language: ui.subLang.value,</span>
+<span class="a">+      resultName: name,</span>
+<span class="a">+    });</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    result = { error: String(err) };</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    state.making = null;</span>
+<span class="a">+    ui.makeSubs.disabled = state.book === null;</span>
+<span class="a">+  }</span>
+<span class="a">+  // The result file waits for its book: pendingSubtitles loads it when the book opens.</span>
+<span class="a">+  if (state.book !== book) {</span>
+<span class="a">+    ui.makeStatus.textContent = &#x27;SubRead finished, but another book is open now.&#x27;;</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+   if (result.error === &#x27;not_installed&#x27;) {
+<span class="d">-    ui.makeStatus.replaceChildren(&#x27;SubRead is not installed. &#x27;);</span>
+<span class="d">-    const a = document.createElement(&#x27;a&#x27;);</span>
+<span class="d">-    a.href = SUBREAD_RELEASES;</span>
+<span class="d">-    a.target = &#x27;_blank&#x27;;</span>
+<span class="d">-    a.rel = &#x27;noopener&#x27;;</span>
+<span class="d">-    a.textContent = &#x27;Get SubRead&#x27;;</span>
+<span class="d">-    ui.makeStatus.append(a);</span>
+<span class="a">+    fill(ui.makeStatus, SUBREAD_NOT_INSTALLED);</span>
+     return;
+   }
+<span class="d">-  if (result.error !== undefined || result.srt === undefined) {</span>
+<span class="d">-    ui.makeStatus.textContent = `SubRead made no subtitles: ${result.error ?? &#x27;no file&#x27;}.`;</span>
+<span class="a">+  // SubRead 0.10 and later also write the .srt into the result file. Read</span>
+<span class="a">+  // it now, so that the file goes, and use it when the answer has no .srt.</span>
+<span class="a">+  const copy = await SubRead.pendingSubtitles({ resultName: name }).catch(() =&gt; ({}) as PendingSrt);</span>
+<span class="a">+  const srt = result.srt ?? copy.srt;</span>
+<span class="a">+  if (srt === undefined) {</span>
+<span class="a">+    ui.makeStatus.textContent = subreadErrorText(result.error ?? &#x27;no file&#x27;);</span>
+     return;
+   }
+<span class="d">-  const rate = result.matchRate !== undefined &amp;&amp; result.matchRate &gt;= 0 ? result.matchRate : null;</span>
+<span class="d">-  ui.makeStatus.textContent =</span>
+<span class="d">-    `${result.cues ?? &#x27;?&#x27;} cues, language ${result.language ?? &#x27;?&#x27;}` +</span>
+<span class="d">-    (rate === null ? &#x27;.&#x27; : `, ${Math.round(rate * 100)}% of the lines found in the book.`) +</span>
+<span class="d">-    (rate !== null &amp;&amp; rate &lt; 0.8</span>
+<span class="d">-      ? &#x27; Under 80% usually means another edition or the wrong language.&#x27;</span>
+<span class="d">-      : &#x27;&#x27;);</span>
+<span class="d">-  loadSubtitles(</span>
+<span class="d">-    { name: srtName(file.name), text: result.srt, source: &#x27;subread&#x27; },</span>
+<span class="d">-    { from: &#x27;SubRead&#x27; },</span>
+<span class="d">-  );</span>
+<span class="d">-});</span>
+<span class="a">+  if (state.book !== book) {</span>
+<span class="a">+    void putMeta(book, { subtitles: subreadSubtitles(book, srt) });</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  ui.makeStatus.textContent = subreadResultText(result);</span>
+<span class="a">+  offerSubreadSubtitles(srt, result);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+type PendingSrt = { srt?: string };</span>
+<span class="a">+</span>
+<span class="a">+/** Subtitles that SubRead made for the book `book`. */</span>
+<span class="a">+function subreadSubtitles(book: string, srt: string): BookSubtitles {</span>
+<span class="a">+  return { name: srtName(bookName(book)), text: srt, source: &#x27;subread&#x27; };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Loads subtitles that SubRead made for the open book. The user confirms</span>
+<span class="a">+ * first when they replace a file that the user loaded, or when the</span>
+<span class="a">+ * language or the match rate of SubRead look wrong (subreadConcerns).</span>
+<span class="a">+ */</span>
+<span class="a">+function offerSubreadSubtitles(</span>
+<span class="a">+  srt: string,</span>
+<span class="a">+  info: { language?: string | null; matchRate?: number },</span>
+<span class="a">+): boolean {</span>
+<span class="a">+  const book = state.book;</span>
+<span class="a">+  if (book === null) return false;</span>
+<span class="a">+  const concerns = subreadConcerns({</span>
+<span class="a">+    requested: ui.subLang.value,</span>
+<span class="a">+    ocrLang: ui.lang.value,</span>
+<span class="a">+    language: info.language,</span>
+<span class="a">+    matchRate: info.matchRate,</span>
+<span class="a">+    loaded: state.subtitles,</span>
+<span class="a">+  });</span>
+<span class="a">+  if (concerns.length &gt; 0 &amp;&amp; !confirm(subreadQuestion(concerns))) {</span>
+<span class="a">+    say(&#x27;The subtitles of SubRead are not loaded.&#x27;);</span>
+<span class="a">+    return false;</span>
+<span class="a">+  }</span>
+<span class="a">+  loadSubtitles(subreadSubtitles(book, srt), { from: &#x27;SubRead&#x27; });</span>
+<span class="a">+  return true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Loads the .srt that SubRead wrote into the result file of the open book.</span>
+<span class="a">+ * SubRead 0.10 and later write it also when Android stopped the reader</span>
+<span class="a">+ * during the job; then no answer comes. The reader checks when a book</span>
+<span class="a">+ * opens and when the app is active again.</span>
+<span class="a">+ */</span>
+<span class="a">+async function checkPendingSubtitles(): Promise&lt;void&gt; {</span>
+<span class="a">+  const book = state.book;</span>
+<span class="a">+  // During a job the answer of makeSubtitles brings the .srt.</span>
+<span class="a">+  if (!isAndroid || book === null || state.making !== null) return;</span>
+<span class="a">+  let pending: PendingSrt;</span>
+<span class="a">+  try {</span>
+<span class="a">+    pending = await SubRead.pendingSubtitles({ resultName: resultName(book) });</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  const srt = pending.srt;</span>
+<span class="a">+  if (srt === undefined) return;</span>
+<span class="a">+  // The call removed the file, so the .srt goes to the meta data of its book.</span>
+<span class="a">+  if (state.book !== book) {</span>
+<span class="a">+    void putMeta(book, { subtitles: subreadSubtitles(book, srt) });</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  if (offerSubreadSubtitles(srt, {})) {</span>
+<span class="a">+    ui.makeStatus.textContent = &#x27;SubRead finished while the reader was closed.&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+ 
+ // --- Alignment ---
+ 
+diff --git a/src/messages.ts b/src/messages.ts
+index 732d003..60a4a91 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -13,6 +13,7 @@ export interface Message {</span>
+ }
+ 
+ export const OVERLAY_RELEASES = &#x27;https://github.com/equwal/subread-overlay/releases/latest&#x27;;
+<span class="a">+export const SUBREAD_RELEASES = &#x27;https://github.com/equwal/subread-android/releases/latest&#x27;;</span>
+ 
+ /** &quot;1 page&quot;, &quot;2 pages&quot;. */
+ function count(n: number, noun: string): string {
+<span class="h">@@ -113,6 +114,46 @@ export function withForceOcr(m: Message | null, forceOcr: boolean): Message | nu</span>
+   return { ...m, text };
+ }
+ 
+<span class="a">+export const SUBREAD_NOT_INSTALLED: Message = {</span>
+<span class="a">+  text: &#x27;SubRead is not installed.&#x27;,</span>
+<span class="a">+  link: { href: SUBREAD_RELEASES, text: &#x27;Get SubRead&#x27; },</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+/** SubRead waits for the reading: it makes the subtitles from the text of all pages. */</span>
+<span class="a">+export function waitPagesText(read: number, total: number): string {</span>
+<span class="a">+  return `Reading pages ${read}/${total} first...`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** What SubRead made: the cues, the language and the share of the lines found in the book. */</span>
+<span class="a">+export function subreadResultText(r: {</span>
+<span class="a">+  cues?: number;</span>
+<span class="a">+  language?: string | null;</span>
+<span class="a">+  matchRate?: number;</span>
+<span class="a">+}): string {</span>
+<span class="a">+  const cues = r.cues !== undefined &amp;&amp; r.cues &gt;= 0 ? String(r.cues) : &#x27;?&#x27;;</span>
+<span class="a">+  const rate = r.matchRate !== undefined &amp;&amp; r.matchRate &gt;= 0 ? r.matchRate : null;</span>
+<span class="a">+  return (</span>
+<span class="a">+    `${cues} cues, language ${r.language ?? &#x27;?&#x27;}` +</span>
+<span class="a">+    (rate === null ? &#x27;.&#x27; : `, ${Math.round(rate * 100)}% of the lines found in the book.`) +</span>
+<span class="a">+    (rate !== null &amp;&amp; rate &lt; 0.8</span>
+<span class="a">+      ? &#x27; Under 80% usually means another edition or the wrong language.&#x27;</span>
+<span class="a">+      : &#x27;&#x27;)</span>
+<span class="a">+  );</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Why SubRead made no subtitles. `cannot_start` means that the read grant of the audio is gone. */</span>
+<span class="a">+export function subreadErrorText(error: string): string {</span>
+<span class="a">+  if (error.startsWith(&#x27;cannot_start&#x27;)) {</span>
+<span class="a">+    return &#x27;SubRead cannot read the audio file. Choose the audio again.&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+  return `SubRead made no subtitles: ${error}.`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The question before the subtitles of SubRead load, with the reasons of subreadConcerns. */</span>
+<span class="a">+export function subreadQuestion(concerns: readonly string[]): string {</span>
+<span class="a">+  return [&#x27;SubRead made subtitles for this book.&#x27;, ...concerns, &#x27;Load them?&#x27;].join(&#x27;\n\n&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The question before the saved pages of one book go. */
+ export function clearBookQuestion(name: string): string {
+   return `Remove the saved pages of ${name}? The reader reads them again the next time it opens the book.`;
+diff --git a/src/token-cache.ts b/src/token-cache.ts
+index 1b502a6..f34f38f 100644
+--- a/src/token-cache.ts
++++ b/src/token-cache.ts
+<span class="h">@@ -124,8 +124,7 @@ async function moveSrtToMeta(</span>
+ 
+ /** Subtitles from SubRead for the book `key`. &quot;book.pdf|123&quot; gives the name &quot;book.srt&quot;. */
+ function subreadSubtitles(key: string, text: string): BookSubtitles {
+<span class="d">-  const bar = key.lastIndexOf(&#x27;|&#x27;);</span>
+<span class="d">-  return { name: srtName(bar &lt; 0 ? key : key.slice(0, bar)), text, source: &#x27;subread&#x27; };</span>
+<span class="a">+  return { name: srtName(bookName(key)), text, source: &#x27;subread&#x27; };</span>
+ }
+ 
+ /** Runs `op` on the database. Gives undefined when IndexedDB fails, and warns once. */
+<span class="h">@@ -148,6 +147,12 @@ export function bookKey(file: FileId): string {</span>
+   return `${file.name}|${file.size}`;
+ }
+ 
+<span class="a">+/** The file name in a book key: &quot;book.pdf|123&quot; gives &quot;book.pdf&quot;. */</span>
+<span class="a">+export function bookName(key: string): string {</span>
+<span class="a">+  const bar = key.lastIndexOf(&#x27;|&#x27;);</span>
+<span class="a">+  return bar &lt; 0 ? key : key.slice(0, bar);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ export function pageKey(file: FileId, page: number, lang: string, source: TextSource): string {
+   return `${bookKey(file)}|${page}|${lang}|${source}`;
+ }
+diff --git a/test/book-subtitles.test.ts b/test/book-subtitles.test.ts
+index 452ea59..394b446 100644
+--- a/test/book-subtitles.test.ts
++++ b/test/book-subtitles.test.ts
+<span class="h">@@ -1,5 +1,6 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import { srtName, subtitlesOnOpen } from &#x27;../src/book-subtitles&#x27;;</span>
+<span class="a">+import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;../src/book-subtitles&#x27;;</span>
+ 
+ describe(&#x27;srtName&#x27;, () =&gt; {
+   it(&#x27;puts .srt in place of .pdf&#x27;, () =&gt; {
+<span class="h">@@ -39,3 +40,87 @@ describe(&#x27;subtitlesOnOpen&#x27;, () =&gt; {</span>
+     expect(subtitlesOnOpen(jpn, jpn, false)).toBe(&#x27;keep&#x27;);
+   });
+ });
+<span class="a">+</span>
+<span class="a">+describe(&#x27;resultName&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;is the FNV-1a hash of the book key&#x27;, () =&gt; {</span>
+<span class="a">+    // The test vectors of FNV-1a (32 bit).</span>
+<span class="a">+    expect(resultName(&#x27;&#x27;)).toBe(&#x27;subread-811c9dc5.srt&#x27;);</span>
+<span class="a">+    expect(resultName(&#x27;a&#x27;)).toBe(&#x27;subread-e40c292c.srt&#x27;);</span>
+<span class="a">+    expect(resultName(&#x27;foobar&#x27;)).toBe(&#x27;subread-bf9cf968.srt&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells apart two Japanese books that the plugin would both call &quot;_&quot;&#x27;, () =&gt; {</span>
+<span class="a">+    const neko = resultName(&#x27;吾輩は猫である.pdf|204800&#x27;);</span>
+<span class="a">+    const botchan = resultName(&#x27;坊っちゃん.pdf|204800&#x27;);</span>
+<span class="a">+    expect(neko).not.toBe(botchan);</span>
+<span class="a">+    expect(resultName(&#x27;吾輩は猫である.pdf|204801&#x27;)).not.toBe(neko);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives a name that the plugin keeps as it is, the same for the same key&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(fc.string({ unit: &#x27;binary&#x27; }), (key) =&gt; {</span>
+<span class="a">+        const name = resultName(key);</span>
+<span class="a">+        expect(name).toMatch(/^subread-[0-9a-f]{8}\.srt$/);</span>
+<span class="a">+        expect(resultName(key)).toBe(name);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;subreadConcerns&#x27;, () =&gt; {</span>
+<span class="a">+  const file = { name: &#x27;sample-eng-2p.srt&#x27;, source: &#x27;file&#x27; as const };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;asks for the phone case: no speech, language km, match rate 1, over a loaded file&#x27;, () =&gt; {</span>
+<span class="a">+    expect(</span>
+<span class="a">+      subreadConcerns({</span>
+<span class="a">+        requested: &#x27;auto&#x27;,</span>
+<span class="a">+        ocrLang: &#x27;eng&#x27;,</span>
+<span class="a">+        language: &#x27;km&#x27;,</span>
+<span class="a">+        matchRate: 1,</span>
+<span class="a">+        loaded: file,</span>
+<span class="a">+      }),</span>
+<span class="a">+    ).toEqual([</span>
+<span class="a">+      &#x27;They replace sample-eng-2p.srt, the subtitles that you loaded.&#x27;,</span>
+<span class="a">+      &#x27;SubRead found the language &quot;km&quot;, not &quot;en&quot;.&#x27;,</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;loads at once a good result over no subtitles or over an earlier SubRead result&#x27;, () =&gt; {</span>
+<span class="a">+    const good = { requested: &#x27;auto&#x27;, ocrLang: &#x27;jpn&#x27;, language: &#x27;ja&#x27;, matchRate: 0.97 };</span>
+<span class="a">+    expect(subreadConcerns(good)).toEqual([]);</span>
+<span class="a">+    const earlier = { name: &#x27;neko.srt&#x27;, source: &#x27;subread&#x27; as const };</span>
+<span class="a">+    expect(subreadConcerns({ ...good, loaded: earlier })).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;compares the found language with the requested one&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;ja&#x27;, ocrLang: &#x27;eng&#x27;, language: &#x27;ja&#x27; })).toEqual([]);</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;ja&#x27;, ocrLang: &#x27;jpn&#x27;, language: &#x27;en&#x27; })).toEqual([</span>
+<span class="a">+      &#x27;SubRead found the language &quot;en&quot;, not &quot;ja&quot;.&#x27;,</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;takes the language of the book from the OCR language when the request is auto&#x27;, () =&gt; {</span>
+<span class="a">+    const both = { requested: &#x27;auto&#x27;, ocrLang: &#x27;jpn+eng&#x27; };</span>
+<span class="a">+    expect(subreadConcerns({ ...both, language: &#x27;en&#x27; })).toEqual([]);</span>
+<span class="a">+    expect(subreadConcerns({ ...both, language: &#x27;ja&#x27; })).toEqual([]);</span>
+<span class="a">+    expect(subreadConcerns({ ...both, language: &#x27;km&#x27; })).toEqual([</span>
+<span class="a">+      &#x27;SubRead found the language &quot;km&quot;, not &quot;ja&quot; or &quot;en&quot;.&#x27;,</span>
+<span class="a">+    ]);</span>
+<span class="a">+    const vertical = { requested: &#x27;auto&#x27;, ocrLang: &#x27;jpn_vert&#x27;, language: &#x27;ja&#x27; };</span>
+<span class="a">+    expect(subreadConcerns(vertical)).toEqual([]);</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;auto&#x27;, ocrLang: &#x27;eng&#x27;, language: &#x27;en-US&#x27; })).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not ask about a language or a match rate that SubRead does not tell&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;ja&#x27;, ocrLang: &#x27;jpn&#x27;, language: null })).toEqual([]);</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;ja&#x27;, ocrLang: &#x27;jpn&#x27;, language: &#x27;&#x27; })).toEqual([]);</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;ja&#x27;, ocrLang: &#x27;jpn&#x27;, matchRate: -1 })).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;asks when less than 80% of the lines are found in the book&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;en&#x27;, ocrLang: &#x27;eng&#x27;, matchRate: 0.42 })).toEqual([</span>
+<span class="a">+      &#x27;SubRead found only 42% of the lines in the book.&#x27;,</span>
+<span class="a">+    ]);</span>
+<span class="a">+    expect(subreadConcerns({ requested: &#x27;en&#x27;, ocrLang: &#x27;eng&#x27;, matchRate: 0.8 })).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index 415f953..b9c0410 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -18,6 +18,10 @@ import {</span>
+   playerProblem,
+   readingEndMessage,
+   readingText,
+<span class="a">+  subreadErrorText,</span>
+<span class="a">+  subreadQuestion,</span>
+<span class="a">+  subreadResultText,</span>
+<span class="a">+  waitPagesText,</span>
+   withForceOcr,
+ } from &#x27;../src/messages&#x27;;
+ 
+<span class="h">@@ -169,6 +173,39 @@ describe(&#x27;the end of the reading&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="a">+describe(&#x27;SubRead texts&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;tells how far the reading is while SubRead waits&#x27;, () =&gt; {</span>
+<span class="a">+    expect(waitPagesText(3, 40)).toBe(&#x27;Reading pages 3/40 first...&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells what SubRead made&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subreadResultText({ cues: 15, language: &#x27;en&#x27;, matchRate: 0.97 })).toBe(</span>
+<span class="a">+      &#x27;15 cues, language en, 97% of the lines found in the book.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+    expect(subreadResultText({ cues: 15, language: &#x27;en&#x27;, matchRate: 0.5 })).toBe(</span>
+<span class="a">+      &#x27;15 cues, language en, 50% of the lines found in the book. Under 80% usually means another edition or the wrong language.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+    // The result file holds only the .srt, and the plugin gives -1 for no value.</span>
+<span class="a">+    expect(subreadResultText({})).toBe(&#x27;? cues, language ?.&#x27;);</span>
+<span class="a">+    expect(subreadResultText({ cues: -1, language: null, matchRate: -1 })).toBe(</span>
+<span class="a">+      &#x27;? cues, language ?.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;asks the user to choose the audio again when SubRead cannot start&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subreadErrorText(&#x27;cannot_start: Permission Denial: opening provider&#x27;)).toBe(</span>
+<span class="a">+      &#x27;SubRead cannot read the audio file. Choose the audio again.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+    expect(subreadErrorText(&#x27;cancelled&#x27;)).toBe(&#x27;SubRead made no subtitles: cancelled.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;asks with the reasons before the subtitles of SubRead load&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subreadQuestion([&#x27;A.&#x27;, &#x27;B.&#x27;])).toBe(</span>
+<span class="a">+      &#x27;SubRead made subtitles for this book.\n\nA.\n\nB.\n\nLoad them?&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;matchedText&#x27;, () =&gt; {
+   it(&#x27;counts the matched cues of the pages read so far&#x27;, () =&gt; {
+     expect(matchedText(2, 15, false)).toBe(&#x27;2/15 cues matched to the pages read so far.&#x27;);
+diff --git a/test/token-cache.test.ts b/test/token-cache.test.ts
+index 716cc97..3f8e61a 100644
+--- a/test/token-cache.test.ts
++++ b/test/token-cache.test.ts
+<span class="h">@@ -206,6 +206,15 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     );
+   }, 30_000);
+ 
+<span class="a">+  it(&#x27;gives back the file name of a book key, also a name with &quot;|&quot;&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(fc.string({ unit: &#x27;binary&#x27; }), fc.nat(), (name, size) =&gt; {</span>
+<span class="a">+        expect(cache.bookName(cache.bookKey({ name, size }))).toBe(name);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;works without IndexedDB, and warns once&#x27;, async () =&gt; {
+     const warn = vi.spyOn(console, &#x27;warn&#x27;).mockImplementation(() =&gt; undefined);
+     vi.spyOn(indexedDB, &#x27;open&#x27;).mockImplementation(() =&gt; {</pre>
+</div></body></html>

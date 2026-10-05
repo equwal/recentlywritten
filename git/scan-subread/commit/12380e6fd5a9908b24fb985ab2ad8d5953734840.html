@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 12380e6f - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 12380e6fd5a9908b24fb985ab2ad8d5953734840
+truex &lt;truex@equwal.com&gt;
+2026-09-26 23:32:50 -0700
+
+Tell when SubRead waits for pages that could not be read
+
+&quot;Make subtitles with SubRead&quot; waits until all pages of the book are
+read. startMakeWhenRead ran only after a page that was read. After &quot;OCR
+could not start...&quot; or &quot;2 pages could not be read.&quot;, the menu still
+said &quot;Reading pages 38/40 first...&quot;, and SubRead never started.
+
+readBook now calls startMakeWhenRead also when the reading ends, and
+when it starts. waitMessage (messages.ts) gives &quot;Reading pages N/M
+first...&quot; while the reading runs. After the reading it gives &quot;SubRead
+waits for 2 pages that could not be read.&quot; with Retry in the menu.
+Retry reads those pages, and startMakeWhenRead then starts SubRead
+after the last one.
+
+</pre><pre> README.md             |  6 ++++--
+ src/main.ts           | 22 ++++++++++++++++++----
+ src/messages.ts       | 15 +++++++++++++++
+ test/messages.test.ts | 23 +++++++++++++++++++++++
+ 4 files changed, 60 insertions(+), 6 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index ae5297d..f3d5b20 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -33,8 +33,10 @@ is open.</span>
+ 2. In the menu, load the subtitles, or on Android press &quot;Make subtitles
+    with SubRead&quot;: pick the audiobook. SubRead starts when all pages are
+    read (&quot;Reading pages N/M first...&quot;), and makes the `.srt` from the
+<span class="d">-   audio and the text of the book. The result loads at once, is kept for</span>
+<span class="d">-   this PDF, and can be shared as a file.</span>
+<span class="a">+   audio and the text of the book. When pages could not be read, the</span>
+<span class="a">+   menu says &quot;SubRead waits for 2 pages that could not be read.&quot; with</span>
+<span class="a">+   Retry, and SubRead starts when Retry reads them. The result loads at</span>
+<span class="a">+   once, is kept for this PDF, and can be shared as a file.</span>
+ 3. Start the player. The status strip shows its position. The page
+    follows.
+ 
+diff --git a/src/main.ts b/src/main.ts
+index 3fb0ff4..eac2625 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -58,7 +58,7 @@ import {</span>
+   subreadQuestion,
+   subreadResultText,
+   UPDATING_CACHE_TEXT,
+<span class="d">-  waitPagesText,</span>
+<span class="a">+  waitMessage,</span>
+   withForceOcr,
+   type Message,
+ } from &#x27;./messages&#x27;;
+<span class="h">@@ -598,6 +598,9 @@ async function readPage(</span>
+ /** The OCR of the reading that runs now. */
+ let readingOcr: OcrJob&lt;HTMLCanvasElement&gt; | undefined;
+ 
+<span class="a">+/** True while readBook reads the pages. */</span>
+<span class="a">+let readingRuns = false;</span>
+<span class="a">+</span>
+ /**
+  * Reads every page of the book: the current page first, then the pages
+  * after it, then the pages before it. The cues are aligned again as pages
+<span class="h">@@ -611,6 +614,7 @@ async function readBook(retry = false): Promise&lt;void&gt; {</span>
+   const { pdf, file } = state;
+   if (!pdf || !file) return;
+   const seq = ++state.readSeq;
+<span class="a">+  readingRuns = true;</span>
+   // The OCR of the reading before stops at once. It does not finish its
+   // page: two quick changes of a setting ran two OCR jobs at the same time.
+   readingOcr?.stop();
+<span class="h">@@ -622,6 +626,8 @@ async function readBook(retry = false): Promise&lt;void&gt; {</span>
+     state.cueParts = [];
+     state.markedCue = -1;
+   }
+<span class="a">+  // A SubRead job that waits shows the reading again, for example after Retry.</span>
+<span class="a">+  startMakeWhenRead();</span>
+   const total = pdf.numPages;
+   const pending = new Set(
+     Array.from({ length: total }, (_, i) =&gt; i).filter((i) =&gt; !state.pages[i]),
+<span class="h">@@ -697,7 +703,12 @@ async function readBook(retry = false): Promise&lt;void&gt; {</span>
+     if (seq === state.readSeq) say(`Cannot read the pages: ${String(err)}`);
+   } finally {
+     ocr.stop();
+<span class="d">-    if (seq === state.readSeq) setReading(readingEndMessage(failed, startFailed));</span>
+<span class="a">+    if (seq === state.readSeq) {</span>
+<span class="a">+      readingRuns = false;</span>
+<span class="a">+      setReading(readingEndMessage(failed, startFailed));</span>
+<span class="a">+      // A SubRead job that waits now waits for pages that could not be read.</span>
+<span class="a">+      startMakeWhenRead();</span>
+<span class="a">+    }</span>
+   }
+ }
+ 
+<span class="h">@@ -880,14 +891,17 @@ ui.makeSubs.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+ 
+ /**
+  * Starts the SubRead job that waits, when all pages of its book are read.
+<span class="d">- * Else tells how far the reading is. readBook calls this after each page.</span>
+<span class="a">+ * Else tells how far the reading is, or after the reading, how many pages</span>
+<span class="a">+ * could not be read, with Retry (waitMessage). readBook calls this after</span>
+<span class="a">+ * each page and at its end, so a Retry that reads those pages starts the job.</span>
+  */
+ function startMakeWhenRead(): void {
+   const wait = state.makeWait;
+   const pdf = state.pdf;
+   if (!wait || !pdf || wait.book !== state.book) return;
+   if (!allPagesRead()) {
+<span class="d">-    ui.makeStatus.textContent = waitPagesText(state.pages.filter((p) =&gt; p).length, pdf.numPages);</span>
+<span class="a">+    const read = state.pages.filter((p) =&gt; p).length;</span>
+<span class="a">+    fill(ui.makeStatus, waitMessage(read, pdf.numPages, readingRuns));</span>
+     return;
+   }
+   state.makeWait = null;
+diff --git a/src/messages.ts b/src/messages.ts
+index 71010ab..9a8029e 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -184,6 +184,21 @@ export function waitPagesText(read: number, total: number): string {</span>
+   return `Reading pages ${read}/${total} first...`;
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * The make status while a SubRead job waits for the pages of its book.</span>
+<span class="a">+ * `reading` is true while the reading of the pages runs. After the reading,</span>
+<span class="a">+ * the pages that are not read could not be read: the job waits until Retry</span>
+<span class="a">+ * reads them. Before, the status kept &quot;Reading pages 38/40 first...&quot;, and</span>
+<span class="a">+ * SubRead never started.</span>
+<span class="a">+ */</span>
+<span class="a">+export function waitMessage(read: number, total: number, reading: boolean): Message {</span>
+<span class="a">+  if (reading) return { text: waitPagesText(read, total) };</span>
+<span class="a">+  return {</span>
+<span class="a">+    text: `SubRead waits for ${count(total - read, &#x27;page&#x27;)} that could not be read.`,</span>
+<span class="a">+    action: RETRY,</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** What SubRead made: the cues, the language and the share of the lines found in the book. */
+ export function subreadResultText(r: {
+   cues?: number;
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index 0a9e440..116ad76 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -26,10 +26,33 @@ import {</span>
+   subreadErrorText,
+   subreadQuestion,
+   subreadResultText,
+<span class="a">+  waitMessage,</span>
+   waitPagesText,
+   withForceOcr,
+ } from &#x27;../src/messages&#x27;;
+ 
+<span class="a">+describe(&#x27;waitMessage&#x27;, () =&gt; {</span>
+<span class="a">+  const retry = { id: &#x27;retry-reading&#x27;, text: &#x27;Retry&#x27; };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells how far the reading is while it runs&#x27;, () =&gt; {</span>
+<span class="a">+    expect(waitMessage(3, 40, true)).toEqual({ text: &#x27;Reading pages 3/40 first...&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells after the reading that SubRead waits for the pages that could not be read&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: after &quot;2 pages could not be read.&quot; the menu still said</span>
+<span class="a">+    // &quot;Reading pages 38/40 first...&quot;, and SubRead never started.</span>
+<span class="a">+    expect(waitMessage(38, 40, false)).toEqual({</span>
+<span class="a">+      text: &#x27;SubRead waits for 2 pages that could not be read.&#x27;,</span>
+<span class="a">+      action: retry,</span>
+<span class="a">+    });</span>
+<span class="a">+    // OCR could not start: no page of the scan is read.</span>
+<span class="a">+    expect(waitMessage(0, 1, false)).toEqual({</span>
+<span class="a">+      text: &#x27;SubRead waits for 1 page that could not be read.&#x27;,</span>
+<span class="a">+      action: retry,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ function state(over: Partial&lt;ClockState&gt;): ClockState {
+   return { positionMs: 0, playing: false, seeked: false, error: null, ...over };
+ }</pre>
+</div></body></html>

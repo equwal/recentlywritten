@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 8218ba7c - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 8218ba7cc9c26469f2d556efc2deb76fa428cb7f
+equwal &lt;truex@equwal.com&gt;
+2026-09-26 15:10:44 -0700
+
+Take back the hours of refunded Google Play purchases
+
+A Google Play buyer can get a refund from Google without the owner. Each
+hour, main.housekeeping now reads the voided purchases of the last 30
+days (purchases.voidedpurchases.list, all pages). For each voided token
+in play_purchases, it takes the hours of the purchase from the account
+that has them now, after any merge, and sets voided_at. A balance never
+goes below zero.
+
+A conditional UPDATE (voided_at IS NULL) marks the row, so two passes at
+the same time take the hours back once. One UPDATE changes the balance,
+as in captions.spend, so that a credit or a spend at the same time is not
+lost. Housekeeping calls Google only when the key file is set. A failure
+of Google gives one warning, and the next pass tries again.
+
+Tests: pytest 243 passed (7 new), with a property test for the take-back.
+The new tests failed before the change. Each of five changes to the new
+code makes a test fail. test_vendor_files_may_be_kept fails before and
+after the change, because a new worktree has no frontend/vendor.
+
+</pre><pre> backend/main.py    |   6 ++-
+ backend/play.py    |  91 ++++++++++++++++++++++++++++++-
+ tests/test_play.py | 156 +++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 248 insertions(+), 5 deletions(-)
+</pre><pre>diff --git a/backend/main.py b/backend/main.py
+index 859a742..20911ff 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -104,7 +104,8 @@ async def lifespan(_: FastAPI):</span>
+ 
+ 
+ def housekeeping() -&gt; None:
+<span class="d">-    &quot;&quot;&quot;One pass of the hourly housekeeping: let go of abandoned browser jobs.</span>
+<span class="a">+    &quot;&quot;&quot;One pass of the hourly housekeeping: let go of abandoned browser jobs,</span>
+<span class="a">+    and take back the hours of Google Play purchases that Google refunded.</span>
+ 
+     It deletes no file. The server keeps each upload and each result for
+     debugging, and the operator deletes them by hand.
+<span class="h">@@ -113,6 +114,9 @@ def housekeeping() -&gt; None:</span>
+ 
+     with SessionLocal() as s:
+         expire_stale_local_jobs(s)
+<span class="a">+    if settings.play_configured:</span>
+<span class="a">+        with SessionLocal() as s:</span>
+<span class="a">+            play.take_back_voided(s)</span>
+ 
+ 
+ async def _housekeeping() -&gt; None:
+diff --git a/backend/play.py b/backend/play.py
+index a439395..e8ef6ca 100644
+--- a/backend/play.py
++++ b/backend/play.py
+<span class="h">@@ -9,6 +9,10 @@ Google for the purchase, adds the hours of the pack to the account once, and</span>
+ consumes the purchase, so that the user can buy the pack again. The app never
+ consumes. If this server does not answer, the app sends the purchase again at
+ its next start.
+<span class="a">+</span>
+<span class="a">+A buyer can get a refund from Google without the owner. So each hour,</span>
+<span class="a">+main.housekeeping asks Google for the purchases that it refunded or charged</span>
+<span class="a">+back, and this module takes their hours back once.</span>
+ &quot;&quot;&quot;
+ from __future__ import annotations
+ 
+<span class="h">@@ -21,7 +25,16 @@ from urllib.parse import quote</span>
+ 
+ from fastapi import APIRouter, Depends, HTTPException
+ from pydantic import BaseModel, Field
+<span class="d">-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String</span>
+<span class="a">+from sqlalchemy import (</span>
+<span class="a">+    Boolean,</span>
+<span class="a">+    DateTime,</span>
+<span class="a">+    ForeignKey,</span>
+<span class="a">+    Integer,</span>
+<span class="a">+    String,</span>
+<span class="a">+    case,</span>
+<span class="a">+    select,</span>
+<span class="a">+    update,</span>
+<span class="a">+)</span>
+ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Mapped, Session, mapped_column
+ 
+<span class="h">@@ -78,6 +91,10 @@ class PlayPurchase(Base):</span>
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True), default=utcnow
+     )
+<span class="a">+    # The time when this server took the hours back after a refund or a chargeback.</span>
+<span class="a">+    voided_at: Mapped[datetime | None] = mapped_column(</span>
+<span class="a">+        DateTime(timezone=True), nullable=True</span>
+<span class="a">+    )</span>
+ 
+ 
+ def _hash(token: str) -&gt; str:
+<span class="h">@@ -150,6 +167,25 @@ def consume(product_id: str, token: str) -&gt; None:</span>
+     _call(&quot;POST&quot;, _url(product_id, token) + &quot;:consume&quot;)
+ 
+ 
+<span class="a">+def voided() -&gt; list[str]:</span>
+<span class="a">+    &quot;&quot;&quot;The tokens of the in-app purchases that Google voided in the last 30 days.</span>
+<span class="a">+</span>
+<span class="a">+    A refund or a chargeback voids a purchase. 30 days is the default and the</span>
+<span class="a">+    longest time of the API, so a missed hour loses nothing.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    tokens: list[str] = []</span>
+<span class="a">+    page = &quot;&quot;</span>
+<span class="a">+    while True:</span>
+<span class="a">+        url = f&quot;{API}/{PACKAGE}/purchases/voidedpurchases&quot;</span>
+<span class="a">+        if page:</span>
+<span class="a">+            url += f&quot;?token={quote(page, safe=&#x27;&#x27;)}&quot;</span>
+<span class="a">+        body = _call(&quot;GET&quot;, url).json()</span>
+<span class="a">+        tokens += [v[&quot;purchaseToken&quot;] for v in body.get(&quot;voidedPurchases&quot;, [])]</span>
+<span class="a">+        page = (body.get(&quot;tokenPagination&quot;) or {}).get(&quot;nextPageToken&quot;, &quot;&quot;)</span>
+<span class="a">+        if not page:</span>
+<span class="a">+            return tokens</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ # ---------------------------------------------------------------------------
+ # the credit
+ # ---------------------------------------------------------------------------
+<span class="h">@@ -199,6 +235,59 @@ def credit(session: Session, account: Account, product_id: str, token: str,</span>
+     return True
+ 
+ 
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# refunds</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def take_back(session: Session, tokens: list[str]) -&gt; int:</span>
+<span class="a">+    &quot;&quot;&quot;Take back the hours of each voided purchase in `tokens`, once.</span>
+<span class="a">+</span>
+<span class="a">+    The hours come from the account that has them now, after any merge. A</span>
+<span class="a">+    balance never goes below zero, so the hours that the buyer used are lost.</span>
+<span class="a">+    Return the number of purchases that this call took back.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    hashes = {_hash(t) for t in tokens}</span>
+<span class="a">+    if not hashes:</span>
+<span class="a">+        return 0</span>
+<span class="a">+    rows = session.scalars(select(PlayPurchase).where(</span>
+<span class="a">+        PlayPurchase.token_hash.in_(hashes), PlayPurchase.voided_at.is_(None))).all()</span>
+<span class="a">+    balance = captions.CaptionBalance</span>
+<span class="a">+    taken = 0</span>
+<span class="a">+    for row in rows:</span>
+<span class="a">+        # Mark the row only if no other pass marked it first. Then two passes</span>
+<span class="a">+        # at the same time take the hours back once.</span>
+<span class="a">+        marked = session.execute(</span>
+<span class="a">+            update(PlayPurchase)</span>
+<span class="a">+            .where(PlayPurchase.id == row.id, PlayPurchase.voided_at.is_(None))</span>
+<span class="a">+            .values(voided_at=utcnow())</span>
+<span class="a">+        ).rowcount</span>
+<span class="a">+        if marked != 1:</span>
+<span class="a">+            continue</span>
+<span class="a">+        owner = accounts.resolve(session, session.get(Account, row.account_id))</span>
+<span class="a">+        # One UPDATE, like captions.spend: a credit or a spend at the same time</span>
+<span class="a">+        # cannot write over it.</span>
+<span class="a">+        session.execute(</span>
+<span class="a">+            update(balance)</span>
+<span class="a">+            .where(balance.account_id == owner.id)</span>
+<span class="a">+            .values(seconds_left=case(</span>
+<span class="a">+                (balance.seconds_left &gt; row.seconds, balance.seconds_left - row.seconds),</span>
+<span class="a">+                else_=0))</span>
+<span class="a">+        )</span>
+<span class="a">+        taken += 1</span>
+<span class="a">+        log.info(&quot;voided play purchase %s: took back up to %d s from %s&quot;,</span>
+<span class="a">+                 row.order_id or &quot;(no order id)&quot;, row.seconds, owner.id)</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return taken</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def take_back_voided(session: Session) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;One pass of main.housekeeping. A failure waits for the next hour.&quot;&quot;&quot;</span>
+<span class="a">+    try:</span>
+<span class="a">+        take_back(session, voided())</span>
+<span class="a">+    except PlayError as exc:</span>
+<span class="a">+        log.warning(&quot;could not read the voided Play purchases: %s&quot;, exc.detail)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ # ---------------------------------------------------------------------------
+ # routes
+ # ---------------------------------------------------------------------------
+diff --git a/tests/test_play.py b/tests/test_play.py
+index 0001c47..5c0e3e5 100644
+--- a/tests/test_play.py
++++ b/tests/test_play.py
+<span class="h">@@ -1,7 +1,7 @@</span>
+ &quot;&quot;&quot;Google Play purchases of cloud caption hours: the Play build of Subrep.
+ 
+<span class="d">-No test reaches Google. FakeGooglePlay replaces play.get and play.consume, and</span>
+<span class="d">-the tests of the HTTP layer give play._session a fake session.</span>
+<span class="a">+No test reaches Google. FakeGooglePlay replaces play.get, play.consume and</span>
+<span class="a">+play.voided, and the tests of the HTTP layer give play._session a fake session.</span>
+ &quot;&quot;&quot;
+ 
+ from __future__ import annotations
+<span class="h">@@ -19,7 +19,7 @@ from hypothesis import given</span>
+ from hypothesis import settings as hsettings
+ from hypothesis import strategies as st
+ 
+<span class="d">-from backend import accounts, captions, play</span>
+<span class="a">+from backend import accounts, captions, main, play</span>
+ from backend.db import Account, SessionLocal
+ from backend.settings import settings
+ 
+<span class="h">@@ -39,6 +39,8 @@ class FakeGooglePlay:</span>
+         self.gets: list[tuple[str, str]] = []
+         self.down = False
+         self.fail_consume = 0
+<span class="a">+        # The tokens of the purchases that Google refunded or charged back.</span>
+<span class="a">+        self.voided_tokens: list[str] = []</span>
+ 
+     def buy(self, token: str, account: str | None, product: str = &quot;captions20&quot;,
+             state: int = 0, quantity: int | None = None, test: bool = False) -&gt; dict:
+<span class="h">@@ -74,6 +76,9 @@ class FakeGooglePlay:</span>
+         self.consumed.append(token)
+         self.purchases[token][&quot;consumptionState&quot;] = 1
+ 
+<span class="a">+    def voided(self) -&gt; list[str]:</span>
+<span class="a">+        return list(self.voided_tokens)</span>
+<span class="a">+</span>
+ 
+ @pytest.fixture(autouse=True)
+ def _no_google(monkeypatch):
+<span class="h">@@ -90,6 +95,7 @@ def google(monkeypatch, tmp_path):</span>
+     fake = FakeGooglePlay()
+     monkeypatch.setattr(play, &quot;get&quot;, fake.get)
+     monkeypatch.setattr(play, &quot;consume&quot;, fake.consume)
+<span class="a">+    monkeypatch.setattr(play, &quot;voided&quot;, fake.voided)</span>
+     key = tmp_path / &quot;play-key.json&quot;
+     key.write_text(&quot;{}&quot;)  # play.get is fake, so nothing reads the key.
+     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, str(key))
+<span class="h">@@ -425,6 +431,123 @@ def test_a_bad_key_file_is_503(tmp_path, content):</span>
+     assert caught.value.status == 503
+ 
+ 
+<span class="a">+def test_the_voided_list_reads_every_page(http):</span>
+<span class="a">+    http.answers = [</span>
+<span class="a">+        FakeResponse(200, {&quot;voidedPurchases&quot;: [{&quot;purchaseToken&quot;: &quot;a&quot;, &quot;orderId&quot;: &quot;GPA.1&quot;}],</span>
+<span class="a">+                           &quot;tokenPagination&quot;: {&quot;nextPageToken&quot;: &quot;p2&quot;}}),</span>
+<span class="a">+        FakeResponse(200, {&quot;voidedPurchases&quot;: [{&quot;purchaseToken&quot;: &quot;b&quot;, &quot;orderId&quot;: &quot;GPA.2&quot;}]}),</span>
+<span class="a">+        FakeResponse(200, {}),</span>
+<span class="a">+    ]</span>
+<span class="a">+    assert play.voided() == [&quot;a&quot;, &quot;b&quot;]</span>
+<span class="a">+    assert play.voided() == []  # No refunds in the last 30 days.</span>
+<span class="a">+    url = (&quot;https://androidpublisher.googleapis.com/androidpublisher/v3/applications/&quot;</span>
+<span class="a">+           &quot;com.honjimaku.subrep/purchases/voidedpurchases&quot;)</span>
+<span class="a">+    assert http.seen == [(&quot;GET&quot;, url), (&quot;GET&quot;, url + &quot;?token=p2&quot;), (&quot;GET&quot;, url)]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- refunds ------------------------------------------------------------------</span>
+<span class="a">+# These tests use SessionLocal and no TestClient: each TestClient starts a pass</span>
+<span class="a">+# of the housekeeping in the background.</span>
+<span class="a">+</span>
+<span class="a">+def paid(product: str = &quot;captions20&quot;, account: str | None = None) -&gt; dict:</span>
+<span class="a">+    &quot;&quot;&quot;A paid purchase that nobody consumed yet, as Google returns it.&quot;&quot;&quot;</span>
+<span class="a">+    purchase = {&quot;purchaseState&quot;: 0, &quot;consumptionState&quot;: 0, &quot;productId&quot;: product}</span>
+<span class="a">+    if account is not None:</span>
+<span class="a">+        purchase[&quot;obfuscatedExternalAccountId&quot;] = account</span>
+<span class="a">+    return purchase</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_refund_takes_back_the_hours_once():</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        me = accounts.new_account(s)</span>
+<span class="a">+        captions.add(s, me.id, 5 * HOUR)  # Hours from an earlier purchase.</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert play.credit(s, me, &quot;captions20&quot;, token, paid(account=me.id))</span>
+<span class="a">+        assert play.take_back(s, [token]) == 1</span>
+<span class="a">+        assert play.take_back(s, [token]) == 0</span>
+<span class="a">+        assert captions.seconds_left(s, me.id) == 5 * HOUR</span>
+<span class="a">+        [row] = s.query(play.PlayPurchase).filter_by(token_hash=play._hash(token)).all()</span>
+<span class="a">+        assert row.voided_at is not None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_two_passes_at_the_same_time_take_the_hours_back_once(monkeypatch):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    with SessionLocal() as s, SessionLocal() as other:</span>
+<span class="a">+        me = accounts.new_account(s)</span>
+<span class="a">+        captions.add(s, me.id, 5 * HOUR)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert play.credit(s, me, &quot;captions20&quot;, token, paid(account=me.id))</span>
+<span class="a">+        # The other pass runs after this pass found the row, and before it</span>
+<span class="a">+        # marks the row.</span>
+<span class="a">+        other_pass = []</span>
+<span class="a">+        execute = s.execute</span>
+<span class="a">+</span>
+<span class="a">+        def execute_after_the_other_pass(*args, **kwargs):</span>
+<span class="a">+            if not other_pass:</span>
+<span class="a">+                other_pass.append(play.take_back(other, [token]))</span>
+<span class="a">+            return execute(*args, **kwargs)</span>
+<span class="a">+</span>
+<span class="a">+        monkeypatch.setattr(s, &quot;execute&quot;, execute_after_the_other_pass)</span>
+<span class="a">+        assert play.take_back(s, [token]) == 0</span>
+<span class="a">+        assert other_pass == [1]</span>
+<span class="a">+        me_id = me.id</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        assert captions.seconds_left(s, me_id) == 5 * HOUR</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_refund_after_a_merge_takes_the_hours_from_the_survivor():</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        old, survivor = accounts.new_account(s), accounts.new_account(s)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert play.credit(s, old, &quot;captions20&quot;, token, paid(account=old.id))</span>
+<span class="a">+        accounts.merge(s, old, survivor)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert captions.seconds_left(s, survivor.id) == 20 * HOUR</span>
+<span class="a">+        assert play.take_back(s, [token]) == 1</span>
+<span class="a">+        assert captions.seconds_left(s, survivor.id) == 0</span>
+<span class="a">+        assert captions.seconds_left(s, old.id) == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_housekeeping_takes_back_refunds_only_when_play_is_set_up(google, monkeypatch):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        me = accounts.new_account(s)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert play.credit(s, me, &quot;captions20&quot;, token, paid(account=me.id))</span>
+<span class="a">+        me_id = me.id</span>
+<span class="a">+    google.voided_tokens = [token]</span>
+<span class="a">+    asked = []</span>
+<span class="a">+</span>
+<span class="a">+    def spy():</span>
+<span class="a">+        asked.append(True)</span>
+<span class="a">+        return google.voided()</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(play, &quot;voided&quot;, spy)</span>
+<span class="a">+    key = settings.play_service_account_file</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, &quot;&quot;)</span>
+<span class="a">+    main.housekeeping()</span>
+<span class="a">+    assert asked == []</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, key)</span>
+<span class="a">+    main.housekeeping()</span>
+<span class="a">+    assert asked == [True]</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        assert captions.seconds_left(s, me_id) == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_google_failure_does_not_stop_housekeeping(google, monkeypatch, caplog):</span>
+<span class="a">+    def down():</span>
+<span class="a">+        raise play.PlayError(502, play.NO_ANSWER)</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(play, &quot;voided&quot;, down)</span>
+<span class="a">+    main.housekeeping()</span>
+<span class="a">+    warnings = [record for record in caplog.records</span>
+<span class="a">+                if record.name == &quot;backend.play&quot; and record.levelno == logging.WARNING]</span>
+<span class="a">+    assert len(warnings) == 1 and play.NO_ANSWER in warnings[0].getMessage()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ # --- properties ---------------------------------------------------------------
+ 
+ @hsettings(max_examples=50, deadline=None)
+<span class="h">@@ -464,6 +587,33 @@ def test_a_token_gives_its_hours_once_and_only_when_paid_for_this_account(buys,</span>
+         assert s.query(play.PlayPurchase).filter_by(account_id=ids[&quot;me&quot;]).count() == len(expected)
+ 
+ 
+<span class="a">+@hsettings(max_examples=50, deadline=None)</span>
+<span class="a">+@given(bought=st.lists(st.sampled_from(sorted(captions.HOURS)), min_size=1, max_size=4),</span>
+<span class="a">+       spent=st.integers(0, 300 * HOUR),</span>
+<span class="a">+       voids=st.lists(st.lists(st.integers(0, 5), max_size=6), max_size=4))</span>
+<span class="a">+def test_a_refund_takes_back_the_hours_once_and_never_below_zero(bought, spent, voids):</span>
+<span class="a">+    run = secrets.token_hex(6)  # The database lives across examples.</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        me = accounts.new_account(s)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        for i, product in enumerate(bought):</span>
+<span class="a">+            assert play.credit(s, me, product, f&quot;{run}.{i}&quot;, paid(product, me.id))</span>
+<span class="a">+        total = sum(captions.HOURS[product] * HOUR for product in bought)</span>
+<span class="a">+        used = min(spent, total)</span>
+<span class="a">+        assert captions.spend(s, me.id, used)</span>
+<span class="a">+        voided: set[int] = set()</span>
+<span class="a">+        taken = 0</span>
+<span class="a">+        for indexes in voids:  # An index past the purchases is a token that this server never saw.</span>
+<span class="a">+            taken += play.take_back(s, [f&quot;{run}.{i}&quot; for i in indexes])</span>
+<span class="a">+            voided |= {i for i in indexes if i &lt; len(bought)}</span>
+<span class="a">+        back = sum(captions.HOURS[bought[i]] * HOUR for i in voided)</span>
+<span class="a">+        assert captions.seconds_left(s, me.id) == max(0, total - used - back)</span>
+<span class="a">+        assert taken == len(voided)</span>
+<span class="a">+        assert s.query(play.PlayPurchase).filter(</span>
+<span class="a">+            play.PlayPurchase.account_id == me.id,</span>
+<span class="a">+            play.PlayPurchase.voided_at.is_not(None)).count() == len(voided)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @given(st.text(min_size=1))
+ def test_any_token_is_one_path_segment_of_the_address(token):
+     url = play._url(&quot;captions20&quot;, token)</pre>
+</div></body></html>

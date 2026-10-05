@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 9dca5aa0 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9dca5aa0c4532d593d473c25e693c46757e0bf2f
+truex &lt;truex@equwal.com&gt;
+2026-09-26 21:37:20 -0700
+
+Stop the OCR worker when its start fails
+
+When the language data does not load, tesseract.js gives the error to
+errorHandler, and its start promise does not settle: src/createWorker.js
+rejects that promise only when the core does not load, and the start
+chain ends in .catch(() =&gt; {}). An earlier change let the error reject
+the start, but the Web Worker stayed, with the WebAssembly core in its
+memory. tesseract.js gives the worker to the app only after the start,
+so the app could not stop it. Each Retry, book open or setting change
+then left one more worker, for as long as the data did not load.
+
+startWorker (ocr.ts) now keeps the Web Worker that createWorker makes:
+createWorker makes it in the synchronous part of the call, so during
+the call a Worker class that keeps each new worker stands in for the
+class of the browser. When the start fails, the app stops that worker.
+An error after the start belongs to a page, and OcrJob handles it.
+
+A Retry still starts a new worker, so OCR starts when the network comes
+back. A check of the language data before the start was not used: the
+URL of the data is internal to tesseract.js and is not one path for
+&quot;jpn+eng&quot;, and a failed or stalled start still left its worker.
+
+</pre><pre> README.md        |  4 +++
+ src/ocr.ts       | 75 ++++++++++++++++++++++++++++++++++++++++++++++----------
+ test/ocr.test.ts | 68 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 134 insertions(+), 13 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 138796e..c586655 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -177,6 +177,10 @@ million pixels. When it takes longer, or when the OCR worker fails, the</span>
+ app stops the worker and counts the page as not read. The next page
+ starts a new worker, so one bad page does not stop the reading.
+ 
+<span class="a">+When the OCR worker cannot start, for example because the language data</span>
+<span class="a">+does not load, the app stops that worker too. tesseract.js does not stop</span>
+<span class="a">+it, so without this each Retry left one more worker in memory.</span>
+<span class="a">+</span>
+ Both give the same tokens: one box per character with a line id and a
+ word id. The alignment, the mark, the page turn and the lookup work the
+ same way on a scan and on a text PDF.
+diff --git a/src/ocr.ts b/src/ocr.ts
+index 8ca327f..3411341 100644
+--- a/src/ocr.ts
++++ b/src/ocr.ts
+<span class="h">@@ -28,7 +28,7 @@ export interface Ocr {</span>
+ /**
+  * Start an OCR worker for `lang` (&quot;eng&quot;, &quot;jpn&quot;, &quot;jpn_vert&quot;, &quot;jpn+eng&quot;, ...).
+  * `onProgress` gets values in [0, 1] while a page is recognized. Rejects with
+<span class="d">- * OcrStartError when the worker cannot start.</span>
+<span class="a">+ * OcrStartError when the worker cannot start, and then the worker stops.</span>
+  */
+ export async function createOcr(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;Ocr&gt; {
+   let worker: TesseractWorker;
+<span class="h">@@ -103,20 +103,69 @@ function ppmOf(canvas: HTMLCanvasElement): ImageLike {</span>
+ /**
+  * Starts the worker of tesseract.js. When the language data does not load,
+  * tesseract.js gives the error to errorHandler, and the promise of
+<span class="d">- * createWorker does not settle. So the first error rejects the start. That</span>
+<span class="d">- * worker cannot be stopped: tesseract.js gives no handle to it.</span>
+<span class="a">+ * createWorker does not settle (src/createWorker.js rejects it only when</span>
+<span class="a">+ * the core does not load). So the first error rejects the start.</span>
+<span class="a">+ *</span>
+<span class="a">+ * tesseract.js does not stop the Web Worker of a start that failed, and it</span>
+<span class="a">+ * gives the app the worker only after the start. So the start keeps the Web</span>
+<span class="a">+ * Worker (see spawnedBy) and stops it when the start fails. Without this,</span>
+<span class="a">+ * each Retry, book or setting change left one more worker, each with the</span>
+<span class="a">+ * WebAssembly core in its memory.</span>
+  */
+ function startWorker(lang: string, onProgress: (p: number) =&gt; void): Promise&lt;TesseractWorker&gt; {
+   return new Promise((resolve, reject) =&gt; {
+<span class="d">-    createWorker(lang, 1, {</span>
+<span class="d">-      workerPath,</span>
+<span class="d">-      corePath,</span>
+<span class="d">-      logger: (m) =&gt; {</span>
+<span class="d">-        if (m.status === &#x27;recognizing text&#x27;) onProgress(m.progress);</span>
+<span class="d">-      },</span>
+<span class="d">-      // Also after the start: without an errorHandler, tesseract.js throws</span>
+<span class="d">-      // each error of a job in the message handler of the worker.</span>
+<span class="d">-      errorHandler: reject,</span>
+<span class="d">-    }).then(resolve, reject);</span>
+<span class="a">+    let settled = false;</span>
+<span class="a">+    let spawned: Worker | undefined;</span>
+<span class="a">+    const fail = (err: unknown): void =&gt; {</span>
+<span class="a">+      // After the start, an error belongs to a page: OcrJob stops the worker.</span>
+<span class="a">+      if (settled) return;</span>
+<span class="a">+      settled = true;</span>
+<span class="a">+      spawned?.terminate();</span>
+<span class="a">+      reject(err);</span>
+<span class="a">+    };</span>
+<span class="a">+    const made = spawnedBy(() =&gt;</span>
+<span class="a">+      createWorker(lang, 1, {</span>
+<span class="a">+        workerPath,</span>
+<span class="a">+        corePath,</span>
+<span class="a">+        logger: (m) =&gt; {</span>
+<span class="a">+          if (m.status === &#x27;recognizing text&#x27;) onProgress(m.progress);</span>
+<span class="a">+        },</span>
+<span class="a">+        // Also after the start: without an errorHandler, tesseract.js throws</span>
+<span class="a">+        // each error of a job in the message handler of the worker.</span>
+<span class="a">+        errorHandler: fail,</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+    spawned = made.worker;</span>
+<span class="a">+    made.result.then((worker) =&gt; {</span>
+<span class="a">+      settled = true;</span>
+<span class="a">+      resolve(worker);</span>
+<span class="a">+    }, fail);</span>
+   });
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Runs `create`, and gives its result and the Web Worker that it made, if</span>
+<span class="a">+ * any. createWorker of tesseract.js makes its Web Worker in the synchronous</span>
+<span class="a">+ * part of the call (src/createWorker.js calls spawnWorker before it</span>
+<span class="a">+ * returns). So during the call, a Worker class that keeps each new worker</span>
+<span class="a">+ * stands in for the Worker class of the browser. The class of the browser</span>
+<span class="a">+ * comes back before any other code runs.</span>
+<span class="a">+ */</span>
+<span class="a">+function spawnedBy&lt;T&gt;(create: () =&gt; T): { result: T; worker: Worker | undefined } {</span>
+<span class="a">+  const Native = globalThis.Worker;</span>
+<span class="a">+  // Node has no Worker: tesseract.js uses worker_threads there.</span>
+<span class="a">+  if (typeof Native !== &#x27;function&#x27;) return { result: create(), worker: undefined };</span>
+<span class="a">+  let worker: Worker | undefined;</span>
+<span class="a">+  globalThis.Worker = class extends Native {</span>
+<span class="a">+    constructor(url: string | URL, options?: WorkerOptions) {</span>
+<span class="a">+      super(url, options);</span>
+<span class="a">+      worker = this;</span>
+<span class="a">+    }</span>
+<span class="a">+  };</span>
+<span class="a">+  try {</span>
+<span class="a">+    const result = create();</span>
+<span class="a">+    return { result, worker };</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    globalThis.Worker = Native;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/test/ocr.test.ts b/test/ocr.test.ts
+index dd1c4d2..7235a02 100644
+--- a/test/ocr.test.ts
++++ b/test/ocr.test.ts
+<span class="h">@@ -38,9 +38,33 @@ function fakeCanvas(): HTMLCanvasElement {</span>
+ /** A path on the origin of the app, for example &quot;/assets/worker.min-abc.js&quot;. */
+ const LOCAL = /^\/(?!\/)/;
+ 
+<span class="a">+/** The Web Worker of the browser, for the tests. It keeps each worker that it makes. */</span>
+<span class="a">+class FakeWebWorker extends EventTarget {</span>
+<span class="a">+  static made: FakeWebWorker[] = [];</span>
+<span class="a">+  terminate = vi.fn();</span>
+<span class="a">+  constructor(readonly url: string | URL) {</span>
+<span class="a">+    super();</span>
+<span class="a">+    FakeWebWorker.made.push(this);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * createWorker as tesseract.js makes it in the browser: it makes its Web</span>
+<span class="a">+ * Worker at once (src/worker/browser/spawnWorker.js). `start` gives the</span>
+<span class="a">+ * promise of the start.</span>
+<span class="a">+ */</span>
+<span class="a">+function spawningCreateWorker(start: (opts: Options) =&gt; Promise&lt;unknown&gt;) {</span>
+<span class="a">+  return (_lang: string, _oem: number, opts: Options): Promise&lt;unknown&gt; =&gt; {</span>
+<span class="a">+    new Worker(&#x27;blob:tesseract-worker&#x27;);</span>
+<span class="a">+    return start(opts);</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ describe(&#x27;createOcr&#x27;, () =&gt; {
+   afterEach(() =&gt; {
+     createWorker.mockReset();
+<span class="a">+    vi.unstubAllGlobals();</span>
+<span class="a">+    FakeWebWorker.made = [];</span>
+   });
+ 
+   it(&#x27;loads the worker script and the core from the app, not from jsDelivr&#x27;, async () =&gt; {
+<span class="h">@@ -92,6 +116,50 @@ describe(&#x27;createOcr&#x27;, () =&gt; {</span>
+     expect((error as OcrStartError).cause).toBe(&#x27;TypeError: Failed to fetch&#x27;);
+   });
+ 
+<span class="a">+  it(&#x27;stops the Web Worker when the language data does not load&#x27;, async () =&gt; {</span>
+<span class="a">+    // The finding: tesseract.js gives no handle to this worker, and it does</span>
+<span class="a">+    // not stop it. Each Retry, book or setting left one more worker.</span>
+<span class="a">+    vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);</span>
+<span class="a">+    createWorker.mockImplementation(</span>
+<span class="a">+      spawningCreateWorker((opts) =&gt; {</span>
+<span class="a">+        setTimeout(() =&gt; opts.errorHandler?.(&#x27;TypeError: Failed to fetch&#x27;), 0);</span>
+<span class="a">+        return new Promise(() =&gt; undefined);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+    const error = await createOcr(&#x27;jpn&#x27;, () =&gt; undefined).catch((e: unknown) =&gt; e);</span>
+<span class="a">+    expect(error).toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect(FakeWebWorker.made).toHaveLength(1);</span>
+<span class="a">+    expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+    // The browser gets its own Worker constructor back.</span>
+<span class="a">+    expect(globalThis.Worker).toBe(FakeWebWorker);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;stops the Web Worker when the start fails&#x27;, async () =&gt; {</span>
+<span class="a">+    // tesseract.js rejects the start when its worker script does not load,</span>
+<span class="a">+    // and it does not stop the Web Worker.</span>
+<span class="a">+    vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);</span>
+<span class="a">+    createWorker.mockImplementation(</span>
+<span class="a">+      spawningCreateWorker(() =&gt; Promise.reject(&#x27;Uncaught NetworkError: failed to load.&#x27;)),</span>
+<span class="a">+    );</span>
+<span class="a">+    await expect(createOcr(&#x27;eng&#x27;, () =&gt; undefined)).rejects.toBeInstanceOf(OcrStartError);</span>
+<span class="a">+    expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not stop the Web Worker for an error after the start&#x27;, async () =&gt; {</span>
+<span class="a">+    // After the start, an error belongs to a page. OcrJob stops the worker then.</span>
+<span class="a">+    vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);</span>
+<span class="a">+    let handler: ((error: unknown) =&gt; void) | undefined;</span>
+<span class="a">+    createWorker.mockImplementation(</span>
+<span class="a">+      spawningCreateWorker((opts) =&gt; {</span>
+<span class="a">+        handler = opts.errorHandler;</span>
+<span class="a">+        return Promise.resolve(fakeWorker());</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+    await createOcr(&#x27;eng&#x27;, () =&gt; undefined);</span>
+<span class="a">+    handler?.(&#x27;The image is empty.&#x27;);</span>
+<span class="a">+    expect(FakeWebWorker.made[0]!.terminate).not.toHaveBeenCalled();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;gives OcrStartError and stops the worker when the page mode cannot be set&#x27;, async () =&gt; {
+     const worker = fakeWorker();
+     worker.setParameters.mockRejectedValue(&#x27;The worker stopped.&#x27;);</pre>
+</div></body></html>

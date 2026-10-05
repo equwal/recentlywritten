@@ -1,0 +1,1945 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 9e16977b - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9e16977b6ac2bcf0915fdc6954a0d10534b83c5e
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 17:21:33 -0700
+
+Add burst mode: Terraform for workers on the cheapest cloud
+
+infra/burst holds everything that burst mode needs. Nothing in it runs
+until the operator turns it on (infra/burst/README.md).
+
+- state/: the shared state, applied once on the web server. It installs
+  Postgres and Redis on 127.0.0.1 and a user that can only forward those
+  two ports (setup-web-server.sh), and it makes the Cloudflare R2 bucket
+  and a token for that bucket only. R2 charges no transfer fee, so
+  workers on any cloud and customers read files at no extra cost.
+- workers/aws/ and workers/hetzner/: one spot instance or one server
+  for each worker. The burst controller writes their variables and
+  applies them. No inbound port on either cloud. On AWS, a power-off
+  ends the instance.
+- cloud-init.yaml.tftpl: the first boot of a worker on either cloud. It
+  opens an autossh tunnel to Postgres and Redis, installs the app at the
+  web server&#x27;s commit from the bucket and the speech stack at the web
+  server&#x27;s versions, starts the worker on the paid queue, and powers the
+  machine off after 90 idle minutes if the controller is gone.
+- systemd/: the controller timer, and the web server&#x27;s own worker with
+  a memory limit that protects Postgres.
+
+The Terraform tests (terraform test, mock providers, no account) check
+the bucket-only token, the pinned host key of the web server, the tunnel
+and database addresses, the spot settings, the closed firewalls and the
+worker names. set-secret.sh can now write a key to another file, for the
+cloud keys of burst mode.
+
+.gitattributes keeps LF line endings for the Terraform, template and
+unit files. A CR from a Windows checkout would reach the cloud-init
+file, the env files and the shell scripts of a worker.
+
+</pre><pre> .gitattributes                                     |   8 +
+ .gitignore                                         |   7 +
+ README.md                                          |   8 +
+ infra/burst/README.md                              | 287 +++++++++++++++++++++
+ infra/burst/cloud-init.yaml.tftpl                  | 163 ++++++++++++
+ infra/burst/state/.terraform.lock.hcl              |  61 +++++
+ infra/burst/state/main.tf                          | 124 +++++++++
+ infra/burst/state/outputs.tf                       |  54 ++++
+ infra/burst/state/setup-web-server.sh              |  76 ++++++
+ infra/burst/state/tests/host_key.pub               |   1 +
+ infra/burst/state/tests/state.tftest.hcl           | 109 ++++++++
+ infra/burst/state/variables.tf                     |  48 ++++
+ infra/burst/systemd/subplz-burst.service           |  15 ++
+ infra/burst/systemd/subplz-burst.timer             |   9 +
+ infra/burst/systemd/subplz-worker.service          |  21 ++
+ infra/burst/worker-constraints.txt                 |  89 +++++++
+ infra/burst/workers/aws/.terraform.lock.hcl        |  26 ++
+ infra/burst/workers/aws/iam-policy.json            |  60 +++++
+ infra/burst/workers/aws/main.tf                    | 128 +++++++++
+ infra/burst/workers/aws/outputs.tf                 |   4 +
+ infra/burst/workers/aws/tests/aws.tftest.hcl       | 109 ++++++++
+ infra/burst/workers/aws/variables.tf               |  48 ++++
+ infra/burst/workers/hetzner/.terraform.lock.hcl    |  23 ++
+ infra/burst/workers/hetzner/main.tf                |  71 +++++
+ infra/burst/workers/hetzner/outputs.tf             |   4 +
+ .../burst/workers/hetzner/tests/hetzner.tftest.hcl |  66 +++++
+ infra/burst/workers/hetzner/variables.tf           |  43 +++
+ tools/set-secret.sh                                |  19 +-
+ 28 files changed, 1673 insertions(+), 8 deletions(-)
+</pre><pre>diff --git a/.gitattributes b/.gitattributes
+index dfdb8b7..a765581 100644
+--- a/.gitattributes
++++ b/.gitattributes
+<span class="h">@@ -1 +1,9 @@</span>
+ *.sh text eol=lf
+<span class="a">+# Terraform, templates and unit files run on Linux: a CR would reach the</span>
+<span class="a">+# cloud-init file, the env files and the shell scripts of a worker.</span>
+<span class="a">+*.tf text eol=lf</span>
+<span class="a">+*.tftpl text eol=lf</span>
+<span class="a">+*.hcl text eol=lf</span>
+<span class="a">+*.service text eol=lf</span>
+<span class="a">+*.timer text eol=lf</span>
+<span class="a">+*.pub text eol=lf</span>
+diff --git a/.gitignore b/.gitignore
+index a846ed3..42c6d87 100644
+--- a/.gitignore
++++ b/.gitignore
+<span class="h">@@ -31,3 +31,10 @@ tests/engine/excerpt-local/</span>
+ 
+ # Test tooling for the browser engine
+ node_modules/
+<span class="a">+</span>
+<span class="a">+# Terraform (infra/burst): providers, and state files, which hold passwords.</span>
+<span class="a">+# The state lives in /var/lib/subplz-burst on the web server, not here.</span>
+<span class="a">+.terraform/</span>
+<span class="a">+*.tfstate</span>
+<span class="a">+*.tfstate.*</span>
+<span class="a">+crash.log</span>
+diff --git a/README.md b/README.md
+index 33c5b09..aaed18c 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -490,6 +490,14 @@ With an external queue the API copies staged uploads into shared storage before</span>
+ enqueuing, and the worker pulls them down, so the API and workers do not need a
+ shared filesystem.
+ 
+<span class="a">+Paid jobs and free jobs go to separate queues. `SUBPLZ_WEB_WORKER_QUEUES`</span>
+<span class="a">+sets which a worker takes: `paid,free` (the default) or `paid`.</span>
+<span class="a">+</span>
+<span class="a">+**Burst mode** adds workers on the cheapest cloud (AWS spot or Hetzner) when</span>
+<span class="a">+paid jobs wait, and removes them when they are idle. It is built with</span>
+<span class="a">+Terraform and is off until the operator turns it on: see</span>
+<span class="a">+[`infra/burst/README.md`](infra/burst/README.md).</span>
+<span class="a">+</span>
+ ### Before going public
+ 
+ - Set the Stripe keys, the webhook and SMTP (see *Turning payments on*).
+diff --git a/infra/burst/README.md b/infra/burst/README.md
+new file mode 100644
+index 0000000..e6ab776
+--- /dev/null
++++ b/infra/burst/README.md
+<span class="h">@@ -0,0 +1,287 @@</span>
+<span class="a">+# Burst mode: more workers, on the cheapest cloud, when paid jobs wait</span>
+<span class="a">+</span>
+<span class="a">+Burst mode is **off**. Nothing here runs, and nothing here costs money, until</span>
+<span class="a">+the owner turns it on with the procedure below.</span>
+<span class="a">+</span>
+<span class="a">+## What it does</span>
+<span class="a">+</span>
+<span class="a">+Today the web server does each server job itself, one at a time. When many</span>
+<span class="a">+paid jobs wait (a 500-book pack, an unlimited plan), buyers wait for hours.</span>
+<span class="a">+</span>
+<span class="a">+In burst mode:</span>
+<span class="a">+</span>
+<span class="a">+- The web server keeps the data: Postgres and Redis on its own 127.0.0.1, and</span>
+<span class="a">+  its own worker, which takes paid jobs first and then free ones.</span>
+<span class="a">+- The files go to a Cloudflare R2 bucket. R2 charges no transfer fee, to any</span>
+<span class="a">+  cloud or to a customer who downloads a result.</span>
+<span class="a">+- Once a minute the burst controller (`python -m tools.burst`) reads the paid</span>
+<span class="a">+  queue. When paid jobs wait, it reads the live offers of each cloud that has</span>
+<span class="a">+  keys: the newest AWS spot prices, and the Hetzner prices of the server types</span>
+<span class="a">+  that are in stock. A new worker goes to the offer with the lowest cost per</span>
+<span class="a">+  book, inside the spend cap.</span>
+<span class="a">+- A worker reaches Postgres and Redis through an SSH tunnel to the web server.</span>
+<span class="a">+  The tunnel user can forward those two ports and do nothing else. A worker</span>
+<span class="a">+  takes no inbound connection.</span>
+<span class="a">+- A worker with no job for 10 minutes stops after its job, and Terraform</span>
+<span class="a">+  destroys its machine. A scale-in never kills a job. When a cloud takes a spot</span>
+<span class="a">+  machine back during a job, the job runs once more on another worker.</span>
+<span class="a">+- Free credits never start a machine: burst workers take paid jobs only.</span>
+<span class="a">+</span>
+<span class="a">+```</span>
+<span class="a">+                  web server (RackNerd, US west)</span>
+<span class="a">+          Postgres + Redis on 127.0.0.1, own worker, controller</span>
+<span class="a">+                 ^                                  |</span>
+<span class="a">+     SSH tunnel  |                                  | terraform apply</span>
+<span class="a">+     (2 ports)   |                                  v</span>
+<span class="a">+        burst workers on AWS spot (us-west-2) or Hetzner, 0..N</span>
+<span class="a">+                 |</span>
+<span class="a">+                 v</span>
+<span class="a">+        Cloudflare R2 bucket (inputs, results, app releases, backups)</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+## Money</span>
+<span class="a">+</span>
+<span class="a">+**Spend cap.** The controller keeps the cost of the burst machines of the last</span>
+<span class="a">+30 days under a cap:</span>
+<span class="a">+</span>
+<span class="a">+    cap = min($100, max($5, 30% of the net server revenue of the last 30 days))</span>
+<span class="a">+</span>
+<span class="a">+The net revenue counts each pack for 30 days after its purchase, and each</span>
+<span class="a">+active subscription, after the Stripe fee (2.9% + 30 cents, and 0.7% more for</span>
+<span class="a">+a subscription). Free credits count for nothing. The $5 floor lets the first</span>
+<span class="a">+buyer have a burst worker. The controller also keeps 2.5 hours of each running</span>
+<span class="a">+worker in reserve. At the cap it starts no new machine, and running jobs</span>
+<span class="a">+finish. Change the numbers with `SUBPLZ_BURST_CAP_SHARE`,</span>
+<span class="a">+`SUBPLZ_BURST_CAP_FLOOR_USD` and `SUBPLZ_BURST_CAP_CEILING_USD`.</span>
+<span class="a">+</span>
+<span class="a">+**Other limits.** `SUBPLZ_BURST_MAX_WORKERS` (default 1). The AWS spot price</span>
+<span class="a">+limit (`max_price`, $0.0625 an hour). The AWS spot limit of a new account (5</span>
+<span class="a">+vCPU: one worker). The Hetzner server limit. A machine powers itself off after</span>
+<span class="a">+90 idle minutes, if the controller is gone.</span>
+<span class="a">+</span>
+<span class="a">+**Prices** (financial advocate, 2026-09-22; the controller reads the live ones):</span>
+<span class="a">+</span>
+<span class="a">+| Offer | Per hour | Compute per 10-hour book | Note |</span>
+<span class="a">+|---|---|---|---|</span>
+<span class="a">+| AWS spot, 4-vCPU x86 (c6a, c7a, m6a) | about $0.06, + $0.007 IPv4 and disk | about $0.14 | billed per second |</span>
+<span class="a">+| AWS spot, 4-vCPU Graviton (c7g) | $0.041-0.056 | $0.10-0.14 | off until one test book: add to `SUBPLZ_BURST_AWS_TYPES` |</span>
+<span class="a">+| Hetzner EU cx33 | about $0.016 | about $0.05 | often sold out; billed per started hour |</span>
+<span class="a">+| Hetzner EU cpx32 | about $0.065 | $0.14-0.20 | 155 ms from the web server |</span>
+<span class="a">+| Hetzner US cpx31 | about $0.115 | $0.25-0.35 | |</span>
+<span class="a">+| R2 bucket | $0.015 per GB-month | | no transfer fee; 10 GB free |</span>
+<span class="a">+</span>
+<span class="a">+While burst mode is on and idle, only the R2 storage costs money. AWS charges</span>
+<span class="a">+$0.09/GB for the results that its workers send to R2, above 100 GB a month:</span>
+<span class="a">+when you pass that, set `SUBPLZ_BURST_AWS_EGRESS_USD_PER_BOOK` (about 0.09 x</span>
+<span class="a">+the GB of a result), so that the price comparison includes it.</span>
+<span class="a">+</span>
+<span class="a">+## Parts</span>
+<span class="a">+</span>
+<span class="a">+| Path | What |</span>
+<span class="a">+|---|---|</span>
+<span class="a">+| `state/` | The web server&#x27;s Postgres, Redis and tunnel user (`setup-web-server.sh`), the R2 bucket and its token. Apply once, on the web server. |</span>
+<span class="a">+| `workers/aws/` | One spot instance for each AWS worker. Only the controller applies it. `iam-policy.json` is the policy of the controller&#x27;s AWS key. |</span>
+<span class="a">+| `workers/hetzner/` | One server for each Hetzner worker. Only the controller applies it. |</span>
+<span class="a">+| `cloud-init.yaml.tftpl` | What a new machine does at first boot, on either cloud. |</span>
+<span class="a">+| `worker-constraints.txt` | The package versions of the web server, so that a worker computes the same result. |</span>
+<span class="a">+| `systemd/` | Units for the web server: the controller timer and the web server&#x27;s own worker. |</span>
+<span class="a">+| `../../tools/burst/` | The controller: `core.py` decides, `offers.py` reads the prices, `revenue.py` reads the revenue. |</span>
+<span class="a">+| `../../tools/copy_database.py` | Copies SQLite to Postgres (once, when burst mode goes on) and back. |</span>
+<span class="a">+</span>
+<span class="a">+## Accounts (owner steps, once)</span>
+<span class="a">+</span>
+<span class="a">+Only the owner does these steps. Claude never types a key.</span>
+<span class="a">+</span>
+<span class="a">+1. **Cloudflare**: an account with R2 turned on (done on 2026-09-22). At</span>
+<span class="a">+   activation, make an API token for Terraform (My Profile, API Tokens, Create</span>
+<span class="a">+   Custom Token) with two permissions: Account, Workers R2 Storage, Edit; and</span>
+<span class="a">+   User, API Tokens, Edit. Write down the account ID (R2 page, right side).</span>
+<span class="a">+2. **AWS**, for spot workers: an account on the Paid plan (the Free plan blocks</span>
+<span class="a">+   xlarge machines), with MFA on the root user. Make an IAM user</span>
+<span class="a">+   `subplz-burst` with the policy in `workers/aws/iam-policy.json`, and an</span>
+<span class="a">+   access key for it.</span>
+<span class="a">+3. **Hetzner**, for Hetzner workers: an account, a project `subplz-burst` with</span>
+<span class="a">+   nothing else in it, and an API token (Read &amp; Write) in that project. Check</span>
+<span class="a">+   the server limit of the project (Limits).</span>
+<span class="a">+</span>
+<span class="a">+The controller uses each cloud that has keys. One cloud is enough; two let it</span>
+<span class="a">+switch to the cheaper one.</span>
+<span class="a">+</span>
+<span class="a">+## Turn burst mode on</span>
+<span class="a">+</span>
+<span class="a">+Do these steps as root on the web server. The site is down from step 8 to</span>
+<span class="a">+step 12, about 10 minutes.</span>
+<span class="a">+</span>
+<span class="a">+1. Install Terraform:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg</span>
+<span class="a">+   echo &quot;deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com bookworm main&quot; &gt; /etc/apt/sources.list.d/hashicorp.list</span>
+<span class="a">+   apt-get update &amp;&amp; apt-get install -y terraform</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+2. Put the keys in `/etc/subplz-burst.env`. Each command asks for the value</span>
+<span class="a">+   with the input hidden. Leave out the lines of a cloud that you do not use:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   cd /opt/subplz-web</span>
+<span class="a">+   tools/set-secret.sh CLOUDFLARE_API_TOKEN /etc/subplz-burst.env</span>
+<span class="a">+   tools/set-secret.sh SUBPLZ_BURST_AWS_ACCESS_KEY_ID /etc/subplz-burst.env</span>
+<span class="a">+   tools/set-secret.sh SUBPLZ_BURST_AWS_SECRET_ACCESS_KEY /etc/subplz-burst.env</span>
+<span class="a">+   tools/set-secret.sh HCLOUD_TOKEN /etc/subplz-burst.env</span>
+<span class="a">+   echo &quot;SUBPLZ_BURST_MAX_WORKERS=1&quot; &gt;&gt; /etc/subplz-burst.env</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+3. Install the queue, storage and Postgres clients into the app, and make the</span>
+<span class="a">+   folder of the Terraform state (it holds passwords):</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   .venv/bin/pip install -c infra/burst/worker-constraints.txt redis rq boto3 &quot;psycopg[binary]&quot;</span>
+<span class="a">+   install -d -m 700 /var/lib/subplz-burst</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+4. Make the shared state. This installs Postgres, Redis and the tunnel user on</span>
+<span class="a">+   this machine, and makes the bucket and its token. Read the plan before you</span>
+<span class="a">+   type `yes`:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   set -a; . /etc/subplz-burst.env; set +a</span>
+<span class="a">+   S=/opt/subplz-web/infra/burst/state</span>
+<span class="a">+   terraform -chdir=$S init -backend-config=path=/var/lib/subplz-burst/state.tfstate</span>
+<span class="a">+   terraform -chdir=$S apply -var cloudflare_account_id=YOUR_ACCOUNT_ID</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+5. Write the storage keys and the backup settings:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   (umask 077</span>
+<span class="a">+    terraform -chdir=$S output -raw storage_env &gt; /etc/subplz-storage.env</span>
+<span class="a">+    terraform -chdir=$S output -raw rclone_env &gt; /etc/subplz-rclone.env</span>
+<span class="a">+    echo &quot;BUCKET=$(terraform -chdir=$S output -raw bucket)&quot; &gt; /etc/subplz-backup.env)</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+6. Make the backups:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   cp .env .env.bak-before-burst</span>
+<span class="a">+   cp data/subplz.db data/subplz.db.bak-before-burst</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+7. Read the new database address:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   DB=$(terraform -chdir=$S output -raw web_env | sed -n &#x27;s/^SUBPLZ_WEB_DATABASE_URL=//p&#x27;)</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+8. Stop the site:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   systemctl stop subplz-web</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+9. Copy the database to Postgres, and the files to the bucket:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   .venv/bin/python -m tools.copy_database sqlite:////opt/subplz-web/data/subplz.db &quot;$DB&quot;</span>
+<span class="a">+   env $(cat /etc/subplz-rclone.env) rclone copy --progress data/artifacts &quot;r2:$(terraform -chdir=$S output -raw bucket)/jobs&quot;</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+10. Tell the app to use the queue, Postgres and the bucket:</span>
+<span class="a">+</span>
+<span class="a">+    ```bash</span>
+<span class="a">+    terraform -chdir=$S output -raw web_env &gt;&gt; .env</span>
+<span class="a">+    install -d /etc/systemd/system/subplz-web.service.d</span>
+<span class="a">+    printf &#x27;[Service]\nEnvironmentFile=/etc/subplz-storage.env\n&#x27; &gt; /etc/systemd/system/subplz-web.service.d/storage.conf</span>
+<span class="a">+    cp infra/burst/systemd/subplz-worker.service infra/burst/systemd/subplz-burst.* /etc/systemd/system/</span>
+<span class="a">+    systemctl daemon-reload</span>
+<span class="a">+    ```</span>
+<span class="a">+</span>
+<span class="a">+11. Start the site, the web server&#x27;s own worker, and the nightly backup:</span>
+<span class="a">+</span>
+<span class="a">+    ```bash</span>
+<span class="a">+    systemctl start subplz-web</span>
+<span class="a">+    systemctl enable --now subplz-worker subplz-pgdump.timer</span>
+<span class="a">+    ```</span>
+<span class="a">+</span>
+<span class="a">+12. Do a test job on the site with &quot;Convert in this browser&quot; off. Make sure</span>
+<span class="a">+    that it succeeds and that its files download. If it fails, turn burst mode</span>
+<span class="a">+    off (below) before you look for the cause.</span>
+<span class="a">+</span>
+<span class="a">+13. Prepare the worker modules of each cloud that has keys:</span>
+<span class="a">+</span>
+<span class="a">+    ```bash</span>
+<span class="a">+    for c in aws hetzner; do</span>
+<span class="a">+      terraform -chdir=infra/burst/workers/$c init -backend-config=path=/var/lib/subplz-burst/workers-$c.tfstate</span>
+<span class="a">+    done</span>
+<span class="a">+    ```</span>
+<span class="a">+</span>
+<span class="a">+14. Start the controller. Do a dry run first: it logs its decision, the offers</span>
+<span class="a">+    and the spend cap, and changes nothing:</span>
+<span class="a">+</span>
+<span class="a">+    ```bash</span>
+<span class="a">+    set -a; . ./.env; . /etc/subplz-storage.env; . /etc/subplz-burst.env; set +a</span>
+<span class="a">+    .venv/bin/python -m tools.burst --dry-run</span>
+<span class="a">+    systemctl enable --now subplz-burst.timer</span>
+<span class="a">+    ```</span>
+<span class="a">+</span>
+<span class="a">+15. Watch it: `journalctl -u subplz-burst -f`. A new worker needs about 10</span>
+<span class="a">+    minutes to install before it takes a job.</span>
+<span class="a">+</span>
+<span class="a">+16. Measure one book on each cloud that the controller used. If a 10-hour book</span>
+<span class="a">+    takes much more or less than 2 hours on 4 vCPU, the price comparison is</span>
+<span class="a">+    off: tell Claude the times.</span>
+<span class="a">+</span>
+<span class="a">+## While burst mode is on</span>
+<span class="a">+</span>
+<span class="a">+- **Deploy**: after `git pull`, restart `subplz-web` and `subplz-worker`. The</span>
+<span class="a">+  controller sees the new commit. It stops the workers of the old commit after</span>
+<span class="a">+  their jobs and starts new ones. You do nothing else.</span>
+<span class="a">+- **Workers**: change `SUBPLZ_BURST_MAX_WORKERS` in `/etc/subplz-burst.env`.</span>
+<span class="a">+  The next run uses it. With `0`, each burst worker stops after its job and its</span>
+<span class="a">+  machine goes.</span>
+<span class="a">+- **AWS spot limit**: when paid jobs often wait for more than an hour, ask AWS</span>
+<span class="a">+  for more spot vCPU (Service Quotas, &quot;All Standard Spot Instance Requests&quot;),</span>
+<span class="a">+  then raise `SUBPLZ_BURST_AWS_VCPU_LIMIT` and `SUBPLZ_BURST_MAX_WORKERS`.</span>
+<span class="a">+- **Keys**: do not change the passwords, the tunnel key or the bucket token</span>
+<span class="a">+  while a worker runs. Set the workers to 0 first, and wait until</span>
+<span class="a">+  `terraform -chdir=infra/burst/workers/&lt;cloud&gt; state list` shows nothing.</span>
+<span class="a">+- **State**: `/var/lib/subplz-burst` is the only record of what Terraform made.</span>
+<span class="a">+  If it is lost, the machines still run and cost money: find them in the AWS</span>
+<span class="a">+  and Hetzner consoles (tag or label `subplz-burst-worker`) and delete them.</span>
+<span class="a">+- **Storage**: nothing deletes files. R2 costs $0.015 per GB-month; watch the</span>
+<span class="a">+  bucket size in the Cloudflare dashboard.</span>
+<span class="a">+</span>
+<span class="a">+## Turn burst mode off</span>
+<span class="a">+</span>
+<span class="a">+1. Set `SUBPLZ_BURST_MAX_WORKERS=0`. Wait until the `state list` of each worker</span>
+<span class="a">+   module shows nothing. Then:</span>
+<span class="a">+   `systemctl disable --now subplz-burst.timer subplz-worker subplz-pgdump.timer`.</span>
+<span class="a">+2. Stop the site. Copy Postgres to a new SQLite file, and the bucket to the</span>
+<span class="a">+   disk:</span>
+<span class="a">+</span>
+<span class="a">+   ```bash</span>
+<span class="a">+   systemctl stop subplz-web</span>
+<span class="a">+   .venv/bin/python -m tools.copy_database &quot;$DB&quot; sqlite:////opt/subplz-web/data/subplz-from-postgres.db</span>
+<span class="a">+   env $(cat /etc/subplz-rclone.env) rclone copy --progress &quot;r2:$(terraform -chdir=$S output -raw bucket)/jobs&quot; data/artifacts</span>
+<span class="a">+   mv data/subplz.db data/subplz.db.bak-burst &amp;&amp; mv data/subplz-from-postgres.db data/subplz.db</span>
+<span class="a">+   ```</span>
+<span class="a">+</span>
+<span class="a">+3. Remove the burst lines from `.env` (the six lines that step 10 added), and</span>
+<span class="a">+   remove `/etc/systemd/system/subplz-web.service.d/storage.conf`. Then</span>
+<span class="a">+   `systemctl daemon-reload &amp;&amp; systemctl start subplz-web`, and do a test job.</span>
+<span class="a">+4. Only after the test job succeeds: remove the bucket and its token with</span>
+<span class="a">+   `terraform -chdir=$S destroy`. It deletes the bucket with its files.</span>
+<span class="a">+   Postgres and Redis stay installed on the web server, unused.</span>
+<span class="a">+</span>
+<span class="a">+## Security</span>
+<span class="a">+</span>
+<span class="a">+- Postgres and Redis listen on 127.0.0.1 only. A worker reaches them through</span>
+<span class="a">+  an SSH tunnel as `subplz-tunnel`, a user with no shell whose key can forward</span>
+<span class="a">+  those two ports and nothing else. The worker checks the web server&#x27;s host key.</span>
+<span class="a">+- A worker accepts no inbound connection (AWS security group and Hetzner</span>
+<span class="a">+  firewall without inbound rules).</span>
+<span class="a">+- The bucket token can read and write that one bucket only. The AWS key can end</span>
+<span class="a">+  only instances tagged `subplz-burst-worker`.</span>
+<span class="a">+- The state files and `/etc/subplz-*.env` hold secrets: root only, mode 0600.</span>
+<span class="a">+  A machine&#x27;s user data holds the tunnel key and the database passwords; only</span>
+<span class="a">+  the cloud account and the machine itself can read it.</span>
+diff --git a/infra/burst/cloud-init.yaml.tftpl b/infra/burst/cloud-init.yaml.tftpl
+new file mode 100644
+index 0000000..9f84b13
+--- /dev/null
++++ b/infra/burst/cloud-init.yaml.tftpl
+<span class="h">@@ -0,0 +1,163 @@</span>
+<span class="a">+#cloud-config</span>
+<span class="a">+# One burst worker, on any cloud: the subplz-web app at commit ${ref}, running</span>
+<span class="a">+# worker.py on the paid queue. Postgres and Redis stay on the web server; the</span>
+<span class="a">+# worker reaches them through an SSH tunnel, on its own 127.0.0.1. The worker</span>
+<span class="a">+# modules (workers/aws, workers/hetzner) render this file.</span>
+<span class="a">+hostname: ${name}</span>
+<span class="a">+preserve_hostname: false</span>
+<span class="a">+package_update: true</span>
+<span class="a">+packages:</span>
+<span class="a">+  - autossh</span>
+<span class="a">+  - curl</span>
+<span class="a">+  - ffmpeg</span>
+<span class="a">+  - git</span>
+<span class="a">+  - python3-venv</span>
+<span class="a">+users:</span>
+<span class="a">+  - name: subplz</span>
+<span class="a">+    system: true</span>
+<span class="a">+    homedir: /opt/subplz-web</span>
+<span class="a">+    shell: /usr/sbin/nologin</span>
+<span class="a">+write_files:</span>
+<span class="a">+  - path: /etc/subplz-worker.env</span>
+<span class="a">+    owner: root:root</span>
+<span class="a">+    permissions: &quot;0600&quot;</span>
+<span class="a">+    content: |</span>
+<span class="a">+      SUBPLZ_WEB_QUEUE_BACKEND=redis</span>
+<span class="a">+      SUBPLZ_WEB_WORKER_QUEUES=paid</span>
+<span class="a">+      SUBPLZ_WEB_REDIS_URL=${redis_url}</span>
+<span class="a">+      SUBPLZ_WEB_DATABASE_URL=${database_url}</span>
+<span class="a">+      SUBPLZ_WEB_STORAGE_BACKEND=s3</span>
+<span class="a">+      SUBPLZ_WEB_S3_BUCKET=${bucket}</span>
+<span class="a">+      SUBPLZ_WEB_S3_PREFIX=${s3_prefix}</span>
+<span class="a">+      SUBPLZ_WEB_DEVICE=cpu</span>
+<span class="a">+      SUBPLZ_WEB_THREADS=${threads}</span>
+<span class="a">+      HOME=/opt/subplz-web</span>
+<span class="a">+      ${indent(6, storage_env)}</span>
+<span class="a">+  - path: /etc/subplz/tunnel_key</span>
+<span class="a">+    permissions: &quot;0600&quot;</span>
+<span class="a">+    content: |</span>
+<span class="a">+      ${indent(6, tunnel_private_key)}</span>
+<span class="a">+  - path: /etc/subplz/known_hosts</span>
+<span class="a">+    permissions: &quot;0644&quot;</span>
+<span class="a">+    content: |</span>
+<span class="a">+      ${known_hosts}</span>
+<span class="a">+  - path: /etc/systemd/system/subplz-tunnel.service</span>
+<span class="a">+    content: |</span>
+<span class="a">+      [Unit]</span>
+<span class="a">+      Description=SSH tunnel to Postgres and Redis on the web server</span>
+<span class="a">+      After=network-online.target</span>
+<span class="a">+      Wants=network-online.target</span>
+<span class="a">+</span>
+<span class="a">+      [Service]</span>
+<span class="a">+      User=subplz</span>
+<span class="a">+      Environment=AUTOSSH_GATETIME=0</span>
+<span class="a">+      ExecStart=/usr/bin/autossh -M 0 -N -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/subplz/known_hosts -o IdentitiesOnly=yes -i /etc/subplz/tunnel_key -p ${ssh_port} -L 127.0.0.1:5432:127.0.0.1:5432 -L 127.0.0.1:6379:127.0.0.1:6379 subplz-tunnel@${web_server_ip}</span>
+<span class="a">+      Restart=always</span>
+<span class="a">+      RestartSec=5</span>
+<span class="a">+</span>
+<span class="a">+      [Install]</span>
+<span class="a">+      WantedBy=multi-user.target</span>
+<span class="a">+  - path: /etc/systemd/system/subplz-worker.service</span>
+<span class="a">+    content: |</span>
+<span class="a">+      [Unit]</span>
+<span class="a">+      Description=subplz-web burst worker</span>
+<span class="a">+      After=subplz-tunnel.service</span>
+<span class="a">+      Requires=subplz-tunnel.service</span>
+<span class="a">+</span>
+<span class="a">+      [Service]</span>
+<span class="a">+      User=subplz</span>
+<span class="a">+      WorkingDirectory=/opt/subplz-web</span>
+<span class="a">+      EnvironmentFile=/etc/subplz-worker.env</span>
+<span class="a">+      Environment=PATH=/opt/subplz-web/.venv/bin:/usr/local/bin:/usr/bin:/bin</span>
+<span class="a">+      ExecStart=/opt/subplz-web/.venv/bin/python worker.py</span>
+<span class="a">+      # After the shutdown command of the burst controller, rq finishes its job</span>
+<span class="a">+      # and exits with 0. Then the worker must stay stopped.</span>
+<span class="a">+      Restart=on-failure</span>
+<span class="a">+      RestartSec=10</span>
+<span class="a">+</span>
+<span class="a">+      [Install]</span>
+<span class="a">+      WantedBy=multi-user.target</span>
+<span class="a">+  - path: /etc/systemd/system/subplz-idle-check.service</span>
+<span class="a">+    content: |</span>
+<span class="a">+      [Unit]</span>
+<span class="a">+      Description=Power off this burst machine when its worker is idle too long</span>
+<span class="a">+</span>
+<span class="a">+      [Service]</span>
+<span class="a">+      Type=oneshot</span>
+<span class="a">+      EnvironmentFile=/etc/subplz-worker.env</span>
+<span class="a">+      ExecStart=/bin/bash /opt/subplz-install/idle-check.sh</span>
+<span class="a">+  - path: /etc/systemd/system/subplz-idle-check.timer</span>
+<span class="a">+    content: |</span>
+<span class="a">+      [Unit]</span>
+<span class="a">+      Description=Check each 10 minutes whether the worker is idle</span>
+<span class="a">+</span>
+<span class="a">+      [Timer]</span>
+<span class="a">+      OnActiveSec=10min</span>
+<span class="a">+      OnUnitActiveSec=10min</span>
+<span class="a">+</span>
+<span class="a">+      [Install]</span>
+<span class="a">+      WantedBy=timers.target</span>
+<span class="a">+  - path: /opt/subplz-install/idle-check.sh</span>
+<span class="a">+    permissions: &quot;0700&quot;</span>
+<span class="a">+    content: |</span>
+<span class="a">+      #!/bin/bash</span>
+<span class="a">+      # A safety net for the burst controller: if the controller is gone, this</span>
+<span class="a">+      # machine still stops. After ${idle_checks} idle checks in a row (10 minutes</span>
+<span class="a">+      # each), or when Redis cannot be reached, power off. On AWS a power-off</span>
+<span class="a">+      # ends the machine and its bill; on Hetzner the controller then deletes it.</span>
+<span class="a">+      state_file=/var/lib/subplz-idle-count</span>
+<span class="a">+      state=$(/opt/subplz-web/.venv/bin/python - &lt;&lt;&#x27;PY&#x27; 2&gt;/dev/null || echo idle</span>
+<span class="a">+      import os, socket</span>
+<span class="a">+      from redis import Redis</span>
+<span class="a">+      from rq import Worker</span>
+<span class="a">+      conn = Redis.from_url(os.environ[&quot;SUBPLZ_WEB_REDIS_URL&quot;], socket_timeout=10)</span>
+<span class="a">+      host = socket.gethostname()</span>
+<span class="a">+      states = [w.get_state() for w in Worker.all(connection=conn) if w.hostname == host]</span>
+<span class="a">+      print(&quot;busy&quot; if &quot;busy&quot; in states else &quot;idle&quot;)</span>
+<span class="a">+      PY</span>
+<span class="a">+      )</span>
+<span class="a">+      if [ &quot;$state&quot; = &quot;busy&quot; ]; then</span>
+<span class="a">+        echo 0 &gt; &quot;$state_file&quot;</span>
+<span class="a">+        exit 0</span>
+<span class="a">+      fi</span>
+<span class="a">+      count=$(( $(cat &quot;$state_file&quot; 2&gt;/dev/null || echo 0) + 1 ))</span>
+<span class="a">+      echo &quot;$count&quot; &gt; &quot;$state_file&quot;</span>
+<span class="a">+      if [ &quot;$count&quot; -ge ${idle_checks} ]; then</span>
+<span class="a">+        systemctl poweroff</span>
+<span class="a">+      fi</span>
+<span class="a">+  - path: /opt/subplz-install/constraints.txt</span>
+<span class="a">+    content: |</span>
+<span class="a">+      ${indent(6, constraints)}</span>
+<span class="a">+  - path: /opt/subplz-install/install.sh</span>
+<span class="a">+    permissions: &quot;0700&quot;</span>
+<span class="a">+    content: |</span>
+<span class="a">+      #!/bin/bash</span>
+<span class="a">+      # Install the app from the bucket (the repository is private), then the</span>
+<span class="a">+      # speech stack at the versions of the web server, then start the tunnel,</span>
+<span class="a">+      # the worker and the idle check.</span>
+<span class="a">+      set -euo pipefail</span>
+<span class="a">+      set -a</span>
+<span class="a">+      . /etc/subplz-worker.env</span>
+<span class="a">+      set +a</span>
+<span class="a">+      chown subplz /etc/subplz/tunnel_key</span>
+<span class="a">+      cd /opt/subplz-install</span>
+<span class="a">+      curl --fail --silent --show-error --retry 5 \</span>
+<span class="a">+        --aws-sigv4 &quot;aws:amz:$AWS_DEFAULT_REGION:s3&quot; \</span>
+<span class="a">+        --user &quot;$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY&quot; \</span>
+<span class="a">+        -o app.tar.gz &quot;$AWS_ENDPOINT_URL_S3/$SUBPLZ_WEB_S3_BUCKET/releases/${ref}.tar.gz&quot;</span>
+<span class="a">+      mkdir -p /opt/subplz-web</span>
+<span class="a">+      tar -xzf app.tar.gz -C /opt/subplz-web</span>
+<span class="a">+      python3 -m venv /opt/subplz-web/.venv</span>
+<span class="a">+      pip=/opt/subplz-web/.venv/bin/pip</span>
+<span class="a">+      # CPU builds of torch and torchaudio both come from the PyTorch index. A</span>
+<span class="a">+      # torchaudio from PyPI is a CUDA build and fails at run time. Their</span>
+<span class="a">+      # dependencies come from PyPI in the next step, at the pinned versions.</span>
+<span class="a">+      $pip install --quiet --no-deps --index-url https://download.pytorch.org/whl/cpu \</span>
+<span class="a">+        -c constraints.txt torch torchaudio</span>
+<span class="a">+      $pip install --quiet -c constraints.txt torch torchaudio &quot;${subplz_spec}&quot; \</span>
+<span class="a">+        -r /opt/subplz-web/requirements.txt redis rq boto3 &quot;psycopg[binary]&quot;</span>
+<span class="a">+      chown -R subplz:subplz /opt/subplz-web</span>
+<span class="a">+      systemctl daemon-reload</span>
+<span class="a">+      systemctl enable --now subplz-tunnel.service subplz-worker.service subplz-idle-check.timer</span>
+<span class="a">+runcmd:</span>
+<span class="a">+  - [bash, /opt/subplz-install/install.sh]</span>
+diff --git a/infra/burst/state/.terraform.lock.hcl b/infra/burst/state/.terraform.lock.hcl
+new file mode 100644
+index 0000000..13a5790
+--- /dev/null
++++ b/infra/burst/state/.terraform.lock.hcl
+<span class="h">@@ -0,0 +1,61 @@</span>
+<span class="a">+# This file is maintained automatically by &quot;terraform init&quot;.</span>
+<span class="a">+# Manual edits may be lost in future updates.</span>
+<span class="a">+</span>
+<span class="a">+provider &quot;registry.terraform.io/cloudflare/cloudflare&quot; {</span>
+<span class="a">+  version     = &quot;5.25.0&quot;</span>
+<span class="a">+  constraints = &quot;~&gt; 5.25&quot;</span>
+<span class="a">+  hashes = [</span>
+<span class="a">+    &quot;h1:JkPKsRlBVN9yY/kN92pjEBmnaI+puaB63gPM3igAZw4=&quot;,</span>
+<span class="a">+    &quot;zh:403d477c0e4c05a9f9886ef7e750dcc3488be7cd2210207e98b4a731bc499159&quot;,</span>
+<span class="a">+    &quot;zh:4a2a4659c3273ddb1437a34865eac21823a117557b050786ba510ac5f34047cf&quot;,</span>
+<span class="a">+    &quot;zh:6e4a2f6ed105b5353c7b56962d00f923873dd68af6509b9b9f595057edba1915&quot;,</span>
+<span class="a">+    &quot;zh:aadd2051c1eb01e7b518d4808de7f5192b2ecbc841d70924785ee3385a889b9e&quot;,</span>
+<span class="a">+    &quot;zh:ab0322bcb0d4e465f8603b39f7e743c836b22ae775c03ed677ad999a6a1b8bf4&quot;,</span>
+<span class="a">+    &quot;zh:c47e38911c92e0b2ffe7be1d36d96b79dd2af79bc61745d6afe5a730cae9f287&quot;,</span>
+<span class="a">+    &quot;zh:df3f13ae57104ce2f7619cc6c050ab90a5a3299470cdbd2ab8dd3809b84edcb8&quot;,</span>
+<span class="a">+    &quot;zh:f809ab383cca0a5f83072981c64208cbd7fa67e986a86ee02dd2c82333221e32&quot;,</span>
+<span class="a">+    &quot;zh:fb7de9d22b02367036c146bd683c8968ec4bbb56aca3185fa84146d118a2bf96&quot;,</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+provider &quot;registry.terraform.io/hashicorp/random&quot; {</span>
+<span class="a">+  version     = &quot;3.9.1&quot;</span>
+<span class="a">+  constraints = &quot;~&gt; 3.6&quot;</span>
+<span class="a">+  hashes = [</span>
+<span class="a">+    &quot;h1:7uiStw0Rl9KOdX5UNMG/sp9nyadoD4LZekQTiYlYPhE=&quot;,</span>
+<span class="a">+    &quot;zh:05f4734c1f0be840b711b3eff259ebc5fca436784c728955b1678078466f48d7&quot;,</span>
+<span class="a">+    &quot;zh:0b91bf19371d012434eba1deeb6aab77158def9b39601dcbd94450b3974a2a26&quot;,</span>
+<span class="a">+    &quot;zh:0ee6eacd47ec00183d55d726a4b6c4ce951a199f944bf22f1aa58392ebdfa7a2&quot;,</span>
+<span class="a">+    &quot;zh:19388a4074b76a89a43a6c8328d7ae8ee2e7de3d346af51e80d3e6d3d12925f1&quot;,</span>
+<span class="a">+    &quot;zh:23e74d48c5e2ac2e823fd527f49fee9db37d32a1990c9e3bf126ead697b843eb&quot;,</span>
+<span class="a">+    &quot;zh:3cabf7fbd096c520064aae3aba61aba670af83ab91291a71fa1b1332929c2b7f&quot;,</span>
+<span class="a">+    &quot;zh:5c0a3b8af0be60be4eca12ddee385cfa8babc1ec8e98cdf9de2f2274c73eabfa&quot;,</span>
+<span class="a">+    &quot;zh:60b4f8a8ef18f52bf8e19215229dae408bee732825964092db7c989fd2de4097&quot;,</span>
+<span class="a">+    &quot;zh:7359015acfedcbd6366f2329c854cf8d3c8ca5cd0faa89d2d37db358d6eba6c5&quot;,</span>
+<span class="a">+    &quot;zh:78d5eefdd9e494defcb3c68d282b8f96630502cac21d1ea161f53cfe9bb483b3&quot;,</span>
+<span class="a">+    &quot;zh:7b38758402f0e13a1071162da28994023cd2ac676e54af350c9ffd8dfa73fa7b&quot;,</span>
+<span class="a">+    &quot;zh:7c7fbb8895eb75bb4de1f933e98553bd99c8d048c89a925ddba490aa5a67f7dc&quot;,</span>
+<span class="a">+    &quot;zh:8c2b8c6a7ccdec16b73e2fb9f3700ea097f58c592571e4c5de60c93d2301732c&quot;,</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+provider &quot;registry.terraform.io/hashicorp/tls&quot; {</span>
+<span class="a">+  version     = &quot;4.4.1&quot;</span>
+<span class="a">+  constraints = &quot;~&gt; 4.0&quot;</span>
+<span class="a">+  hashes = [</span>
+<span class="a">+    &quot;h1:BHiQRPHBNJKfcr+kzFko7BZ2wWqsDx4U8A0MPDQRbPk=&quot;,</span>
+<span class="a">+    &quot;zh:0855f9a980426a0af2c4415fb23cccbbb88c2d1dd40d83da6f45622c075b398b&quot;,</span>
+<span class="a">+    &quot;zh:189227fdae28e547b1d988f5d83c4280fce02e3152d8b62aa810047e2f9f7e59&quot;,</span>
+<span class="a">+    &quot;zh:2557db4f493aa90b3683905d9eeb103e55a3facc4ccda763d6de6025116ae121&quot;,</span>
+<span class="a">+    &quot;zh:2cfd8d6a543ac61c6e7c0461839ab89bb8da1ba6c8090ab946b1cf47f100d7fa&quot;,</span>
+<span class="a">+    &quot;zh:5c04cf2a683ea60a0072c59bbcf415f232c382c891b3aaeb9bbbb28213e0d878&quot;,</span>
+<span class="a">+    &quot;zh:6681e35d50328bc11a49bb61c002121353f6a844cc6d63a0c3db57745ec38a56&quot;,</span>
+<span class="a">+    &quot;zh:693b810e438bb1dfbc13a42629597284ac1eb08eb30f46f18738d7a9bb768d34&quot;,</span>
+<span class="a">+    &quot;zh:77c4425f75346b23817837f3947b6ab7e765308abbf573fec5d2cafd4b82f142&quot;,</span>
+<span class="a">+    &quot;zh:b3fd64ec1cecea98c88d2332dbeac40498ce2506e3235bdbd1afdfbaa47bb758&quot;,</span>
+<span class="a">+    &quot;zh:c06224b5797b129a84e2514be43f2b140622928fe9c92b55d7941be3296ea289&quot;,</span>
+<span class="a">+    &quot;zh:debc830ec123f27944c6170d76cb4ea3542845896960bb9fc530702774df328e&quot;,</span>
+<span class="a">+    &quot;zh:f300fcc909014550fd74b2b751665dcc049f874e7a475903f65671baf2c2d86d&quot;,</span>
+<span class="a">+    &quot;zh:f569b65999264a9416862bca5cd2a6177d94ccb0424f3a4ef424428912b9cb3c&quot;,</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/state/main.tf b/infra/burst/state/main.tf
+new file mode 100644
+index 0000000..b317b5d
+--- /dev/null
++++ b/infra/burst/state/main.tf
+<span class="h">@@ -0,0 +1,124 @@</span>
+<span class="a">+# The shared state of burst mode: Postgres and Redis on the web server, the</span>
+<span class="a">+# file bucket (Cloudflare R2), and the key of the SSH tunnel that each burst</span>
+<span class="a">+# worker uses to reach Postgres and Redis. Workers can come from any cloud;</span>
+<span class="a">+# this module does not depend on one.</span>
+<span class="a">+#</span>
+<span class="a">+# Run it ON THE WEB SERVER, as root: the setup step changes this machine</span>
+<span class="a">+# (see setup-web-server.sh). See ../README.md for when and how.</span>
+<span class="a">+</span>
+<span class="a">+terraform {</span>
+<span class="a">+  required_version = &quot;&gt;= 1.9&quot;</span>
+<span class="a">+  required_providers {</span>
+<span class="a">+    cloudflare = {</span>
+<span class="a">+      source  = &quot;cloudflare/cloudflare&quot;</span>
+<span class="a">+      version = &quot;~&gt; 5.25&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+    random = {</span>
+<span class="a">+      source  = &quot;hashicorp/random&quot;</span>
+<span class="a">+      version = &quot;~&gt; 3.6&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+    tls = {</span>
+<span class="a">+      source  = &quot;hashicorp/tls&quot;</span>
+<span class="a">+      version = &quot;~&gt; 4.0&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  # The state holds passwords and keys: /var/lib/subplz-burst, root only.</span>
+<span class="a">+  backend &quot;local&quot; {}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# Reads CLOUDFLARE_API_TOKEN.</span>
+<span class="a">+provider &quot;cloudflare&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+resource &quot;random_password&quot; &quot;postgres&quot; {</span>
+<span class="a">+  length  = 32</span>
+<span class="a">+  special = false</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+resource &quot;random_password&quot; &quot;redis&quot; {</span>
+<span class="a">+  length  = 32</span>
+<span class="a">+  special = false</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# One key for every worker: it can open the two tunnels and nothing else.</span>
+<span class="a">+resource &quot;tls_private_key&quot; &quot;tunnel&quot; {</span>
+<span class="a">+  algorithm = &quot;ED25519&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+resource &quot;cloudflare_r2_bucket&quot; &quot;files&quot; {</span>
+<span class="a">+  account_id = var.cloudflare_account_id</span>
+<span class="a">+  name       = var.bucket_name</span>
+<span class="a">+  location   = var.bucket_location</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# The permission groups &quot;read objects&quot; and &quot;write objects&quot; of R2, found by name</span>
+<span class="a">+# unless var.r2_permission_group_ids gives them.</span>
+<span class="a">+data &quot;cloudflare_api_token_permission_groups_list&quot; &quot;r2_read&quot; {</span>
+<span class="a">+  count = var.r2_permission_group_ids == null ? 1 : 0</span>
+<span class="a">+  name  = &quot;Workers%20R2%20Storage%20Bucket%20Item%20Read&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+data &quot;cloudflare_api_token_permission_groups_list&quot; &quot;r2_write&quot; {</span>
+<span class="a">+  count = var.r2_permission_group_ids == null ? 1 : 0</span>
+<span class="a">+  name  = &quot;Workers%20R2%20Storage%20Bucket%20Item%20Write&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# The app and the workers get a key for this bucket only. R2 takes the token</span>
+<span class="a">+# id as the S3 key id, and the SHA-256 of the token value as the S3 secret.</span>
+<span class="a">+resource &quot;cloudflare_api_token&quot; &quot;files&quot; {</span>
+<span class="a">+  name = &quot;${var.bucket_name}-app&quot;</span>
+<span class="a">+  policies = [{</span>
+<span class="a">+    effect            = &quot;allow&quot;</span>
+<span class="a">+    permission_groups = [for id in local.r2_permission_groups : { id = id }]</span>
+<span class="a">+    resources = jsonencode({</span>
+<span class="a">+      &quot;com.cloudflare.edge.r2.bucket.${var.cloudflare_account_id}_default_${cloudflare_r2_bucket.files.name}&quot; = &quot;*&quot;</span>
+<span class="a">+    })</span>
+<span class="a">+  }]</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# Postgres and Redis on 127.0.0.1, and the tunnel user. The script is</span>
+<span class="a">+# idempotent: a second run changes nothing.</span>
+<span class="a">+resource &quot;terraform_data&quot; &quot;web_server&quot; {</span>
+<span class="a">+  triggers_replace = [</span>
+<span class="a">+    filesha256(&quot;${path.module}/setup-web-server.sh&quot;),</span>
+<span class="a">+    sha256(random_password.postgres.result),</span>
+<span class="a">+    sha256(random_password.redis.result),</span>
+<span class="a">+    tls_private_key.tunnel.public_key_openssh,</span>
+<span class="a">+  ]</span>
+<span class="a">+</span>
+<span class="a">+  provisioner &quot;local-exec&quot; {</span>
+<span class="a">+    command = &quot;bash ${path.module}/setup-web-server.sh&quot;</span>
+<span class="a">+    environment = {</span>
+<span class="a">+      POSTGRES_PASSWORD = random_password.postgres.result</span>
+<span class="a">+      REDIS_PASSWORD    = random_password.redis.result</span>
+<span class="a">+      TUNNEL_PUBLIC_KEY = tls_private_key.tunnel.public_key_openssh</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+locals {</span>
+<span class="a">+  r2_permission_groups = var.r2_permission_group_ids != null ? var.r2_permission_group_ids : concat(</span>
+<span class="a">+    [for d in data.cloudflare_api_token_permission_groups_list.r2_read : d.result[0].id],</span>
+<span class="a">+    [for d in data.cloudflare_api_token_permission_groups_list.r2_write : d.result[0].id],</span>
+<span class="a">+  )</span>
+<span class="a">+  s3_endpoint = &quot;https://${var.cloudflare_account_id}.r2.cloudflarestorage.com&quot;</span>
+<span class="a">+  s3_key_id   = cloudflare_api_token.files.id</span>
+<span class="a">+  s3_secret   = sha256(cloudflare_api_token.files.value)</span>
+<span class="a">+  # Through the tunnel, a worker sees Postgres and Redis on its own 127.0.0.1,</span>
+<span class="a">+  # as the web server does.</span>
+<span class="a">+  database_url = &quot;postgresql+psycopg://subplz:${random_password.postgres.result}@127.0.0.1:5432/subplz&quot;</span>
+<span class="a">+  redis_url    = &quot;redis://:${random_password.redis.result}@127.0.0.1:6379/0&quot;</span>
+<span class="a">+  known_hosts = (</span>
+<span class="a">+    var.ssh_port == 22</span>
+<span class="a">+    ? &quot;${var.web_server_ip} ${trimspace(file(var.host_key_file))}&quot;</span>
+<span class="a">+    : &quot;[${var.web_server_ip}]:${var.ssh_port} ${trimspace(file(var.host_key_file))}&quot;</span>
+<span class="a">+  )</span>
+<span class="a">+  # boto3 1.36 and later send checksums that some S3 services refuse.</span>
+<span class="a">+  storage_env = &lt;&lt;-EOT</span>
+<span class="a">+    AWS_ACCESS_KEY_ID=${local.s3_key_id}</span>
+<span class="a">+    AWS_SECRET_ACCESS_KEY=${local.s3_secret}</span>
+<span class="a">+    AWS_ENDPOINT_URL_S3=${local.s3_endpoint}</span>
+<span class="a">+    AWS_DEFAULT_REGION=auto</span>
+<span class="a">+    AWS_REQUEST_CHECKSUM_CALCULATION=when_required</span>
+<span class="a">+    AWS_RESPONSE_CHECKSUM_VALIDATION=when_required</span>
+<span class="a">+  EOT</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/state/outputs.tf b/infra/burst/state/outputs.tf
+new file mode 100644
+index 0000000..02c10b2
+--- /dev/null
++++ b/infra/burst/state/outputs.tf
+<span class="h">@@ -0,0 +1,54 @@</span>
+<span class="a">+# What the worker modules read (through terraform_remote_state).</span>
+<span class="a">+output &quot;worker&quot; {</span>
+<span class="a">+  description = &quot;Settings of a burst worker, on any cloud.&quot;</span>
+<span class="a">+  sensitive   = true</span>
+<span class="a">+  value = {</span>
+<span class="a">+    web_server_ip      = var.web_server_ip</span>
+<span class="a">+    ssh_port           = var.ssh_port</span>
+<span class="a">+    known_hosts        = local.known_hosts</span>
+<span class="a">+    tunnel_private_key = tls_private_key.tunnel.private_key_openssh</span>
+<span class="a">+    database_url       = local.database_url</span>
+<span class="a">+    redis_url          = local.redis_url</span>
+<span class="a">+    bucket             = cloudflare_r2_bucket.files.name</span>
+<span class="a">+    s3_prefix          = &quot;jobs/&quot;</span>
+<span class="a">+    storage_env        = local.storage_env</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# The lines to add to /opt/subplz-web/.env on the web server when burst mode goes on.</span>
+<span class="a">+output &quot;web_env&quot; {</span>
+<span class="a">+  description = &quot;Settings of the app on the web server (append to /opt/subplz-web/.env).&quot;</span>
+<span class="a">+  sensitive   = true</span>
+<span class="a">+  value       = &lt;&lt;-EOT</span>
+<span class="a">+    SUBPLZ_WEB_QUEUE_BACKEND=redis</span>
+<span class="a">+    SUBPLZ_WEB_REDIS_URL=${local.redis_url}</span>
+<span class="a">+    SUBPLZ_WEB_DATABASE_URL=${local.database_url}</span>
+<span class="a">+    SUBPLZ_WEB_STORAGE_BACKEND=s3</span>
+<span class="a">+    SUBPLZ_WEB_S3_BUCKET=${cloudflare_r2_bucket.files.name}</span>
+<span class="a">+    SUBPLZ_WEB_S3_PREFIX=jobs/</span>
+<span class="a">+  EOT</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# boto3 reads these from the process environment, not from .env: they go to</span>
+<span class="a">+# /etc/subplz-storage.env, which the systemd units load.</span>
+<span class="a">+output &quot;storage_env&quot; {</span>
+<span class="a">+  description = &quot;Storage keys for the web server (write to /etc/subplz-storage.env, mode 0600).&quot;</span>
+<span class="a">+  sensitive   = true</span>
+<span class="a">+  value       = local.storage_env</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+output &quot;rclone_env&quot; {</span>
+<span class="a">+  description = &quot;Environment for rclone: the one-time copy of the files, and the nightly Postgres backup.&quot;</span>
+<span class="a">+  sensitive   = true</span>
+<span class="a">+  value       = &lt;&lt;-EOT</span>
+<span class="a">+    RCLONE_CONFIG_R2_TYPE=s3</span>
+<span class="a">+    RCLONE_CONFIG_R2_PROVIDER=Cloudflare</span>
+<span class="a">+    RCLONE_CONFIG_R2_ENDPOINT=${local.s3_endpoint}</span>
+<span class="a">+    RCLONE_CONFIG_R2_ACCESS_KEY_ID=${local.s3_key_id}</span>
+<span class="a">+    RCLONE_CONFIG_R2_SECRET_ACCESS_KEY=${local.s3_secret}</span>
+<span class="a">+  EOT</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+output &quot;bucket&quot; {</span>
+<span class="a">+  value = cloudflare_r2_bucket.files.name</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/state/setup-web-server.sh b/infra/burst/state/setup-web-server.sh
+new file mode 100644
+index 0000000..447c640
+--- /dev/null
++++ b/infra/burst/state/setup-web-server.sh
+<span class="h">@@ -0,0 +1,76 @@</span>
+<span class="a">+#!/bin/bash</span>
+<span class="a">+# Set up the shared state of burst mode on the web server (Debian 12):</span>
+<span class="a">+#</span>
+<span class="a">+#   - Postgres on 127.0.0.1: role and database &quot;subplz&quot;.</span>
+<span class="a">+#   - Redis on 127.0.0.1, with a password, and a journal on disk.</span>
+<span class="a">+#   - The user &quot;subplz-tunnel&quot;: burst workers log in as this user only to</span>
+<span class="a">+#     forward two ports (Postgres and Redis). No shell, no other port.</span>
+<span class="a">+#   - A nightly Postgres backup to the bucket (enabled by the runbook).</span>
+<span class="a">+#</span>
+<span class="a">+# Terraform (main.tf) runs this script on the web server itself. It is</span>
+<span class="a">+# idempotent: a second run changes nothing. Input: POSTGRES_PASSWORD,</span>
+<span class="a">+# REDIS_PASSWORD, TUNNEL_PUBLIC_KEY in the environment.</span>
+<span class="a">+set -euo pipefail</span>
+<span class="a">+: &quot;${POSTGRES_PASSWORD:?}&quot; &quot;${REDIS_PASSWORD:?}&quot; &quot;${TUNNEL_PUBLIC_KEY:?}&quot;</span>
+<span class="a">+</span>
+<span class="a">+export DEBIAN_FRONTEND=noninteractive</span>
+<span class="a">+apt-get update -q</span>
+<span class="a">+apt-get install -y -q postgresql redis-server rclone</span>
+<span class="a">+</span>
+<span class="a">+# --- Postgres: the Debian package listens on localhost only. -----------------</span>
+<span class="a">+runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 -v pw=&quot;$POSTGRES_PASSWORD&quot; &lt;&lt;&#x27;SQL&#x27;</span>
+<span class="a">+SELECT &#x27;CREATE ROLE subplz LOGIN&#x27; WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = &#x27;subplz&#x27;)\gexec</span>
+<span class="a">+ALTER ROLE subplz PASSWORD :&#x27;pw&#x27;;</span>
+<span class="a">+SELECT &#x27;CREATE DATABASE subplz OWNER subplz&#x27; WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = &#x27;subplz&#x27;)\gexec</span>
+<span class="a">+SQL</span>
+<span class="a">+</span>
+<span class="a">+# --- Redis: localhost only, a password, and a journal (the queue survives a restart).</span>
+<span class="a">+conf=/etc/redis/redis.conf</span>
+<span class="a">+set_conf() {</span>
+<span class="a">+  if grep -q &quot;^$1 &quot; &quot;$conf&quot;; then</span>
+<span class="a">+    sed -i &quot;s|^$1 .*|$1 $2|&quot; &quot;$conf&quot;</span>
+<span class="a">+  else</span>
+<span class="a">+    echo &quot;$1 $2&quot; &gt;&gt; &quot;$conf&quot;</span>
+<span class="a">+  fi</span>
+<span class="a">+}</span>
+<span class="a">+set_conf bind &quot;127.0.0.1 -::1&quot;</span>
+<span class="a">+set_conf requirepass &quot;$REDIS_PASSWORD&quot;</span>
+<span class="a">+set_conf appendonly yes</span>
+<span class="a">+systemctl restart redis-server</span>
+<span class="a">+</span>
+<span class="a">+# --- The tunnel user. ---------------------------------------------------------</span>
+<span class="a">+if ! id subplz-tunnel &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+  useradd --system --create-home --shell /usr/sbin/nologin subplz-tunnel</span>
+<span class="a">+fi</span>
+<span class="a">+home=$(getent passwd subplz-tunnel | cut -d: -f6)</span>
+<span class="a">+install -d -m 700 -o subplz-tunnel -g subplz-tunnel &quot;$home/.ssh&quot;</span>
+<span class="a">+printf &#x27;restrict,port-forwarding,permitopen=&quot;127.0.0.1:5432&quot;,permitopen=&quot;127.0.0.1:6379&quot; %s\n&#x27; \</span>
+<span class="a">+  &quot;$TUNNEL_PUBLIC_KEY&quot; &gt; &quot;$home/.ssh/authorized_keys&quot;</span>
+<span class="a">+chown subplz-tunnel:subplz-tunnel &quot;$home/.ssh/authorized_keys&quot;</span>
+<span class="a">+chmod 600 &quot;$home/.ssh/authorized_keys&quot;</span>
+<span class="a">+</span>
+<span class="a">+# --- Nightly backup of Postgres to the bucket. The runbook writes</span>
+<span class="a">+# /etc/subplz-rclone.env and /etc/subplz-backup.env, then enables the timer.</span>
+<span class="a">+cat &gt; /etc/systemd/system/subplz-pgdump.service &lt;&lt;&#x27;UNIT&#x27;</span>
+<span class="a">+[Unit]</span>
+<span class="a">+Description=Back up the subplz Postgres database to the bucket</span>
+<span class="a">+</span>
+<span class="a">+[Service]</span>
+<span class="a">+Type=oneshot</span>
+<span class="a">+EnvironmentFile=/etc/subplz-rclone.env</span>
+<span class="a">+EnvironmentFile=/etc/subplz-backup.env</span>
+<span class="a">+ExecStart=/bin/bash -c &#x27;set -o pipefail; runuser -u postgres -- pg_dump -Fc subplz | rclone rcat &quot;r2:$BUCKET/backups/subplz-$(date -u +%%Y%%m%%d).dump&quot;&#x27;</span>
+<span class="a">+UNIT</span>
+<span class="a">+cat &gt; /etc/systemd/system/subplz-pgdump.timer &lt;&lt;&#x27;UNIT&#x27;</span>
+<span class="a">+[Unit]</span>
+<span class="a">+Description=Back up the subplz Postgres database each night</span>
+<span class="a">+</span>
+<span class="a">+[Timer]</span>
+<span class="a">+OnCalendar=*-*-* 04:30:00</span>
+<span class="a">+Persistent=true</span>
+<span class="a">+</span>
+<span class="a">+[Install]</span>
+<span class="a">+WantedBy=timers.target</span>
+<span class="a">+UNIT</span>
+<span class="a">+systemctl daemon-reload</span>
+<span class="a">+echo &quot;web server ready: Postgres, Redis, tunnel user&quot;</span>
+diff --git a/infra/burst/state/tests/host_key.pub b/infra/burst/state/tests/host_key.pub
+new file mode 100644
+index 0000000..e1482e4
+--- /dev/null
++++ b/infra/burst/state/tests/host_key.pub
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKeyForTestsOnly0000000000000000000 root@web</span>
+diff --git a/infra/burst/state/tests/state.tftest.hcl b/infra/burst/state/tests/state.tftest.hcl
+new file mode 100644
+index 0000000..263352a
+--- /dev/null
++++ b/infra/burst/state/tests/state.tftest.hcl
+<span class="h">@@ -0,0 +1,109 @@</span>
+<span class="a">+# terraform test with mock providers: no account, no cost. Only plans run:</span>
+<span class="a">+# an apply would run setup-web-server.sh on this machine.</span>
+<span class="a">+</span>
+<span class="a">+mock_provider &quot;cloudflare&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+mock_provider &quot;random&quot; {}</span>
+<span class="a">+mock_provider &quot;tls&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+# Values that exist only after apply, known during plan for the tests.</span>
+<span class="a">+override_resource {</span>
+<span class="a">+  target          = random_password.postgres</span>
+<span class="a">+  override_during = plan</span>
+<span class="a">+  values          = { result = &quot;pgpw&quot; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+override_resource {</span>
+<span class="a">+  target          = random_password.redis</span>
+<span class="a">+  override_during = plan</span>
+<span class="a">+  values          = { result = &quot;redispw&quot; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+override_resource {</span>
+<span class="a">+  target          = cloudflare_api_token.files</span>
+<span class="a">+  override_during = plan</span>
+<span class="a">+  values          = { id = &quot;token-id&quot;, value = &quot;token-value&quot; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variables {</span>
+<span class="a">+  cloudflare_account_id = &quot;0123456789abcdef0123456789abcdef&quot;</span>
+<span class="a">+  host_key_file         = &quot;tests/host_key.pub&quot;</span>
+<span class="a">+  # The test framework cannot mock the nested result of the permission lookup.</span>
+<span class="a">+  r2_permission_group_ids = [&quot;read-group&quot;, &quot;write-group&quot;]</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;the_token_can_touch_the_bucket_and_nothing_else&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = jsondecode(cloudflare_api_token.files.policies[0].resources) == {</span>
+<span class="a">+      &quot;com.cloudflare.edge.r2.bucket.0123456789abcdef0123456789abcdef_default_subplz-files&quot; = &quot;*&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+    error_message = &quot;The app token must be scoped to the one bucket.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = [for g in cloudflare_api_token.files.policies[0].permission_groups : g.id] == [&quot;read-group&quot;, &quot;write-group&quot;]</span>
+<span class="a">+    error_message = &quot;The app token must read and write objects, with no other permission.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = cloudflare_r2_bucket.files.location == &quot;wnam&quot;</span>
+<span class="a">+    error_message = &quot;The bucket must be near the web server (western North America).&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;workers_accept_only_the_web_server_host_key&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = startswith(local.known_hosts, &quot;198.44.53.27 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeHostKey&quot;)</span>
+<span class="a">+    error_message = &quot;known_hosts must pin the web server&#x27;s host key.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;a_port_other_than_22_is_written_the_ssh_way&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  variables {</span>
+<span class="a">+    ssh_port = 2222</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = startswith(local.known_hosts, &quot;[198.44.53.27]:2222 ssh-ed25519 &quot;)</span>
+<span class="a">+    error_message = &quot;known_hosts needs [host]:port for a port other than 22.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;the_databases_are_reached_on_127_0_0_1&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = startswith(local.database_url, &quot;postgresql+psycopg://subplz:&quot;) &amp;&amp; endswith(local.database_url, &quot;@127.0.0.1:5432/subplz&quot;)</span>
+<span class="a">+    error_message = &quot;Postgres must be reached through the tunnel on 127.0.0.1.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = startswith(local.redis_url, &quot;redis://:&quot;) &amp;&amp; endswith(local.redis_url, &quot;@127.0.0.1:6379/0&quot;)</span>
+<span class="a">+    error_message = &quot;Redis must be reached through the tunnel on 127.0.0.1.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = local.database_url == &quot;postgresql+psycopg://subplz:pgpw@127.0.0.1:5432/subplz&quot; &amp;&amp; local.redis_url == &quot;redis://:redispw@127.0.0.1:6379/0&quot;</span>
+<span class="a">+    error_message = &quot;The URLs must carry the generated passwords.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = strcontains(local.storage_env, &quot;AWS_ACCESS_KEY_ID=token-id\n&quot;) &amp;&amp; strcontains(local.storage_env, &quot;AWS_SECRET_ACCESS_KEY=${sha256(&quot;token-value&quot;)}\n&quot;)</span>
+<span class="a">+    error_message = &quot;R2 takes the token id as the key id, and the SHA-256 of the token value as the secret.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = strcontains(local.storage_env, &quot;AWS_ENDPOINT_URL_S3=https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com\n&quot;)</span>
+<span class="a">+    error_message = &quot;The storage endpoint must be the account&#x27;s R2 endpoint.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;a_bad_account_id_is_refused&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  variables {</span>
+<span class="a">+    cloudflare_account_id = &quot;not-an-id&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  expect_failures = [var.cloudflare_account_id]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/state/variables.tf b/infra/burst/state/variables.tf
+new file mode 100644
+index 0000000..6d52825
+--- /dev/null
++++ b/infra/burst/state/variables.tf
+<span class="h">@@ -0,0 +1,48 @@</span>
+<span class="a">+variable &quot;cloudflare_account_id&quot; {</span>
+<span class="a">+  description = &quot;The Cloudflare account that holds the bucket (R2, right-hand column).&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+</span>
+<span class="a">+  validation {</span>
+<span class="a">+    condition     = can(regex(&quot;^[0-9a-f]{32}$&quot;, var.cloudflare_account_id))</span>
+<span class="a">+    error_message = &quot;cloudflare_account_id must be the 32-character account ID.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;r2_permission_group_ids&quot; {</span>
+<span class="a">+  description = &quot;Ids of the R2 permission groups that read and write objects. Null: look them up by name.&quot;</span>
+<span class="a">+  type        = list(string)</span>
+<span class="a">+  default     = null</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;bucket_name&quot; {</span>
+<span class="a">+  type    = string</span>
+<span class="a">+  default = &quot;subplz-files&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;bucket_location&quot; {</span>
+<span class="a">+  description = &quot;R2 location hint. wnam: western North America, near the web server.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;wnam&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;web_server_ip&quot; {</span>
+<span class="a">+  description = &quot;Public IPv4 address of the web server. Burst workers open their SSH tunnel to it.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;198.44.53.27&quot;</span>
+<span class="a">+</span>
+<span class="a">+  validation {</span>
+<span class="a">+    condition     = can(cidrhost(&quot;${var.web_server_ip}/32&quot;, 0))</span>
+<span class="a">+    error_message = &quot;web_server_ip must be one IPv4 address.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;ssh_port&quot; {</span>
+<span class="a">+  type    = number</span>
+<span class="a">+  default = 22</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;host_key_file&quot; {</span>
+<span class="a">+  description = &quot;The web server&#x27;s SSH host key. Workers accept this key only.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;/etc/ssh/ssh_host_ed25519_key.pub&quot;</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/systemd/subplz-burst.service b/infra/burst/systemd/subplz-burst.service
+new file mode 100644
+index 0000000..461c6b2
+--- /dev/null
++++ b/infra/burst/systemd/subplz-burst.service
+<span class="h">@@ -0,0 +1,15 @@</span>
+<span class="a">+[Unit]</span>
+<span class="a">+Description=subplz-web burst controller: start burst workers on the cheapest cloud</span>
+<span class="a">+After=network-online.target</span>
+<span class="a">+Wants=network-online.target</span>
+<span class="a">+</span>
+<span class="a">+[Service]</span>
+<span class="a">+Type=oneshot</span>
+<span class="a">+User=root</span>
+<span class="a">+WorkingDirectory=/opt/subplz-web</span>
+<span class="a">+# The app settings (SUBPLZ_WEB_REDIS_URL, SUBPLZ_WEB_S3_BUCKET, the database),</span>
+<span class="a">+# the storage keys, and the cloud keys for Terraform (see infra/burst/README.md).</span>
+<span class="a">+EnvironmentFile=/opt/subplz-web/.env</span>
+<span class="a">+EnvironmentFile=/etc/subplz-storage.env</span>
+<span class="a">+EnvironmentFile=/etc/subplz-burst.env</span>
+<span class="a">+ExecStart=/opt/subplz-web/.venv/bin/python -m tools.burst</span>
+diff --git a/infra/burst/systemd/subplz-burst.timer b/infra/burst/systemd/subplz-burst.timer
+new file mode 100644
+index 0000000..8984846
+--- /dev/null
++++ b/infra/burst/systemd/subplz-burst.timer
+<span class="h">@@ -0,0 +1,9 @@</span>
+<span class="a">+[Unit]</span>
+<span class="a">+Description=Run the subplz-web burst controller once a minute</span>
+<span class="a">+</span>
+<span class="a">+[Timer]</span>
+<span class="a">+OnBootSec=2min</span>
+<span class="a">+OnUnitActiveSec=1min</span>
+<span class="a">+</span>
+<span class="a">+[Install]</span>
+<span class="a">+WantedBy=timers.target</span>
+diff --git a/infra/burst/systemd/subplz-worker.service b/infra/burst/systemd/subplz-worker.service
+new file mode 100644
+index 0000000..a71cc09
+--- /dev/null
++++ b/infra/burst/systemd/subplz-worker.service
+<span class="h">@@ -0,0 +1,21 @@</span>
+<span class="a">+[Unit]</span>
+<span class="a">+Description=subplz-web worker on the web server</span>
+<span class="a">+After=network-online.target subplz-web.service</span>
+<span class="a">+Wants=network-online.target</span>
+<span class="a">+</span>
+<span class="a">+[Service]</span>
+<span class="a">+User=subplz</span>
+<span class="a">+WorkingDirectory=/opt/subplz-web</span>
+<span class="a">+EnvironmentFile=/opt/subplz-web/.env</span>
+<span class="a">+EnvironmentFile=/etc/subplz-storage.env</span>
+<span class="a">+Environment=PATH=/opt/subplz-web/.venv/bin:/usr/local/bin:/usr/bin:/bin</span>
+<span class="a">+Environment=HOME=/opt/subplz-web</span>
+<span class="a">+ExecStart=/opt/subplz-web/.venv/bin/python worker.py</span>
+<span class="a">+# Postgres and Redis run on this machine too: if memory runs out, the kernel</span>
+<span class="a">+# must stop this worker, not the database.</span>
+<span class="a">+MemoryMax=2800M</span>
+<span class="a">+Restart=always</span>
+<span class="a">+RestartSec=10</span>
+<span class="a">+</span>
+<span class="a">+[Install]</span>
+<span class="a">+WantedBy=multi-user.target</span>
+diff --git a/infra/burst/worker-constraints.txt b/infra/burst/worker-constraints.txt
+new file mode 100644
+index 0000000..20e081f
+--- /dev/null
++++ b/infra/burst/worker-constraints.txt
+<span class="h">@@ -0,0 +1,89 @@</span>
+<span class="a">+# Exact versions of the web server&#x27;s venv (pip freeze on 2026-09-22), so that</span>
+<span class="a">+# a burst worker computes what the web server computes. Also the queue, storage</span>
+<span class="a">+# and Postgres clients, which the web server installs when it turns burst on.</span>
+<span class="a">+# pip, setuptools and wheel are left out: pip manages them itself. subplz comes</span>
+<span class="a">+# from git and is pinned in variables.tf (subplz_spec): a constraint cannot be a URL.</span>
+<span class="a">+annotated-doc==0.0.5</span>
+<span class="a">+annotated-types==0.8.0</span>
+<span class="a">+anyio==4.15.1</span>
+<span class="a">+av==18.1.0</span>
+<span class="a">+beautifulsoup4==4.13.5</span>
+<span class="a">+biopython==1.88</span>
+<span class="a">+certifi==2026.7.22</span>
+<span class="a">+charset-normalizer==3.5.1</span>
+<span class="a">+click==8.5.0</span>
+<span class="a">+ctranslate2==4.6.0</span>
+<span class="a">+EbookLib==0.20</span>
+<span class="a">+emoji==2.16.0</span>
+<span class="a">+fastapi==0.141.1</span>
+<span class="a">+faster-whisper==1.2.0</span>
+<span class="a">+ffmpeg-python==0.2.0</span>
+<span class="a">+filelock==3.32.3</span>
+<span class="a">+flatbuffers==25.12.19</span>
+<span class="a">+fsspec==2026.7.0</span>
+<span class="a">+future==1.0.0</span>
+<span class="a">+greenlet==3.5.6</span>
+<span class="a">+h11==0.16.0</span>
+<span class="a">+hf-xet==1.6.0</span>
+<span class="a">+httpcore==1.0.9</span>
+<span class="a">+httptools==0.8.0</span>
+<span class="a">+httpx==0.28.1</span>
+<span class="a">+huggingface_hub==1.32.0</span>
+<span class="a">+idna==3.20</span>
+<span class="a">+Jinja2==3.1.6</span>
+<span class="a">+lingua-language-detector==2.1.1</span>
+<span class="a">+llvmlite==0.49.0</span>
+<span class="a">+loguru==0.7.3</span>
+<span class="a">+lxml==6.1.3</span>
+<span class="a">+MarkupSafe==3.0.3</span>
+<span class="a">+mobi==0.4.1</span>
+<span class="a">+more-itertools==11.1.0</span>
+<span class="a">+mpmath==1.3.0</span>
+<span class="a">+natsort==8.4.0</span>
+<span class="a">+networkx==3.6.1</span>
+<span class="a">+numba==0.67.0</span>
+<span class="a">+numpy==1.26.4</span>
+<span class="a">+onnxruntime==1.30.0</span>
+<span class="a">+openai-whisper==20250625</span>
+<span class="a">+packaging==26.3</span>
+<span class="a">+protobuf==7.36.2</span>
+<span class="a">+pycountry==24.6.1</span>
+<span class="a">+pydantic==2.13.5</span>
+<span class="a">+pydantic-settings==2.15.0</span>
+<span class="a">+pydantic_core==2.46.5</span>
+<span class="a">+pysbd==0.3.4</span>
+<span class="a">+python-dotenv==1.2.3</span>
+<span class="a">+python-multipart==0.0.32</span>
+<span class="a">+PyYAML==6.0.3</span>
+<span class="a">+RapidFuzz==3.12.2</span>
+<span class="a">+regex==2024.11.6</span>
+<span class="a">+requests==2.34.2</span>
+<span class="a">+six==1.17.0</span>
+<span class="a">+soupsieve==2.9.2</span>
+<span class="a">+SQLAlchemy==2.0.54</span>
+<span class="a">+stable-ts==2.19.1</span>
+<span class="a">+standard-imghdr==3.13.0</span>
+<span class="a">+stanza==1.10.1</span>
+<span class="a">+starlette==1.6.0</span>
+<span class="a">+stripe==15.6.1</span>
+<span class="a">+sympy==1.14.0</span>
+<span class="a">+tiktoken==0.14.0</span>
+<span class="a">+tokenizers==0.23.2</span>
+<span class="a">+torch==2.14.0+cpu</span>
+<span class="a">+torchaudio==2.11.0+cpu</span>
+<span class="a">+tqdm==4.67.3</span>
+<span class="a">+triton==3.8.0</span>
+<span class="a">+typing-inspection==0.4.4</span>
+<span class="a">+typing_extensions==4.16.0</span>
+<span class="a">+urllib3==2.8.0</span>
+<span class="a">+uvicorn==0.53.0</span>
+<span class="a">+uvloop==0.22.1</span>
+<span class="a">+watchdog==6.0.0</span>
+<span class="a">+watchfiles==1.2.0</span>
+<span class="a">+wcwidth==0.8.4</span>
+<span class="a">+websockets==17.1</span>
+<span class="a">+redis==8.1.0</span>
+<span class="a">+rq==2.12.0</span>
+<span class="a">+boto3==1.43.100</span>
+<span class="a">+psycopg==3.3.6</span>
+<span class="a">+psycopg-binary==3.3.6</span>
+diff --git a/infra/burst/workers/aws/.terraform.lock.hcl b/infra/burst/workers/aws/.terraform.lock.hcl
+new file mode 100644
+index 0000000..5764421
+--- /dev/null
++++ b/infra/burst/workers/aws/.terraform.lock.hcl
+<span class="h">@@ -0,0 +1,26 @@</span>
+<span class="a">+# This file is maintained automatically by &quot;terraform init&quot;.</span>
+<span class="a">+# Manual edits may be lost in future updates.</span>
+<span class="a">+</span>
+<span class="a">+provider &quot;registry.terraform.io/hashicorp/aws&quot; {</span>
+<span class="a">+  version     = &quot;6.66.0&quot;</span>
+<span class="a">+  constraints = &quot;~&gt; 6.66&quot;</span>
+<span class="a">+  hashes = [</span>
+<span class="a">+    &quot;h1:xehZnyesOrJ1/R9tmnRSu7FRkwoDDKelEHI3WdnJ72g=&quot;,</span>
+<span class="a">+    &quot;zh:156fe7164a3d26ef6b35734c43e99fb198df90575ed897d1182b8e930b8cd523&quot;,</span>
+<span class="a">+    &quot;zh:1af52b22b35be00f8d16e3ebebff9fa699ec4db2ef69e6032ba5c536f80c03d9&quot;,</span>
+<span class="a">+    &quot;zh:2545a8478bd551fdc9694f6cc1a1ad24617f6736f8bde0ad6cae90987c65380f&quot;,</span>
+<span class="a">+    &quot;zh:4070db1ee369ccb41cb610bfd887386bc0a9b9ecad60aeb4dbce58443d2519dd&quot;,</span>
+<span class="a">+    &quot;zh:53da7d3c1840ef875c7d34e967732502a64fe677af0e78824773d4c15a8fe740&quot;,</span>
+<span class="a">+    &quot;zh:576a93a28bf611a4de2a2e6ced697a41d5126b8fd31d30782b16797e410a9706&quot;,</span>
+<span class="a">+    &quot;zh:58fed5fa9a033355b9d4f3092c817b70d934100e0d8678d6e4c93f3c9493d4e4&quot;,</span>
+<span class="a">+    &quot;zh:6a9ca2f24e2ee9156dd785d159a850b35d190e9cf7eca21cb9582970c2db80cd&quot;,</span>
+<span class="a">+    &quot;zh:729edd30f99cc16009deba5c013265b0c81eda261a3d0821cbd011d3287fd230&quot;,</span>
+<span class="a">+    &quot;zh:7ae460049b75bd4aefee465ef7c53a01ac2df46d4d3e3ac00824afa8b5cb83fb&quot;,</span>
+<span class="a">+    &quot;zh:9051fa85c8034ade8a57a5c6f232fd33da28f3800bb5aa40bc8625dbc5e27632&quot;,</span>
+<span class="a">+    &quot;zh:906547e4319805e7acf7fbdf2bac28a4b1a7370790a2a430c7adb1b29bb934eb&quot;,</span>
+<span class="a">+    &quot;zh:998f27410a66158a35ee5ed142c27e5b21fe8601941da55da2157f8042d6dcca&quot;,</span>
+<span class="a">+    &quot;zh:9b12af85486a96aedd8d7984b0ff811a4b42e3d88dad1a3fb4c0b580d04fa425&quot;,</span>
+<span class="a">+    &quot;zh:9c1804eff1dda0446dc2d215231015bb65a2fc6c3b7ba24584fe45f1ddd3fa9f&quot;,</span>
+<span class="a">+    &quot;zh:b03ff5efdee310502aaaeb460144dc059bce72a0d8217e6b989099ef8aef9283&quot;,</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/aws/iam-policy.json b/infra/burst/workers/aws/iam-policy.json
+new file mode 100644
+index 0000000..99bf100
+--- /dev/null
++++ b/infra/burst/workers/aws/iam-policy.json
+<span class="h">@@ -0,0 +1,60 @@</span>
+<span class="a">+{</span>
+<span class="a">+  &quot;Version&quot;: &quot;2012-10-17&quot;,</span>
+<span class="a">+  &quot;Statement&quot;: [</span>
+<span class="a">+    {</span>
+<span class="a">+      &quot;Sid&quot;: &quot;ReadPricesImagesNetworkAndInstances&quot;,</span>
+<span class="a">+      &quot;Effect&quot;: &quot;Allow&quot;,</span>
+<span class="a">+      &quot;Action&quot;: [</span>
+<span class="a">+        &quot;ec2:Describe*&quot;</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;Resource&quot;: &quot;*&quot;</span>
+<span class="a">+    },</span>
+<span class="a">+    {</span>
+<span class="a">+      &quot;Sid&quot;: &quot;StartWorkers&quot;,</span>
+<span class="a">+      &quot;Effect&quot;: &quot;Allow&quot;,</span>
+<span class="a">+      &quot;Action&quot;: [</span>
+<span class="a">+        &quot;ec2:RunInstances&quot;,</span>
+<span class="a">+        &quot;ec2:CreateTags&quot;</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;Resource&quot;: &quot;*&quot;</span>
+<span class="a">+    },</span>
+<span class="a">+    {</span>
+<span class="a">+      &quot;Sid&quot;: &quot;EndOnlyBurstWorkers&quot;,</span>
+<span class="a">+      &quot;Effect&quot;: &quot;Allow&quot;,</span>
+<span class="a">+      &quot;Action&quot;: [</span>
+<span class="a">+        &quot;ec2:TerminateInstances&quot;,</span>
+<span class="a">+        &quot;ec2:ModifyInstanceAttribute&quot;</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;Resource&quot;: &quot;*&quot;,</span>
+<span class="a">+      &quot;Condition&quot;: {</span>
+<span class="a">+        &quot;StringEquals&quot;: {</span>
+<span class="a">+          &quot;aws:ResourceTag/Role&quot;: &quot;subplz-burst-worker&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+      }</span>
+<span class="a">+    },</span>
+<span class="a">+    {</span>
+<span class="a">+      &quot;Sid&quot;: &quot;TheWorkerSecurityGroup&quot;,</span>
+<span class="a">+      &quot;Effect&quot;: &quot;Allow&quot;,</span>
+<span class="a">+      &quot;Action&quot;: [</span>
+<span class="a">+        &quot;ec2:CreateSecurityGroup&quot;,</span>
+<span class="a">+        &quot;ec2:DeleteSecurityGroup&quot;,</span>
+<span class="a">+        &quot;ec2:AuthorizeSecurityGroupEgress&quot;,</span>
+<span class="a">+        &quot;ec2:RevokeSecurityGroupEgress&quot;,</span>
+<span class="a">+        &quot;ec2:AuthorizeSecurityGroupIngress&quot;,</span>
+<span class="a">+        &quot;ec2:RevokeSecurityGroupIngress&quot;</span>
+<span class="a">+      ],</span>
+<span class="a">+      &quot;Resource&quot;: &quot;*&quot;</span>
+<span class="a">+    },</span>
+<span class="a">+    {</span>
+<span class="a">+      &quot;Sid&quot;: &quot;TheSpotRoleOnce&quot;,</span>
+<span class="a">+      &quot;Effect&quot;: &quot;Allow&quot;,</span>
+<span class="a">+      &quot;Action&quot;: &quot;iam:CreateServiceLinkedRole&quot;,</span>
+<span class="a">+      &quot;Resource&quot;: &quot;*&quot;,</span>
+<span class="a">+      &quot;Condition&quot;: {</span>
+<span class="a">+        &quot;StringEquals&quot;: {</span>
+<span class="a">+          &quot;iam:AWSServiceName&quot;: &quot;spot.amazonaws.com&quot;</span>
+<span class="a">+        }</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/aws/main.tf b/infra/burst/workers/aws/main.tf
+new file mode 100644
+index 0000000..a55691e
+--- /dev/null
++++ b/infra/burst/workers/aws/main.tf
+<span class="h">@@ -0,0 +1,128 @@</span>
+<span class="a">+# Burst workers on AWS: one spot instance for each entry of var.workers. The</span>
+<span class="a">+# burst controller (python -m tools.burst) writes var.workers and applies this</span>
+<span class="a">+# when the set changes; do not apply it by hand while burst mode is on.</span>
+<span class="a">+</span>
+<span class="a">+terraform {</span>
+<span class="a">+  required_version = &quot;&gt;= 1.9&quot;</span>
+<span class="a">+  required_providers {</span>
+<span class="a">+    aws = {</span>
+<span class="a">+      source  = &quot;hashicorp/aws&quot;</span>
+<span class="a">+      version = &quot;~&gt; 6.66&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  backend &quot;local&quot; {}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# Reads AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and AWS_REGION. The controller</span>
+<span class="a">+# sets them from SUBPLZ_BURST_AWS_* (see tools/burst/__main__.py).</span>
+<span class="a">+provider &quot;aws&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+data &quot;terraform_remote_state&quot; &quot;state&quot; {</span>
+<span class="a">+  backend = &quot;local&quot;</span>
+<span class="a">+  config = {</span>
+<span class="a">+    path = var.state_file</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+locals {</span>
+<span class="a">+  state = data.terraform_remote_state.state.outputs.worker</span>
+<span class="a">+  # Graviton families (c7g, m6g ...) are arm64; the others are x86-64.</span>
+<span class="a">+  arch = { for name, w in var.workers : name =&gt; can(regex(&quot;^[a-z]+[0-9]+g[a-z]*\\.&quot;, w.machine)) ? &quot;arm64&quot; : &quot;amd64&quot; }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+data &quot;aws_ami&quot; &quot;debian&quot; {</span>
+<span class="a">+  for_each    = toset([&quot;amd64&quot;, &quot;arm64&quot;])</span>
+<span class="a">+  most_recent = true</span>
+<span class="a">+  owners      = [&quot;136693071363&quot;] # Debian</span>
+<span class="a">+  filter {</span>
+<span class="a">+    name   = &quot;name&quot;</span>
+<span class="a">+    values = [&quot;debian-12-${each.key}-*&quot;]</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+data &quot;aws_vpc&quot; &quot;default&quot; {</span>
+<span class="a">+  default = true</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+data &quot;aws_subnet&quot; &quot;zone&quot; {</span>
+<span class="a">+  for_each          = toset([for w in var.workers : w.zone])</span>
+<span class="a">+  vpc_id            = data.aws_vpc.default.id</span>
+<span class="a">+  availability_zone = each.key</span>
+<span class="a">+  default_for_az    = true</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# No inbound port: a worker only connects out (the SSH tunnel, the bucket, the</span>
+<span class="a">+# package indexes).</span>
+<span class="a">+resource &quot;aws_security_group&quot; &quot;worker&quot; {</span>
+<span class="a">+  name        = &quot;subplz-burst-worker&quot;</span>
+<span class="a">+  description = &quot;subplz burst workers: outbound only&quot;</span>
+<span class="a">+  vpc_id      = data.aws_vpc.default.id</span>
+<span class="a">+</span>
+<span class="a">+  # An empty list, not a missing one: Terraform then removes any inbound rule.</span>
+<span class="a">+  ingress = []</span>
+<span class="a">+</span>
+<span class="a">+  egress {</span>
+<span class="a">+    from_port   = 0</span>
+<span class="a">+    to_port     = 0</span>
+<span class="a">+    protocol    = &quot;-1&quot;</span>
+<span class="a">+    cidr_blocks = [&quot;0.0.0.0/0&quot;]</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+resource &quot;aws_instance&quot; &quot;worker&quot; {</span>
+<span class="a">+  for_each = var.workers</span>
+<span class="a">+</span>
+<span class="a">+  ami                                  = data.aws_ami.debian[local.arch[each.key]].id</span>
+<span class="a">+  instance_type                        = each.value.machine</span>
+<span class="a">+  subnet_id                            = data.aws_subnet.zone[each.value.zone].id</span>
+<span class="a">+  vpc_security_group_ids               = [aws_security_group.worker.id]</span>
+<span class="a">+  associate_public_ip_address          = true</span>
+<span class="a">+  instance_initiated_shutdown_behavior = &quot;terminate&quot; # the idle check powers off: the bill ends</span>
+<span class="a">+</span>
+<span class="a">+  instance_market_options {</span>
+<span class="a">+    market_type = &quot;spot&quot;</span>
+<span class="a">+    spot_options {</span>
+<span class="a">+      max_price                      = var.max_price</span>
+<span class="a">+      spot_instance_type             = &quot;one-time&quot;</span>
+<span class="a">+      instance_interruption_behavior = &quot;terminate&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  root_block_device {</span>
+<span class="a">+    volume_size = 20</span>
+<span class="a">+    volume_type = &quot;gp3&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  metadata_options {</span>
+<span class="a">+    http_tokens = &quot;required&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  user_data = templatefile(&quot;${path.module}/../../cloud-init.yaml.tftpl&quot;, {</span>
+<span class="a">+    name               = each.key</span>
+<span class="a">+    ref                = each.value.ref</span>
+<span class="a">+    subplz_spec        = var.subplz_spec</span>
+<span class="a">+    threads            = var.threads</span>
+<span class="a">+    idle_checks        = var.idle_checks</span>
+<span class="a">+    constraints        = file(&quot;${path.module}/../../worker-constraints.txt&quot;)</span>
+<span class="a">+    web_server_ip      = local.state.web_server_ip</span>
+<span class="a">+    ssh_port           = local.state.ssh_port</span>
+<span class="a">+    known_hosts        = local.state.known_hosts</span>
+<span class="a">+    tunnel_private_key = local.state.tunnel_private_key</span>
+<span class="a">+    database_url       = local.state.database_url</span>
+<span class="a">+    redis_url          = local.state.redis_url</span>
+<span class="a">+    bucket             = local.state.bucket</span>
+<span class="a">+    s3_prefix          = local.state.s3_prefix</span>
+<span class="a">+    storage_env        = local.state.storage_env</span>
+<span class="a">+  })</span>
+<span class="a">+</span>
+<span class="a">+  tags = {</span>
+<span class="a">+    Name = each.key</span>
+<span class="a">+    Role = &quot;subplz-burst-worker&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  # A change of these would replace a machine, and kill the job on it. New</span>
+<span class="a">+  # workers get the new values; the controller replaces old ones when idle.</span>
+<span class="a">+  lifecycle {</span>
+<span class="a">+    ignore_changes = [user_data, ami]</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/aws/outputs.tf b/infra/burst/workers/aws/outputs.tf
+new file mode 100644
+index 0000000..a921d75
+--- /dev/null
++++ b/infra/burst/workers/aws/outputs.tf
+<span class="h">@@ -0,0 +1,4 @@</span>
+<span class="a">+output &quot;workers&quot; {</span>
+<span class="a">+  description = &quot;Each worker on AWS and its public IPv4 address.&quot;</span>
+<span class="a">+  value       = { for name, i in aws_instance.worker : name =&gt; i.public_ip }</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/aws/tests/aws.tftest.hcl b/infra/burst/workers/aws/tests/aws.tftest.hcl
+new file mode 100644
+index 0000000..dc7c039
+--- /dev/null
++++ b/infra/burst/workers/aws/tests/aws.tftest.hcl
+<span class="h">@@ -0,0 +1,109 @@</span>
+<span class="a">+# terraform test with a mock provider: no account and no cost.</span>
+<span class="a">+</span>
+<span class="a">+mock_provider &quot;aws&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+override_data {</span>
+<span class="a">+  target = data.terraform_remote_state.state</span>
+<span class="a">+  values = {</span>
+<span class="a">+    outputs = {</span>
+<span class="a">+      worker = {</span>
+<span class="a">+        web_server_ip      = &quot;198.44.53.27&quot;</span>
+<span class="a">+        ssh_port           = 22</span>
+<span class="a">+        known_hosts        = &quot;198.44.53.27 ssh-ed25519 AAAAhostkey&quot;</span>
+<span class="a">+        tunnel_private_key = &quot;-----BEGIN OPENSSH PRIVATE KEY-----\nTUNNELKEY\n-----END OPENSSH PRIVATE KEY-----\n&quot;</span>
+<span class="a">+        database_url       = &quot;postgresql+psycopg://subplz:pgpw@127.0.0.1:5432/subplz&quot;</span>
+<span class="a">+        redis_url          = &quot;redis://:redispw@127.0.0.1:6379/0&quot;</span>
+<span class="a">+        bucket             = &quot;subplz-files&quot;</span>
+<span class="a">+        s3_prefix          = &quot;jobs/&quot;</span>
+<span class="a">+        storage_env        = &quot;AWS_ACCESS_KEY_ID=kid\nAWS_SECRET_ACCESS_KEY=secret\nAWS_ENDPOINT_URL_S3=https://acct.r2.cloudflarestorage.com\nAWS_DEFAULT_REGION=auto\n&quot;</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variables {</span>
+<span class="a">+  workers = {</span>
+<span class="a">+    &quot;subplz-burst-1790000000-0&quot; = { ref = &quot;0123456789abcdef0123456789abcdef01234567&quot;, machine = &quot;c6a.xlarge&quot;, zone = &quot;us-west-2a&quot; }</span>
+<span class="a">+    &quot;subplz-burst-1790000000-1&quot; = { ref = &quot;89abcdef0123456789abcdef0123456789abcdef&quot;, machine = &quot;c7g.xlarge&quot;, zone = &quot;us-west-2b&quot; }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;one_spot_instance_for_each_worker&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = length(aws_instance.worker) == 2</span>
+<span class="a">+    error_message = &quot;Expected one instance for each worker.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = alltrue([for n, i in aws_instance.worker :</span>
+<span class="a">+      i.instance_type == var.workers[n].machine</span>
+<span class="a">+      &amp;&amp; i.instance_market_options[0].market_type == &quot;spot&quot;</span>
+<span class="a">+      &amp;&amp; i.instance_market_options[0].spot_options[0].max_price == &quot;0.0625&quot;</span>
+<span class="a">+      &amp;&amp; i.instance_initiated_shutdown_behavior == &quot;terminate&quot;</span>
+<span class="a">+    ])</span>
+<span class="a">+    error_message = &quot;Each worker must be a spot instance of its type, with a price limit, that ends when it powers off.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = local.arch[&quot;subplz-burst-1790000000-0&quot;] == &quot;amd64&quot; &amp;&amp; local.arch[&quot;subplz-burst-1790000000-1&quot;] == &quot;arm64&quot;</span>
+<span class="a">+    error_message = &quot;A Graviton type must get the arm64 image, the others the amd64 image.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = length(aws_security_group.worker.ingress) == 0</span>
+<span class="a">+    error_message = &quot;A worker must take no inbound connection.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;the_cloud_config_names_the_host_and_opens_the_tunnel&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = alltrue([for n, i in aws_instance.worker : yamldecode(i.user_data).hostname == n])</span>
+<span class="a">+    error_message = &quot;The host name must be the machine name: the controller matches rq workers by host name.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = alltrue([for n, i in aws_instance.worker :</span>
+<span class="a">+      strcontains(i.user_data, &quot;releases/${var.workers[n].ref}.tar.gz&quot;)</span>
+<span class="a">+      &amp;&amp; strcontains(i.user_data, &quot;SUBPLZ_WEB_WORKER_QUEUES=paid\n&quot;)</span>
+<span class="a">+      &amp;&amp; strcontains(i.user_data, &quot;-L 127.0.0.1:5432:127.0.0.1:5432 -L 127.0.0.1:6379:127.0.0.1:6379 subplz-tunnel@198.44.53.27&quot;)</span>
+<span class="a">+      &amp;&amp; strcontains(i.user_data, &quot;AWS_ENDPOINT_URL_S3=https://acct.r2.cloudflarestorage.com\n&quot;)</span>
+<span class="a">+    ])</span>
+<span class="a">+    error_message = &quot;Each worker must run its own commit, take paid jobs, reach the databases through the tunnel, and use the bucket.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = alltrue([for i in aws_instance.worker :</span>
+<span class="a">+      contains([for f in yamldecode(i.user_data).write_files : f.content],</span>
+<span class="a">+      &quot;-----BEGIN OPENSSH PRIVATE KEY-----\nTUNNELKEY\n-----END OPENSSH PRIVATE KEY-----\n&quot;)</span>
+<span class="a">+    ])</span>
+<span class="a">+    error_message = &quot;The tunnel key must be written whole.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = alltrue([for i in aws_instance.worker :</span>
+<span class="a">+      strcontains(one([for f in yamldecode(i.user_data).write_files : f.content if f.path == &quot;/opt/subplz-install/idle-check.sh&quot;]),</span>
+<span class="a">+    &quot;-ge 9 ]&quot;)])</span>
+<span class="a">+    error_message = &quot;The idle check must power off after var.idle_checks idle checks.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;no_workers_means_no_instances&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  variables {</span>
+<span class="a">+    workers = {}</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = length(aws_instance.worker) == 0</span>
+<span class="a">+    error_message = &quot;An empty set must make no instances.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;a_name_without_the_prefix_is_refused&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  variables {</span>
+<span class="a">+    workers = { &quot;web-1&quot; = { ref = &quot;0123456789abcdef0123456789abcdef01234567&quot;, machine = &quot;c6a.xlarge&quot;, zone = &quot;us-west-2a&quot; } }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  expect_failures = [var.workers]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/aws/variables.tf b/infra/burst/workers/aws/variables.tf
+new file mode 100644
+index 0000000..03eb66d
+--- /dev/null
++++ b/infra/burst/workers/aws/variables.tf
+<span class="h">@@ -0,0 +1,48 @@</span>
+<span class="a">+variable &quot;workers&quot; {</span>
+<span class="a">+  description = &quot;The workers on AWS: machine name -&gt; app commit, instance type, availability zone. The burst controller writes this.&quot;</span>
+<span class="a">+  type = map(object({</span>
+<span class="a">+    ref     = string</span>
+<span class="a">+    machine = string</span>
+<span class="a">+    zone    = string</span>
+<span class="a">+  }))</span>
+<span class="a">+  default = {}</span>
+<span class="a">+</span>
+<span class="a">+  validation {</span>
+<span class="a">+    condition     = alltrue([for name in keys(var.workers) : can(regex(&quot;^subplz-burst-[0-9a-z-]{1,40}$&quot;, name))])</span>
+<span class="a">+    error_message = &quot;Each worker name must start with subplz-burst-: the controller finds its workers by that prefix.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  validation {</span>
+<span class="a">+    condition     = alltrue([for w in values(var.workers) : can(regex(&quot;^[0-9a-f]{40}$&quot;, w.ref))])</span>
+<span class="a">+    error_message = &quot;Each ref must be a full git commit hash.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;max_price&quot; {</span>
+<span class="a">+  description = &quot;Highest spot price per hour, in USD. Above it AWS does not start the machine.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;0.0625&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;threads&quot; {</span>
+<span class="a">+  description = &quot;Whisper threads: all vCPUs of an xlarge instance.&quot;</span>
+<span class="a">+  type        = number</span>
+<span class="a">+  default     = 4</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;idle_checks&quot; {</span>
+<span class="a">+  description = &quot;Idle checks (10 minutes each) before a machine powers itself off, if the controller is gone.&quot;</span>
+<span class="a">+  type        = number</span>
+<span class="a">+  default     = 9</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;subplz_spec&quot; {</span>
+<span class="a">+  description = &quot;The subplz package, pinned to the commit that the web server runs.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;subplz @ git+https://github.com/kanjieater/SubPlz.git@6be8b6fab185372b458bdde13c61f4da204dc6fc&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;state_file&quot; {</span>
+<span class="a">+  description = &quot;Path of the state file of ../../state.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;/var/lib/subplz-burst/state.tfstate&quot;</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/hetzner/.terraform.lock.hcl b/infra/burst/workers/hetzner/.terraform.lock.hcl
+new file mode 100644
+index 0000000..eecbb7a
+--- /dev/null
++++ b/infra/burst/workers/hetzner/.terraform.lock.hcl
+<span class="h">@@ -0,0 +1,23 @@</span>
+<span class="a">+# This file is maintained automatically by &quot;terraform init&quot;.</span>
+<span class="a">+# Manual edits may be lost in future updates.</span>
+<span class="a">+</span>
+<span class="a">+provider &quot;registry.terraform.io/hetznercloud/hcloud&quot; {</span>
+<span class="a">+  version     = &quot;1.69.0&quot;</span>
+<span class="a">+  constraints = &quot;~&gt; 1.69&quot;</span>
+<span class="a">+  hashes = [</span>
+<span class="a">+    &quot;h1:MLxpeLlRL97wDLqL+WNpb7L9Vk+g8aUHLjXspFPR+tg=&quot;,</span>
+<span class="a">+    &quot;zh:023c0580c46b48a1dce8aeb5832ec9896ce53ee019a2b296d854873f92aad7d9&quot;,</span>
+<span class="a">+    &quot;zh:02fa14eebb1c48b52b9acb33fb987425513537b70a50dac5639aecfe62c4b66f&quot;,</span>
+<span class="a">+    &quot;zh:0f534ee078e5f0f3c21e99cc020c3a9be565fceed4936d88b978f7b7d4b981fc&quot;,</span>
+<span class="a">+    &quot;zh:42dcf6859d097179c30cbe346931be731548a51ef7c73d08cd4af69a044bd60f&quot;,</span>
+<span class="a">+    &quot;zh:6d319ee6c9e64437634f3e682196dab24025ea91a7332b40972279e9c6e67f64&quot;,</span>
+<span class="a">+    &quot;zh:71a1dc59a47ab1b4127696e8047b54bb4bc8f92b8994ecc13509eaeb7e13a729&quot;,</span>
+<span class="a">+    &quot;zh:781310b68c74dede2e225096d7ada9a0b4b9252b6cafa4dc1ff064dd9ea4c817&quot;,</span>
+<span class="a">+    &quot;zh:7c4e0411e6e10ca6bd49c8e699c7c61cd9750d32d46ee5472d01faa30fbd222f&quot;,</span>
+<span class="a">+    &quot;zh:c4c70587a7632aea65d6b1bb0bbe8da2145a7acb6d16a7dd0e0dbbde6195c8ca&quot;,</span>
+<span class="a">+    &quot;zh:caaab2e9bb7cf8bb478b143bc0156c40729d720d3e2c77cf021e515fbeca3a6a&quot;,</span>
+<span class="a">+    &quot;zh:cbd1c2040111b595cfa5daa201166560b4988eb0227dd6be17e8ae72a5ff1df0&quot;,</span>
+<span class="a">+    &quot;zh:eba595371b98a66c1bf64dfb9f9256e6dc365e990e7202c50b6977fb3d24f822&quot;,</span>
+<span class="a">+    &quot;zh:fd477dca1d5b0bc7f41cce6b9f3e3250b58597cc178a70fa3136717343ffeede&quot;,</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/hetzner/main.tf b/infra/burst/workers/hetzner/main.tf
+new file mode 100644
+index 0000000..2d4afa2
+--- /dev/null
++++ b/infra/burst/workers/hetzner/main.tf
+<span class="h">@@ -0,0 +1,71 @@</span>
+<span class="a">+# Burst workers on Hetzner Cloud: one server for each entry of var.workers. The</span>
+<span class="a">+# burst controller (python -m tools.burst) writes var.workers and applies this</span>
+<span class="a">+# when the set changes; do not apply it by hand while burst mode is on.</span>
+<span class="a">+</span>
+<span class="a">+terraform {</span>
+<span class="a">+  required_version = &quot;&gt;= 1.9&quot;</span>
+<span class="a">+  required_providers {</span>
+<span class="a">+    hcloud = {</span>
+<span class="a">+      source  = &quot;hetznercloud/hcloud&quot;</span>
+<span class="a">+      version = &quot;~&gt; 1.69&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  backend &quot;local&quot; {}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# Reads HCLOUD_TOKEN. Keep the burst servers in a Hetzner project of their own.</span>
+<span class="a">+provider &quot;hcloud&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+data &quot;terraform_remote_state&quot; &quot;state&quot; {</span>
+<span class="a">+  backend = &quot;local&quot;</span>
+<span class="a">+  config = {</span>
+<span class="a">+    path = var.state_file</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+locals {</span>
+<span class="a">+  state = data.terraform_remote_state.state.outputs.worker</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# No inbound rule: Hetzner then drops all inbound traffic. A worker only</span>
+<span class="a">+# connects out (the SSH tunnel, the bucket, the package indexes).</span>
+<span class="a">+resource &quot;hcloud_firewall&quot; &quot;worker&quot; {</span>
+<span class="a">+  name = &quot;subplz-burst-worker&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+resource &quot;hcloud_server&quot; &quot;worker&quot; {</span>
+<span class="a">+  for_each = var.workers</span>
+<span class="a">+</span>
+<span class="a">+  name         = each.key</span>
+<span class="a">+  server_type  = each.value.machine</span>
+<span class="a">+  location     = each.value.zone</span>
+<span class="a">+  image        = &quot;debian-12&quot;</span>
+<span class="a">+  firewall_ids = [hcloud_firewall.worker.id]</span>
+<span class="a">+  labels = {</span>
+<span class="a">+    role = &quot;subplz-burst-worker&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  user_data = templatefile(&quot;${path.module}/../../cloud-init.yaml.tftpl&quot;, {</span>
+<span class="a">+    name               = each.key</span>
+<span class="a">+    ref                = each.value.ref</span>
+<span class="a">+    subplz_spec        = var.subplz_spec</span>
+<span class="a">+    threads            = var.threads</span>
+<span class="a">+    idle_checks        = var.idle_checks</span>
+<span class="a">+    constraints        = file(&quot;${path.module}/../../worker-constraints.txt&quot;)</span>
+<span class="a">+    web_server_ip      = local.state.web_server_ip</span>
+<span class="a">+    ssh_port           = local.state.ssh_port</span>
+<span class="a">+    known_hosts        = local.state.known_hosts</span>
+<span class="a">+    tunnel_private_key = local.state.tunnel_private_key</span>
+<span class="a">+    database_url       = local.state.database_url</span>
+<span class="a">+    redis_url          = local.state.redis_url</span>
+<span class="a">+    bucket             = local.state.bucket</span>
+<span class="a">+    s3_prefix          = local.state.s3_prefix</span>
+<span class="a">+    storage_env        = local.state.storage_env</span>
+<span class="a">+  })</span>
+<span class="a">+</span>
+<span class="a">+  # A change of these would replace a server, and kill the job on it. New</span>
+<span class="a">+  # workers get the new values; the controller replaces old ones when idle.</span>
+<span class="a">+  lifecycle {</span>
+<span class="a">+    ignore_changes = [user_data, image]</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/hetzner/outputs.tf b/infra/burst/workers/hetzner/outputs.tf
+new file mode 100644
+index 0000000..203373b
+--- /dev/null
++++ b/infra/burst/workers/hetzner/outputs.tf
+<span class="h">@@ -0,0 +1,4 @@</span>
+<span class="a">+output &quot;workers&quot; {</span>
+<span class="a">+  description = &quot;Each worker on Hetzner and its public IPv4 address.&quot;</span>
+<span class="a">+  value       = { for name, s in hcloud_server.worker : name =&gt; s.ipv4_address }</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/hetzner/tests/hetzner.tftest.hcl b/infra/burst/workers/hetzner/tests/hetzner.tftest.hcl
+new file mode 100644
+index 0000000..660427f
+--- /dev/null
++++ b/infra/burst/workers/hetzner/tests/hetzner.tftest.hcl
+<span class="h">@@ -0,0 +1,66 @@</span>
+<span class="a">+# terraform test with a mock provider: no account and no cost.</span>
+<span class="a">+</span>
+<span class="a">+mock_provider &quot;hcloud&quot; {}</span>
+<span class="a">+</span>
+<span class="a">+override_data {</span>
+<span class="a">+  target = data.terraform_remote_state.state</span>
+<span class="a">+  values = {</span>
+<span class="a">+    outputs = {</span>
+<span class="a">+      worker = {</span>
+<span class="a">+        web_server_ip      = &quot;198.44.53.27&quot;</span>
+<span class="a">+        ssh_port           = 22</span>
+<span class="a">+        known_hosts        = &quot;198.44.53.27 ssh-ed25519 AAAAhostkey&quot;</span>
+<span class="a">+        tunnel_private_key = &quot;-----BEGIN OPENSSH PRIVATE KEY-----\nTUNNELKEY\n-----END OPENSSH PRIVATE KEY-----\n&quot;</span>
+<span class="a">+        database_url       = &quot;postgresql+psycopg://subplz:pgpw@127.0.0.1:5432/subplz&quot;</span>
+<span class="a">+        redis_url          = &quot;redis://:redispw@127.0.0.1:6379/0&quot;</span>
+<span class="a">+        bucket             = &quot;subplz-files&quot;</span>
+<span class="a">+        s3_prefix          = &quot;jobs/&quot;</span>
+<span class="a">+        storage_env        = &quot;AWS_ACCESS_KEY_ID=kid\nAWS_SECRET_ACCESS_KEY=secret\nAWS_ENDPOINT_URL_S3=https://acct.r2.cloudflarestorage.com\nAWS_DEFAULT_REGION=auto\n&quot;</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variables {</span>
+<span class="a">+  workers = {</span>
+<span class="a">+    &quot;subplz-burst-1790000000-0&quot; = { ref = &quot;0123456789abcdef0123456789abcdef01234567&quot;, machine = &quot;cx33&quot;, zone = &quot;fsn1&quot; }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;one_server_for_each_worker_behind_a_closed_firewall&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = alltrue([for n, s in hcloud_server.worker :</span>
+<span class="a">+      s.server_type == &quot;cx33&quot; &amp;&amp; s.location == &quot;fsn1&quot; &amp;&amp; s.image == &quot;debian-12&quot;</span>
+<span class="a">+    ])</span>
+<span class="a">+    error_message = &quot;Each worker must be a Debian 12 server of its type, in its location.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition     = length(hcloud_firewall.worker.rule) == 0</span>
+<span class="a">+    error_message = &quot;The firewall must have no inbound rule, so that it drops all inbound traffic.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;the_cloud_config_names_the_host_and_opens_the_tunnel&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  assert {</span>
+<span class="a">+    condition = alltrue([for n, s in hcloud_server.worker :</span>
+<span class="a">+      yamldecode(s.user_data).hostname == n</span>
+<span class="a">+      &amp;&amp; strcontains(s.user_data, &quot;subplz-tunnel@198.44.53.27&quot;)</span>
+<span class="a">+      &amp;&amp; strcontains(s.user_data, &quot;SUBPLZ_WEB_WORKER_QUEUES=paid\n&quot;)</span>
+<span class="a">+    ])</span>
+<span class="a">+    error_message = &quot;The server must name itself, open the tunnel, and take paid jobs.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+run &quot;a_short_ref_is_refused&quot; {</span>
+<span class="a">+  command = plan</span>
+<span class="a">+</span>
+<span class="a">+  variables {</span>
+<span class="a">+    workers = { &quot;subplz-burst-1-0&quot; = { ref = &quot;0123abc&quot;, machine = &quot;cx33&quot;, zone = &quot;fsn1&quot; } }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  expect_failures = [var.workers]</span>
+<span class="a">+}</span>
+diff --git a/infra/burst/workers/hetzner/variables.tf b/infra/burst/workers/hetzner/variables.tf
+new file mode 100644
+index 0000000..bbb9b3b
+--- /dev/null
++++ b/infra/burst/workers/hetzner/variables.tf
+<span class="h">@@ -0,0 +1,43 @@</span>
+<span class="a">+variable &quot;workers&quot; {</span>
+<span class="a">+  description = &quot;The workers on Hetzner: server name -&gt; app commit, server type, location. The burst controller writes this.&quot;</span>
+<span class="a">+  type = map(object({</span>
+<span class="a">+    ref     = string</span>
+<span class="a">+    machine = string</span>
+<span class="a">+    zone    = string</span>
+<span class="a">+  }))</span>
+<span class="a">+  default = {}</span>
+<span class="a">+</span>
+<span class="a">+  validation {</span>
+<span class="a">+    condition     = alltrue([for name in keys(var.workers) : can(regex(&quot;^subplz-burst-[0-9a-z-]{1,40}$&quot;, name))])</span>
+<span class="a">+    error_message = &quot;Each worker name must start with subplz-burst-: the controller finds its workers by that prefix.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+  validation {</span>
+<span class="a">+    condition     = alltrue([for w in values(var.workers) : can(regex(&quot;^[0-9a-f]{40}$&quot;, w.ref))])</span>
+<span class="a">+    error_message = &quot;Each ref must be a full git commit hash.&quot;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;threads&quot; {</span>
+<span class="a">+  description = &quot;Whisper threads: all vCPUs of a 4-vCPU server type.&quot;</span>
+<span class="a">+  type        = number</span>
+<span class="a">+  default     = 4</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;idle_checks&quot; {</span>
+<span class="a">+  description = &quot;Idle checks (10 minutes each) before a machine powers itself off, if the controller is gone.&quot;</span>
+<span class="a">+  type        = number</span>
+<span class="a">+  default     = 9</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;subplz_spec&quot; {</span>
+<span class="a">+  description = &quot;The subplz package, pinned to the commit that the web server runs.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;subplz @ git+https://github.com/kanjieater/SubPlz.git@6be8b6fab185372b458bdde13c61f4da204dc6fc&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+variable &quot;state_file&quot; {</span>
+<span class="a">+  description = &quot;Path of the state file of ../../state.&quot;</span>
+<span class="a">+  type        = string</span>
+<span class="a">+  default     = &quot;/var/lib/subplz-burst/state.tfstate&quot;</span>
+<span class="a">+}</span>
+diff --git a/tools/set-secret.sh b/tools/set-secret.sh
+index eea3589..4043128 100755
+--- a/tools/set-secret.sh
++++ b/tools/set-secret.sh
+<span class="h">@@ -1,13 +1,14 @@</span>
+ #!/usr/bin/env bash
+<span class="d">-# Put one secret into .env without it touching shell history, the process list</span>
+<span class="d">-# or the screen.</span>
+<span class="a">+# Put one secret into .env (or into FILE) without it touching shell history,</span>
+<span class="a">+# the process list or the screen.</span>
+ #
+ #   tools/set-secret.sh SUBPLZ_WEB_STRIPE_SECRET_KEY
+<span class="a">+#   tools/set-secret.sh DIGITALOCEAN_TOKEN /etc/subplz-burst.env</span>
+ set -euo pipefail
+ 
+<span class="d">-key=&quot;${1:?usage: set-secret.sh VARIABLE_NAME}&quot;</span>
+<span class="a">+key=&quot;${1:?usage: set-secret.sh VARIABLE_NAME [FILE]}&quot;</span>
+ root=&quot;$(cd &quot;$(dirname &quot;$0&quot;)/..&quot; &amp;&amp; pwd)&quot;
+<span class="d">-env_file=&quot;$root/.env&quot;</span>
+<span class="a">+env_file=&quot;${2:-$root/.env}&quot;</span>
+ 
+ read -r -s -p &quot;Value for $key (input hidden): &quot; value
+ echo
+<span class="h">@@ -20,9 +21,11 @@ printf &#x27;%s=%s\n&#x27; &quot;$key&quot; &quot;$value&quot; &gt;&gt; &quot;$tmp&quot;</span>
+ cat &quot;$tmp&quot; &gt; &quot;$env_file&quot;
+ rm -f &quot;$tmp&quot;
+ 
+<span class="d">-# The service does not run as root; keep the file readable by whoever owns the</span>
+<span class="d">-# checkout, and by nobody else.</span>
+<span class="d">-chown &quot;$(stat -c %U:%G &quot;$root&quot;)&quot; &quot;$env_file&quot; 2&gt;/dev/null || true</span>
+<span class="a">+# The service does not run as root; keep .env readable by whoever owns the</span>
+<span class="a">+# checkout, and by nobody else. Another FILE stays with root.</span>
+<span class="a">+if [ -z &quot;${2:-}&quot; ]; then</span>
+<span class="a">+  chown &quot;$(stat -c %U:%G &quot;$root&quot;)&quot; &quot;$env_file&quot; 2&gt;/dev/null || true</span>
+<span class="a">+fi</span>
+ chmod 600 &quot;$env_file&quot;
+ 
+<span class="d">-echo &quot;$key saved. Apply it with: systemctl restart subplz-web&quot;</span>
+<span class="a">+echo &quot;$key saved in $env_file. Restart the services that read it.&quot;</span></pre>
+</div></body></html>

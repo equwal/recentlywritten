@@ -1,0 +1,1381 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web ed855021 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit ed85502140ba70bba39bfb3ecfa76d68bd74aeb6
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:51:20 -0700
+
+Sell Subrep Pro with the accounts of this site
+
+Subrep Pro is the paid plan of the Subrep desktop app. This site now sells
+it with the same accounts and the same Stripe checkout as the book plans.
+
+- Plans: $9.99 a year (first on the page) and $0.99 a month. The owner
+  chose $0.99 a month. The financial advocate chose $9.99 a year and no
+  free trial.
+- A Stripe subscription of a Subrep plan goes to its own table
+  (subrep_licences). It does not touch the book plan. An account can have
+  both.
+- /subrep.html shows a link command: the account id and a refresh key.
+  The desktop app sends the two to POST /api/subrep/refresh and gets a
+  licence token, signed with an Ed25519 key. The token has the format of
+  subrep/licensing.py, so the desktop client works without a change. A
+  token ends with the paid period, and after 31 days at most.
+- tools/subrep_key.py makes the key on the server. It prints only the
+  public key.
+- POST /api/subrep/waitlist keeps the emails for the iPhone app (kind
+  &quot;ios&quot;).
+- Where the server can send a sign-in email, only a verified account can
+  pay. A $0.99 checkout draws card testing.
+- A checkout can come back to /subrep.html. The return trip checks the
+  page against a list.
+- A recurring plan has an interval (&quot;month&quot; or &quot;year&quot;).
+- New dependency: cryptography, for Ed25519 signatures. The standard
+  library has no Ed25519.
+
+</pre><pre> .env.example         |   6 +
+ backend/accounts.py  |   3 +-
+ backend/api.py       |   9 +-
+ backend/main.py      |   3 +-
+ backend/payments.py  |  36 +++--
+ backend/pricing.py   |   2 +
+ backend/settings.py  |   7 +
+ backend/subrep.py    | 408 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ frontend/subrep.html | 184 +++++++++++++++++++++++
+ frontend/terms.html  |   9 ++
+ requirements.txt     |   4 +
+ tests/test_subrep.py | 370 ++++++++++++++++++++++++++++++++++++++++++++++
+ tools/subrep_key.py  |  61 ++++++++
+ 13 files changed, 1088 insertions(+), 14 deletions(-)
+</pre><pre>diff --git a/.env.example b/.env.example
+index e4c59a4..585b360 100644
+--- a/.env.example
++++ b/.env.example
+<span class="h">@@ -93,5 +93,11 @@ SUBPLZ_WEB_CONTACT_EMAIL=</span>
+ # Override the plan catalogue (see backend/pricing.py for the shape).
+ # SUBPLZ_WEB_PLANS_JSON=[...]
+ 
+<span class="a">+# --- Subrep Pro --------------------------------------------------------------</span>
+<span class="a">+# The key that signs the licences of the Subrep desktop app. Do not type it:</span>
+<span class="a">+# make it on the server with tools/subrep_key.py, which also prints the public</span>
+<span class="a">+# key for the desktop build. Without it, Subrep Pro is not for sale.</span>
+<span class="a">+# SUBPLZ_WEB_SUBREP_LICENSE_KEY=</span>
+<span class="a">+</span>
+ # --- uploads ---------------------------------------------------------------
+ SUBPLZ_WEB_MAX_UPLOAD_BYTES=2147483648
+diff --git a/backend/accounts.py b/backend/accounts.py
+index 48b8acb..e58b124 100644
+--- a/backend/accounts.py
++++ b/backend/accounts.py
+<span class="h">@@ -64,9 +64,10 @@ def merge(session: Session, src: Account, dst: Account) -&gt; None:</span>
+     session.query(Purchase).filter(Purchase.account_id == src.id).update(
+         {Purchase.account_id: dst.id}, synchronize_session=False
+     )
+<span class="d">-    from . import captions  # captions imports api, which imports this module</span>
+<span class="a">+    from . import captions, subrep  # they import api, which imports this module</span>
+ 
+     captions.merge(session, src, dst)
+<span class="a">+    subrep.merge(session, src, dst)</span>
+     dst.purchased_credits += src.purchased_credits
+     src.purchased_credits = 0
+     # Add the free credits used, not the free credits left: a second device
+diff --git a/backend/api.py b/backend/api.py
+index 8c93a2b..08c31e0 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -425,10 +425,16 @@ def create_checkout(</span>
+     return {&quot;url&quot;: url}
+ 
+ 
+<span class="a">+# The pages that a checkout can come back to. Any other page goes to &quot;/&quot;, so</span>
+<span class="a">+# the return trip cannot send the browser off this site.</span>
+<span class="a">+RETURN_PAGES = {&quot;/&quot;, &quot;/subrep.html&quot;}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @router.get(&quot;/billing/return&quot;)
+ def checkout_return(
+     session_id: str,
+     session: Annotated[Session, Depends(get_session)],
+<span class="a">+    page: str = &quot;/&quot;,</span>
+ ):
+     &quot;&quot;&quot;Where Stripe sends the browser after paying.
+ 
+<span class="h">@@ -442,7 +448,8 @@ def checkout_return(</span>
+     except payments.PaymentsUnavailable:
+         paid = False
+     state = &quot;paid&quot; if paid else &quot;pending&quot;
+<span class="d">-    return RedirectResponse(f&quot;/?checkout={state}&quot;, status_code=303)</span>
+<span class="a">+    page = page if page in RETURN_PAGES else &quot;/&quot;</span>
+<span class="a">+    return RedirectResponse(f&quot;{page}?checkout={state}&quot;, status_code=303)</span>
+ 
+ 
+ @router.post(&quot;/billing/webhook&quot;)
+diff --git a/backend/main.py b/backend/main.py
+index d50ca52..ffe9c0e 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -19,7 +19,7 @@ from fastapi import FastAPI</span>
+ from fastapi.responses import FileResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+<span class="d">-from . import captions</span>
+<span class="a">+from . import captions, subrep</span>
+ from .api import router
+ from .db import Job, JobStatus, SessionLocal, init_db
+ from .languages import all_languages
+<span class="h">@@ -128,6 +128,7 @@ app = FastAPI(</span>
+ )
+ app.include_router(router)
+ app.include_router(captions.router)
+<span class="a">+app.include_router(subrep.router)</span>
+ 
+ 
+ @app.middleware(&quot;http&quot;)
+diff --git a/backend/payments.py b/backend/payments.py
+index 8cd2b61..0c62543 100644
+--- a/backend/payments.py
++++ b/backend/payments.py
+<span class="h">@@ -22,6 +22,7 @@ from __future__ import annotations</span>
+ import json
+ import logging
+ from datetime import datetime, timezone
+<span class="a">+from urllib.parse import quote</span>
+ 
+ from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Session
+<span class="h">@@ -68,7 +69,7 @@ def _base() -&gt; str:</span>
+ # ---------------------------------------------------------------------------
+ 
+ def _catalogue_price(stripe, plan: pricing.Plan) -&gt; str | None:
+<span class="d">-    &quot;&quot;&quot;The id of the Stripe price of a monthly plan (lookup key = plan id).</span>
+<span class="a">+    &quot;&quot;&quot;The id of the Stripe price of a recurring plan (lookup key = plan id).</span>
+ 
+     The customer portal switches a subscription only between prices of the
+     Stripe catalogue, so a plan checks out with its catalogue price when one
+<span class="h">@@ -83,7 +84,7 @@ def _catalogue_price(stripe, plan: pricing.Plan) -&gt; str | None:</span>
+     for price in found.get(&quot;data&quot;) or []:
+         if (price.get(&quot;unit_amount&quot;) == plan.price_cents
+                 and price.get(&quot;currency&quot;) == plan.currency
+<span class="d">-                and (price.get(&quot;recurring&quot;) or {}).get(&quot;interval&quot;) == &quot;month&quot;):</span>
+<span class="a">+                and (price.get(&quot;recurring&quot;) or {}).get(&quot;interval&quot;) == plan.interval):</span>
+             return price[&quot;id&quot;]
+         log.warning(&quot;Stripe price %s does not match plan %s&quot;, price.get(&quot;id&quot;), plan.id)
+     return None
+<span class="h">@@ -107,7 +108,7 @@ def ensure_plan_prices() -&gt; list[tuple[str, str, bool]]:</span>
+             price = _plain(stripe.Price.create(
+                 unit_amount=plan.price_cents,
+                 currency=plan.currency,
+<span class="d">-                recurring={&quot;interval&quot;: &quot;month&quot;},</span>
+<span class="a">+                recurring={&quot;interval&quot;: plan.interval},</span>
+                 lookup_key=plan.id,
+                 # A price that does not match keeps its product; move the key.
+                 transfer_lookup_key=True,
+<span class="h">@@ -118,11 +119,18 @@ def ensure_plan_prices() -&gt; list[tuple[str, str, bool]]:</span>
+     return out
+ 
+ 
+<span class="d">-def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; str:</span>
+<span class="d">-    &quot;&quot;&quot;Return the Stripe-hosted payment page for `plan`.&quot;&quot;&quot;</span>
+<span class="a">+def start_checkout(session: Session, account: Account, plan: pricing.Plan,</span>
+<span class="a">+                   page: str = &quot;/&quot;) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;Return the Stripe-hosted payment page for `plan`.</span>
+<span class="a">+</span>
+<span class="a">+    `page` is the page of this site that the browser comes back to. It must be</span>
+<span class="a">+    one of api.RETURN_PAGES.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+     stripe = _stripe()
+ 
+<span class="d">-    if plan.recurring and billing.is_subscribed(account):</span>
+<span class="a">+    # One book plan at a time. A Subrep plan (subrep.py) is not a book plan.</span>
+<span class="a">+    if plan.recurring and pricing.get(plan.id, retired=True) is not None \</span>
+<span class="a">+            and billing.is_subscribed(account):</span>
+         raise PaymentError(
+             &quot;You already have a monthly plan. Change or cancel it with Manage plan.&quot;
+         )
+<span class="h">@@ -133,7 +141,7 @@ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; st</span>
+         &quot;product_data&quot;: {&quot;name&quot;: f&quot;{settings.site_name} - {plan.name}&quot;},
+     }
+     if plan.recurring:
+<span class="d">-        price[&quot;recurring&quot;] = {&quot;interval&quot;: &quot;month&quot;}</span>
+<span class="a">+        price[&quot;recurring&quot;] = {&quot;interval&quot;: plan.interval}</span>
+ 
+     line: dict = {&quot;quantity&quot;: 1, &quot;price_data&quot;: price}
+     if plan.recurring:
+<span class="h">@@ -142,6 +150,7 @@ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; st</span>
+             line = {&quot;quantity&quot;: 1, &quot;price&quot;: price_id}
+ 
+     meta = {&quot;account_id&quot;: account.id, &quot;plan_id&quot;: plan.id}
+<span class="a">+    back = &quot;&quot; if page == &quot;/&quot; else f&quot;&amp;page={quote(page, safe=&#x27;&#x27;)}&quot;</span>
+     params: dict = {
+         &quot;mode&quot;: &quot;subscription&quot; if plan.recurring else &quot;payment&quot;,
+         &quot;line_items&quot;: [line],
+<span class="h">@@ -150,8 +159,8 @@ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; st</span>
+         # Stripe substitutes the real id; the return handler re-reads the
+         # session from it rather than trusting anything in the URL.
+         &quot;success_url&quot;: f&quot;{_base()}/api/billing/return&quot;
+<span class="d">-                       &quot;?session_id={CHECKOUT_SESSION_ID}&quot;,</span>
+<span class="d">-        &quot;cancel_url&quot;: f&quot;{_base()}/?checkout=cancelled&quot;,</span>
+<span class="a">+                       &quot;?session_id={CHECKOUT_SESSION_ID}&quot; + back,</span>
+<span class="a">+        &quot;cancel_url&quot;: f&quot;{_base()}{page}?checkout=cancelled&quot;,</span>
+         &quot;allow_promotion_codes&quot;: True,
+     }
+     if account.stripe_customer_id:
+<span class="h">@@ -236,6 +245,10 @@ def _our_plan_id(sub: dict) -&gt; str | None:</span>
+ 
+ def apply_subscription(session: Session, sub: dict) -&gt; None:
+     &quot;&quot;&quot;Mirror a Stripe subscription onto its account.&quot;&quot;&quot;
+<span class="a">+    from . import subrep  # subrep imports api, which imports this module</span>
+<span class="a">+</span>
+<span class="a">+    if subrep.apply_subscription(session, sub):</span>
+<span class="a">+        return</span>
+     plan_id = _our_plan_id(sub)
+     if plan_id is None:
+         log.info(&quot;subscription %s is not for a plan of this site; ignored&quot;, sub.get(&quot;id&quot;))
+<span class="h">@@ -279,10 +292,11 @@ def fulfil(session: Session, checkout: dict) -&gt; Account | None:</span>
+     )
+     # A retired plan too: the buyer may have opened the payment page before
+     # the plan was retired.
+<span class="d">-    from . import captions  # captions imports api, which imports this module</span>
+<span class="a">+    from . import captions, subrep  # they import api, which imports this module</span>
+ 
+     plan = (pricing.get(meta.get(&quot;plan_id&quot;) or &quot;&quot;, retired=True)
+<span class="d">-            or captions.pack(meta.get(&quot;plan_id&quot;) or &quot;&quot;))</span>
+<span class="a">+            or captions.pack(meta.get(&quot;plan_id&quot;) or &quot;&quot;)</span>
+<span class="a">+            or subrep.plan(meta.get(&quot;plan_id&quot;) or &quot;&quot;))</span>
+     if account is None or plan is None:
+         log.error(&quot;checkout %s: unknown account or plan %r&quot;, checkout.get(&quot;id&quot;), meta)
+         return None
+diff --git a/backend/pricing.py b/backend/pricing.py
+index 329ff8a..b4772a1 100644
+--- a/backend/pricing.py
++++ b/backend/pricing.py
+<span class="h">@@ -74,6 +74,8 @@ class Plan:</span>
+     price_cents: int
+     currency: str = &quot;usd&quot;
+     recurring: bool = False
+<span class="a">+    # How often a recurring plan renews: &quot;month&quot; or &quot;year&quot;.</span>
+<span class="a">+    interval: str = &quot;month&quot;</span>
+     blurb: str = &quot;&quot;
+ 
+     @property
+diff --git a/backend/settings.py b/backend/settings.py
+index 24eb257..a4f2758 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -141,6 +141,13 @@ class Settings(BaseSettings):</span>
+     # The longest piece of speech in one request. The app sends 11 s at most.
+     caption_max_seconds: int = 30
+ 
+<span class="a">+    # --- Subrep Pro -------------------------------------------------------</span>
+<span class="a">+    # The Ed25519 key that signs the licences of the Subrep desktop app</span>
+<span class="a">+    # (base64url of the 32-byte private key). Without it, Subrep Pro is not</span>
+<span class="a">+    # for sale. Make it on the server with tools/subrep_key.py: every licence</span>
+<span class="a">+    # of every customer depends on it, so never replace it.</span>
+<span class="a">+    subrep_license_key: str = &quot;&quot;</span>
+<span class="a">+</span>
+     # --- uploads -----------------------------------------------------------
+     max_upload_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GiB
+ 
+diff --git a/backend/subrep.py b/backend/subrep.py
+new file mode 100644
+index 0000000..914feac
+--- /dev/null
++++ b/backend/subrep.py
+<span class="h">@@ -0,0 +1,408 @@</span>
+<span class="a">+&quot;&quot;&quot;Subrep Pro: the plan of the Subrep desktop app, sold with the accounts of this site.</span>
+<span class="a">+</span>
+<span class="a">+Subrep (https://honjimaku.com/subrep/) makes live captions of the sound on the</span>
+<span class="a">+customer&#x27;s own computer. The free edition makes live captions. Pro unlocks the</span>
+<span class="a">+paid features of the desktop app (FEATURES in subrep/licensing.py of the</span>
+<span class="a">+Subrep repo). The owner chose the prices on 2026-09-22:</span>
+<span class="a">+</span>
+<span class="a">+  yearly   $9.99 a year    (first on the page: 16% less than 12 x $0.99)</span>
+<span class="a">+  monthly  $0.99 a month</span>
+<span class="a">+</span>
+<span class="a">+There is no free trial: the free edition is the trial.</span>
+<span class="a">+</span>
+<span class="a">+How the desktop app gets Pro:</span>
+<span class="a">+</span>
+<span class="a">+1. The customer pays here. A Stripe subscription makes the account Pro until</span>
+<span class="a">+   the end of the paid period (SubrepLicence).</span>
+<span class="a">+2. The Subrep page (/subrep.html) shows a link command with the account id</span>
+<span class="a">+   and a refresh key. The customer runs it once on each computer.</span>
+<span class="a">+3. The app sends the two to POST /api/subrep/refresh and gets a licence token:</span>
+<span class="a">+   JSON claims, signed with the Ed25519 key of this server</span>
+<span class="a">+   (SUBPLZ_WEB_SUBREP_LICENSE_KEY, made by tools/subrep_key.py). The app</span>
+<span class="a">+   checks the token offline with the public key in its build, and asks for a</span>
+<span class="a">+   new one before the token ends.</span>
+<span class="a">+</span>
+<span class="a">+The token format is that of sign_token in subrep/licensing.py:</span>
+<span class="a">+base64url(JSON with sorted keys) &quot;.&quot; base64url(signature). A token ends with</span>
+<span class="a">+the paid period, and after TOKEN_DAYS at most, so a refund or a chargeback</span>
+<span class="a">+ends Pro within a month.</span>
+<span class="a">+</span>
+<span class="a">+A Subrep plan is not a book plan: billing.py does not see it, and an account</span>
+<span class="a">+can have both. payments.py sells the plans and gives each subscription event</span>
+<span class="a">+to apply_subscription first.</span>
+<span class="a">+</span>
+<span class="a">+The iOS waitlist is here too: the emails that ask to hear when an iPhone app</span>
+<span class="a">+ships. The owner counts them on 2026-11-30 (waitlist_count): 30 is one of the</span>
+<span class="a">+conditions to build the app.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import base64</span>
+<span class="a">+import hmac</span>
+<span class="a">+import importlib.util</span>
+<span class="a">+import json</span>
+<span class="a">+import logging</span>
+<span class="a">+import secrets</span>
+<span class="a">+from datetime import datetime, timedelta</span>
+<span class="a">+from typing import Annotated</span>
+<span class="a">+</span>
+<span class="a">+from fastapi import APIRouter, Depends, HTTPException</span>
+<span class="a">+from fastapi.responses import JSONResponse</span>
+<span class="a">+from pydantic import BaseModel</span>
+<span class="a">+from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint</span>
+<span class="a">+from sqlalchemy.exc import IntegrityError</span>
+<span class="a">+from sqlalchemy.orm import Mapped, Session, mapped_column</span>
+<span class="a">+</span>
+<span class="a">+from . import accounts, billing, payments</span>
+<span class="a">+from .api import get_account, get_session</span>
+<span class="a">+from .db import Account, Base, utcnow</span>
+<span class="a">+from .pricing import Plan</span>
+<span class="a">+from .settings import settings</span>
+<span class="a">+</span>
+<span class="a">+log = logging.getLogger(__name__)</span>
+<span class="a">+</span>
+<span class="a">+# A plan that was sold must stay in this list: a subscription that still runs</span>
+<span class="a">+# names it. Change a price with a new plan id.</span>
+<span class="a">+PLANS: list[Plan] = [</span>
+<span class="a">+    Plan(id=&quot;subrep_year&quot;, name=&quot;Subrep Pro, yearly&quot;, credits=0, price_cents=999,</span>
+<span class="a">+         recurring=True, interval=&quot;year&quot;,</span>
+<span class="a">+         blurb=&quot;Renews each year until you cancel. 16% less than monthly.&quot;),</span>
+<span class="a">+    Plan(id=&quot;subrep_month&quot;, name=&quot;Subrep Pro, monthly&quot;, credits=0, price_cents=99,</span>
+<span class="a">+         recurring=True, interval=&quot;month&quot;,</span>
+<span class="a">+         blurb=&quot;Renews each month until you cancel.&quot;),</span>
+<span class="a">+]</span>
+<span class="a">+</span>
+<span class="a">+# The longest time that one licence token is good for.</span>
+<span class="a">+TOKEN_DAYS = 31</span>
+<span class="a">+</span>
+<span class="a">+WAITLISTS = {&quot;ios&quot;}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class SubrepLicence(Base):</span>
+<span class="a">+    &quot;&quot;&quot;The Subrep Pro subscription of an account, and its refresh key.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    __tablename__ = &quot;subrep_licences&quot;</span>
+<span class="a">+</span>
+<span class="a">+    account_id: Mapped[str] = mapped_column(</span>
+<span class="a">+        String(64), ForeignKey(&quot;accounts.id&quot;), primary_key=True</span>
+<span class="a">+    )</span>
+<span class="a">+    # The desktop app sends it to get a licence. It is kept as it is, like the</span>
+<span class="a">+    # device token of an account: the page shows the same link command on</span>
+<span class="a">+    # each visit, so that each computer of the customer can use it.</span>
+<span class="a">+    refresh_key: Mapped[str | None] = mapped_column(String(64), nullable=True)</span>
+<span class="a">+    subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True)</span>
+<span class="a">+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)</span>
+<span class="a">+    plan_id: Mapped[str | None] = mapped_column(String(32), nullable=True)</span>
+<span class="a">+    period_end: Mapped[datetime | None] = mapped_column(</span>
+<span class="a">+        DateTime(timezone=True), nullable=True</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class WaitlistEntry(Base):</span>
+<span class="a">+    &quot;&quot;&quot;An email that asks to hear when an app ships (kind &quot;ios&quot;).&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    __tablename__ = &quot;waitlist&quot;</span>
+<span class="a">+    __table_args__ = (UniqueConstraint(&quot;kind&quot;, &quot;email&quot;),)</span>
+<span class="a">+</span>
+<span class="a">+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)</span>
+<span class="a">+    kind: Mapped[str] = mapped_column(String(16))</span>
+<span class="a">+    email: Mapped[str] = mapped_column(String(320))</span>
+<span class="a">+    account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)</span>
+<span class="a">+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def plan(plan_id: str) -&gt; Plan | None:</span>
+<span class="a">+    return next((p for p in PLANS if p.id == plan_id), None)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def licence(session: Session, account_id: str) -&gt; SubrepLicence | None:</span>
+<span class="a">+    return session.get(SubrepLicence, account_id)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def is_pro(row: SubrepLicence | None, now: datetime | None = None) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Whether the subscription is paid for the current period.&quot;&quot;&quot;</span>
+<span class="a">+    if row is None or row.status not in billing._SUBSCRIBED:</span>
+<span class="a">+        return False</span>
+<span class="a">+    end = billing._aware(row.period_end)</span>
+<span class="a">+    return end is None or end &gt; (now or utcnow())</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def can_sign() -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;A key is set, and the package that signs with it is installed.&quot;&quot;&quot;</span>
+<span class="a">+    return bool(settings.subrep_license_key) and (</span>
+<span class="a">+        importlib.util.find_spec(&quot;cryptography&quot;) is not None</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def available() -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Subrep Pro is for sale: the server can take the money and sign a licence.&quot;&quot;&quot;</span>
+<span class="a">+    return can_sign() and settings.payments_configured</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# subscriptions</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def _plan_of(sub: dict) -&gt; Plan | None:</span>
+<span class="a">+    &quot;&quot;&quot;The Subrep plan of a subscription, or None if it is not one.</span>
+<span class="a">+</span>
+<span class="a">+    As in payments._our_plan_id: the lookup key of the price names the plan</span>
+<span class="a">+    after a switch in the customer portal, and the checkout metadata names it</span>
+<span class="a">+    before that.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    items = (sub.get(&quot;items&quot;) or {}).get(&quot;data&quot;) or []</span>
+<span class="a">+    price = (items[0].get(&quot;price&quot;) or {}) if items else {}</span>
+<span class="a">+    for plan_id in (price.get(&quot;lookup_key&quot;), (sub.get(&quot;metadata&quot;) or {}).get(&quot;plan_id&quot;)):</span>
+<span class="a">+        found = plan(plan_id or &quot;&quot;)</span>
+<span class="a">+        if found is not None:</span>
+<span class="a">+            return found</span>
+<span class="a">+    return None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def apply_subscription(session: Session, sub: dict) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Mirror a Stripe subscription of a Subrep plan. False if it is not one.&quot;&quot;&quot;</span>
+<span class="a">+    found = _plan_of(sub)</span>
+<span class="a">+    if found is None:</span>
+<span class="a">+        return False</span>
+<span class="a">+    meta = sub.get(&quot;metadata&quot;) or {}</span>
+<span class="a">+    account = payments._account_for(session, meta.get(&quot;account_id&quot;), sub.get(&quot;customer&quot;))</span>
+<span class="a">+    if account is None:</span>
+<span class="a">+        log.warning(&quot;subrep subscription %s matches no account&quot;, sub.get(&quot;id&quot;))</span>
+<span class="a">+        return True</span>
+<span class="a">+    row = licence(session, account.id) or SubrepLicence(account_id=account.id)</span>
+<span class="a">+    # The end of an old subscription must not end its replacement.</span>
+<span class="a">+    if row.subscription_id and row.subscription_id != sub.get(&quot;id&quot;) \</span>
+<span class="a">+            and sub.get(&quot;status&quot;) in (&quot;canceled&quot;, &quot;incomplete_expired&quot;):</span>
+<span class="a">+        return True</span>
+<span class="a">+    row.subscription_id = sub.get(&quot;id&quot;)</span>
+<span class="a">+    row.status = sub.get(&quot;status&quot;)</span>
+<span class="a">+    row.plan_id = found.id</span>
+<span class="a">+    row.period_end = payments._period_end(sub)</span>
+<span class="a">+    session.add(row)</span>
+<span class="a">+    if sub.get(&quot;customer&quot;) and not account.stripe_customer_id:</span>
+<span class="a">+        account.stripe_customer_id = sub[&quot;customer&quot;]</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    return True</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def merge(session: Session, src: Account, dst: Account) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Called by accounts.merge: the Subrep plan of `src` goes to `dst`.&quot;&quot;&quot;</span>
+<span class="a">+    row = licence(session, src.id)</span>
+<span class="a">+    if row is None:</span>
+<span class="a">+        return</span>
+<span class="a">+    target = licence(session, dst.id)</span>
+<span class="a">+    if target is None or (is_pro(row) and not is_pro(target)):</span>
+<span class="a">+        target = target or SubrepLicence(account_id=dst.id)</span>
+<span class="a">+        target.subscription_id, target.status = row.subscription_id, row.status</span>
+<span class="a">+        target.plan_id, target.period_end = row.plan_id, row.period_end</span>
+<span class="a">+        session.add(target)</span>
+<span class="a">+    # The computers that were linked to `src` keep their link command.</span>
+<span class="a">+    target.refresh_key = target.refresh_key or row.refresh_key</span>
+<span class="a">+    session.delete(row)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# licence tokens</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def _b64e(raw: bytes) -&gt; str:</span>
+<span class="a">+    return base64.urlsafe_b64encode(raw).rstrip(b&quot;=&quot;).decode(&quot;ascii&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _private_key():</span>
+<span class="a">+    # cryptography only here: a server without Subrep Pro does not need it.</span>
+<span class="a">+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey</span>
+<span class="a">+</span>
+<span class="a">+    text = settings.subrep_license_key</span>
+<span class="a">+    return Ed25519PrivateKey.from_private_bytes(</span>
+<span class="a">+        base64.urlsafe_b64decode(text + &quot;=&quot; * (-len(text) % 4))</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def sign(claims: dict) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;A licence token, in the format of sign_token in subrep/licensing.py.&quot;&quot;&quot;</span>
+<span class="a">+    payload = json.dumps(claims, separators=(&quot;,&quot;, &quot;:&quot;), sort_keys=True).encode()</span>
+<span class="a">+    return _b64e(payload) + &quot;.&quot; + _b64e(_private_key().sign(payload))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def public_key() -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;The key to build into the desktop app (SUBREP_LICENSE_PUBKEY).&quot;&quot;&quot;</span>
+<span class="a">+    return _b64e(_private_key().public_key().public_bytes_raw())</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class LicenceRefused(Exception):</span>
+<span class="a">+    def __init__(self, status: int, message: str):</span>
+<span class="a">+        super().__init__(message)</span>
+<span class="a">+        self.status = status</span>
+<span class="a">+        self.message = message</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def token(session: Session, account_id: str, refresh_key: str,</span>
+<span class="a">+          now: datetime | None = None) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;A licence token for the desktop app, or LicenceRefused.&quot;&quot;&quot;</span>
+<span class="a">+    now = now or utcnow()</span>
+<span class="a">+    account = session.get(Account, account_id or &quot;&quot;)</span>
+<span class="a">+    if account is not None:</span>
+<span class="a">+        account = accounts.resolve(session, account)</span>
+<span class="a">+    row = licence(session, account.id) if account is not None else None</span>
+<span class="a">+    if row is None or not row.refresh_key or not hmac.compare_digest(</span>
+<span class="a">+            row.refresh_key.encode(), (refresh_key or &quot;&quot;).encode()):</span>
+<span class="a">+        raise LicenceRefused(</span>
+<span class="a">+            403, &quot;This link command is not valid. &quot;</span>
+<span class="a">+                 &quot;Copy it again from the Subrep page of subread.space.&quot;)</span>
+<span class="a">+    if not is_pro(row, now):</span>
+<span class="a">+        raise LicenceRefused(402, &quot;This account has no active Subrep Pro plan.&quot;)</span>
+<span class="a">+    latest = now + timedelta(days=TOKEN_DAYS)</span>
+<span class="a">+    end = min(billing._aware(row.period_end) or latest, latest)</span>
+<span class="a">+    return sign({&quot;sub&quot;: account.email or account.id, &quot;tier&quot;: &quot;pro&quot;,</span>
+<span class="a">+                 &quot;plan&quot;: row.plan_id, &quot;iat&quot;: int(now.timestamp()),</span>
+<span class="a">+                 &quot;exp&quot;: int(end.timestamp())})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def link(session: Session, account: Account) -&gt; dict:</span>
+<span class="a">+    &quot;&quot;&quot;The link command of a Pro account. The first call makes its refresh key.&quot;&quot;&quot;</span>
+<span class="a">+    row = licence(session, account.id)</span>
+<span class="a">+    if row is None:</span>
+<span class="a">+        raise LicenceRefused(402, &quot;This account has no Subrep Pro plan.&quot;)</span>
+<span class="a">+    if not row.refresh_key:</span>
+<span class="a">+        row.refresh_key = secrets.token_urlsafe(24)</span>
+<span class="a">+        session.commit()</span>
+<span class="a">+    server = f&quot;{settings.public_base_url.rstrip(&#x27;/&#x27;)}/api/subrep&quot;</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;account&quot;: account.id,</span>
+<span class="a">+        &quot;refresh_key&quot;: row.refresh_key,</span>
+<span class="a">+        &quot;server&quot;: server,</span>
+<span class="a">+        &quot;command&quot;: f&#x27;subrep license --link &quot;{account.id}&quot; &quot;{row.refresh_key}&quot; &quot;{server}&quot;&#x27;,</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# waitlist</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def join(session: Session, kind: str, email: str, account_id: str | None) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Put `email` on a waitlist. False if it was on it already.&quot;&quot;&quot;</span>
+<span class="a">+    session.add(WaitlistEntry(kind=kind, email=email, account_id=account_id))</span>
+<span class="a">+    try:</span>
+<span class="a">+        session.commit()</span>
+<span class="a">+    except IntegrityError:</span>
+<span class="a">+        session.rollback()</span>
+<span class="a">+        return False</span>
+<span class="a">+    return True</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def waitlist_count(session: Session, kind: str) -&gt; int:</span>
+<span class="a">+    return session.query(WaitlistEntry).filter(WaitlistEntry.kind == kind).count()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# routes</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+router = APIRouter(prefix=&quot;/api/subrep&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class PlanIn(BaseModel):</span>
+<span class="a">+    plan_id: str</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class RefreshIn(BaseModel):</span>
+<span class="a">+    account: str = &quot;&quot;</span>
+<span class="a">+    refresh_key: str = &quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class WaitlistIn(BaseModel):</span>
+<span class="a">+    email: str</span>
+<span class="a">+    kind: str = &quot;ios&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _needs_sign_in(account: Account) -&gt; bool:</span>
+<span class="a">+    # A $0.99 checkout draws card testing. Where email sign-in exists, only a</span>
+<span class="a">+    # verified account may pay.</span>
+<span class="a">+    return settings.sign_in_available and not account.email_verified</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.get(&quot;&quot;)</span>
+<span class="a">+def subrep_state(</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    row = licence(session, account.id)</span>
+<span class="a">+    pro = is_pro(row)</span>
+<span class="a">+    end = billing._aware(row.period_end) if pro and row is not None else None</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;available&quot;: available(),</span>
+<span class="a">+        &quot;public_key&quot;: public_key() if can_sign() else None,</span>
+<span class="a">+        &quot;plans&quot;: [</span>
+<span class="a">+            {&quot;id&quot;: p.id, &quot;name&quot;: p.name, &quot;interval&quot;: p.interval,</span>
+<span class="a">+             &quot;price_cents&quot;: p.price_cents, &quot;price_display&quot;: p.price_display,</span>
+<span class="a">+             &quot;blurb&quot;: p.blurb}</span>
+<span class="a">+            for p in PLANS</span>
+<span class="a">+        ],</span>
+<span class="a">+        &quot;pro&quot;: pro,</span>
+<span class="a">+        &quot;plan_id&quot;: row.plan_id if pro and row is not None else None,</span>
+<span class="a">+        &quot;period_end&quot;: end.isoformat() if end else None,</span>
+<span class="a">+        &quot;link&quot;: link(session, account) if pro else None,</span>
+<span class="a">+        &quot;needs_sign_in&quot;: _needs_sign_in(account),</span>
+<span class="a">+        &quot;email&quot;: account.email,</span>
+<span class="a">+        &quot;can_manage&quot;: bool(account.stripe_customer_id),</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/checkout&quot;)</span>
+<span class="a">+def subrep_checkout(</span>
+<span class="a">+    body: PlanIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    found = plan(body.plan_id)</span>
+<span class="a">+    if found is None:</span>
+<span class="a">+        raise HTTPException(404, &quot;No such plan.&quot;)</span>
+<span class="a">+    if not available():</span>
+<span class="a">+        raise HTTPException(503, &quot;Subrep Pro is not for sale on this server yet.&quot;)</span>
+<span class="a">+    if _needs_sign_in(account):</span>
+<span class="a">+        raise HTTPException(403, &quot;Sign in with your email first.&quot;)</span>
+<span class="a">+    if is_pro(licence(session, account.id)):</span>
+<span class="a">+        raise HTTPException(</span>
+<span class="a">+            400, &quot;You already have Subrep Pro. Change or cancel it with Manage plan.&quot;)</span>
+<span class="a">+    try:</span>
+<span class="a">+        return {&quot;url&quot;: payments.start_checkout(session, account, found, page=&quot;/subrep.html&quot;)}</span>
+<span class="a">+    except payments.PaymentsUnavailable as exc:</span>
+<span class="a">+        raise HTTPException(503, str(exc)) from exc</span>
+<span class="a">+    except payments.PaymentError as exc:</span>
+<span class="a">+        raise HTTPException(400, str(exc)) from exc</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/refresh&quot;)</span>
+<span class="a">+def subrep_refresh(</span>
+<span class="a">+    body: RefreshIn,</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    &quot;&quot;&quot;The desktop app asks for a licence (refresh in subrep/licensing.py).</span>
+<span class="a">+</span>
+<span class="a">+    No cookie: the app is not a browser. A refusal is {&quot;error&quot;: ...}, because</span>
+<span class="a">+    the app shows that text to the customer.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if not can_sign():</span>
+<span class="a">+        return JSONResponse({&quot;error&quot;: &quot;Subrep Pro is not set up on this server.&quot;},</span>
+<span class="a">+                            status_code=503)</span>
+<span class="a">+    try:</span>
+<span class="a">+        return {&quot;token&quot;: token(session, body.account, body.refresh_key)}</span>
+<span class="a">+    except LicenceRefused as exc:</span>
+<span class="a">+        return JSONResponse({&quot;error&quot;: exc.message}, status_code=exc.status)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/waitlist&quot;)</span>
+<span class="a">+def subrep_waitlist(</span>
+<span class="a">+    body: WaitlistIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    if body.kind not in WAITLISTS:</span>
+<span class="a">+        raise HTTPException(404, &quot;No such waitlist.&quot;)</span>
+<span class="a">+    try:</span>
+<span class="a">+        email = accounts.normalize_email(body.email)</span>
+<span class="a">+    except accounts.InvalidEmail as exc:</span>
+<span class="a">+        raise HTTPException(400, str(exc)) from exc</span>
+<span class="a">+    join(session, body.kind, email, account.id)</span>
+<span class="a">+    return {&quot;joined&quot;: True, &quot;kind&quot;: body.kind}</span>
+diff --git a/frontend/subrep.html b/frontend/subrep.html
+new file mode 100644
+index 0000000..980b9c0
+--- /dev/null
++++ b/frontend/subrep.html
+<span class="h">@@ -0,0 +1,184 @@</span>
+<span class="a">+&lt;!doctype html&gt;</span>
+<span class="a">+&lt;html lang=&quot;en&quot;&gt;</span>
+<span class="a">+&lt;head&gt;</span>
+<span class="a">+&lt;meta charset=&quot;utf-8&quot;&gt;</span>
+<span class="a">+&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1&quot;&gt;</span>
+<span class="a">+&lt;title&gt;Subrep Pro — SubRead&lt;/title&gt;</span>
+<span class="a">+&lt;link rel=&quot;stylesheet&quot; href=&quot;/style.css?v=13&quot;&gt;</span>
+<span class="a">+&lt;style&gt;</span>
+<span class="a">+  main.pro { max-width: 720px; padding-top: 24px; padding-bottom: 60px; }</span>
+<span class="a">+  main.pro h1 { font-size: 26px; margin: 12px 0 6px; }</span>
+<span class="a">+  main.pro li { margin: 6px 0; }</span>
+<span class="a">+  main.pro a { color: var(--accent); }</span>
+<span class="a">+  .command { display: flex; gap: 8px; align-items: stretch; margin: 10px 0; }</span>
+<span class="a">+  .command code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;</span>
+<span class="a">+    padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px;</span>
+<span class="a">+    background: var(--bg); font-size: 13px; }</span>
+<span class="a">+  .waitlist { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }</span>
+<span class="a">+  .waitlist input { flex: 1; min-width: 200px; font: inherit; padding: 9px 12px;</span>
+<span class="a">+    border: 1px solid var(--line); border-radius: 9px; background: var(--bg); color: var(--ink); }</span>
+<span class="a">+  .note { margin-top: 12px; padding: 10px 14px; border-radius: 9px;</span>
+<span class="a">+    background: var(--accent-soft); }</span>
+<span class="a">+  .note:empty { display: none; }</span>
+<span class="a">+&lt;/style&gt;</span>
+<span class="a">+&lt;/head&gt;</span>
+<span class="a">+&lt;body&gt;</span>
+<span class="a">+&lt;main class=&quot;pro&quot;&gt;</span>
+<span class="a">+  &lt;p&gt;&lt;a href=&quot;https://honjimaku.com/subrep/&quot;&gt;← Subrep&lt;/a&gt; · &lt;a href=&quot;/&quot;&gt;SubRead&lt;/a&gt;&lt;/p&gt;</span>
+<span class="a">+  &lt;h1&gt;Subrep Pro&lt;/h1&gt;</span>
+<span class="a">+  &lt;p class=&quot;muted&quot;&gt;Subrep makes live captions of the sound on your computer, on your computer.</span>
+<span class="a">+    Live captions are free. Pro adds:&lt;/p&gt;</span>
+<span class="a">+  &lt;ul&gt;</span>
+<span class="a">+    &lt;li&gt;&lt;strong&gt;Replay clips:&lt;/strong&gt; get back the sentence that you just heard, as a clip with</span>
+<span class="a">+      subtitles that you can mine with Yomitan.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;&lt;strong&gt;Anki cards&lt;/strong&gt; from a clip.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;&lt;strong&gt;The large and medium speech models&lt;/strong&gt;, for better text.&lt;/li&gt;</span>
+<span class="a">+  &lt;/ul&gt;</span>
+<span class="a">+  &lt;p class=&quot;note&quot; id=&quot;note&quot; role=&quot;status&quot;&gt;&lt;/p&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;section class=&quot;panel&quot; id=&quot;buy&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Choose a plan&lt;/h2&gt;</span>
+<span class="a">+    &lt;div class=&quot;plans&quot; id=&quot;plans&quot;&gt;&lt;/div&gt;</span>
+<span class="a">+    &lt;p class=&quot;muted small&quot; id=&quot;sign-in-note&quot; hidden&gt;Sign in with your email on</span>
+<span class="a">+      &lt;a href=&quot;/&quot;&gt;the SubRead page&lt;/a&gt; first, then come back here.&lt;/p&gt;</span>
+<span class="a">+    &lt;p class=&quot;muted small&quot;&gt;Stripe takes the payment. Cancel at any time with &quot;Manage plan&quot;: the plan</span>
+<span class="a">+      then runs to the end of the period that you paid for. We refund a first payment on request</span>
+<span class="a">+      within 14 days. &lt;a href=&quot;/terms.html&quot;&gt;Terms&lt;/a&gt;&lt;/p&gt;</span>
+<span class="a">+  &lt;/section&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;section class=&quot;panel&quot; id=&quot;pro&quot; hidden&gt;</span>
+<span class="a">+    &lt;h2&gt;Your Subrep Pro&lt;/h2&gt;</span>
+<span class="a">+    &lt;p id=&quot;pro-status&quot;&gt;&lt;/p&gt;</span>
+<span class="a">+    &lt;p&gt;Run this command once on each computer that has Subrep. It links the computer to this</span>
+<span class="a">+      account, and the computer then renews its licence by itself:&lt;/p&gt;</span>
+<span class="a">+    &lt;div class=&quot;command&quot;&gt;</span>
+<span class="a">+      &lt;code id=&quot;command&quot;&gt;&lt;/code&gt;</span>
+<span class="a">+      &lt;button class=&quot;ghost compact&quot; id=&quot;copy&quot; type=&quot;button&quot;&gt;Copy&lt;/button&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+    &lt;p class=&quot;muted small&quot;&gt;Keep the command private: it gives Pro to any computer that runs it.&lt;/p&gt;</span>
+<span class="a">+    &lt;div class=&quot;actions&quot;&gt;</span>
+<span class="a">+      &lt;button class=&quot;ghost&quot; id=&quot;manage&quot; type=&quot;button&quot;&gt;Manage plan&lt;/button&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+  &lt;/section&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;section class=&quot;panel&quot; id=&quot;ios&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Subrep for iPhone&lt;/h2&gt;</span>
+<span class="a">+    &lt;p&gt;There is no iPhone app yet. Leave your email, and we write to you once, when it ships.&lt;/p&gt;</span>
+<span class="a">+    &lt;form class=&quot;waitlist&quot; id=&quot;waitlist&quot;&gt;</span>
+<span class="a">+      &lt;input id=&quot;waitlist-email&quot; type=&quot;email&quot; required autocomplete=&quot;email&quot;</span>
+<span class="a">+        aria-label=&quot;Email&quot; placeholder=&quot;you@example.com&quot;&gt;</span>
+<span class="a">+      &lt;button class=&quot;primary&quot; type=&quot;submit&quot;&gt;Tell me&lt;/button&gt;</span>
+<span class="a">+    &lt;/form&gt;</span>
+<span class="a">+    &lt;p class=&quot;muted small&quot;&gt;On an iPhone today, open the share link of a caption stream in Safari.&lt;/p&gt;</span>
+<span class="a">+  &lt;/section&gt;</span>
+<span class="a">+</span>
+<span class="a">+  &lt;section class=&quot;panel&quot;&gt;</span>
+<span class="a">+    &lt;h2&gt;Free editions&lt;/h2&gt;</span>
+<span class="a">+    &lt;ul&gt;</span>
+<span class="a">+      &lt;li&gt;&lt;a href=&quot;https://honjimaku.com/subrep/&quot;&gt;Subrep for Windows&lt;/a&gt;&lt;/li&gt;</span>
+<span class="a">+      &lt;li&gt;&lt;a href=&quot;https://github.com/equwal/subrep-android/releases/latest&quot;&gt;Subrep for Android&lt;/a&gt;&lt;/li&gt;</span>
+<span class="a">+    &lt;/ul&gt;</span>
+<span class="a">+  &lt;/section&gt;</span>
+<span class="a">+&lt;/main&gt;</span>
+<span class="a">+&lt;script type=&quot;module&quot;&gt;</span>
+<span class="a">+  const $ = (id) =&gt; document.getElementById(id);</span>
+<span class="a">+  const say = (text) =&gt; { $(&#x27;note&#x27;).textContent = text; };</span>
+<span class="a">+</span>
+<span class="a">+  async function post(path, body) {</span>
+<span class="a">+    const res = await fetch(path, {</span>
+<span class="a">+      method: &#x27;POST&#x27;, credentials: &#x27;same-origin&#x27;,</span>
+<span class="a">+      headers: { &#x27;Content-Type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+      body: JSON.stringify(body || {}),</span>
+<span class="a">+    });</span>
+<span class="a">+    const data = await res.json().catch(() =&gt; ({}));</span>
+<span class="a">+    if (!res.ok) throw new Error(data.detail || data.error || `Error ${res.status}`);</span>
+<span class="a">+    return data;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function planCard(plan, state, first) {</span>
+<span class="a">+    const card = document.createElement(&#x27;div&#x27;);</span>
+<span class="a">+    card.className = &#x27;plan&#x27; + (first ? &#x27; featured&#x27; : &#x27;&#x27;);</span>
+<span class="a">+    const name = document.createElement(&#x27;div&#x27;);</span>
+<span class="a">+    name.className = &#x27;plan-name&#x27;;</span>
+<span class="a">+    name.textContent = plan.name;</span>
+<span class="a">+    const price = document.createElement(&#x27;div&#x27;);</span>
+<span class="a">+    price.className = &#x27;plan-price&#x27;;</span>
+<span class="a">+    price.textContent = plan.price_display + &#x27; &#x27;;</span>
+<span class="a">+    const per = document.createElement(&#x27;small&#x27;);</span>
+<span class="a">+    per.textContent = plan.interval === &#x27;year&#x27; ? &#x27;billed yearly&#x27; : &#x27;billed monthly&#x27;;</span>
+<span class="a">+    price.append(per);</span>
+<span class="a">+    const blurb = document.createElement(&#x27;p&#x27;);</span>
+<span class="a">+    blurb.className = &#x27;plan-blurb&#x27;;</span>
+<span class="a">+    blurb.textContent = plan.blurb;</span>
+<span class="a">+    const buy = document.createElement(&#x27;button&#x27;);</span>
+<span class="a">+    buy.className = first ? &#x27;primary&#x27; : &#x27;ghost&#x27;;</span>
+<span class="a">+    buy.type = &#x27;button&#x27;;</span>
+<span class="a">+    buy.textContent = `Pay ${plan.price_display}`;</span>
+<span class="a">+    buy.disabled = !state.available || state.needs_sign_in;</span>
+<span class="a">+    buy.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+      buy.disabled = true;</span>
+<span class="a">+      try {</span>
+<span class="a">+        location.href = (await post(&#x27;/api/subrep/checkout&#x27;, { plan_id: plan.id })).url;</span>
+<span class="a">+      } catch (err) {</span>
+<span class="a">+        say(err.message);</span>
+<span class="a">+        buy.disabled = false;</span>
+<span class="a">+      }</span>
+<span class="a">+    });</span>
+<span class="a">+    card.append(name, price, blurb, buy);</span>
+<span class="a">+    return card;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  async function render() {</span>
+<span class="a">+    const state = await (await fetch(&#x27;/api/subrep&#x27;, { credentials: &#x27;same-origin&#x27; })).json();</span>
+<span class="a">+    $(&#x27;plans&#x27;).replaceChildren(...state.plans.map((p, i) =&gt; planCard(p, state, i === 0)));</span>
+<span class="a">+    $(&#x27;sign-in-note&#x27;).hidden = !state.needs_sign_in;</span>
+<span class="a">+    $(&#x27;buy&#x27;).hidden = state.pro;</span>
+<span class="a">+    $(&#x27;pro&#x27;).hidden = !state.pro;</span>
+<span class="a">+    if (!state.available) say(&#x27;Subrep Pro is not for sale yet. Check again soon.&#x27;);</span>
+<span class="a">+    if (state.pro) {</span>
+<span class="a">+      const ends = new Date(state.period_end).toLocaleDateString();</span>
+<span class="a">+      const plan = state.plans.find((p) =&gt; p.id === state.plan_id);</span>
+<span class="a">+      $(&#x27;pro-status&#x27;).textContent = `${plan ? plan.name : &#x27;Subrep Pro&#x27;}: paid until ${ends}.`;</span>
+<span class="a">+      $(&#x27;command&#x27;).textContent = state.link.command;</span>
+<span class="a">+    }</span>
+<span class="a">+    return state;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  $(&#x27;copy&#x27;).addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    await navigator.clipboard.writeText($(&#x27;command&#x27;).textContent);</span>
+<span class="a">+    $(&#x27;copy&#x27;).textContent = &#x27;Copied&#x27;;</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  $(&#x27;manage&#x27;).addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+    try {</span>
+<span class="a">+      location.href = (await post(&#x27;/api/billing/portal&#x27;)).url;</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      say(err.message);</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  $(&#x27;waitlist&#x27;).addEventListener(&#x27;submit&#x27;, async (event) =&gt; {</span>
+<span class="a">+    event.preventDefault();</span>
+<span class="a">+    try {</span>
+<span class="a">+      await post(&#x27;/api/subrep/waitlist&#x27;, { email: $(&#x27;waitlist-email&#x27;).value, kind: &#x27;ios&#x27; });</span>
+<span class="a">+      $(&#x27;waitlist&#x27;).replaceChildren(&#x27;Thank you. We write to you when the iPhone app ships.&#x27;);</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      say(err.message);</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  const checkout = new URLSearchParams(location.search).get(&#x27;checkout&#x27;);</span>
+<span class="a">+  const state = await render();</span>
+<span class="a">+  if (checkout === &#x27;cancelled&#x27;) say(&#x27;The payment was cancelled. No money was taken.&#x27;);</span>
+<span class="a">+  if (checkout === &#x27;paid&#x27; || checkout === &#x27;pending&#x27;) {</span>
+<span class="a">+    // The webhook can land a few seconds after the browser comes back.</span>
+<span class="a">+    say(state.pro ? &#x27;Thank you. Subrep Pro is on.&#x27; : &#x27;The payment is in progress…&#x27;);</span>
+<span class="a">+    for (let i = 0; i &lt; 10 &amp;&amp; !(await render()).pro; i++) {</span>
+<span class="a">+      await new Promise((done) =&gt; setTimeout(done, 3000));</span>
+<span class="a">+    }</span>
+<span class="a">+    if ((await render()).pro) say(&#x27;Thank you. Subrep Pro is on.&#x27;);</span>
+<span class="a">+  }</span>
+<span class="a">+  history.replaceState(null, &#x27;&#x27;, location.pathname + location.hash);</span>
+<span class="a">+&lt;/script&gt;</span>
+<span class="a">+&lt;/body&gt;</span>
+<span class="a">+&lt;/html&gt;</span>
+diff --git a/frontend/terms.html b/frontend/terms.html
+index 2b0353c..8dca898 100644
+--- a/frontend/terms.html
++++ b/frontend/terms.html
+<span class="h">@@ -26,6 +26,8 @@</span>
+       finished subtitles, so that this page can list your conversions.&lt;/li&gt;
+     &lt;li&gt;&lt;strong&gt;On our server (credits):&lt;/strong&gt; you upload the audio and the book, and the server
+       does the work. One credit converts one book. New visitors get some free credits to try it.&lt;/li&gt;
+<span class="a">+    &lt;li&gt;&lt;strong&gt;Subrep Pro:&lt;/strong&gt; the paid plan of the Subrep desktop app, which makes live</span>
+<span class="a">+      captions on your computer. This site sells the plan and keeps its account.&lt;/li&gt;</span>
+   &lt;/ul&gt;
+ 
+   &lt;h2&gt;Your files&lt;/h2&gt;
+<span class="h">@@ -55,6 +57,9 @@</span>
+       conversion in your browser first: it uses the same method, and it shows whether your
+       book and your audio match.&lt;/li&gt;
+     &lt;li&gt;Unused credits are refunded on request within 14 days of the purchase.&lt;/li&gt;
+<span class="a">+    &lt;li&gt;Subrep Pro renews each month or each year, until you cancel it. Cancel at any time with</span>
+<span class="a">+      &quot;Manage plan&quot;: the plan then runs to the end of the period that you paid for. We refund the</span>
+<span class="a">+      first payment of Subrep Pro on request within 14 days.&lt;/li&gt;</span>
+   &lt;/ul&gt;
+ 
+   &lt;h2&gt;Accounts and privacy&lt;/h2&gt;
+<span class="h">@@ -66,6 +71,10 @@</span>
+       links and for answers to your messages, and for nothing else.&lt;/li&gt;
+     &lt;li&gt;We store: your email address (if you gave one), your credits and purchases, and the list of
+       your conversions (file names, sizes, language, times). Write to us to have all of it deleted.&lt;/li&gt;
+<span class="a">+    &lt;li&gt;For Subrep Pro, we store your plan and a link key. The Subrep app on your computer sends</span>
+<span class="a">+      the key to get its licence. The app sends nothing else to this site.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;If you ask to hear about the iPhone app, we use your email once, to tell you that it</span>
+<span class="a">+      ships.&lt;/li&gt;</span>
+     &lt;li&gt;The server keeps ordinary web logs (IP address, time, page) for a short time, for security.&lt;/li&gt;
+   &lt;/ul&gt;
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 6f8778e..9957924 100644
+--- a/requirements.txt
++++ b/requirements.txt
+<span class="h">@@ -13,6 +13,10 @@ mobi&gt;=0.4</span>
+ # small and pure Python, and leaving it optional only makes deploys fiddlier.
+ stripe&gt;=13
+ 
+<span class="a">+# Subrep Pro licences (backend/subrep.py): Ed25519 signatures that the Subrep</span>
+<span class="a">+# desktop app checks. The standard library has no Ed25519.</span>
+<span class="a">+cryptography&gt;=42</span>
+<span class="a">+</span>
+ # --- public deployment extras (not needed on localhost) ---
+ # redis&gt;=5.0          # SUBPLZ_WEB_QUEUE_BACKEND=redis
+ # rq&gt;=1.16            # external worker processes
+diff --git a/tests/test_subrep.py b/tests/test_subrep.py
+new file mode 100644
+index 0000000..5205975
+--- /dev/null
++++ b/tests/test_subrep.py
+<span class="h">@@ -0,0 +1,370 @@</span>
+<span class="a">+&quot;&quot;&quot;Subrep Pro: the plan of the Subrep desktop app, sold with the accounts of this site.</span>
+<span class="a">+</span>
+<span class="a">+  yearly   $9.99 a year (first on the page)</span>
+<span class="a">+  monthly  $0.99 a month</span>
+<span class="a">+</span>
+<span class="a">+A Stripe subscription makes the account Pro. The desktop app does not have the</span>
+<span class="a">+cookie of the browser: the page gives a link command with the account id and a</span>
+<span class="a">+refresh key, and the app sends the two to /api/subrep/refresh. The answer is a</span>
+<span class="a">+licence token that the app checks offline with the public key in its build.</span>
+<span class="a">+A Subrep plan is not a book plan: an account can have both, or one of them.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import base64</span>
+<span class="a">+import json</span>
+<span class="a">+import time</span>
+<span class="a">+from urllib.parse import parse_qs, urlparse</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+import stripe</span>
+<span class="a">+from cryptography.exceptions import InvalidSignature</span>
+<span class="a">+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey</span>
+<span class="a">+from hypothesis import given</span>
+<span class="a">+from hypothesis import settings as hsettings</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+</span>
+<span class="a">+from backend import accounts, subrep</span>
+<span class="a">+from backend.db import Account, SessionLocal</span>
+<span class="a">+from backend.settings import settings</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import FakeStripeObject, account_id, checkout_event, post_webhook</span>
+<span class="a">+</span>
+<span class="a">+SEED = bytes(range(32))  # a fixed key for the tests, never the key of a server</span>
+<span class="a">+PRIVATE_KEY = base64.urlsafe_b64encode(SEED).rstrip(b&quot;=&quot;).decode()</span>
+<span class="a">+PUBLIC_KEY = Ed25519PrivateKey.from_private_bytes(SEED).public_key()</span>
+<span class="a">+DAY = 86400</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture(autouse=True)</span>
+<span class="a">+def licence_key(monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;subrep_license_key&quot;, PRIVATE_KEY)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def b64d(text: str) -&gt; bytes:</span>
+<span class="a">+    return base64.urlsafe_b64decode(text + &quot;=&quot; * (-len(text) % 4))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def verify(token: str) -&gt; dict:</span>
+<span class="a">+    &quot;&quot;&quot;The check of the desktop app (verify_token in subrep/licensing.py).&quot;&quot;&quot;</span>
+<span class="a">+    payload, sig = token.split(&quot;.&quot;)</span>
+<span class="a">+    PUBLIC_KEY.verify(b64d(sig), b64d(payload))</span>
+<span class="a">+    return json.loads(b64d(payload))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def sub_object(account, plan_id, status=&quot;active&quot;, period_end=None, sub_id=None,</span>
+<span class="a">+               price_key=None) -&gt; dict:</span>
+<span class="a">+    item: dict = {&quot;current_period_end&quot;: period_end or int(time.time()) + 30 * DAY}</span>
+<span class="a">+    if price_key:</span>
+<span class="a">+        item[&quot;price&quot;] = {&quot;id&quot;: f&quot;price_{price_key}&quot;, &quot;lookup_key&quot;: price_key}</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;id&quot;: sub_id or f&quot;sub_subrep_{account}&quot;, &quot;object&quot;: &quot;subscription&quot;,</span>
+<span class="a">+        &quot;status&quot;: status, &quot;customer&quot;: f&quot;cus_{account}&quot;,</span>
+<span class="a">+        &quot;metadata&quot;: {&quot;account_id&quot;: account, &quot;plan_id&quot;: plan_id},</span>
+<span class="a">+        &quot;items&quot;: {&quot;data&quot;: [item]},</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def sub_event(kind: str, obj: dict) -&gt; dict:</span>
+<span class="a">+    return {&quot;id&quot;: f&quot;evt_{kind}_{time.time_ns()}&quot;, &quot;type&quot;: f&quot;customer.subscription.{kind}&quot;,</span>
+<span class="a">+            &quot;data&quot;: {&quot;object&quot;: obj}}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def buy(client, monkeypatch, plan_id=&quot;subrep_year&quot;, email=None) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;Pay for Subrep Pro, as the checkout webhook tells it. Returns the account id.&quot;&quot;&quot;</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    sub = sub_object(acct, plan_id)</span>
+<span class="a">+    monkeypatch.setattr(stripe.Subscription, &quot;retrieve&quot;, lambda sid: FakeStripeObject(sub))</span>
+<span class="a">+    event = checkout_event(f&quot;cs_{time.time_ns()}&quot;, acct, plan_id,</span>
+<span class="a">+                           email=email or f&quot;pro-{time.time_ns()}@example.com&quot;,</span>
+<span class="a">+                           subscription=sub[&quot;id&quot;])</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+<span class="a">+    return acct</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def state(client) -&gt; dict:</span>
+<span class="a">+    return client.get(&quot;/api/subrep&quot;).json()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def refresh(client, account: str, key: str):</span>
+<span class="a">+    return client.post(&quot;/api/subrep/refresh&quot;, json={&quot;account&quot;: account, &quot;refresh_key&quot;: key})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def fake_checkout(monkeypatch) -&gt; dict:</span>
+<span class="a">+    seen: dict = {}</span>
+<span class="a">+    monkeypatch.setattr(</span>
+<span class="a">+        stripe.checkout.Session, &quot;create&quot;,</span>
+<span class="a">+        lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/pro&quot;}),</span>
+<span class="a">+    )</span>
+<span class="a">+    return seen</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- plans and checkout ------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_the_page_offers_the_yearly_plan_first_then_the_monthly_plan(client):</span>
+<span class="a">+    plans = state(client)[&quot;plans&quot;]</span>
+<span class="a">+    assert [(p[&quot;id&quot;], p[&quot;price_cents&quot;], p[&quot;interval&quot;]) for p in plans] == [</span>
+<span class="a">+        (&quot;subrep_year&quot;, 999, &quot;year&quot;), (&quot;subrep_month&quot;, 99, &quot;month&quot;)]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_book_page_does_not_show_subrep_pro(client):</span>
+<span class="a">+    ids = {p[&quot;id&quot;] for p in client.get(&quot;/api/pricing&quot;).json()[&quot;plans&quot;]}</span>
+<span class="a">+    assert not ids &amp; {p.id for p in subrep.PLANS}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_plan_checks_out_as_a_subscription_of_its_interval(client, monkeypatch):</span>
+<span class="a">+    seen = fake_checkout(monkeypatch)</span>
+<span class="a">+    r = client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_year&quot;})</span>
+<span class="a">+    assert r.status_code == 200 and r.json()[&quot;url&quot;] == &quot;https://stripe.test/pro&quot;</span>
+<span class="a">+    assert seen[&quot;mode&quot;] == &quot;subscription&quot;</span>
+<span class="a">+    price = seen[&quot;line_items&quot;][0][&quot;price_data&quot;]</span>
+<span class="a">+    assert price[&quot;recurring&quot;] == {&quot;interval&quot;: &quot;year&quot;} and price[&quot;unit_amount&quot;] == 999</span>
+<span class="a">+    assert seen[&quot;subscription_data&quot;][&quot;metadata&quot;][&quot;plan_id&quot;] == &quot;subrep_year&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_checkout_comes_back_to_the_subrep_page(client, monkeypatch):</span>
+<span class="a">+    seen = fake_checkout(monkeypatch)</span>
+<span class="a">+    client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_month&quot;})</span>
+<span class="a">+    assert seen[&quot;cancel_url&quot;] == &quot;https://example.test/subrep.html?checkout=cancelled&quot;</span>
+<span class="a">+    success = urlparse(seen[&quot;success_url&quot;])</span>
+<span class="a">+    assert success.path == &quot;/api/billing/return&quot;</span>
+<span class="a">+    assert parse_qs(success.query)[&quot;page&quot;] == [&quot;/subrep.html&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_return_trip_goes_only_to_a_known_page(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(stripe.checkout.Session, &quot;retrieve&quot;,</span>
+<span class="a">+                        lambda sid: FakeStripeObject({&quot;id&quot;: sid, &quot;payment_status&quot;: &quot;unpaid&quot;}))</span>
+<span class="a">+    r = client.get(&quot;/api/billing/return?session_id=cs_x&amp;page=/subrep.html&quot;,</span>
+<span class="a">+                   follow_redirects=False)</span>
+<span class="a">+    assert r.status_code == 303 and r.headers[&quot;location&quot;] == &quot;/subrep.html?checkout=pending&quot;</span>
+<span class="a">+    r = client.get(&quot;/api/billing/return?session_id=cs_x&amp;page=https://evil.test/&quot;,</span>
+<span class="a">+                   follow_redirects=False)</span>
+<span class="a">+    assert r.headers[&quot;location&quot;] == &quot;/?checkout=pending&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_book_plan_does_not_stop_a_subrep_checkout(client, monkeypatch):</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    books = sub_object(acct, &quot;month10&quot;, sub_id=f&quot;sub_books_{acct}&quot;)</span>
+<span class="a">+    assert post_webhook(client, sub_event(&quot;created&quot;, books)).status_code == 200</span>
+<span class="a">+    assert client.get(&quot;/api/account&quot;).json()[&quot;subscribed&quot;] is True</span>
+<span class="a">+    fake_checkout(monkeypatch)</span>
+<span class="a">+    assert client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_month&quot;}).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_second_subrep_plan_is_refused(client, monkeypatch):</span>
+<span class="a">+    buy(client, monkeypatch)</span>
+<span class="a">+    fake_checkout(monkeypatch)</span>
+<span class="a">+    r = client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_month&quot;})</span>
+<span class="a">+    assert r.status_code == 400 and &quot;Manage plan&quot; in r.json()[&quot;detail&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_only_a_subrep_plan_is_sold_here(client):</span>
+<span class="a">+    assert client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 404</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_checkout_needs_a_verified_email_when_the_server_can_send_one(client, monkeypatch):</span>
+<span class="a">+    # A $0.99 checkout draws card testing. With email sign-in, only a verified</span>
+<span class="a">+    # account may pay. Without it, the checks of Stripe are all there is.</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;smtp_host&quot;, &quot;smtp.example.test&quot;)</span>
+<span class="a">+    fake_checkout(monkeypatch)</span>
+<span class="a">+    assert state(client)[&quot;needs_sign_in&quot;] is True</span>
+<span class="a">+    assert client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_year&quot;}).status_code == 403</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        row = s.get(Account, account_id(client))</span>
+<span class="a">+        row.email, row.email_verified = f&quot;v-{time.time_ns()}@example.com&quot;, 1</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+    assert client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_year&quot;}).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_server_without_a_licence_key_sells_nothing(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;subrep_license_key&quot;, &quot;&quot;)</span>
+<span class="a">+    assert state(client)[&quot;available&quot;] is False</span>
+<span class="a">+    assert client.post(&quot;/api/subrep/checkout&quot;, json={&quot;plan_id&quot;: &quot;subrep_year&quot;}).status_code == 503</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- Pro, the link command and the licence -------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_paying_makes_the_account_pro_and_gives_a_link_command(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch)</span>
+<span class="a">+    s = state(client)</span>
+<span class="a">+    assert s[&quot;pro&quot;] is True and s[&quot;plan_id&quot;] == &quot;subrep_year&quot;</span>
+<span class="a">+    link = s[&quot;link&quot;]</span>
+<span class="a">+    assert link[&quot;account&quot;] == acct and link[&quot;server&quot;] == &quot;https://example.test/api/subrep&quot;</span>
+<span class="a">+    assert link[&quot;command&quot;] == (</span>
+<span class="a">+        f&#x27;subrep license --link &quot;{acct}&quot; &quot;{link[&quot;refresh_key&quot;]}&quot; &quot;{link[&quot;server&quot;]}&quot;&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_page_shows_the_same_link_command_on_each_visit(client, monkeypatch):</span>
+<span class="a">+    # Each computer of the customer runs the same command.</span>
+<span class="a">+    buy(client, monkeypatch)</span>
+<span class="a">+    assert state(client)[&quot;link&quot;] == state(client)[&quot;link&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_subrep_plan_does_not_touch_the_book_plan(client, monkeypatch):</span>
+<span class="a">+    buy(client, monkeypatch)</span>
+<span class="a">+    a = client.get(&quot;/api/account&quot;).json()</span>
+<span class="a">+    assert a[&quot;subscribed&quot;] is False and a[&quot;plan_credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_desktop_app_gets_a_licence_that_the_public_key_verifies(client, monkeypatch):</span>
+<span class="a">+    email = f&quot;desk-{time.time_ns()}@example.com&quot;</span>
+<span class="a">+    acct = buy(client, monkeypatch, email=email)</span>
+<span class="a">+    r = refresh(client, acct, state(client)[&quot;link&quot;][&quot;refresh_key&quot;])</span>
+<span class="a">+    assert r.status_code == 200</span>
+<span class="a">+    claims = verify(r.json()[&quot;token&quot;])</span>
+<span class="a">+    assert claims[&quot;tier&quot;] == &quot;pro&quot; and claims[&quot;sub&quot;] == email</span>
+<span class="a">+    assert time.time() &lt; claims[&quot;exp&quot;] &lt;= time.time() + 31 * DAY</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_licence_ends_with_the_paid_period(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch, plan_id=&quot;subrep_month&quot;)</span>
+<span class="a">+    end = int(time.time()) + 3 * DAY</span>
+<span class="a">+    post_webhook(client, sub_event(&quot;updated&quot;, sub_object(acct, &quot;subrep_month&quot;, period_end=end)))</span>
+<span class="a">+    token = refresh(client, acct, state(client)[&quot;link&quot;][&quot;refresh_key&quot;]).json()[&quot;token&quot;]</span>
+<span class="a">+    assert verify(token)[&quot;exp&quot;] == end</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_yearly_licence_ends_within_31_days(client, monkeypatch):</span>
+<span class="a">+    # The app asks again before then, so a refund ends Pro within a month.</span>
+<span class="a">+    acct = buy(client, monkeypatch)</span>
+<span class="a">+    post_webhook(client, sub_event(&quot;updated&quot;, sub_object(</span>
+<span class="a">+        acct, &quot;subrep_year&quot;, period_end=int(time.time()) + 365 * DAY)))</span>
+<span class="a">+    token = refresh(client, acct, state(client)[&quot;link&quot;][&quot;refresh_key&quot;]).json()[&quot;token&quot;]</span>
+<span class="a">+    assert verify(token)[&quot;exp&quot;] &lt;= time.time() + 31 * DAY</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_wrong_refresh_key_gets_no_licence(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch)</span>
+<span class="a">+    key = state(client)[&quot;link&quot;][&quot;refresh_key&quot;]  # the account has a key now</span>
+<span class="a">+    r = refresh(client, acct, key[:-1] + (&quot;A&quot; if key[-1] != &quot;A&quot; else &quot;B&quot;))</span>
+<span class="a">+    assert r.status_code == 403 and &quot;error&quot; in r.json()</span>
+<span class="a">+    assert refresh(client, acct, key).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_account_without_a_link_command_gets_no_licence(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch)  # the page was never opened: no key yet</span>
+<span class="a">+    assert refresh(client, acct, &quot;&quot;).status_code == 403</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_cancelled_plan_gets_no_licence(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch, plan_id=&quot;subrep_month&quot;)</span>
+<span class="a">+    key = state(client)[&quot;link&quot;][&quot;refresh_key&quot;]</span>
+<span class="a">+    ended = sub_object(acct, &quot;subrep_month&quot;, status=&quot;canceled&quot;)</span>
+<span class="a">+    assert post_webhook(client, sub_event(&quot;deleted&quot;, ended)).status_code == 200</span>
+<span class="a">+    s = state(client)</span>
+<span class="a">+    assert s[&quot;pro&quot;] is False and s[&quot;link&quot;] is None</span>
+<span class="a">+    r = refresh(client, acct, key)</span>
+<span class="a">+    assert r.status_code == 402 and &quot;error&quot; in r.json()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_switch_in_the_portal_changes_the_plan(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch, plan_id=&quot;subrep_month&quot;)</span>
+<span class="a">+    post_webhook(client, sub_event(&quot;updated&quot;, sub_object(</span>
+<span class="a">+        acct, &quot;subrep_month&quot;, price_key=&quot;subrep_year&quot;)))</span>
+<span class="a">+    assert state(client)[&quot;plan_id&quot;] == &quot;subrep_year&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_end_of_an_old_subscription_does_not_end_its_replacement(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch)</span>
+<span class="a">+    old = sub_object(acct, &quot;subrep_month&quot;, status=&quot;canceled&quot;, sub_id=&quot;sub_old&quot;)</span>
+<span class="a">+    post_webhook(client, sub_event(&quot;deleted&quot;, old))</span>
+<span class="a">+    assert state(client)[&quot;pro&quot;] is True</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_merging_accounts_keeps_the_licence(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch)</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        owner = accounts.new_account(s)</span>
+<span class="a">+        accounts.merge(s, s.get(Account, acct), owner)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert subrep.is_pro(subrep.licence(s, owner.id))</span>
+<span class="a">+        assert subrep.licence(s, acct) is None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_link_command_of_a_merged_account_still_works(client, monkeypatch):</span>
+<span class="a">+    acct = buy(client, monkeypatch)</span>
+<span class="a">+    key = state(client)[&quot;link&quot;][&quot;refresh_key&quot;]</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        owner = accounts.new_account(s)</span>
+<span class="a">+        accounts.merge(s, s.get(Account, acct), owner)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+    assert refresh(client, acct, key).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- the iOS waitlist ------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_the_ios_waitlist_keeps_one_entry_for_each_email(client):</span>
+<span class="a">+    email = f&quot;Wait-{time.time_ns()}@Example.com&quot;</span>
+<span class="a">+    for _ in range(2):</span>
+<span class="a">+        r = client.post(&quot;/api/subrep/waitlist&quot;, json={&quot;email&quot;: email})</span>
+<span class="a">+        assert r.status_code == 200 and r.json()[&quot;joined&quot;] is True</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        rows = s.query(subrep.WaitlistEntry).filter_by(email=email.lower()).all()</span>
+<span class="a">+        assert [row.kind for row in rows] == [&quot;ios&quot;]</span>
+<span class="a">+        assert subrep.waitlist_count(s, &quot;ios&quot;) &gt;= 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_waitlist_refuses_what_is_not_an_email(client):</span>
+<span class="a">+    assert client.post(&quot;/api/subrep/waitlist&quot;, json={&quot;email&quot;: &quot;nope&quot;}).status_code == 400</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_there_is_no_waitlist_for_an_unknown_app(client):</span>
+<span class="a">+    r = client.post(&quot;/api/subrep/waitlist&quot;, json={&quot;email&quot;: &quot;a@example.com&quot;, &quot;kind&quot;: &quot;tv&quot;})</span>
+<span class="a">+    assert r.status_code == 404</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- the token format ------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+claims_st = st.dictionaries(</span>
+<span class="a">+    st.text(min_size=1, max_size=12),</span>
+<span class="a">+    st.one_of(st.integers(), st.text(max_size=20), st.booleans()),</span>
+<span class="a">+    max_size=6,</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@hsettings(max_examples=60, deadline=None)</span>
+<span class="a">+@given(claims=claims_st)</span>
+<span class="a">+def test_a_token_carries_its_claims_and_its_signature_checks(claims):</span>
+<span class="a">+    assert verify(subrep.sign(claims)) == claims</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@hsettings(max_examples=60, deadline=None)</span>
+<span class="a">+@given(claims=claims_st, where=st.integers(min_value=0))</span>
+<span class="a">+def test_a_changed_token_fails_the_check(claims, where):</span>
+<span class="a">+    payload, sig = subrep.sign(claims).split(&quot;.&quot;)</span>
+<span class="a">+    raw = bytearray(b64d(payload))</span>
+<span class="a">+    raw[where % len(raw)] ^= 1</span>
+<span class="a">+    changed = base64.urlsafe_b64encode(bytes(raw)).rstrip(b&quot;=&quot;).decode() + &quot;.&quot; + sig</span>
+<span class="a">+    with pytest.raises(InvalidSignature):</span>
+<span class="a">+        verify(changed)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_page_shows_the_public_key_for_the_desktop_build(client):</span>
+<span class="a">+    assert b64d(state(client)[&quot;public_key&quot;]) == PUBLIC_KEY.public_bytes_raw()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_key_tool_makes_one_key_and_never_replaces_it(tmp_path, monkeypatch, capsys):</span>
+<span class="a">+    import importlib.util</span>
+<span class="a">+    from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+    spec = importlib.util.spec_from_file_location(</span>
+<span class="a">+        &quot;subrep_key&quot;, Path(__file__).resolve().parent.parent / &quot;tools&quot; / &quot;subrep_key.py&quot;)</span>
+<span class="a">+    tool = importlib.util.module_from_spec(spec)</span>
+<span class="a">+    spec.loader.exec_module(tool)</span>
+<span class="a">+    env = tmp_path / &quot;.env&quot;</span>
+<span class="a">+    env.write_text(&quot;SUBPLZ_WEB_OTHER=1&quot;, encoding=&quot;utf-8&quot;)  # no newline at the end</span>
+<span class="a">+    monkeypatch.setattr(tool, &quot;ROOT&quot;, tmp_path)</span>
+<span class="a">+    monkeypatch.setattr(tool, &quot;ENV&quot;, env)</span>
+<span class="a">+</span>
+<span class="a">+    assert tool.main() == 0</span>
+<span class="a">+    public = capsys.readouterr().out.strip()</span>
+<span class="a">+    text = env.read_text(encoding=&quot;utf-8&quot;)</span>
+<span class="a">+    assert text.startswith(&quot;SUBPLZ_WEB_OTHER=1\nSUBPLZ_WEB_SUBREP_LICENSE_KEY=&quot;)</span>
+<span class="a">+    saved = text.split(&quot;SUBPLZ_WEB_SUBREP_LICENSE_KEY=&quot;)[1].strip()</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;subrep_license_key&quot;, saved)</span>
+<span class="a">+    assert subrep.public_key() == public  # the printed key belongs to the saved key</span>
+<span class="a">+</span>
+<span class="a">+    assert tool.main() == 0</span>
+<span class="a">+    assert capsys.readouterr().out.strip() == public</span>
+<span class="a">+    assert env.read_text(encoding=&quot;utf-8&quot;) == text</span>
+diff --git a/tools/subrep_key.py b/tools/subrep_key.py
+new file mode 100644
+index 0000000..6a999a2
+--- /dev/null
++++ b/tools/subrep_key.py
+<span class="h">@@ -0,0 +1,61 @@</span>
+<span class="a">+&quot;&quot;&quot;Make the licence key of Subrep Pro on the server, once.</span>
+<span class="a">+</span>
+<span class="a">+    python tools/subrep_key.py</span>
+<span class="a">+</span>
+<span class="a">+It writes SUBPLZ_WEB_SUBREP_LICENSE_KEY into .env and never shows it. It</span>
+<span class="a">+prints the public key: build that into the Subrep desktop app (PUBLIC_KEY_B64</span>
+<span class="a">+in subrep/licensing.py). When .env has the key already, it prints the public</span>
+<span class="a">+key of that key and changes nothing. Every licence of every customer depends</span>
+<span class="a">+on the key, so this tool never replaces it.</span>
+<span class="a">+</span>
+<span class="a">+After the first run: systemctl restart subplz-web</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import base64</span>
+<span class="a">+import os</span>
+<span class="a">+import sys</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey</span>
+<span class="a">+</span>
+<span class="a">+NAME = &quot;SUBPLZ_WEB_SUBREP_LICENSE_KEY&quot;</span>
+<span class="a">+ROOT = Path(__file__).resolve().parent.parent</span>
+<span class="a">+ENV = ROOT / &quot;.env&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def b64e(raw: bytes) -&gt; str:</span>
+<span class="a">+    return base64.urlsafe_b64encode(raw).rstrip(b&quot;=&quot;).decode(&quot;ascii&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def b64d(text: str) -&gt; bytes:</span>
+<span class="a">+    return base64.urlsafe_b64decode(text + &quot;=&quot; * (-len(text) % 4))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main() -&gt; int:</span>
+<span class="a">+    text = ENV.read_text(encoding=&quot;utf-8&quot;) if ENV.exists() else &quot;&quot;</span>
+<span class="a">+    found = [line.split(&quot;=&quot;, 1)[1].strip() for line in text.splitlines()</span>
+<span class="a">+             if line.startswith(NAME + &quot;=&quot;)]</span>
+<span class="a">+    if found and found[-1]:</span>
+<span class="a">+        key = Ed25519PrivateKey.from_private_bytes(b64d(found[-1]))</span>
+<span class="a">+        print(f&quot;{NAME} is set already. It stays as it is.&quot;, file=sys.stderr)</span>
+<span class="a">+    else:</span>
+<span class="a">+        key = Ed25519PrivateKey.generate()</span>
+<span class="a">+        with ENV.open(&quot;a&quot;, encoding=&quot;utf-8&quot;) as f:</span>
+<span class="a">+            if text and not text.endswith(&quot;\n&quot;):</span>
+<span class="a">+                f.write(&quot;\n&quot;)</span>
+<span class="a">+            f.write(f&quot;{NAME}={b64e(key.private_bytes_raw())}\n&quot;)</span>
+<span class="a">+        # As tools/set-secret.sh: the service does not run as root. The file</span>
+<span class="a">+        # belongs to the owner of the checkout, and nobody else may read it.</span>
+<span class="a">+        if hasattr(os, &quot;chown&quot;):</span>
+<span class="a">+            owner = ROOT.stat()</span>
+<span class="a">+            os.chown(ENV, owner.st_uid, owner.st_gid)</span>
+<span class="a">+        os.chmod(ENV, 0o600)</span>
+<span class="a">+        print(f&quot;{NAME} saved in {ENV}. Apply it with: systemctl restart subplz-web&quot;,</span>
+<span class="a">+              file=sys.stderr)</span>
+<span class="a">+    print(b64e(key.public_key().public_bytes_raw()))</span>
+<span class="a">+    return 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    sys.exit(main())</span></pre>
+</div></body></html>

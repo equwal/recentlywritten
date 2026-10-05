@@ -1,0 +1,764 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread da506ca9 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit da506ca9a8ab8382c10e18f6398d65a25b2fa6c4
+truex &lt;truex@equwal.com&gt;
+2026-09-26 18:43:05 -0700
+
+Go on after a page that OCR cannot read, and keep Force OCR per book
+
+- The reading ended with an unhandled rejection when OCR could not
+  start, and the progress stayed in the strip: the stop did
+  `await (await started).terminate()`. stopOcr stops a started OCR and
+  ignores a start that failed.
+- When OCR cannot start, the strip says &quot;OCR could not start. The first
+  OCR run needs a network connection to download the language data.&quot;
+  with Retry. OCR starts before the render, so no page renders for
+  nothing.
+- One page that fails no longer stops the other pages. The reading
+  counts it and goes on, and at the end the strip says &quot;N pages could
+  not be read.&quot; with Retry. Retry reads only the pages that are not
+  read.
+- A new reading (another OCR language, Force OCR, another book) stops
+  the OCR of the reading before at once. Two quick changes of a setting
+  ran two OCR jobs at the same time. tesseract.js does not settle a
+  page when its worker stops, so a page of a stopped OCR now rejects.
+- Force OCR is a setting of the book, in its meta data. As a global
+  setting it sent each later text PDF through the slow OCR. The
+  checkbox shows the setting of the open book, and the strip says
+  &quot;Force OCR is on&quot; while it is on.
+- &quot;Clear the page cache&quot; removed the OCR work of all books with no
+  question. &quot;Clear this book&#x27;s pages&quot; and &quot;Clear all pages&quot; ask first.
+
+The strip shows a button after a message (fill, onAction). OcrStartError
+moves to ocr-job.ts, so main.ts can use it without tesseract.js in its
+chunk.
+
+</pre><pre> index.html            |   3 +-
+ src/main.ts           | 155 +++++++++++++++++++++++++++++++++++++++++---------
+ src/messages.ts       |  43 +++++++++++++-
+ src/ocr-job.ts        |  23 ++++++++
+ src/ocr.ts            |  34 ++++++-----
+ src/status.ts         |  33 +++++++++--
+ src/style.css         |  11 ++++
+ test/messages.test.ts |  39 +++++++++++++
+ test/ocr-job.test.ts  |  45 +++++++++++++++
+ test/ocr.test.ts      |  13 +++++
+ 10 files changed, 351 insertions(+), 48 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index 7aadff2..598d06a 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -140,7 +140,8 @@</span>
+         &gt;&lt;input id=&quot;pause-lookup&quot; type=&quot;checkbox&quot; checked /&gt; Pause on lookup&lt;/label
+       &gt;
+       &lt;div class=&quot;row&quot;&gt;
+<span class="d">-        &lt;button id=&quot;clear-cache&quot;&gt;Clear the page cache&lt;/button&gt;</span>
+<span class="a">+        &lt;button id=&quot;clear-book&quot;&gt;Clear this book&#x27;s pages&lt;/button&gt;</span>
+<span class="a">+        &lt;button id=&quot;clear-all&quot;&gt;Clear all pages&lt;/button&gt;</span>
+       &lt;/div&gt;
+ 
+       &lt;ol id=&quot;cues&quot;&gt;&lt;/ol&gt;
+diff --git a/src/main.ts b/src/main.ts
+index ea24bba..fc21eda 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -15,6 +15,8 @@ import { follow, type FollowEvent, type FollowMode } from &#x27;./follower&#x27;;</span>
+ import { lookupText, tapTolerance, tokenAt } from &#x27;./hit-test&#x27;;
+ import { lineBoxes, padBox } from &#x27;./line-boxes&#x27;;
+ import {
+<span class="a">+  CLEAR_ALL_QUESTION,</span>
+<span class="a">+  clearBookQuestion,</span>
+   clockText,
+   EMPTY_FILE_TEXT,
+   errorMessage,
+<span class="h">@@ -26,17 +28,20 @@ import {</span>
+   pdfLoadedText,
+   pdfOpenText,
+   playerMessage,
+<span class="a">+  readingEndMessage,</span>
+   readingText,
+   UPDATING_CACHE_TEXT,
+<span class="a">+  withForceOcr,</span>
+   type Message,
+ } from &#x27;./messages&#x27;;
+ import { setupNav } from &#x27;./nav&#x27;;
+ import type { Ocr } from &#x27;./ocr&#x27;;
+<span class="a">+import { OcrStartError, stopOcr } from &#x27;./ocr-job&#x27;;</span>
+ import { defaultRtl } from &#x27;./paging&#x27;;
+ import type { PdfDoc } from &#x27;./pdf&#x27;;
+ import { nextPage } from &#x27;./read-order&#x27;;
+ import { scrollTarget } from &#x27;./scroll&#x27;;
+<span class="d">-import { say, showPlayer, showReading } from &#x27;./status&#x27;;</span>
+<span class="a">+import { onAction, say, showPlayer, showReading } from &#x27;./status&#x27;;</span>
+ import { isAndroid, SubRead } from &#x27;./subread&#x27;;
+ import { decodeSubtitles, lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+ import {
+<span class="h">@@ -99,7 +104,8 @@ const ui = {</span>
+   dict: el&lt;HTMLSelectElement&gt;(&#x27;dict&#x27;),
+   pauseRow: el&lt;HTMLLabelElement&gt;(&#x27;pause-row&#x27;),
+   pauseLookup: el&lt;HTMLInputElement&gt;(&#x27;pause-lookup&#x27;),
+<span class="d">-  clearCache: el&lt;HTMLButtonElement&gt;(&#x27;clear-cache&#x27;),</span>
+<span class="a">+  clearBook: el&lt;HTMLButtonElement&gt;(&#x27;clear-book&#x27;),</span>
+<span class="a">+  clearAll: el&lt;HTMLButtonElement&gt;(&#x27;clear-all&#x27;),</span>
+   cues: el&lt;HTMLOListElement&gt;(&#x27;cues&#x27;),
+   pageLeft: el&lt;HTMLButtonElement&gt;(&#x27;page-left&#x27;),
+   pageRight: el&lt;HTMLButtonElement&gt;(&#x27;page-right&#x27;),
+<span class="h">@@ -150,6 +156,8 @@ const state = {</span>
+   reading: null as Message | string | null,
+   /** True while the database is not open after SLOW_DB_MS. */
+   dbSlow: false,
+<span class="a">+  /** &quot;Force OCR&quot; of the open book: the reading skips the text layer. */</span>
+<span class="a">+  forceOcr: false,</span>
+   /** True while the player waits for a dictionary lookup that this app paused. */
+   lookupPaused: false,
+   /** True while a page turn by the user holds the follow. */
+<span class="h">@@ -195,7 +203,6 @@ function loadSettings(): void {</span>
+   }
+   ui.lang.value = settings.get(&#x27;lang&#x27;, &#x27;eng&#x27;);
+   ui.subLang.value = settings.get(&#x27;subLang&#x27;, &#x27;auto&#x27;);
+<span class="d">-  ui.forceOcr.checked = settings.get(&#x27;forceOcr&#x27;, &#x27;0&#x27;) === &#x27;1&#x27;;</span>
+   ui.pauseLookup.checked = settings.get(&#x27;pauseLookup&#x27;, &#x27;1&#x27;) === &#x27;1&#x27;;
+   loadRtl();
+ }
+<span class="h">@@ -229,11 +236,23 @@ ui.lang.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+   loadRtl();
+   void readBook();
+ });
+<span class="a">+// Force OCR is a setting of the book. As a global setting it sent each</span>
+<span class="a">+// later text PDF through the slow OCR.</span>
+ ui.forceOcr.addEventListener(&#x27;change&#x27;, () =&gt; {
+<span class="d">-  settings.set(&#x27;forceOcr&#x27;, ui.forceOcr.checked ? &#x27;1&#x27; : &#x27;0&#x27;);</span>
+<span class="a">+  const book = state.book;</span>
+<span class="a">+  if (book === null) return;</span>
+<span class="a">+  setForceOcr(ui.forceOcr.checked);</span>
+<span class="a">+  void putMeta(book, { forceOcr: state.forceOcr });</span>
+   void readBook();
+ });
+ 
+<span class="a">+/** Sets Force OCR of the open book: the state, the checkbox and the strip. */</span>
+<span class="a">+function setForceOcr(on: boolean): void {</span>
+<span class="a">+  state.forceOcr = on;</span>
+<span class="a">+  ui.forceOcr.checked = on;</span>
+<span class="a">+  showReadingPart();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** Shows a command that failed in the strip. */
+ function sayError(err: unknown): void {
+   say(errorMessage(err, isAndroid));
+<span class="h">@@ -314,6 +333,9 @@ async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {</span>
+     clearSubtitles();
+   }
+   const subtitlesSeq = state.subtitlesSeq;
+<span class="a">+  setForceOcr(meta?.forceOcr ?? false);</span>
+<span class="a">+  ui.forceOcr.disabled = false;</span>
+<span class="a">+  ui.clearBook.disabled = false;</span>
+   ui.makeSubs.disabled = false;
+   ui.empty.hidden = true;
+   ui.page.hidden = false;
+<span class="h">@@ -355,6 +377,11 @@ function applyMeta(meta: BookMeta, attempt: number, subtitlesSeq: number): void</span>
+   if (page !== undefined &amp;&amp; page !== state.currentPage &amp;&amp; state.currentPage === 0) {
+     void showPage(page);
+   }
+<span class="a">+  const forceOcr = meta.forceOcr ?? false;</span>
+<span class="a">+  if (forceOcr !== state.forceOcr) {</span>
+<span class="a">+    setForceOcr(forceOcr);</span>
+<span class="a">+    void readBook();</span>
+<span class="a">+  }</span>
+   if (state.subtitlesSeq !== subtitlesSeq) return;
+   const loaded = state.subtitles ? state.subtitlesBook : undefined;
+   switch (subtitlesOnOpen(loaded, key, meta.subtitles !== undefined)) {
+<span class="h">@@ -451,15 +478,19 @@ function watchDb(): void {</span>
+   });
+ }
+ 
+<span class="d">-/** The tokens of one page: from the cache, else the text layer, else OCR. */</span>
+<span class="a">+/**</span>
+<span class="a">+ * The tokens of one page: from the cache, else the text layer, else OCR.</span>
+<span class="a">+ * `force` skips the text layer. Rejects with OcrStartError when the page</span>
+<span class="a">+ * needs OCR and OCR cannot start.</span>
+<span class="a">+ */</span>
+ async function readPage(
+   pdf: PdfDoc,
+   file: File,
+   page: number,
+<span class="a">+  lang: string,</span>
+<span class="a">+  force: boolean,</span>
+   ocr: () =&gt; Promise&lt;Ocr&gt;,
+ ): Promise&lt;PageEntry&gt; {
+<span class="d">-  const lang = ui.lang.value;</span>
+<span class="d">-  const force = ui.forceOcr.checked;</span>
+   if (!force) {
+     const cached = await getPage(pageKey(file, page, lang, &#x27;text&#x27;));
+     if (cached) return cached;
+<span class="h">@@ -474,32 +505,55 @@ async function readPage(</span>
+       return entry;
+     }
+   }
+<span class="a">+  // OCR starts before the render: when it cannot start, no page is rendered for nothing.</span>
+<span class="a">+  const engine = await ocr();</span>
+   const canvas = await pdf.renderPage(page, OCR_WIDTH);
+<span class="d">-  const tokens = await (await ocr()).recognize(canvas, page);</span>
+<span class="a">+  const tokens = await engine.recognize(canvas, page);</span>
+   const entry: PageEntry = { tokens, width: canvas.width, height: canvas.height, source: &#x27;ocr&#x27; };
+   await putPage(pageKey(file, page, lang, &#x27;ocr&#x27;), entry);
+   return entry;
+ }
+ 
+<span class="a">+/** The OCR of the reading that runs now. */</span>
+<span class="a">+let readingOcr: { started?: Promise&lt;Ocr&gt; } = {};</span>
+<span class="a">+</span>
+ /**
+  * Reads every page of the book: the current page first, then the pages
+  * after it, then the pages before it. The cues are aligned again as pages
+  * finish, so the follow starts before the whole book is read.
+<span class="a">+ *</span>
+<span class="a">+ * A page that cannot be read does not stop the other pages. At the end the</span>
+<span class="a">+ * strip tells how many pages could not be read, with Retry. `retry` reads</span>
+<span class="a">+ * only the pages that are not read.</span>
+  */
+<span class="d">-async function readBook(): Promise&lt;void&gt; {</span>
+<span class="a">+async function readBook(retry = false): Promise&lt;void&gt; {</span>
+   const { pdf, file } = state;
+   if (!pdf || !file) return;
+   const seq = ++state.readSeq;
+<span class="d">-  state.pages = [];</span>
+<span class="d">-  state.tokens = [];</span>
+<span class="d">-  // The spans index the old tokens, so they go too.</span>
+<span class="d">-  state.spans = [];</span>
+<span class="d">-  state.cueParts = [];</span>
+<span class="d">-  state.markedCue = -1;</span>
+<span class="a">+  // The OCR of the reading before stops at once. It does not finish its</span>
+<span class="a">+  // page: two quick changes of a setting ran two OCR jobs at the same time.</span>
+<span class="a">+  stopOcr(readingOcr.started);</span>
+<span class="a">+  const ocr: { started?: Promise&lt;Ocr&gt; } = {};</span>
+<span class="a">+  readingOcr = ocr;</span>
+<span class="a">+  if (!retry) {</span>
+<span class="a">+    state.pages = [];</span>
+<span class="a">+    state.tokens = [];</span>
+<span class="a">+    // The spans index the old tokens, so they go too.</span>
+<span class="a">+    state.spans = [];</span>
+<span class="a">+    state.cueParts = [];</span>
+<span class="a">+    state.markedCue = -1;</span>
+<span class="a">+  }</span>
+   const total = pdf.numPages;
+<span class="d">-  const pending = new Set(Array.from({ length: total }, (_, i) =&gt; i));</span>
+<span class="a">+  const pending = new Set(</span>
+<span class="a">+    Array.from({ length: total }, (_, i) =&gt; i).filter((i) =&gt; !state.pages[i]),</span>
+<span class="a">+  );</span>
+   const counts = { text: 0, ocr: 0 };
+<span class="a">+  for (const entry of state.pages) if (entry) counts[entry.source]++;</span>
+   const read = (): number =&gt; counts.text + counts.ocr;
+<span class="a">+  let failed = 0;</span>
+<span class="a">+  let startFailed = false;</span>
+<span class="a">+  const lang = ui.lang.value;</span>
+<span class="a">+  const force = state.forceOcr;</span>
+   /** The page that is read now. */
+   let page = -1;
+   const onOcrProgress = (p: number): void =&gt; {
+<span class="h">@@ -508,10 +562,13 @@ async function readBook(): Promise&lt;void&gt; {</span>
+     }
+   };
+   // The OCR worker, and tesseract.js itself, load on the first page that needs them.
+<span class="d">-  const ocr: { started?: Promise&lt;Ocr&gt; } = {};</span>
+   const getOcr = (): Promise&lt;Ocr&gt; =&gt; {
+<span class="d">-    const lang = ui.lang.value;</span>
+<span class="d">-    ocr.started ??= import(&#x27;./ocr&#x27;).then(({ createOcr }) =&gt; createOcr(lang, onOcrProgress));</span>
+<span class="a">+    ocr.started ??= import(&#x27;./ocr&#x27;).then(</span>
+<span class="a">+      ({ createOcr }) =&gt; createOcr(lang, onOcrProgress),</span>
+<span class="a">+      (err: unknown) =&gt; {</span>
+<span class="a">+        throw new OcrStartError(err);</span>
+<span class="a">+      },</span>
+<span class="a">+    );</span>
+     return ocr.started;
+   };
+   try {
+<span class="h">@@ -519,7 +576,21 @@ async function readBook(): Promise&lt;void&gt; {</span>
+       page = nextPage(pending, state.currentPage);
+       pending.delete(page);
+       setReading(readingText(read(), total, `page ${page + 1}`));
+<span class="d">-      const entry = await readPage(pdf, file, page, getOcr);</span>
+<span class="a">+      let entry: PageEntry;</span>
+<span class="a">+      try {</span>
+<span class="a">+        entry = await readPage(pdf, file, page, lang, force, getOcr);</span>
+<span class="a">+      } catch (err) {</span>
+<span class="a">+        if (seq !== state.readSeq) return; // Another book or another setting took over.</span>
+<span class="a">+        failed++;</span>
+<span class="a">+        // Each page that needs OCR gives the same start error. Tell it once.</span>
+<span class="a">+        if (err instanceof OcrStartError) {</span>
+<span class="a">+          if (!startFailed) console.warn(err);</span>
+<span class="a">+          startFailed = true;</span>
+<span class="a">+        } else {</span>
+<span class="a">+          console.warn(`Page ${page + 1} could not be read.`, err);</span>
+<span class="a">+        }</span>
+<span class="a">+        continue;</span>
+<span class="a">+      }</span>
+       if (seq !== state.readSeq) return; // Another book or another setting took over.
+       counts[entry.source]++;
+       state.pages[page] = entry;
+<span class="h">@@ -534,19 +605,27 @@ async function readBook(): Promise&lt;void&gt; {</span>
+     const matched = align();
+     say(
+       pagesReadText(counts) +
+<span class="d">-        (matched === null ? &#x27;&#x27; : ` ${matchedText(matched, state.cues.length, true)}`),</span>
+<span class="a">+        (matched === null ? &#x27;&#x27; : ` ${matchedText(matched, state.cues.length, failed === 0)}`),</span>
+     );
+   } catch (err) {
+     if (seq === state.readSeq) say(`Cannot read the pages: ${String(err)}`);
+   } finally {
+<span class="d">-    if (ocr.started) await (await ocr.started).terminate().catch(() =&gt; undefined);</span>
+<span class="d">-    if (seq === state.readSeq) setReading(null);</span>
+<span class="a">+    stopOcr(ocr.started);</span>
+<span class="a">+    if (seq === state.readSeq) setReading(readingEndMessage(failed, startFailed));</span>
+   }
+ }
+ 
+<span class="d">-/** Shows the reading part of the strip: the database notice, else the reading of the pages. */</span>
+<span class="a">+/**</span>
+<span class="a">+ * Shows the reading part of the strip: the database notice, else the</span>
+<span class="a">+ * reading of the pages, with the note while Force OCR is on.</span>
+<span class="a">+ */</span>
+ function showReadingPart(): void {
+<span class="d">-  showReading(state.dbSlow ? UPDATING_CACHE_TEXT : state.reading);</span>
+<span class="a">+  if (state.dbSlow) {</span>
+<span class="a">+    showReading(UPDATING_CACHE_TEXT);</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  const m = typeof state.reading === &#x27;string&#x27; ? { text: state.reading } : state.reading;</span>
+<span class="a">+  showReading(withForceOcr(m, state.forceOcr &amp;&amp; state.book !== null));</span>
+ }
+ 
+ function setReading(m: Message | string | null): void {
+<span class="h">@@ -560,9 +639,18 @@ function allPagesRead(): boolean {</span>
+   return !!pdf &amp;&amp; state.pages.filter((p) =&gt; p).length === pdf.numPages;
+ }
+ 
+<span class="d">-ui.clearCache.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+// The pages of other books cost hours of OCR, so each clear asks first.</span>
+<span class="a">+ui.clearBook.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+  const { book, file } = state;</span>
+<span class="a">+  if (book === null || !file || !confirm(clearBookQuestion(file.name))) return;</span>
+<span class="a">+  await clearPages(book);</span>
+<span class="a">+  say(`The saved pages of ${file.name} are removed.`);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+ui.clearAll.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+<span class="a">+  if (!confirm(CLEAR_ALL_QUESTION)) return;</span>
+   await clearPages();
+<span class="d">-  say(&#x27;Page cache cleared.&#x27;);</span>
+<span class="a">+  say(&#x27;The saved pages of all books are removed.&#x27;);</span>
+ });
+ 
+ // --- Subtitles ---
+<span class="h">@@ -1011,9 +1099,22 @@ ui.dict.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+   SubRead.setDictionary({ component: ui.dict.value }).catch(sayError);
+ });
+ 
+<span class="a">+// --- The buttons in the strip ---</span>
+<span class="a">+</span>
+<span class="a">+onAction((id) =&gt; {</span>
+<span class="a">+  switch (id) {</span>
+<span class="a">+    case &#x27;retry-reading&#x27;:</span>
+<span class="a">+      void readBook(true);</span>
+<span class="a">+      break;</span>
+<span class="a">+  }</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ // --- Start ---
+ 
+ loadSettings();
+<span class="a">+// Force OCR and the pages of one book need an open book.</span>
+<span class="a">+ui.forceOcr.disabled = true;</span>
+<span class="a">+ui.clearBook.disabled = true;</span>
+ ui.make.hidden = !isAndroid;
+ ui.audioRow.hidden = isAndroid;
+ // The web copies a lookup at once: there is no dictionary app to choose or to wait for.
+diff --git a/src/messages.ts b/src/messages.ts
+index 3745483..732d003 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -2,10 +2,14 @@</span>
+ 
+ import { PlayerError, type ClockState } from &#x27;./clock-source&#x27;;
+ 
+<span class="d">-/** A text, and a link after it. */</span>
+<span class="a">+/** The actions of the buttons in the strip. main.ts runs them. */</span>
+<span class="a">+export type ActionId = &#x27;retry-reading&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** A text, and a link or a button after it. */</span>
+ export interface Message {
+   text: string;
+   link?: { href: string; text: string };
+<span class="a">+  action?: { id: ActionId; text: string };</span>
+ }
+ 
+ export const OVERLAY_RELEASES = &#x27;https://github.com/equwal/subread-overlay/releases/latest&#x27;;
+<span class="h">@@ -80,6 +84,43 @@ export function pagesReadText(counts: { text: number; ocr: number }): string {</span>
+   return `${count(counts.text + counts.ocr, &#x27;page&#x27;)} read: ${counts.text} text layer, ${counts.ocr} OCR.`;
+ }
+ 
+<span class="a">+export const OCR_START_TEXT =</span>
+<span class="a">+  &#x27;OCR could not start. The first OCR run needs a network connection to download the language data.&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const RETRY = { id: &#x27;retry-reading&#x27;, text: &#x27;Retry&#x27; } as const;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The reading part of the strip after the reading of the pages ends: what</span>
+<span class="a">+ * went wrong, with Retry. `failed` is the count of pages that could not be</span>
+<span class="a">+ * read. `startFailed` is true when OCR could not start. Null when each page</span>
+<span class="a">+ * is read.</span>
+<span class="a">+ */</span>
+<span class="a">+export function readingEndMessage(failed: number, startFailed: boolean): Message | null {</span>
+<span class="a">+  if (startFailed) return { text: OCR_START_TEXT, action: RETRY };</span>
+<span class="a">+  if (failed &gt; 0) return { text: `${count(failed, &#x27;page&#x27;)} could not be read.`, action: RETRY };</span>
+<span class="a">+  return null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export const FORCE_OCR_NOTE = &#x27;Force OCR is on&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The reading part of the strip, with the note while Force OCR is on for the open book. */</span>
+<span class="a">+export function withForceOcr(m: Message | null, forceOcr: boolean): Message | null {</span>
+<span class="a">+  if (!forceOcr) return m;</span>
+<span class="a">+  if (m === null) return { text: `${FORCE_OCR_NOTE}.` };</span>
+<span class="a">+  const text = m.text.endsWith(&#x27;.&#x27;)</span>
+<span class="a">+    ? `${m.text} ${FORCE_OCR_NOTE}.`</span>
+<span class="a">+    : `${m.text} · ${FORCE_OCR_NOTE}`;</span>
+<span class="a">+  return { ...m, text };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The question before the saved pages of one book go. */</span>
+<span class="a">+export function clearBookQuestion(name: string): string {</span>
+<span class="a">+  return `Remove the saved pages of ${name}? The reader reads them again the next time it opens the book.`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export const CLEAR_ALL_QUESTION =</span>
+<span class="a">+  &#x27;Remove the saved pages of all books? The reader reads each book again the next time it opens it.&#x27;;</span>
+<span class="a">+</span>
+ /** The message for a tap on a page that is not read yet. */
+ export function notReadText(read: number, total: number): string {
+   return `This page is not read yet (${read}/${total} read).`;
+diff --git a/src/ocr-job.ts b/src/ocr-job.ts
+new file mode 100644
+index 0000000..d20f745
+--- /dev/null
++++ b/src/ocr-job.ts
+<span class="h">@@ -0,0 +1,23 @@</span>
+<span class="a">+// The OCR of one reading of the book: the start error and the stop. No</span>
+<span class="a">+// tesseract.js here, so main.ts can use this module and still load</span>
+<span class="a">+// tesseract.js only when a page needs OCR.</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * OCR could not start: the OCR code, the worker script, the core or the</span>
+<span class="a">+ * language data did not load. `cause` holds the error. The first OCR run of</span>
+<span class="a">+ * a language needs the network to download the language data.</span>
+<span class="a">+ */</span>
+<span class="a">+export class OcrStartError extends Error {</span>
+<span class="a">+  constructor(cause: unknown) {</span>
+<span class="a">+    super(`OCR could not start: ${String(cause)}`, { cause });</span>
+<span class="a">+    this.name = &#x27;OcrStartError&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Stops the OCR of a reading, and does not wait. A reading whose OCR did</span>
+<span class="a">+ * not start has nothing to stop, and its start error is no new error here.</span>
+<span class="a">+ */</span>
+<span class="a">+export function stopOcr(started: Promise&lt;{ terminate(): Promise&lt;void&gt; }&gt; | undefined): void {</span>
+<span class="a">+  started?.then((ocr) =&gt; ocr.terminate()).catch(() =&gt; undefined);</span>
+<span class="a">+}</span>
+diff --git a/src/ocr.ts b/src/ocr.ts
+index dd427ff..4a6ff1b 100644
+--- a/src/ocr.ts
++++ b/src/ocr.ts
+<span class="h">@@ -13,25 +13,17 @@ import workerPath from &#x27;tesseract.js/dist/worker.min.js?url&#x27;;</span>
+ // current browsers have WebAssembly SIMD.
+ import corePath from &#x27;tesseract.js-core/tesseract-core-simd-lstm.wasm.js?url&#x27;;
+ import type { OcrToken } from &#x27;./align&#x27;;
+<span class="a">+import { OcrStartError } from &#x27;./ocr-job&#x27;;</span>
+ import { pageToTokens } from &#x27;./ocr-tokens&#x27;;
+ 
+<span class="a">+export { OcrStartError };</span>
+<span class="a">+</span>
+ export interface Ocr {
+<span class="a">+  /** Rejects when the OCR stops before the page is read. */</span>
+   recognize(image: HTMLCanvasElement, pageIndex: number): Promise&lt;OcrToken[]&gt;;
+   terminate(): Promise&lt;void&gt;;
+ }
+ 
+<span class="d">-/**</span>
+<span class="d">- * OCR could not start: the worker script, the core or the language data did</span>
+<span class="d">- * not load. `cause` holds the error of tesseract.js. The first OCR run of a</span>
+<span class="d">- * language needs the network to download the language data.</span>
+<span class="d">- */</span>
+<span class="d">-export class OcrStartError extends Error {</span>
+<span class="d">-  constructor(cause: unknown) {</span>
+<span class="d">-    super(`OCR could not start: ${String(cause)}`, { cause });</span>
+<span class="d">-    this.name = &#x27;OcrStartError&#x27;;</span>
+<span class="d">-  }</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+ /**
+  * Start an OCR worker for `lang` (&quot;eng&quot;, &quot;jpn&quot;, &quot;jpn_vert&quot;, &quot;jpn+eng&quot;, ...).
+  * `onProgress` gets values in [0, 1] while a page is recognized. Rejects with
+<span class="h">@@ -52,12 +44,24 @@ export async function createOcr(lang: string, onProgress: (p: number) =&gt; void):</span>
+       throw new OcrStartError(err);
+     }
+   }
+<span class="a">+  // tesseract.js does not settle a job that runs when its worker stops. So</span>
+<span class="a">+  // each page also waits for the stop, and the reading does not wait for</span>
+<span class="a">+  // ever for a page of a stopped worker.</span>
+<span class="a">+  let stop: (reason: Error) =&gt; void = () =&gt; undefined;</span>
+<span class="a">+  const stopped = new Promise&lt;never&gt;((_resolve, reject) =&gt; {</span>
+<span class="a">+    stop = reject;</span>
+<span class="a">+  });</span>
+<span class="a">+  // A stop while no page runs is no error.</span>
+<span class="a">+  stopped.catch(() =&gt; undefined);</span>
+   return {
+<span class="d">-    async recognize(image, pageIndex) {</span>
+<span class="d">-      const { data } = await worker.recognize(image, {}, { blocks: true, text: false });</span>
+<span class="d">-      return pageToTokens(data, pageIndex);</span>
+<span class="a">+    recognize(image, pageIndex) {</span>
+<span class="a">+      const page = worker</span>
+<span class="a">+        .recognize(image, {}, { blocks: true, text: false })</span>
+<span class="a">+        .then(({ data }) =&gt; pageToTokens(data, pageIndex));</span>
+<span class="a">+      return Promise.race([page, stopped]);</span>
+     },
+     async terminate() {
+<span class="a">+      stop(new Error(&#x27;OCR stopped.&#x27;));</span>
+       await worker.terminate();
+     },
+   };
+diff --git a/src/status.ts b/src/status.ts
+index e4b74c9..ff9eb68 100644
+--- a/src/status.ts
++++ b/src/status.ts
+<span class="h">@@ -2,7 +2,7 @@</span>
+ // the reading of the pages, and the last event. Only the event part is a
+ // live region, because the other parts change often.
+ 
+<span class="d">-import type { Message } from &#x27;./messages&#x27;;</span>
+<span class="a">+import type { ActionId, Message } from &#x27;./messages&#x27;;</span>
+ 
+ /** Milliseconds that an event message stays before it fades. */
+ export const EVENT_MS = 6000;
+<span class="h">@@ -22,8 +22,11 @@ const event = el(&#x27;status&#x27;);</span>
+ 
+ let fadeTimer: ReturnType&lt;typeof setTimeout&gt; | undefined;
+ 
+<span class="d">-/** Writes a message into `target`: the text, then the link. */</span>
+<span class="d">-function fill(target: HTMLElement, m: Message): void {</span>
+<span class="a">+/**</span>
+<span class="a">+ * Writes a message into `target`: the text, then the link or the button. A</span>
+<span class="a">+ * click on the button runs the handler of onAction.</span>
+<span class="a">+ */</span>
+<span class="a">+export function fill(target: HTMLElement, m: Message): void {</span>
+   target.textContent = m.text;
+   if (m.link) {
+     const a = document.createElement(&#x27;a&#x27;);
+<span class="h">@@ -33,15 +36,37 @@ function fill(target: HTMLElement, m: Message): void {</span>
+     a.textContent = m.link.text;
+     target.append(&#x27; &#x27;, a);
+   }
+<span class="a">+  if (m.action) {</span>
+<span class="a">+    const button = document.createElement(&#x27;button&#x27;);</span>
+<span class="a">+    button.type = &#x27;button&#x27;;</span>
+<span class="a">+    button.className = &#x27;action&#x27;;</span>
+<span class="a">+    button.dataset.action = m.action.id;</span>
+<span class="a">+    button.textContent = m.action.text;</span>
+<span class="a">+    target.append(&#x27; &#x27;, button);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+let runAction: ((id: ActionId) =&gt; void) | null = null;</span>
+<span class="a">+</span>
+<span class="a">+/** Sets the handler of the buttons that fill makes. */</span>
+<span class="a">+export function onAction(handler: (id: ActionId) =&gt; void): void {</span>
+<span class="a">+  runAction = handler;</span>
+ }
+ 
+<span class="a">+document.addEventListener(&#x27;click&#x27;, (e) =&gt; {</span>
+<span class="a">+  const button = e.target instanceof Element ? e.target.closest(&#x27;button[data-action]&#x27;) : null;</span>
+<span class="a">+  if (button instanceof HTMLButtonElement &amp;&amp; button.dataset.action) {</span>
+<span class="a">+    runAction?.(button.dataset.action as ActionId);</span>
+<span class="a">+  }</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ let lastPlayer = &#x27;&#x27;;
+ 
+ /** Shows the state of the player. Null hides this part. */
+ export function showPlayer(m: Message | null): void {
+   // The clock sends a state four times a second. A new link under the
+   // finger can lose a tap, so the part changes only when the text changes.
+<span class="d">-  const key = m ? `${m.text}|${m.link?.href ?? &#x27;&#x27;}` : &#x27;&#x27;;</span>
+<span class="a">+  const key = m ? `${m.text}|${m.link?.href ?? &#x27;&#x27;}|${m.action?.id ?? &#x27;&#x27;}` : &#x27;&#x27;;</span>
+   if (key === lastPlayer) return;
+   lastPlayer = key;
+   player.hidden = m === null;
+diff --git a/src/style.css b/src/style.css
+index c876674..9f3adfe 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -159,6 +159,17 @@ body {</span>
+   color: inherit;
+ }
+ 
+<span class="a">+/* A button after a message, for example Retry. */</span>
+<span class="a">+button.action {</span>
+<span class="a">+  font: inherit;</span>
+<span class="a">+  padding: 0 0.5rem;</span>
+<span class="a">+  color: inherit;</span>
+<span class="a">+  background: none;</span>
+<span class="a">+  border: 1px solid currentColor;</span>
+<span class="a">+  border-radius: 4px;</span>
+<span class="a">+  cursor: pointer;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ #pages-status {
+   opacity: 0.8;
+ }
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index cd8a46b..415f953 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -9,13 +9,16 @@ import {</span>
+   MISMATCH_TEXT,
+   noCuesText,
+   notReadText,
+<span class="a">+  OCR_START_TEXT,</span>
+   OVERLAY_RELEASES,
+   pagesReadText,
+   pdfLoadedText,
+   pdfOpenText,
+   playerMessage,
+   playerProblem,
+<span class="a">+  readingEndMessage,</span>
+   readingText,
+<span class="a">+  withForceOcr,</span>
+ } from &#x27;../src/messages&#x27;;
+ 
+ function state(over: Partial&lt;ClockState&gt;): ClockState {
+<span class="h">@@ -130,6 +133,42 @@ describe(&#x27;file texts&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="a">+describe(&#x27;the end of the reading&#x27;, () =&gt; {</span>
+<span class="a">+  const retry = { id: &#x27;retry-reading&#x27;, text: &#x27;Retry&#x27; };</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells that OCR could not start, with Retry&#x27;, () =&gt; {</span>
+<span class="a">+    expect(readingEndMessage(40, true)).toEqual({ text: OCR_START_TEXT, action: retry });</span>
+<span class="a">+    expect(OCR_START_TEXT).toBe(</span>
+<span class="a">+      &#x27;OCR could not start. The first OCR run needs a network connection to download the language data.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;counts the pages that could not be read, with Retry&#x27;, () =&gt; {</span>
+<span class="a">+    expect(readingEndMessage(1, false)).toEqual({</span>
+<span class="a">+      text: &#x27;1 page could not be read.&#x27;,</span>
+<span class="a">+      action: retry,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(readingEndMessage(3, false)).toEqual({</span>
+<span class="a">+      text: &#x27;3 pages could not be read.&#x27;,</span>
+<span class="a">+      action: retry,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(readingEndMessage(0, false)).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;adds the Force OCR note while it is on&#x27;, () =&gt; {</span>
+<span class="a">+    expect(withForceOcr(null, false)).toBeNull();</span>
+<span class="a">+    expect(withForceOcr(null, true)).toEqual({ text: &#x27;Force OCR is on.&#x27; });</span>
+<span class="a">+    expect(withForceOcr({ text: &#x27;Reading 1/2 · page 2: OCR 45%&#x27; }, true)).toEqual({</span>
+<span class="a">+      text: &#x27;Reading 1/2 · page 2: OCR 45% · Force OCR is on&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(withForceOcr(readingEndMessage(2, false), true)).toEqual({</span>
+<span class="a">+      text: &#x27;2 pages could not be read. Force OCR is on.&#x27;,</span>
+<span class="a">+      action: retry,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(withForceOcr({ text: &#x27;Reading 1/2&#x27; }, false)).toEqual({ text: &#x27;Reading 1/2&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;matchedText&#x27;, () =&gt; {
+   it(&#x27;counts the matched cues of the pages read so far&#x27;, () =&gt; {
+     expect(matchedText(2, 15, false)).toBe(&#x27;2/15 cues matched to the pages read so far.&#x27;);
+diff --git a/test/ocr-job.test.ts b/test/ocr-job.test.ts
+new file mode 100644
+index 0000000..17e9584
+--- /dev/null
++++ b/test/ocr-job.test.ts
+<span class="h">@@ -0,0 +1,45 @@</span>
+<span class="a">+import { afterEach, describe, expect, it, vi } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { OcrStartError, stopOcr } from &#x27;../src/ocr-job&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The reasons of the unhandled rejections while `run` runs, and 20 ms after it. */</span>
+<span class="a">+async function unhandledDuring(run: () =&gt; void): Promise&lt;unknown[]&gt; {</span>
+<span class="a">+  const reasons: unknown[] = [];</span>
+<span class="a">+  const record = (reason: unknown): void =&gt; {</span>
+<span class="a">+    reasons.push(reason);</span>
+<span class="a">+  };</span>
+<span class="a">+  process.on(&#x27;unhandledRejection&#x27;, record);</span>
+<span class="a">+  try {</span>
+<span class="a">+    run();</span>
+<span class="a">+    await new Promise((resolve) =&gt; setTimeout(resolve, 20));</span>
+<span class="a">+  } finally {</span>
+<span class="a">+    process.off(&#x27;unhandledRejection&#x27;, record);</span>
+<span class="a">+  }</span>
+<span class="a">+  return reasons;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;stopOcr&#x27;, () =&gt; {</span>
+<span class="a">+  afterEach(() =&gt; vi.restoreAllMocks());</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;stops the OCR that started&#x27;, async () =&gt; {</span>
+<span class="a">+    const terminate = vi.fn(() =&gt; Promise.resolve());</span>
+<span class="a">+    stopOcr(Promise.resolve({ terminate }));</span>
+<span class="a">+    await new Promise((resolve) =&gt; setTimeout(resolve, 0));</span>
+<span class="a">+    expect(terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does nothing when no OCR started&#x27;, () =&gt; {</span>
+<span class="a">+    expect(() =&gt; stopOcr(undefined)).not.toThrow();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives no unhandled rejection when the OCR could not start&#x27;, async () =&gt; {</span>
+<span class="a">+    // The web finding: the reading ended with an unhandled rejection, and the</span>
+<span class="a">+    // progress stayed in the strip.</span>
+<span class="a">+    const failed = Promise.reject(new OcrStartError(&#x27;TypeError: Failed to fetch&#x27;));</span>
+<span class="a">+    expect(await unhandledDuring(() =&gt; void stopOcr(failed))).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives no unhandled rejection when the stop fails&#x27;, async () =&gt; {</span>
+<span class="a">+    const terminate = vi.fn(() =&gt; Promise.reject(new Error(&#x27;The worker is gone.&#x27;)));</span>
+<span class="a">+    expect(await unhandledDuring(() =&gt; void stopOcr(Promise.resolve({ terminate })))).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/ocr.test.ts b/test/ocr.test.ts
+index 1e3db9d..c9bc2fc 100644
+--- a/test/ocr.test.ts
++++ b/test/ocr.test.ts
+<span class="h">@@ -90,6 +90,19 @@ describe(&#x27;createOcr&#x27;, () =&gt; {</span>
+     expect(worker.terminate).toHaveBeenCalledTimes(1);
+   });
+ 
+<span class="a">+  it(&#x27;rejects the page that runs when the OCR stops&#x27;, async () =&gt; {</span>
+<span class="a">+    // tesseract.js does not settle a job when its worker stops. The web</span>
+<span class="a">+    // finding: a new reading started while the old job still read its page.</span>
+<span class="a">+    const worker = fakeWorker();</span>
+<span class="a">+    worker.recognize.mockImplementation(() =&gt; new Promise(() =&gt; undefined));</span>
+<span class="a">+    createWorker.mockResolvedValue(worker);</span>
+<span class="a">+    const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);</span>
+<span class="a">+    const page = ocr.recognize({} as HTMLCanvasElement, 0);</span>
+<span class="a">+    await ocr.terminate();</span>
+<span class="a">+    await expect(page).rejects.toThrow(&#x27;OCR stopped.&#x27;);</span>
+<span class="a">+    expect(worker.terminate).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  }, 1000);</span>
+<span class="a">+</span>
+   it(&#x27;gives the error of a page as it is, not as OcrStartError&#x27;, async () =&gt; {
+     createWorker.mockResolvedValue(fakeWorker());
+     const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);</pre>
+</div></body></html>

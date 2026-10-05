@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 34c6d9ca - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 34c6d9caaf933f4462b6472f133a90384eb671a5
+truex &lt;truex@equwal.com&gt;
+2026-09-26 23:18:11 -0700
+
+Let a book that the user opens win over the restore of the last book
+
+restoreLastBook did not know about the opens of the user:
+
+- The last book L is large, and the user picks a small PDF B while L
+  loads. B shows first, and its copy replaces L. Then the open of L
+  gives false, and the restore read that as &quot;the copy cannot be read&quot;:
+  clearLastBook deleted the copy, which was the copy of B now.
+- On the slow first start (the database upgrade), the start card shows
+  after 2 s, and the user picks B. The database opens while B loads.
+  state.pdf is still null, so the restore opened L as a later attempt,
+  and L won over the pick of the user.
+
+Opens now counts the opens of the user (byUser). The restore notes the
+count when it starts, and userOpened tells when the user started an
+open after that. Then the restore does not open L, and does not forget
+the copy. clearLastBook(key) also deletes the copy only while it is of
+the book `key`, in one transaction.
+
+</pre><pre> README.md                |  4 +-
+ src/book-open.ts         | 25 +++++++++---
+ src/main.ts              | 32 ++++++++++------
+ src/token-cache.ts       | 18 +++++++--
+ test/book-open.test.ts   | 99 +++++++++++++++++++++++++++++++++++++++---------
+ test/token-cache.test.ts | 20 ++++++++--
+ 6 files changed, 157 insertions(+), 41 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 34f6cc8..67905fc 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -57,7 +57,9 @@ its page, with its subtitles, without a picker. Android stops the</span>
+ reader while you are in the dictionary or in the player app, and the
+ reader comes back where you were. When the copy cannot be read, for
+ example after the app storage was cleared, the app forgets it and shows
+<span class="d">-the start card.</span>
+<span class="a">+the start card. A book that you open while the last book loads, or while</span>
+<span class="a">+the start waits for the database, wins: the app does not open the last</span>
+<span class="a">+book over it, and it keeps the copy of your book.</span>
+ 
+ Subtitles belong to a book. Another book opens with its own subtitles,
+ or with none. Subtitles that you load while no book is open are for the
+diff --git a/src/book-open.ts b/src/book-open.ts
+index ad0249c..fab6fa7 100644
+--- a/src/book-open.ts
++++ b/src/book-open.ts
+<span class="h">@@ -1,5 +1,5 @@</span>
+<span class="d">-// The open of a book: the open attempts, and the owner of subtitles that</span>
+<span class="d">-// load during an open. Pure: no DOM.</span>
+<span class="a">+// The open of a book: the open attempts, the owner of subtitles that load</span>
+<span class="a">+// during an open, and the restore of the last book. Pure: no DOM.</span>
+ 
+ /**
+  * The open attempts of books. Each attempt gets the next number: 1, 2, 3 ...
+<span class="h">@@ -11,17 +11,20 @@ export interface Opens {</span>
+   tried: number;
+   /** The attempt of the book that shows, or 0. */
+   shown: number;
+<span class="a">+  /** The count of attempts that the user started: a file of the file picker. */</span>
+<span class="a">+  byUser: number;</span>
+   /** The attempts that still load. */
+   loading: Set&lt;number&gt;;
+ }
+ 
+ export function createOpens(): Opens {
+<span class="d">-  return { tried: 0, shown: 0, loading: new Set() };</span>
+<span class="a">+  return { tried: 0, shown: 0, byUser: 0, loading: new Set() };</span>
+ }
+ 
+<span class="d">-/** Starts an attempt, and gives its number. */</span>
+<span class="d">-export function beginOpen(o: Opens): number {</span>
+<span class="a">+/** Starts an attempt, and gives its number. `byUser` is true for a file that the user picked. */</span>
+<span class="a">+export function beginOpen(o: Opens, byUser: boolean): number {</span>
+   const attempt = ++o.tried;
+<span class="a">+  if (byUser) o.byUser++;</span>
+   o.loading.add(attempt);
+   return attempt;
+ }
+<span class="h">@@ -55,3 +58,15 @@ export function opening(o: Opens): boolean {</span>
+ export function subtitlesOwner(o: Opens, book: string | null): string | null {
+   return opening(o) ? null : book;
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * True when the user started an open after `since`, the value of o.byUser</span>
+<span class="a">+ * when the restore of the last book started. The restore waits for the</span>
+<span class="a">+ * database, and the first open after an upgrade can take many seconds. A</span>
+<span class="a">+ * book that the user picks meanwhile wins: the restore does not open the</span>
+<span class="a">+ * last book over it, also while it still loads, and does not forget the copy</span>
+<span class="a">+ * of the last book, because the copy can be of the user&#x27;s book now.</span>
+<span class="a">+ */</span>
+<span class="a">+export function userOpened(o: Opens, since: number): boolean {</span>
+<span class="a">+  return o.byUser !== since;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index 51f56cd..c74f97a 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -9,7 +9,7 @@ import { App } from &#x27;@capacitor/app&#x27;;</span>
+ import { createAligner, shiftSpans, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+ import { ankiCard, cardSource } from &#x27;./anki-card&#x27;;
+ import { backStep, keepScreenOn } from &#x27;./app-state&#x27;;
+<span class="d">-import { beginOpen, createOpens, endOpen, subtitlesOwner } from &#x27;./book-open&#x27;;</span>
+<span class="a">+import { beginOpen, createOpens, endOpen, subtitlesOwner, userOpened } from &#x27;./book-open&#x27;;</span>
+ import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+<span class="h">@@ -313,17 +313,19 @@ const opens = createOpens();</span>
+  * file loads: a file that is not a PDF, or is damaged, changes nothing.
+  *
+  * `meta` is what the reader keeps for the book, when the caller has it:
+<span class="d">- * the book opens at its page. Else the meta data comes from IndexedDB</span>
+<span class="d">- * after the open. The page shows and the reading starts at once, and the</span>
+<span class="d">- * meta data applies when it comes: an upgrade of the database can hold</span>
+<span class="d">- * IndexedDB for many seconds. Gives true when the new book is open.</span>
+<span class="a">+ * the book opens at its page. Only the restore of the last book gives it,</span>
+<span class="a">+ * so an open without it is a file that the user picked. Else the meta data</span>
+<span class="a">+ * comes from IndexedDB after the open. The page shows and the reading</span>
+<span class="a">+ * starts at once, and the meta data applies when it comes: an upgrade of</span>
+<span class="a">+ * the database can hold IndexedDB for many seconds. Gives true when the new</span>
+<span class="a">+ * book is open.</span>
+  */
+ async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {
+   if (file.size === 0) {
+     say(EMPTY_FILE_TEXT);
+     return false;
+   }
+<span class="d">-  const attempt = beginOpen(opens);</span>
+<span class="a">+  const attempt = beginOpen(opens, meta === undefined);</span>
+   let bytes: ArrayBuffer;
+   try {
+     bytes = await file.arrayBuffer();
+<span class="h">@@ -485,20 +487,26 @@ function showStart(): void {</span>
+  * Opens the last book at its page, with its subtitles. Android stops the
+  * reader while the user is in the dictionary or in the player app, and a
+  * reload forgets the file that the user opened.
+<span class="a">+ *</span>
+<span class="a">+ * A book that the user opens while the restore waits for the database</span>
+<span class="a">+ * wins, also while it still loads (userOpened).</span>
+  */
+ async function restoreLastBook(): Promise&lt;void&gt; {
+<span class="a">+  const since = opens.byUser;</span>
+   const file = await getLastBook();
+<span class="d">-  // The user opened a book while the database was busy.</span>
+<span class="d">-  if (state.pdf) return;</span>
+<span class="d">-  if (!file) {</span>
+<span class="a">+  if (!file || userOpened(opens, since)) {</span>
+     showStart();
+     return;
+   }
+   const meta = await getMeta(bookKey(file));
+<span class="d">-  if (state.pdf) return;</span>
+<span class="a">+  if (userOpened(opens, since)) {</span>
+<span class="a">+    showStart();</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+   if (await openBook(file, meta)) return;
+<span class="d">-  // The copy cannot be read, or it is no PDF now: forget it.</span>
+<span class="d">-  await clearLastBook();</span>
+<span class="a">+  // The copy cannot be read, or it is no PDF now: forget it. After an open</span>
+<span class="a">+  // by the user, the copy can be of the user&#x27;s book, so it stays.</span>
+<span class="a">+  if (!userOpened(opens, since)) await clearLastBook(bookKey(file));</span>
+   showStart();
+ }
+ 
+diff --git a/src/token-cache.ts b/src/token-cache.ts
+index f34f38f..659201b 100644
+--- a/src/token-cache.ts
++++ b/src/token-cache.ts
+<span class="h">@@ -198,9 +198,21 @@ export function getLastBook(): Promise&lt;File | undefined&gt; {</span>
+   });
+ }
+ 
+<span class="d">-/** Removes the copy of the last book, for example when its data cannot be read. */</span>
+<span class="d">-export async function clearLastBook(): Promise&lt;void&gt; {</span>
+<span class="d">-  await tryDb((d) =&gt; d.delete(&#x27;books&#x27;, LAST));</span>
+<span class="a">+/**</span>
+<span class="a">+ * Removes the copy of the last book, for example when its data cannot be</span>
+<span class="a">+ * read, but only while the copy is of the book `key` (see bookKey). The copy</span>
+<span class="a">+ * of another book stays: the user can open a book while the restore of the</span>
+<span class="a">+ * last book runs, and the copy of that book replaces the last book.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function clearLastBook(key: string): Promise&lt;void&gt; {</span>
+<span class="a">+  await tryDb((d) =&gt; {</span>
+<span class="a">+    // One transaction reads and deletes, so a new copy cannot come between.</span>
+<span class="a">+    const tx = d.transaction(&#x27;books&#x27;, &#x27;readwrite&#x27;);</span>
+<span class="a">+    const remove = async (): Promise&lt;void&gt; =&gt; {</span>
+<span class="a">+      if ((await tx.store.get(LAST))?.key === key) await tx.store.delete(LAST);</span>
+<span class="a">+    };</span>
+<span class="a">+    return Promise.all([remove(), tx.done]);</span>
+<span class="a">+  });</span>
+ }
+ 
+ /**
+diff --git a/test/book-open.test.ts b/test/book-open.test.ts
+index 6241e83..5d9e51b 100644
+--- a/test/book-open.test.ts
++++ b/test/book-open.test.ts
+<span class="h">@@ -6,14 +6,18 @@ import {</span>
+   endOpen,
+   opening,
+   subtitlesOwner,
+<span class="a">+  userOpened,</span>
+   type Opens,
+ } from &#x27;../src/book-open&#x27;;
+ 
+ /** One step of a script of opens: start the next attempt, or end one that loads. */
+ interface Step {
+   begin: boolean;
+<span class="d">-  /** The attempt that ends, when `begin` is false. */</span>
+<span class="a">+  /** The attempt that starts or ends. */</span>
+   attempt: number;
+<span class="a">+  /** For a start: the user picked the file. */</span>
+<span class="a">+  byUser: boolean;</span>
+<span class="a">+  /** For an end: the file loaded as a PDF. */</span>
+   loaded: boolean;
+ }
+ 
+<span class="h">@@ -24,29 +28,39 @@ interface Step {</span>
+ const scripts: fc.Arbitrary&lt;Step[]&gt; = fc
+   .record({
+     count: fc.integer({ min: 1, max: 6 }),
+<span class="a">+    byUser: fc.array(fc.boolean(), { minLength: 6, maxLength: 6 }),</span>
+     loaded: fc.array(fc.boolean(), { minLength: 6, maxLength: 6 }),
+     picks: fc.array(fc.nat(), { minLength: 12, maxLength: 12 }),
+   })
+<span class="d">-  .map(({ count, loaded, picks }) =&gt; {</span>
+<span class="a">+  .map(({ count, byUser, loaded, picks }) =&gt; {</span>
+     const steps: Step[] = [];
+     const loading: number[] = [];
+     let begun = 0;
+<span class="a">+    const end = (attempt: number): Step =&gt; ({</span>
+<span class="a">+      begin: false,</span>
+<span class="a">+      attempt,</span>
+<span class="a">+      byUser: false,</span>
+<span class="a">+      loaded: loaded[attempt - 1]!,</span>
+<span class="a">+    });</span>
+     for (const pick of picks) {
+       if (begun &lt; count &amp;&amp; (loading.length === 0 || pick % 2 === 0)) {
+         loading.push(++begun);
+<span class="d">-        steps.push({ begin: true, attempt: begun, loaded: false });</span>
+<span class="a">+        steps.push({ begin: true, attempt: begun, byUser: byUser[begun - 1]!, loaded: false });</span>
+       } else if (loading.length &gt; 0) {
+<span class="d">-        const [attempt] = loading.splice(pick % loading.length, 1);</span>
+<span class="d">-        steps.push({ begin: false, attempt: attempt!, loaded: loaded[attempt! - 1]! });</span>
+<span class="a">+        steps.push(end(loading.splice(pick % loading.length, 1)[0]!));</span>
+       }
+     }
+     // The attempts that still load end in their order.
+<span class="d">-    for (const attempt of loading) {</span>
+<span class="d">-      steps.push({ begin: false, attempt, loaded: loaded[attempt - 1]! });</span>
+<span class="d">-    }</span>
+<span class="a">+    for (const attempt of loading) steps.push(end(attempt));</span>
+     return steps;
+   });
+ 
+<span class="a">+/** Runs one step of a script. */</span>
+<span class="a">+function run(o: Opens, step: Step): void {</span>
+<span class="a">+  if (step.begin) beginOpen(o, step.byUser);</span>
+<span class="a">+  else endOpen(o, step.attempt, step.loaded);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ describe(&#x27;open attempts&#x27;, () =&gt; {
+   it(&#x27;shows the book of the last attempt that loaded, whatever the order of the loads&#x27;, () =&gt; {
+     fc.assert(
+<span class="h">@@ -56,7 +70,7 @@ describe(&#x27;open attempts&#x27;, () =&gt; {</span>
+         for (const step of steps) {
+           const before = o.shown;
+           if (step.begin) {
+<span class="d">-            expect(beginOpen(o)).toBe(step.attempt);</span>
+<span class="a">+            expect(beginOpen(o, step.byUser)).toBe(step.attempt);</span>
+           } else {
+             const shows = endOpen(o, step.attempt, step.loaded);
+             // An attempt shows when it loaded and no later attempt shows.
+<span class="h">@@ -78,7 +92,7 @@ describe(&#x27;open attempts&#x27;, () =&gt; {</span>
+ /** Opens where book P shows, and the attempt of P. */
+ function withP(): { o: Opens; p: number } {
+   const o = createOpens();
+<span class="d">-  const p = beginOpen(o);</span>
+<span class="a">+  const p = beginOpen(o, true);</span>
+   endOpen(o, p, true);
+   return { o, p };
+ }
+<span class="h">@@ -90,7 +104,7 @@ describe(&#x27;subtitlesOwner&#x27;, () =&gt; {</span>
+     // over the subtitles of P, and the open of A then cleared it.
+     const { o } = withP();
+     expect(subtitlesOwner(o, &#x27;P&#x27;)).toBe(&#x27;P&#x27;);
+<span class="d">-    const a = beginOpen(o);</span>
+<span class="a">+    const a = beginOpen(o, true);</span>
+     expect(subtitlesOwner(o, &#x27;P&#x27;)).toBeNull();
+     expect(endOpen(o, a, true)).toBe(true);
+     expect(subtitlesOwner(o, &#x27;A&#x27;)).toBe(&#x27;A&#x27;);
+<span class="h">@@ -98,7 +112,7 @@ describe(&#x27;subtitlesOwner&#x27;, () =&gt; {</span>
+ 
+   it(&#x27;gives them to the book that stays open when the open fails&#x27;, () =&gt; {
+     const { o } = withP();
+<span class="d">-    const a = beginOpen(o);</span>
+<span class="a">+    const a = beginOpen(o, true);</span>
+     expect(subtitlesOwner(o, &#x27;P&#x27;)).toBeNull();
+     expect(endOpen(o, a, false)).toBe(false);
+     expect(subtitlesOwner(o, &#x27;P&#x27;)).toBe(&#x27;P&#x27;);
+<span class="h">@@ -107,8 +121,8 @@ describe(&#x27;subtitlesOwner&#x27;, () =&gt; {</span>
+   it(&#x27;does not wait for an older open that cannot show&#x27;, () =&gt; {
+     // The user picks a large A, then a small B. B shows while A loads.
+     const o = createOpens();
+<span class="d">-    const a = beginOpen(o);</span>
+<span class="d">-    const b = beginOpen(o);</span>
+<span class="a">+    const a = beginOpen(o, true);</span>
+<span class="a">+    const b = beginOpen(o, true);</span>
+     expect(endOpen(o, b, true)).toBe(true);
+     expect(subtitlesOwner(o, &#x27;B&#x27;)).toBe(&#x27;B&#x27;);
+     expect(endOpen(o, a, true)).toBe(false);
+<span class="h">@@ -117,7 +131,7 @@ describe(&#x27;subtitlesOwner&#x27;, () =&gt; {</span>
+   it(&#x27;gives no book while no book is open&#x27;, () =&gt; {
+     const o = createOpens();
+     expect(subtitlesOwner(o, null)).toBeNull();
+<span class="d">-    beginOpen(o);</span>
+<span class="a">+    beginOpen(o, true);</span>
+     expect(subtitlesOwner(o, null)).toBeNull();
+   });
+ 
+<span class="h">@@ -126,11 +140,62 @@ describe(&#x27;subtitlesOwner&#x27;, () =&gt; {</span>
+       fc.property(scripts, (steps) =&gt; {
+         const o = createOpens();
+         for (const step of steps) {
+<span class="d">-          if (step.begin) beginOpen(o);</span>
+<span class="d">-          else endOpen(o, step.attempt, step.loaded);</span>
+<span class="a">+          run(o, step);</span>
+           expect(subtitlesOwner(o, &#x27;book&#x27;)).toBe(opening(o) ? null : &#x27;book&#x27;);
+         }
+       }),
+     );
+   });
+ });
+<span class="a">+</span>
+<span class="a">+describe(&#x27;userOpened&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;keeps the copy of a book that the user opened while the last book loaded&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: the restore opens a large last book L. The user picks a</span>
+<span class="a">+    // small B, B shows first, and the copy of B replaces L. The open of L</span>
+<span class="a">+    // then gives false, and the restore deleted the copy of B.</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const since = o.byUser;</span>
+<span class="a">+    const l = beginOpen(o, false);</span>
+<span class="a">+    const b = beginOpen(o, true);</span>
+<span class="a">+    expect(endOpen(o, b, true)).toBe(true);</span>
+<span class="a">+    expect(endOpen(o, l, true)).toBe(false);</span>
+<span class="a">+    expect(userOpened(o, since)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not open the last book over a book that the user picked while the database opened&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: the database upgrade holds the restore, and the start</span>
+<span class="a">+    // card shows. The user picks B. When the database opens, B still loads</span>
+<span class="a">+    // and no book shows, so the restore opened the last book as a later</span>
+<span class="a">+    // attempt, and it won over B.</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const since = o.byUser;</span>
+<span class="a">+    beginOpen(o, true);</span>
+<span class="a">+    expect(o.shown).toBe(0);</span>
+<span class="a">+    expect(userOpened(o, since)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;lets the restore open and forget the last book when the user opened nothing&#x27;, () =&gt; {</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const since = o.byUser;</span>
+<span class="a">+    const l = beginOpen(o, false);</span>
+<span class="a">+    expect(userOpened(o, since)).toBe(false);</span>
+<span class="a">+    expect(endOpen(o, l, false)).toBe(false);</span>
+<span class="a">+    expect(userOpened(o, since)).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;is true exactly when the user started an open after the restore started&#x27;, () =&gt; {</span>
+<span class="a">+    const input = scripts.chain((steps) =&gt;</span>
+<span class="a">+      fc.tuple(fc.constant(steps), fc.nat({ max: steps.length })),</span>
+<span class="a">+    );</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ([steps, start]) =&gt; {</span>
+<span class="a">+        const o = createOpens();</span>
+<span class="a">+        steps.slice(0, start).forEach((step) =&gt; run(o, step));</span>
+<span class="a">+        const since = o.byUser;</span>
+<span class="a">+        steps.slice(start).forEach((step) =&gt; run(o, step));</span>
+<span class="a">+        const later = steps.slice(start).some((step) =&gt; step.begin &amp;&amp; step.byUser);</span>
+<span class="a">+        expect(userOpened(o, since)).toBe(later);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/token-cache.test.ts b/test/token-cache.test.ts
+index 3f8e61a..5e32219 100644
+--- a/test/token-cache.test.ts
++++ b/test/token-cache.test.ts
+<span class="h">@@ -143,12 +143,26 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     await cache.putLastBook(neko);
+     await cache.putMeta(cache.bookKey(neko), { page: 2 });
+     await cache.putPage(cache.pageKey(neko, 0, &#x27;jpn&#x27;, &#x27;ocr&#x27;), entry);
+<span class="d">-    await cache.clearLastBook();</span>
+<span class="a">+    await cache.clearLastBook(cache.bookKey(neko));</span>
+     expect(await cache.getLastBook()).toBeUndefined();
+     expect(await cache.getMeta(cache.bookKey(neko))).toEqual({ page: 2 });
+     expect(await cache.getPage(cache.pageKey(neko, 0, &#x27;jpn&#x27;, &#x27;ocr&#x27;))).toEqual(entry);
+     // No last book: nothing to forget.
+<span class="d">-    await expect(cache.clearLastBook()).resolves.toBeUndefined();</span>
+<span class="a">+    await expect(cache.clearLastBook(cache.bookKey(neko))).resolves.toBeUndefined();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;forgets the last book only while the copy is of that book&#x27;, async () =&gt; {</span>
+<span class="a">+    // The finding: the restore of the last book failed after the user had</span>
+<span class="a">+    // opened another book, and it deleted the copy of the user&#x27;s book.</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    const last = new File([&#x27;%PDF-1.7 猫&#x27;], &#x27;neko.pdf&#x27;, { type: &#x27;application/pdf&#x27; });</span>
+<span class="a">+    const picked = new File([&#x27;%PDF-1.7 犬と猫&#x27;], &#x27;inu.pdf&#x27;, { type: &#x27;application/pdf&#x27; });</span>
+<span class="a">+    await cache.putLastBook(last);</span>
+<span class="a">+    await cache.putLastBook(picked);</span>
+<span class="a">+    await cache.clearLastBook(cache.bookKey(last));</span>
+<span class="a">+    expect((await cache.getLastBook())?.name).toBe(&#x27;inu.pdf&#x27;);</span>
+<span class="a">+    await cache.clearLastBook(cache.bookKey(picked));</span>
+<span class="a">+    expect(await cache.getLastBook()).toBeUndefined();</span>
+   });
+ 
+   it(&#x27;tells when the database is open, after the upgrade&#x27;, async () =&gt; {
+<span class="h">@@ -229,7 +243,7 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     await expect(cache.putMeta(&#x27;b&#x27;, { page: 1 })).resolves.toBeUndefined();
+     await expect(cache.putLastBook(new File([&#x27;x&#x27;], &#x27;b.pdf&#x27;))).resolves.toBe(false);
+     await expect(cache.getLastBook()).resolves.toBeUndefined();
+<span class="d">-    await expect(cache.clearLastBook()).resolves.toBeUndefined();</span>
+<span class="a">+    await expect(cache.clearLastBook(&#x27;b.pdf|1&#x27;)).resolves.toBeUndefined();</span>
+     await expect(cache.dbReady()).resolves.toBeUndefined();
+     expect(warn).toHaveBeenCalledTimes(1);
+   });</pre>
+</div></body></html>

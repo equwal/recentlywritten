@@ -1,0 +1,1172 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread ffe76e52 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit ffe76e52550e49ca8ca4e51bc29c5cb65ee7c548
+truex &lt;truex@equwal.com&gt;
+2026-09-26 13:28:33 -0700
+
+Align each page on its own with unique 8-character runs
+
+One character diff of all cues against the pages read so far took 9 s
+for a book of 300 000 characters. When few pages were read, it matched
+cues to wrong pages, and subtitles of another text matched too.
+
+The aligner now finds each page in the cue stream with anchors: the
+8-character runs of the page that occur only once in the cues. A page
+with fewer than three anchors is not in the subtitles. A character diff
+compares the page with its region only. The longest rising chain of
+(cue character, token) pairs keeps the spans in order. The aligner
+keeps the result of each page, so one more page costs one page.
+
+createAligner(cues).spans(pages) is the new API. alignCuesToTokens
+stays as a wrapper. An unmatched cue gets an empty span. The gap fill
+is removed, because the UI never draws an unmatched cue. A cue stream
+of 64 characters or less is compared with each whole page.
+
+</pre><pre> README.md                   |  14 +-
+ src/align.ts                | 355 ++++++++++++++++++++++++++++++++------------
+ test/align.property.test.ts | 261 ++++++++++++++++++++++++++++----
+ test/align.test.ts          | 213 +++++++++++++++++++-------
+ test/book.ts                | 114 ++++++++++++++
+ 5 files changed, 779 insertions(+), 178 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 24ee73b..d536fd8 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -287,9 +287,17 @@ in a browser bundle.</span>
+ 
+ ## Scope limits
+ 
+<span class="d">-- The alignment runs over the whole book each time a page is read. It</span>
+<span class="d">-  takes about 5 s for 200k characters at 10% OCR noise, and well under</span>
+<span class="d">-  1 s for a chapter.</span>
+<span class="a">+- The alignment finds each page in the subtitles on its own: runs of 8</span>
+<span class="a">+  characters that occur only once in the subtitles show where the page</span>
+<span class="a">+  is, and a character diff compares the page with that part only. So a</span>
+<span class="a">+  cue matches only a page that is read, and subtitles of another text</span>
+<span class="a">+  match nothing. A page is aligned once, when it is read. That takes a</span>
+<span class="a">+  few milliseconds; all the pages of a book of 300 000 characters take</span>
+<span class="a">+  about 1 s (Node on a desktop).</span>
+<span class="a">+- A page with fewer than three such runs gets no cues, for example a</span>
+<span class="a">+  page with only a few words. A subtitle file of 64 characters or less</span>
+<span class="a">+  is too short for the runs: it is compared with each whole page, and</span>
+<span class="a">+  text that is not in it can match by chance.</span>
+ - A vertical font in a text layer (`dir: &#x27;ttb&#x27;` in pdf.js) lays the
+   characters down the page. This path has unit tests with mocked items,
+   but no fixture PDF: pdf-lib does not write vertical text.
+diff --git a/src/align.ts b/src/align.ts
+index 3246457..e632e94 100644
+--- a/src/align.ts
++++ b/src/align.ts
+<span class="h">@@ -1,14 +1,31 @@</span>
+ // Pure text alignment. No DOM, no OCR engine.
+ //
+<span class="d">-// Input: subtitle cue texts and OCR tokens in reading order.</span>
+<span class="d">-// Output: for each cue, the span of OCR tokens that shows that cue.</span>
+<span class="a">+// Input: the texts of the subtitle cues, and the tokens of the pages that</span>
+<span class="a">+// are read so far. Output: for each cue, the span of tokens that shows the</span>
+<span class="a">+// cue.</span>
+ //
+<span class="d">-// Method: normalize both sides to a plain character stream. Run a</span>
+<span class="d">-// character diff (Myers, via fast-diff) between the joined cue stream and</span>
+<span class="d">-// the OCR stream. Equal runs of two or more characters are anchors. Each</span>
+<span class="d">-// cue gets the span between its first and last anchor. A cue with no</span>
+<span class="d">-// anchor gets a share of the gap between its matched neighbors. The diff</span>
+<span class="d">-// is monotonic, so the spans are monotonic too.</span>
+<span class="a">+// A book has some hundred thousand characters, and the reader reads its</span>
+<span class="a">+// pages one by one. One diff of all cues against a few pages is slow, and</span>
+<span class="a">+// it matches cues to wrong places. So each page is aligned on its own:</span>
+<span class="a">+//</span>
+<span class="a">+// 1. All cues, normalized and joined, make the cue stream. An index holds</span>
+<span class="a">+//    each K-gram (a run of K characters) that occurs only once in it.</span>
+<span class="a">+// 2. Each K-gram of a page that is in the index gives an anchor: a cue</span>
+<span class="a">+//    position and a page position. The longest chain of anchors that rises</span>
+<span class="a">+//    in both stays. An anchor far from the median shift of the chain is a</span>
+<span class="a">+//    chance hit and goes too. A page with fewer than MIN_ANCHORS anchors is</span>
+<span class="a">+//    not in the subtitles.</span>
+<span class="a">+// 3. The first and the last anchor give the region of the cue stream that</span>
+<span class="a">+//    the page shows. A character diff (Myers, via fast-diff) of the region</span>
+<span class="a">+//    against the page maps cue characters to page tokens.</span>
+<span class="a">+// 4. The pairs (cue character, token) of all read pages must rise in both.</span>
+<span class="a">+//    The longest rising chain of pairs stays. The other pairs go, for</span>
+<span class="a">+//    example the pairs of a page that is out of order.</span>
+<span class="a">+// 5. Each cue gets the span from its first to its last mapped token.</span>
+<span class="a">+//</span>
+<span class="a">+// The aligner keeps the result of steps 2 and 3 for each page, so one more</span>
+<span class="a">+// page costs the work of one page. A short cue stream has too few K-grams</span>
+<span class="a">+// for anchors: its region is the whole stream.</span>
+ 
+ import diff from &#x27;fast-diff&#x27;;
+ 
+<span class="h">@@ -23,23 +40,40 @@ export interface OcrToken {</span>
+   bbox: { x0: number; y0: number; x1: number; y1: number };
+ }
+ 
+<span class="d">-/** Half-open character span [start, end) in the normalized OCR stream. */</span>
+<span class="d">-export interface CharSpan {</span>
+<span class="d">-  start: number;</span>
+<span class="d">-  end: number;</span>
+<span class="d">-  /** True when at least one anchor supports the span. */</span>
+<span class="d">-  matched: boolean;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-/** Half-open token span [start, end) in the token list. */</span>
+<span class="a">+/** Half-open token span [start, end) in the tokens of the read pages. */</span>
+ export interface TokenSpan {
+   start: number;
+   end: number;
+<span class="a">+  /** True when a character of the cue is mapped. An unmatched cue has the span [0, 0). */</span>
+   matched: boolean;
+ }
+ 
+<span class="d">-/** Shortest equal run that counts as an anchor. */</span>
+<span class="d">-const MIN_ANCHOR = 2;</span>
+<span class="a">+/** The length of the K-grams in the index. */</span>
+<span class="a">+const K = 8;</span>
+<span class="a">+</span>
+<span class="a">+/** A page with fewer anchors than this is not in the subtitles. */</span>
+<span class="a">+const MIN_ANCHORS = 3;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * An anchor whose shift (cue position minus page position) is further than</span>
+<span class="a">+ * this from the median shift of its page is a chance hit. A long page can</span>
+<span class="a">+ * have a longer part that is not narrated, such as a caption, so a quarter</span>
+<span class="a">+ * of the page length applies when it is more.</span>
+<span class="a">+ */</span>
+<span class="a">+const SHIFT_LIMIT = 50;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * A cue stream of this length or less (a few subtitle lines) is too short</span>
+<span class="a">+ * for anchors. Each page is then compared with the whole stream, so text</span>
+<span class="a">+ * that is not in the subtitles can match by chance.</span>
+<span class="a">+ */</span>
+<span class="a">+const SHORT_STREAM = 64;</span>
+<span class="a">+</span>
+<span class="a">+/** The shortest equal run of the diff that counts as a match. */</span>
+<span class="a">+const MIN_RUN = 2;</span>
+<span class="a">+</span>
+<span class="a">+/** The longest edit next to a shorter equal run that still counts as local noise. */</span>
+<span class="a">+const MAX_LOCAL_EDIT = 2;</span>
+ 
+ const KEEP = /[\p{L}\p{N}\p{M}]/u;
+ 
+<span class="h">@@ -75,29 +109,175 @@ export function buildStream(texts: readonly string[]): Stream {</span>
+   return { chars, tokenOf };
+ }
+ 
+<span class="a">+/** The tokens of one page. The aligner uses only their text. */</span>
+<span class="a">+export type PageTokens = readonly Pick&lt;OcrToken, &#x27;text&#x27;&gt;[];</span>
+<span class="a">+</span>
+<span class="a">+/** Aligns the cues of one subtitle file to the pages that are read. */</span>
+<span class="a">+export interface Aligner {</span>
+<span class="a">+  /**</span>
+<span class="a">+   * One span for each cue. `pages[p]` holds the tokens of page p, or</span>
+<span class="a">+   * undefined when page p is not read. The spans index the tokens of the</span>
+<span class="a">+   * read pages, joined in page order. The spans of the matched cues rise:</span>
+<span class="a">+   * a later cue starts and ends at or after an earlier cue.</span>
+<span class="a">+   */</span>
+<span class="a">+  spans(pages: readonly (PageTokens | undefined)[]): TokenSpan[];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The pairs (cue character, page token) of one page, in page order. Both rise. */</span>
+<span class="a">+interface PageMatch {</span>
+<span class="a">+  /** Positions in the cue stream. */</span>
+<span class="a">+  cue: Int32Array;</span>
+<span class="a">+  /** For each position in `cue`, the index of its token on the page. */</span>
+<span class="a">+  token: Int32Array;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A half-open range [from, to) of the cue stream. */</span>
+<span class="a">+interface Region {</span>
+<span class="a">+  from: number;</span>
+<span class="a">+  to: number;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /**
+<span class="d">- * Align normalized cue texts to a normalized OCR stream.</span>
+<span class="d">- * Returns one CharSpan per cue. Spans are monotonic and inside [0, ocr.length].</span>
+<span class="a">+ * Make an aligner for the cues of one subtitle file. Keep it while the</span>
+<span class="a">+ * subtitles stay loaded: it keeps the result of each page that it saw.</span>
+  */
+<span class="d">-export function alignCues(cueTexts: readonly string[], ocr: string): CharSpan[] {</span>
+<span class="d">-  const n = cueTexts.length;</span>
+<span class="d">-  const offsets: number[] = [];</span>
+<span class="d">-  let joined = &#x27;&#x27;;</span>
+<span class="d">-  for (const t of cueTexts) {</span>
+<span class="d">-    offsets.push(joined.length);</span>
+<span class="d">-    joined += t;</span>
+<span class="a">+export function createAligner(cueTexts: readonly string[]): Aligner {</span>
+<span class="a">+  const cues = cueTexts.map(normalizeText);</span>
+<span class="a">+  const stream = cues.join(&#x27;&#x27;);</span>
+<span class="a">+  /** cueOf[i] is the index of the cue that holds stream[i]. */</span>
+<span class="a">+  const cueOf = new Int32Array(stream.length);</span>
+<span class="a">+  let at = 0;</span>
+<span class="a">+  cues.forEach((cue, i) =&gt; {</span>
+<span class="a">+    cueOf.fill(i, at, at + cue.length);</span>
+<span class="a">+    at += cue.length;</span>
+<span class="a">+  });</span>
+<span class="a">+  const grams = uniqueGrams(stream);</span>
+<span class="a">+  /** The match of each page, by the identity of its token array. */</span>
+<span class="a">+  const matches = new WeakMap&lt;PageTokens, PageMatch&gt;();</span>
+<span class="a">+</span>
+<span class="a">+  function matchPage(tokens: PageTokens): PageMatch {</span>
+<span class="a">+    const page = buildStream(tokens.map((t) =&gt; t.text));</span>
+<span class="a">+    const region =</span>
+<span class="a">+      stream.length &lt;= SHORT_STREAM</span>
+<span class="a">+        ? { from: 0, to: stream.length }</span>
+<span class="a">+        : locate(page.chars, stream, grams);</span>
+<span class="a">+    return region</span>
+<span class="a">+      ? mapRegion(stream, region, page)</span>
+<span class="a">+      : { cue: new Int32Array(), token: new Int32Array() };</span>
+   }
+<span class="d">-  offsets.push(joined.length);</span>
+ 
+<span class="d">-  // Map each anchored cue char to its OCR position.</span>
+<span class="d">-  const mapped = new Int32Array(joined.length).fill(-1);</span>
+<span class="d">-  const ops = diff(joined, ocr);</span>
+<span class="d">-  let a = 0;</span>
+<span class="a">+  return {</span>
+<span class="a">+    spans(pages) {</span>
+<span class="a">+      // Join the pairs of the read pages in page order. A token index counts</span>
+<span class="a">+      // the tokens of all read pages before it.</span>
+<span class="a">+      const parts: { match: PageMatch; base: number }[] = [];</span>
+<span class="a">+      let base = 0;</span>
+<span class="a">+      let count = 0;</span>
+<span class="a">+      for (const tokens of pages) {</span>
+<span class="a">+        if (!tokens) continue;</span>
+<span class="a">+        let match = matches.get(tokens);</span>
+<span class="a">+        if (!match) {</span>
+<span class="a">+          match = matchPage(tokens);</span>
+<span class="a">+          matches.set(tokens, match);</span>
+<span class="a">+        }</span>
+<span class="a">+        parts.push({ match, base });</span>
+<span class="a">+        base += tokens.length;</span>
+<span class="a">+        count += match.cue.length;</span>
+<span class="a">+      }</span>
+<span class="a">+      const cue = new Int32Array(count);</span>
+<span class="a">+      const token = new Int32Array(count);</span>
+<span class="a">+      let n = 0;</span>
+<span class="a">+      for (const part of parts) {</span>
+<span class="a">+        cue.set(part.match.cue, n);</span>
+<span class="a">+        for (let k = 0; k &lt; part.match.token.length; k++) {</span>
+<span class="a">+          token[n + k] = part.base + part.match.token[k]!;</span>
+<span class="a">+        }</span>
+<span class="a">+        n += part.match.cue.length;</span>
+<span class="a">+      }</span>
+<span class="a">+</span>
+<span class="a">+      // The tokens rise already. Keep the longest chain of pairs whose cue</span>
+<span class="a">+      // positions rise too. Then each cue spans its first to its last token.</span>
+<span class="a">+      const spans: TokenSpan[] = cues.map(() =&gt; ({ start: 0, end: 0, matched: false }));</span>
+<span class="a">+      for (const k of risingChain(cue)) {</span>
+<span class="a">+        const span = spans[cueOf[cue[k]!]!]!;</span>
+<span class="a">+        if (!span.matched) {</span>
+<span class="a">+          span.start = token[k]!;</span>
+<span class="a">+          span.matched = true;</span>
+<span class="a">+        }</span>
+<span class="a">+        span.end = token[k]! + 1;</span>
+<span class="a">+      }</span>
+<span class="a">+      return spans;</span>
+<span class="a">+    },</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A hash of the K characters of `text` at `at`. Two different K-grams can have the same hash. */</span>
+<span class="a">+function gramHash(text: string, at: number): number {</span>
+<span class="a">+  let h = 0;</span>
+<span class="a">+  for (let i = at; i &lt; at + K; i++) h = (Math.imul(h, 31) + text.charCodeAt(i)) | 0;</span>
+<span class="a">+  return h;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * For each K-gram hash of the stream: the position of the K-gram when the</span>
+<span class="a">+ * hash occurs once, else -1.</span>
+<span class="a">+ */</span>
+<span class="a">+function uniqueGrams(stream: string): Map&lt;number, number&gt; {</span>
+<span class="a">+  const grams = new Map&lt;number, number&gt;();</span>
+<span class="a">+  for (let i = 0; i + K &lt;= stream.length; i++) {</span>
+<span class="a">+    const h = gramHash(stream, i);</span>
+<span class="a">+    grams.set(h, grams.has(h) ? -1 : i);</span>
+<span class="a">+  }</span>
+<span class="a">+  return grams;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The region of the cue stream that a page shows, found with anchors.</span>
+<span class="a">+ * Null when the page has too few anchors: it is not in the subtitles.</span>
+<span class="a">+ */</span>
+<span class="a">+function locate(page: string, stream: string, grams: ReadonlyMap&lt;number, number&gt;): Region | null {</span>
+<span class="a">+  // The anchors in page order. A hash hit counts only when the text agrees.</span>
+<span class="a">+  const cuePos: number[] = [];</span>
+<span class="a">+  const pagePos: number[] = [];</span>
+<span class="a">+  for (let j = 0; j + K &lt;= page.length; j++) {</span>
+<span class="a">+    const at = grams.get(gramHash(page, j));</span>
+<span class="a">+    if (at !== undefined &amp;&amp; at &gt;= 0 &amp;&amp; stream.startsWith(page.slice(j, j + K), at)) {</span>
+<span class="a">+      cuePos.push(at);</span>
+<span class="a">+      pagePos.push(j);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  // A chance hit breaks the order, so keep the longest chain that rises in</span>
+<span class="a">+  // both. A chance hit in the chain is far from the median shift.</span>
+<span class="a">+  const chain = risingChain(cuePos);</span>
+<span class="a">+  if (chain.length &lt; MIN_ANCHORS) return null;</span>
+<span class="a">+  const shift = (k: number): number =&gt; cuePos[k]! - pagePos[k]!;</span>
+<span class="a">+  const median = chain.map(shift).sort((x, y) =&gt; x - y)[chain.length &gt;&gt; 1]!;</span>
+<span class="a">+  const limit = Math.max(SHIFT_LIMIT, page.length / 4);</span>
+<span class="a">+  const kept = chain.filter((k) =&gt; Math.abs(shift(k) - median) &lt;= limit);</span>
+<span class="a">+  if (kept.length &lt; MIN_ANCHORS) return null;</span>
+<span class="a">+  // The page ends, projected along the shift of the first and the last anchor.</span>
+<span class="a">+  const first = kept[0]!;</span>
+<span class="a">+  const last = kept[kept.length - 1]!;</span>
+<span class="a">+  return {</span>
+<span class="a">+    from: Math.max(0, shift(first)),</span>
+<span class="a">+    to: Math.min(stream.length, shift(last) + page.length),</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Map the cue characters of a region to the tokens of a page with a character diff. */</span>
+<span class="a">+function mapRegion(stream: string, region: Region, page: Stream): PageMatch {</span>
+<span class="a">+  const cue: number[] = [];</span>
+<span class="a">+  const token: number[] = [];</span>
+<span class="a">+  const ops = diff(stream.slice(region.from, region.to), page.chars);</span>
+<span class="a">+  let a = region.from;</span>
+   let b = 0;
+   ops.forEach(([op, text], i) =&gt; {
+     if (op === diff.EQUAL) {
+<span class="d">-      if (text.length &gt;= MIN_ANCHOR || isLocalNoise(ops, i)) {</span>
+<span class="d">-        for (let k = 0; k &lt; text.length; k++) mapped[a + k] = b + k;</span>
+<span class="a">+      if (text.length &gt;= MIN_RUN || isLocalNoise(ops, i)) {</span>
+<span class="a">+        for (let k = 0; k &lt; text.length; k++) {</span>
+<span class="a">+          cue.push(a + k);</span>
+<span class="a">+          token.push(page.tokenOf[b + k]!);</span>
+<span class="a">+        }</span>
+       }
+       a += text.length;
+       b += text.length;
+<span class="h">@@ -107,30 +287,9 @@ export function alignCues(cueTexts: readonly string[], ocr: string): CharSpan[]</span>
+       b += text.length;
+     }
+   });
+<span class="d">-</span>
+<span class="d">-  // Build matched spans.</span>
+<span class="d">-  const spans: CharSpan[] = [];</span>
+<span class="d">-  for (let i = 0; i &lt; n; i++) {</span>
+<span class="d">-    let lo = -1;</span>
+<span class="d">-    let hi = -1;</span>
+<span class="d">-    for (let k = offsets[i]!; k &lt; offsets[i + 1]!; k++) {</span>
+<span class="d">-      const p = mapped[k]!;</span>
+<span class="d">-      if (p &lt; 0) continue;</span>
+<span class="d">-      if (lo &lt; 0) lo = p;</span>
+<span class="d">-      hi = p + 1;</span>
+<span class="d">-    }</span>
+<span class="d">-    spans.push(</span>
+<span class="d">-      lo &lt; 0 ? { start: 0, end: 0, matched: false } : { start: lo, end: hi, matched: true },</span>
+<span class="d">-    );</span>
+<span class="d">-  }</span>
+<span class="d">-</span>
+<span class="d">-  fillGaps(spans, cueTexts, ocr.length);</span>
+<span class="d">-  return spans;</span>
+<span class="a">+  return { cue: Int32Array.from(cue), token: Int32Array.from(token) };</span>
+ }
+ 
+<span class="d">-/** Longest edit next to a short equal run that still counts as local noise. */</span>
+<span class="d">-const MAX_LOCAL_EDIT = 2;</span>
+<span class="d">-</span>
+ /**
+  * True when the equal run at ops[i] sits between short edits, such as one
+  * substituted or one dropped character. A short equal run inside a long
+<span class="h">@@ -145,54 +304,54 @@ function isLocalNoise(ops: readonly diff.Diff[], i: number): boolean {</span>
+ }
+ 
+ /**
+<span class="d">- * Give each run of unmatched cues a share of the gap between its matched</span>
+<span class="d">- * neighbors, in proportion to cue length.</span>
+<span class="a">+ * The indices of a longest chain of `values` that rises strictly, in index</span>
+<span class="a">+ * order. Patience sorting: O(n log n).</span>
+  */
+<span class="d">-function fillGaps(spans: CharSpan[], cueTexts: readonly string[], ocrLength: number): void {</span>
+<span class="d">-  let i = 0;</span>
+<span class="d">-  while (i &lt; spans.length) {</span>
+<span class="d">-    if (spans[i]!.matched) {</span>
+<span class="d">-      i++;</span>
+<span class="d">-      continue;</span>
+<span class="d">-    }</span>
+<span class="d">-    let j = i;</span>
+<span class="d">-    while (j &lt; spans.length &amp;&amp; !spans[j]!.matched) j++;</span>
+<span class="d">-    const gapStart = i &gt; 0 ? spans[i - 1]!.end : 0;</span>
+<span class="d">-    const gapEnd = j &lt; spans.length ? spans[j]!.start : ocrLength;</span>
+<span class="d">-    let total = 0;</span>
+<span class="d">-    for (let k = i; k &lt; j; k++) total += cueTexts[k]!.length;</span>
+<span class="d">-    let pos = gapStart;</span>
+<span class="d">-    for (let k = i; k &lt; j; k++) {</span>
+<span class="d">-      const share = total &gt; 0 ? Math.round(((gapEnd - gapStart) * cueTexts[k]!.length) / total) : 0;</span>
+<span class="d">-      const end = k === j - 1 ? gapEnd : Math.min(gapEnd, pos + share);</span>
+<span class="d">-      spans[k] = { start: pos, end, matched: false };</span>
+<span class="d">-      pos = end;</span>
+<span class="a">+export function risingChain(values: ArrayLike&lt;number&gt;): number[] {</span>
+<span class="a">+  /** ends[k] is the index of the smallest last value of a rising chain of length k + 1. */</span>
+<span class="a">+  const ends = new Int32Array(values.length);</span>
+<span class="a">+  /** before[i] is the index before i in the chain that ends at i, or -1. */</span>
+<span class="a">+  const before = new Int32Array(values.length);</span>
+<span class="a">+  let length = 0;</span>
+<span class="a">+  for (let i = 0; i &lt; values.length; i++) {</span>
+<span class="a">+    const value = values[i]!;</span>
+<span class="a">+    // Find the shortest chain whose last value is not below `value`. Most</span>
+<span class="a">+    // values extend the longest chain, so try that first.</span>
+<span class="a">+    let lo = length;</span>
+<span class="a">+    if (length === 0 || values[ends[length - 1]!]! &gt;= value) {</span>
+<span class="a">+      lo = 0;</span>
+<span class="a">+      let hi = length;</span>
+<span class="a">+      while (lo &lt; hi) {</span>
+<span class="a">+        const mid = (lo + hi) &gt;&gt; 1;</span>
+<span class="a">+        if (values[ends[mid]!]! &lt; value) lo = mid + 1;</span>
+<span class="a">+        else hi = mid;</span>
+<span class="a">+      }</span>
+     }
+<span class="d">-    i = j;</span>
+<span class="a">+    before[i] = lo &gt; 0 ? ends[lo - 1]! : -1;</span>
+<span class="a">+    ends[lo] = i;</span>
+<span class="a">+    if (lo === length) length++;</span>
+   }
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-/** Convert a char span to a token span with the char-to-token map. */</span>
+<span class="d">-export function toTokenSpan(span: CharSpan, stream: Stream): TokenSpan {</span>
+<span class="d">-  if (span.end &lt;= span.start) {</span>
+<span class="d">-    // Empty span: point at the token at or after the position.</span>
+<span class="d">-    const t =</span>
+<span class="d">-      span.start &lt; stream.tokenOf.length ? stream.tokenOf[span.start]! : stream.tokenOf.length;</span>
+<span class="d">-    return { start: t, end: t, matched: span.matched };</span>
+<span class="a">+  const chain = new Array&lt;number&gt;(length);</span>
+<span class="a">+  for (let k = length - 1, i = length &gt; 0 ? ends[length - 1]! : -1; k &gt;= 0; k--, i = before[i]!) {</span>
+<span class="a">+    chain[k] = i;</span>
+   }
+<span class="d">-  return {</span>
+<span class="d">-    start: stream.tokenOf[span.start]!,</span>
+<span class="d">-    end: stream.tokenOf[span.end - 1]! + 1,</span>
+<span class="d">-    matched: span.matched,</span>
+<span class="d">-  };</span>
+<span class="a">+  return chain;</span>
+ }
+ 
+<span class="d">-/** Full pipeline: raw cue texts and OCR tokens to token spans. */</span>
+<span class="a">+/**</span>
+<span class="a">+ * Align cues to tokens in one call. The tokens must be in page order, the</span>
+<span class="a">+ * order that the reader keeps them in. The spans index `tokens`.</span>
+<span class="a">+ */</span>
+ export function alignCuesToTokens(
+   cueTexts: readonly string[],
+<span class="d">-  tokens: readonly Pick&lt;OcrToken, &#x27;text&#x27;&gt;[],</span>
+<span class="a">+  tokens: readonly Pick&lt;OcrToken, &#x27;text&#x27; | &#x27;page&#x27;&gt;[],</span>
+ ): TokenSpan[] {
+<span class="d">-  const stream = buildStream(tokens.map((t) =&gt; t.text));</span>
+<span class="d">-  const spans = alignCues(cueTexts.map(normalizeText), stream.chars);</span>
+<span class="d">-  return spans.map((s) =&gt; toTokenSpan(s, stream));</span>
+<span class="a">+  const pages: Pick&lt;OcrToken, &#x27;text&#x27; | &#x27;page&#x27;&gt;[][] = [];</span>
+<span class="a">+  tokens.forEach((t, i) =&gt; {</span>
+<span class="a">+    if (i &gt; 0 &amp;&amp; t.page &lt; tokens[i - 1]!.page) {</span>
+<span class="a">+      throw new Error(&#x27;alignCuesToTokens: the tokens are not in page order.&#x27;);</span>
+<span class="a">+    }</span>
+<span class="a">+    (pages[t.page] ??= []).push(t);</span>
+<span class="a">+  });</span>
+<span class="a">+  return createAligner(cueTexts).spans(pages);</span>
+ }
+diff --git a/test/align.property.test.ts b/test/align.property.test.ts
+index 40cc0d0..7f51019 100644
+--- a/test/align.property.test.ts
++++ b/test/align.property.test.ts
+<span class="h">@@ -1,12 +1,62 @@</span>
+ import fc from &#x27;fast-check&#x27;;
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import { alignCues, normalizeText } from &#x27;../src/align&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  alignCuesToTokens,</span>
+<span class="a">+  createAligner,</span>
+<span class="a">+  normalizeText,</span>
+<span class="a">+  risingChain,</span>
+<span class="a">+  type TokenSpan,</span>
+<span class="a">+} from &#x27;../src/align&#x27;;</span>
+<span class="a">+import { books, char, grams, pagesOfCue, readPages, word, type Book, type Token } from &#x27;./book&#x27;;</span>
+ 
+<span class="d">-// A small mixed alphabet: Latin, kana and kanji, so CJK is always covered.</span>
+<span class="d">-const ALPHABET = [...&#x27;abcdefghijklmnop&#x27;, ...&#x27;あいうえおかきくけこ&#x27;, ...&#x27;吾輩猫名前春夏秋冬&#x27;];</span>
+<span class="d">-const char = fc.constantFrom(...ALPHABET);</span>
+<span class="d">-const word = (min: number, max: number) =&gt;</span>
+<span class="d">-  fc.array(char, { minLength: min, maxLength: max }).map((cs) =&gt; cs.join(&#x27;&#x27;));</span>
+<span class="a">+/** One token for each character of `text`, all on `page`. */</span>
+<span class="a">+function tokensOf(text: string, page = 0): Token[] {</span>
+<span class="a">+  return [...text].map((ch) =&gt; ({ text: ch, page }));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Books without noise that are long enough for anchors. */</span>
+<span class="a">+const exactBooks = books({ cues: [15, 60], cueLength: [5, 40], pageLength: [16, 200], noise: 0 });</span>
+<span class="a">+</span>
+<span class="a">+/** A book and a random choice of read pages. About one page in three is read. */</span>
+<span class="a">+function withReadPages(arb: fc.Arbitrary&lt;Book&gt;): fc.Arbitrary&lt;[Book, boolean[]]&gt; {</span>
+<span class="a">+  return arb.chain((book) =&gt;</span>
+<span class="a">+    fc.tuple(</span>
+<span class="a">+      fc.constant(book),</span>
+<span class="a">+      fc.array(fc.constantFrom(true, false, false), {</span>
+<span class="a">+        minLength: book.pages.length,</span>
+<span class="a">+        maxLength: book.pages.length,</span>
+<span class="a">+      }),</span>
+<span class="a">+    ),</span>
+<span class="a">+  );</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * For a book without noise: the index of each character in the tokens of</span>
+<span class="a">+ * the read pages, joined in page order. -1 for a character on an unread page.</span>
+<span class="a">+ */</span>
+<span class="a">+function tokenIndex(book: Book, read: readonly boolean[]): number[] {</span>
+<span class="a">+  let next = 0;</span>
+<span class="a">+  return book.pageOf.map((page) =&gt; (read[page] ? next++ : -1));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The spans of the matched cues rise and stay inside [0, total]. */</span>
+<span class="a">+function expectRising(spans: readonly TokenSpan[], total: number, disjoint: boolean): void {</span>
+<span class="a">+  let last: TokenSpan | null = null;</span>
+<span class="a">+  for (const span of spans) {</span>
+<span class="a">+    if (!span.matched) {</span>
+<span class="a">+      expect(span).toEqual({ start: 0, end: 0, matched: false });</span>
+<span class="a">+      continue;</span>
+<span class="a">+    }</span>
+<span class="a">+    expect(span.start).toBeGreaterThanOrEqual(0);</span>
+<span class="a">+    expect(span.end).toBeGreaterThan(span.start);</span>
+<span class="a">+    expect(span.end).toBeLessThanOrEqual(total);</span>
+<span class="a">+    if (last) {</span>
+<span class="a">+      expect(span.start).toBeGreaterThanOrEqual(disjoint ? last.end : last.start);</span>
+<span class="a">+      expect(span.end).toBeGreaterThanOrEqual(last.end);</span>
+<span class="a">+    }</span>
+<span class="a">+    last = span;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+ 
+ describe(&#x27;normalizeText&#x27;, () =&gt; {
+   it(&#x27;is idempotent&#x27;, () =&gt; {
+<span class="h">@@ -19,40 +69,198 @@ describe(&#x27;normalizeText&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="d">-describe(&#x27;alignCues properties&#x27;, () =&gt; {</span>
+<span class="d">-  it(&#x27;maps exact text to exact spans&#x27;, () =&gt; {</span>
+<span class="a">+describe(&#x27;risingChain&#x27;, () =&gt; {</span>
+<span class="a">+  /** The length of a longest strictly rising chain, by the slow O(n²) method. */</span>
+<span class="a">+  function slowLength(values: readonly number[]): number {</span>
+<span class="a">+    const best = values.map(() =&gt; 1);</span>
+<span class="a">+    for (let i = 0; i &lt; values.length; i++) {</span>
+<span class="a">+      for (let j = 0; j &lt; i; j++) {</span>
+<span class="a">+        if (values[j]! &lt; values[i]!) best[i] = Math.max(best[i]!, best[j]! + 1);</span>
+<span class="a">+      }</span>
+<span class="a">+    }</span>
+<span class="a">+    return Math.max(0, ...best);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives a strictly rising chain as long as the slow reference&#x27;, () =&gt; {</span>
+     fc.assert(
+<span class="d">-      fc.property(fc.array(word(1, 30), { minLength: 1, maxLength: 20 }), (cues) =&gt; {</span>
+<span class="d">-        const spans = alignCues(cues, cues.join(&#x27;&#x27;));</span>
+<span class="d">-        let offset = 0;</span>
+<span class="d">-        cues.forEach((cue, i) =&gt; {</span>
+<span class="d">-          expect(spans[i]).toMatchObject({ start: offset, end: offset + cue.length });</span>
+<span class="d">-          offset += cue.length;</span>
+<span class="a">+      fc.property(fc.array(fc.integer({ min: 0, max: 20 }), { maxLength: 40 }), (values) =&gt; {</span>
+<span class="a">+        const chain = risingChain(values);</span>
+<span class="a">+        for (let k = 1; k &lt; chain.length; k++) {</span>
+<span class="a">+          expect(chain[k]!).toBeGreaterThan(chain[k - 1]!);</span>
+<span class="a">+          expect(values[chain[k]!]!).toBeGreaterThan(values[chain[k - 1]!]!);</span>
+<span class="a">+        }</span>
+<span class="a">+        expect(chain.length).toBe(slowLength(values));</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;createAligner properties&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;maps exact text on all pages to exactly the tokens of each cue&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(exactBooks, (book) =&gt; {</span>
+<span class="a">+        const spans = createAligner(book.cues).spans(book.pages);</span>
+<span class="a">+        book.cues.forEach((_, i) =&gt; {</span>
+<span class="a">+          expect(spans[i]).toEqual({</span>
+<span class="a">+            start: book.offsets[i],</span>
+<span class="a">+            end: book.offsets[i + 1],</span>
+<span class="a">+            matched: true,</span>
+<span class="a">+          });</span>
+         });
+       }),
+     );
+   });
+ 
+<span class="d">-  it(&#x27;gives every cue a contiguous in-range span, monotonic across cues&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;matches cues only on read pages, and each cue there to exactly its tokens&#x27;, () =&gt; {</span>
+<span class="a">+    // The regression: with a few pages read, cues matched to wrong places.</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(withReadPages(exactBooks), ([book, read]) =&gt; {</span>
+<span class="a">+        const spans = createAligner(book.cues).spans(readPages(book, read));</span>
+<span class="a">+        const index = tokenIndex(book, read);</span>
+<span class="a">+        book.cues.forEach((_, i) =&gt; {</span>
+<span class="a">+          const tokens = index.slice(book.offsets[i], book.offsets[i + 1]).filter((t) =&gt; t &gt;= 0);</span>
+<span class="a">+          if (tokens.length === 0) {</span>
+<span class="a">+            // The cue lies wholly on unread pages: no false positive.</span>
+<span class="a">+            expect(spans[i]!.matched).toBe(false);</span>
+<span class="a">+          } else {</span>
+<span class="a">+            expect(spans[i]).toEqual({</span>
+<span class="a">+              start: tokens[0],</span>
+<span class="a">+              end: tokens[tokens.length - 1]! + 1,</span>
+<span class="a">+              matched: true,</span>
+<span class="a">+            });</span>
+<span class="a">+          }</span>
+<span class="a">+        });</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;matches no cue when the cues share no 8-character run with the pages&#x27;, () =&gt; {</span>
+<span class="a">+    // Cues from one random text, pages from another. Both use one alphabet,</span>
+<span class="a">+    // so chance runs of a few characters are common. The cue stream is</span>
+<span class="a">+    // longer than a short stream, which is compared with the pages in full.</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(</span>
+<span class="a">+        fc.array(word(15, 40), { minLength: 5, maxLength: 30 }),</span>
+<span class="a">+        exactBooks,</span>
+<span class="a">+        (cues, book) =&gt; {</span>
+<span class="a">+          const cueGrams = grams(cues.join(&#x27;&#x27;));</span>
+<span class="a">+          fc.pre(</span>
+<span class="a">+            book.pages.every((page) =&gt;</span>
+<span class="a">+              [...grams(page.map((t) =&gt; t.text).join(&#x27;&#x27;))].every((g) =&gt; !cueGrams.has(g)),</span>
+<span class="a">+            ),</span>
+<span class="a">+          );</span>
+<span class="a">+          const spans = createAligner(cues).spans(book.pages);</span>
+<span class="a">+          expect(spans.filter((s) =&gt; s.matched)).toEqual([]);</span>
+<span class="a">+        },</span>
+<span class="a">+      ),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the same spans with the page cache as a new aligner&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(withReadPages(exactBooks), ([book, read]) =&gt; {</span>
+<span class="a">+        const aligner = createAligner(book.cues);</span>
+<span class="a">+        aligner.spans(readPages(book, read));</span>
+<span class="a">+        // Read the other pages one by one, as the reader does.</span>
+<span class="a">+        const now = [...read];</span>
+<span class="a">+        for (let p = 0; p &lt; now.length; p++) {</span>
+<span class="a">+          if (now[p]) continue;</span>
+<span class="a">+          now[p] = true;</span>
+<span class="a">+          const pages = readPages(book, now);</span>
+<span class="a">+          expect(aligner.spans(pages)).toEqual(createAligner(book.cues).spans(pages));</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+      { numRuns: 30 },</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives rising, in-range spans when pages repeat, overlap or come out of order&#x27;, () =&gt; {</span>
+<span class="a">+    const slices = (length: number) =&gt;</span>
+<span class="a">+      fc.array(</span>
+<span class="a">+        fc.option(fc.record({ start: fc.nat({ max: length }), length: fc.nat({ max: 300 }) }), {</span>
+<span class="a">+          nil: undefined,</span>
+<span class="a">+        }),</span>
+<span class="a">+        { maxLength: 12 },</span>
+<span class="a">+      );</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(</span>
+<span class="a">+        exactBooks.chain((book) =&gt; fc.tuple(fc.constant(book), slices(book.pageOf.length))),</span>
+<span class="a">+        ([book, parts]) =&gt; {</span>
+<span class="a">+          const text = book.cues.join(&#x27;&#x27;);</span>
+<span class="a">+          const pages = parts.map(</span>
+<span class="a">+            (s, p) =&gt; s &amp;&amp; tokensOf(text.slice(s.start, s.start + s.length), p),</span>
+<span class="a">+          );</span>
+<span class="a">+          const total = pages.reduce((n, p) =&gt; n + (p?.length ?? 0), 0);</span>
+<span class="a">+          // One character per token: the spans do not overlap.</span>
+<span class="a">+          expectRising(createAligner(book.cues).spans(pages), total, true);</span>
+<span class="a">+        },</span>
+<span class="a">+      ),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives rising, in-range spans for any text&#x27;, () =&gt; {</span>
+     fc.assert(
+       fc.property(
+         fc.array(fc.string({ unit: &#x27;grapheme&#x27; }), { maxLength: 20 }),
+<span class="d">-        fc.string({ unit: &#x27;grapheme&#x27; }),</span>
+<span class="d">-        (cues, ocr) =&gt; {</span>
+<span class="d">-          const spans = alignCues(cues, ocr);</span>
+<span class="a">+        fc.array(fc.option(fc.array(fc.string({ unit: &#x27;grapheme&#x27; })), { nil: undefined }), {</span>
+<span class="a">+          maxLength: 5,</span>
+<span class="a">+        }),</span>
+<span class="a">+        (cues, texts) =&gt; {</span>
+<span class="a">+          const pages = texts.map((page, p) =&gt; page?.map((text) =&gt; ({ text, page: p })));</span>
+<span class="a">+          const total = pages.reduce((n, p) =&gt; n + (p?.length ?? 0), 0);</span>
+<span class="a">+          const spans = createAligner(cues).spans(pages);</span>
+           expect(spans).toHaveLength(cues.length);
+<span class="d">-          let prevEnd = 0;</span>
+<span class="d">-          for (const s of spans) {</span>
+<span class="d">-            expect(s.start).toBeGreaterThanOrEqual(prevEnd);</span>
+<span class="d">-            expect(s.end).toBeGreaterThanOrEqual(s.start);</span>
+<span class="d">-            expect(s.end).toBeLessThanOrEqual(ocr.length);</span>
+<span class="d">-            prevEnd = s.end;</span>
+<span class="d">-          }</span>
+<span class="a">+          // A token can hold characters of two cues, so two spans can share a token.</span>
+<span class="a">+          expectRising(spans, total, false);</span>
+         },
+       ),
+     );
+   });
+ 
+<span class="a">+  it(&#x27;keeps 95% of the cues on read pages on their own pages under 5% noise&#x27;, () =&gt; {</span>
+<span class="a">+    const noisy = books({</span>
+<span class="a">+      cues: [100, 150],</span>
+<span class="a">+      cueLength: [10, 40],</span>
+<span class="a">+      pageLength: [100, 400],</span>
+<span class="a">+      noise: 0.05,</span>
+<span class="a">+    });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(withReadPages(noisy), ([book, read]) =&gt; {</span>
+<span class="a">+        const pages = readPages(book, read);</span>
+<span class="a">+        const tokens = pages.flatMap((p) =&gt; p ?? []);</span>
+<span class="a">+        const spans = createAligner(book.cues).spans(pages);</span>
+<span class="a">+        let onRead = 0;</span>
+<span class="a">+        let right = 0;</span>
+<span class="a">+        book.cues.forEach((_, i) =&gt; {</span>
+<span class="a">+          const own = pagesOfCue(book, i);</span>
+<span class="a">+          if (![...own].every((p) =&gt; read[p])) return;</span>
+<span class="a">+          onRead++;</span>
+<span class="a">+          const span = spans[i]!;</span>
+<span class="a">+          if (span.matched &amp;&amp; tokens.slice(span.start, span.end).every((t) =&gt; own.has(t.page))) {</span>
+<span class="a">+            right++;</span>
+<span class="a">+          }</span>
+<span class="a">+        });</span>
+<span class="a">+        expect(right).toBeGreaterThanOrEqual(0.95 * onRead);</span>
+<span class="a">+      }),</span>
+<span class="a">+      { numRuns: 30 },</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;alignCuesToTokens on one page&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;maps exact text to exact spans, for short cues too&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(fc.array(word(1, 30), { minLength: 1, maxLength: 20 }), (cues) =&gt; {</span>
+<span class="a">+        const spans = alignCuesToTokens(cues, tokensOf(cues.join(&#x27;&#x27;)));</span>
+<span class="a">+        let offset = 0;</span>
+<span class="a">+        cues.forEach((cue, i) =&gt; {</span>
+<span class="a">+          expect(spans[i]).toEqual({ start: offset, end: offset + cue.length, matched: true });</span>
+<span class="a">+          offset += cue.length;</span>
+<span class="a">+        });</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+   it(&#x27;keeps spans near the truth under modest random character noise&#x27;, () =&gt; {
+     // One cue with up to one edit per ten characters.
+     const noisyCue = word(15, 40).chain((text) =&gt;
+<span class="h">@@ -73,8 +281,7 @@ describe(&#x27;alignCues properties&#x27;, () =&gt; {</span>
+       fc.property(fc.array(noisyCue, { minLength: 1, maxLength: 15 }), (items) =&gt; {
+         const cues = items.map(([text]) =&gt; text);
+         const noisy = items.map(([text, edits]) =&gt; applyEdits(text, edits));
+<span class="d">-        const ocr = noisy.join(&#x27;&#x27;);</span>
+<span class="d">-        const spans = alignCues(cues, ocr);</span>
+<span class="a">+        const spans = alignCuesToTokens(cues, tokensOf(noisy.join(&#x27;&#x27;)));</span>
+ 
+         let offset = 0;
+         noisy.forEach((truth, i) =&gt; {
+diff --git a/test/align.test.ts b/test/align.test.ts
+index 0ac49c2..5e97872 100644
+--- a/test/align.test.ts
++++ b/test/align.test.ts
+<span class="h">@@ -1,11 +1,25 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import {</span>
+<span class="d">-  alignCues,</span>
+<span class="d">-  alignCuesToTokens,</span>
+<span class="d">-  buildStream,</span>
+<span class="d">-  normalizeText,</span>
+<span class="d">-  toTokenSpan,</span>
+<span class="d">-} from &#x27;../src/align&#x27;;</span>
+<span class="a">+import { alignCuesToTokens, buildStream, createAligner, normalizeText } from &#x27;../src/align&#x27;;</span>
+<span class="a">+import { ENG2 } from &#x27;../fixtures/sample-text&#x27;;</span>
+<span class="a">+import { books, char, grams, pagesOfCue, readPages, type Token } from &#x27;./book&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** One token for each character of `text`, all on `page`. */</span>
+<span class="a">+function tokensOf(text: string, page = 0): Token[] {</span>
+<span class="a">+  return [...text].map((ch) =&gt; ({ text: ch, page }));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The opening of A Tale of Two Cities, as cues. */</span>
+<span class="a">+const TWO_CITIES = [</span>
+<span class="a">+  &#x27;It was the best of times,&#x27;,</span>
+<span class="a">+  &#x27;it was the worst of times,&#x27;,</span>
+<span class="a">+  &#x27;it was the age of wisdom,&#x27;,</span>
+<span class="a">+  &#x27;it was the age of foolishness,&#x27;,</span>
+<span class="a">+  &#x27;it was the epoch of belief,&#x27;,</span>
+<span class="a">+  &#x27;it was the epoch of incredulity,&#x27;,</span>
+<span class="a">+  &#x27;it was the season of Light,&#x27;,</span>
+<span class="a">+  &#x27;it was the season of Darkness,&#x27;,</span>
+<span class="a">+];</span>
+ 
+ describe(&#x27;normalizeText&#x27;, () =&gt; {
+   it(&#x27;drops spaces and punctuation and folds case&#x27;, () =&gt; {
+<span class="h">@@ -21,11 +35,10 @@ describe(&#x27;normalizeText&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="d">-describe(&#x27;alignCues&#x27;, () =&gt; {</span>
+<span class="a">+describe(&#x27;alignCuesToTokens on one page&#x27;, () =&gt; {</span>
+   it(&#x27;maps exact text to exact spans&#x27;, () =&gt; {
+     const cues = [&#x27;thequick&#x27;, &#x27;brownfox&#x27;, &#x27;jumps&#x27;];
+<span class="d">-    const spans = alignCues(cues, cues.join(&#x27;&#x27;));</span>
+<span class="d">-    expect(spans).toEqual([</span>
+<span class="a">+    expect(alignCuesToTokens(cues, tokensOf(cues.join(&#x27;&#x27;)))).toEqual([</span>
+       { start: 0, end: 8, matched: true },
+       { start: 8, end: 16, matched: true },
+       { start: 16, end: 21, matched: true },
+<span class="h">@@ -35,69 +48,51 @@ describe(&#x27;alignCues&#x27;, () =&gt; {</span>
+   it(&#x27;tolerates OCR substitutions and drops&#x27;, () =&gt; {
+     // &quot;rn&quot; read as &quot;m&quot;, &quot;l&quot; read as &quot;1&quot;, one char lost.
+     const cues = [&#x27;themorningsun&#x27;, &#x27;wasclearandbright&#x27;];
+<span class="d">-    const ocr = &#x27;thernorningsun&#x27; + &#x27;wasc1earandbrigt&#x27;;</span>
+<span class="d">-    const spans = alignCues(cues, ocr);</span>
+<span class="a">+    const spans = alignCuesToTokens(cues, tokensOf(&#x27;thernorningsun&#x27; + &#x27;wasc1earandbrigt&#x27;));</span>
+     expect(spans[0]).toEqual({ start: 0, end: 14, matched: true });
+     expect(spans[1]).toEqual({ start: 14, end: 30, matched: true });
+   });
+ 
+   it(&#x27;skips OCR text that no cue covers, such as a page header&#x27;, () =&gt; {
+     const cues = [&#x27;firstline&#x27;, &#x27;secondline&#x27;];
+<span class="d">-    const ocr = &#x27;chapterone&#x27; + &#x27;firstline&#x27; + &#x27;pagenumber12&#x27; + &#x27;secondline&#x27;;</span>
+<span class="d">-    const spans = alignCues(cues, ocr);</span>
+<span class="a">+    const spans = alignCuesToTokens(</span>
+<span class="a">+      cues,</span>
+<span class="a">+      tokensOf(&#x27;chapterone&#x27; + &#x27;firstline&#x27; + &#x27;pagenumber12&#x27; + &#x27;secondline&#x27;),</span>
+<span class="a">+    );</span>
+     expect(spans[0]).toEqual({ start: 10, end: 19, matched: true });
+     expect(spans[1]).toEqual({ start: 31, end: 41, matched: true });
+   });
+ 
+<span class="d">-  it(&#x27;gives an unmatched cue a share of the gap between its neighbors&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;leaves a cue that is not on the page unmatched, with an empty span&#x27;, () =&gt; {</span>
+     const cues = [&#x27;abcdefgh&#x27;, &#x27;zzzzzzzz&#x27;, &#x27;ijklmnop&#x27;];
+<span class="d">-    const ocr = &#x27;abcdefgh&#x27; + &#x27;qqqqqqqq&#x27; + &#x27;ijklmnop&#x27;;</span>
+<span class="d">-    const spans = alignCues(cues, ocr);</span>
+<span class="d">-    expect(spans[1]).toEqual({ start: 8, end: 16, matched: false });</span>
+<span class="a">+    const spans = alignCuesToTokens(cues, tokensOf(&#x27;abcdefgh&#x27; + &#x27;qqqqqqqq&#x27; + &#x27;ijklmnop&#x27;));</span>
+<span class="a">+    expect(spans).toEqual([</span>
+<span class="a">+      { start: 0, end: 8, matched: true },</span>
+<span class="a">+      { start: 0, end: 0, matched: false },</span>
+<span class="a">+      { start: 16, end: 24, matched: true },</span>
+<span class="a">+    ]);</span>
+   });
+ 
+   it(&#x27;aligns Japanese text at character level with OCR noise&#x27;, () =&gt; {
+     const cues = [&#x27;吾輩は猫である&#x27;, &#x27;名前はまだ無い&#x27;, &#x27;どこで生れたか&#x27;];
+     // 猫 read as 描, one char doubled, one char lost.
+<span class="d">-    const ocr = &#x27;吾輩は描である&#x27; + &#x27;名前はまだだ無い&#x27; + &#x27;どこで生れか&#x27;;</span>
+<span class="d">-    const spans = alignCues(cues, ocr);</span>
+<span class="a">+    const spans = alignCuesToTokens(</span>
+<span class="a">+      cues,</span>
+<span class="a">+      tokensOf(&#x27;吾輩は描である&#x27; + &#x27;名前はまだだ無い&#x27; + &#x27;どこで生れか&#x27;),</span>
+<span class="a">+    );</span>
+     expect(spans[0]).toEqual({ start: 0, end: 7, matched: true });
+     expect(spans[1]).toEqual({ start: 7, end: 15, matched: true });
+     expect(spans[2]).toEqual({ start: 15, end: 21, matched: true });
+   });
+ 
+   it(&#x27;returns empty spans for empty input&#x27;, () =&gt; {
+<span class="d">-    expect(alignCues([], &#x27;abc&#x27;)).toEqual([]);</span>
+<span class="d">-    expect(alignCues([&#x27;abc&#x27;], &#x27;&#x27;)).toEqual([{ start: 0, end: 0, matched: false }]);</span>
+<span class="a">+    expect(alignCuesToTokens([], tokensOf(&#x27;abc&#x27;))).toEqual([]);</span>
+<span class="a">+    expect(alignCuesToTokens([&#x27;abc&#x27;], [])).toEqual([{ start: 0, end: 0, matched: false }]);</span>
+   });
+<span class="d">-});</span>
+ 
+<span class="d">-describe(&#x27;buildStream and toTokenSpan&#x27;, () =&gt; {</span>
+<span class="d">-  it(&#x27;maps chars back to the tokens that hold them&#x27;, () =&gt; {</span>
+<span class="d">-    const stream = buildStream([&#x27;The&#x27;, &#x27;quick,&#x27;, &#x27;—&#x27;, &#x27;fox&#x27;]);</span>
+<span class="d">-    expect(stream.chars).toBe(&#x27;thequickfox&#x27;);</span>
+<span class="d">-    expect(stream.tokenOf).toEqual([0, 0, 0, 1, 1, 1, 1, 1, 3, 3, 3]);</span>
+<span class="d">-    expect(toTokenSpan({ start: 3, end: 11, matched: true }, stream)).toEqual({</span>
+<span class="d">-      start: 1,</span>
+<span class="d">-      end: 4,</span>
+<span class="d">-      matched: true,</span>
+<span class="d">-    });</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;points an empty span at the token at that position&#x27;, () =&gt; {</span>
+<span class="d">-    const stream = buildStream([&#x27;ab&#x27;, &#x27;cd&#x27;]);</span>
+<span class="d">-    expect(toTokenSpan({ start: 2, end: 2, matched: false }, stream)).toEqual({</span>
+<span class="d">-      start: 1,</span>
+<span class="d">-      end: 1,</span>
+<span class="d">-      matched: false,</span>
+<span class="d">-    });</span>
+<span class="d">-  });</span>
+<span class="d">-});</span>
+<span class="d">-</span>
+<span class="d">-describe(&#x27;alignCuesToTokens&#x27;, () =&gt; {</span>
+   it(&#x27;runs the full pipeline on word tokens with punctuation tokens&#x27;, () =&gt; {
+     const tokens = [&#x27;It&#x27;, &#x27;was&#x27;, &#x27;a&#x27;, &#x27;dark&#x27;, &#x27;and&#x27;, &#x27;stormy&#x27;, &#x27;night&#x27;, &#x27;.&#x27;, &#x27;The&#x27;, &#x27;rain&#x27;].map(
+<span class="d">-      (text) =&gt; ({ text }),</span>
+<span class="a">+      (text) =&gt; ({ text, page: 0 }),</span>
+     );
+     const spans = alignCuesToTokens([&#x27;It was a dark&#x27;, &#x27;and stormy night.&#x27;, &#x27;The rain&#x27;], tokens);
+     expect(spans).toEqual([
+<span class="h">@@ -108,10 +103,128 @@ describe(&#x27;alignCuesToTokens&#x27;, () =&gt; {</span>
+   });
+ 
+   it(&#x27;works with one token per character, as for vertical Japanese&#x27;, () =&gt; {
+<span class="d">-    const text = &#x27;春はあけぼの。やうやう白くなりゆく山ぎは&#x27;;</span>
+<span class="d">-    const tokens = [...text].map((ch) =&gt; ({ text: ch }));</span>
+<span class="d">-    const spans = alignCuesToTokens([&#x27;春はあけぼの&#x27;, &#x27;やうやう白くなりゆく山ぎは&#x27;], tokens);</span>
+<span class="a">+    const spans = alignCuesToTokens(</span>
+<span class="a">+      [&#x27;春はあけぼの&#x27;, &#x27;やうやう白くなりゆく山ぎは&#x27;],</span>
+<span class="a">+      tokensOf(&#x27;春はあけぼの。やうやう白くなりゆく山ぎは&#x27;),</span>
+<span class="a">+    );</span>
+     expect(spans[0]).toEqual({ start: 0, end: 6, matched: true });
+     expect(spans[1]).toEqual({ start: 7, end: 20, matched: true });
+   });
+<span class="a">+</span>
+<span class="a">+  it(&#x27;refuses tokens that are not in page order&#x27;, () =&gt; {</span>
+<span class="a">+    const tokens = [</span>
+<span class="a">+      { text: &#x27;a&#x27;, page: 1 },</span>
+<span class="a">+      { text: &#x27;b&#x27;, page: 0 },</span>
+<span class="a">+    ];</span>
+<span class="a">+    expect(() =&gt; alignCuesToTokens([&#x27;ab&#x27;], tokens)).toThrow(/page order/);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;buildStream&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;maps chars back to the tokens that hold them&#x27;, () =&gt; {</span>
+<span class="a">+    const stream = buildStream([&#x27;The&#x27;, &#x27;quick,&#x27;, &#x27;—&#x27;, &#x27;fox&#x27;]);</span>
+<span class="a">+    expect(stream.chars).toBe(&#x27;thequickfox&#x27;);</span>
+<span class="a">+    expect(stream.tokenOf).toEqual([0, 0, 0, 1, 1, 1, 1, 1, 3, 3, 3]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;createAligner&#x27;, () =&gt; {</span>
+<span class="a">+  const text = normalizeText(TWO_CITIES.join(&#x27;&#x27;));</span>
+<span class="a">+  const cues = text.match(/.{1,20}/g)!;</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;indexes the tokens of the read pages, joined in page order&#x27;, () =&gt; {</span>
+<span class="a">+    const pages = [tokensOf(text.slice(0, 60), 0), undefined, tokensOf(text.slice(60), 2)];</span>
+<span class="a">+    const spans = createAligner(cues).spans(pages);</span>
+<span class="a">+    expect(spans.map((s) =&gt; s.matched)).toEqual(cues.map(() =&gt; true));</span>
+<span class="a">+    expect(spans[0]).toEqual({ start: 0, end: 20, matched: true });</span>
+<span class="a">+    expect(spans[3]).toEqual({ start: 60, end: 80, matched: true });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;leaves the cues of an unread page unmatched&#x27;, () =&gt; {</span>
+<span class="a">+    const pages = [undefined, undefined, tokensOf(text.slice(60), 2)];</span>
+<span class="a">+    const spans = createAligner(cues).spans(pages);</span>
+<span class="a">+    expect(spans.slice(0, 3).map((s) =&gt; s.matched)).toEqual([false, false, false]);</span>
+<span class="a">+    expect(spans[3]).toEqual({ start: 0, end: 20, matched: true });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;matches no cue of subtitles for another text (regression)&#x27;, () =&gt; {</span>
+<span class="a">+    // The opening of A Tale of Two Cities over the two pages of the</span>
+<span class="a">+    // sample-eng-2p fixture. The texts share no 8-character run, so no</span>
+<span class="a">+    // page has an anchor. One diff of all cues matched every cue on chance</span>
+<span class="a">+    // runs of two characters.</span>
+<span class="a">+    const pages = ENG2.pages.map((lines, p) =&gt; tokensOf(lines.join(&#x27; &#x27;), p));</span>
+<span class="a">+    const pageGrams = grams(ENG2.pages.flat().join(&#x27;&#x27;));</span>
+<span class="a">+    expect([...grams(TWO_CITIES.join(&#x27;&#x27;))].filter((g) =&gt; pageGrams.has(g))).toEqual([]);</span>
+<span class="a">+</span>
+<span class="a">+    const spans = alignCuesToTokens(TWO_CITIES, pages.flat());</span>
+<span class="a">+    expect(spans.filter((s) =&gt; s.matched)).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;matches no cue to a wrong page when only 3 pages in the middle are read (regression)&#x27;, () =&gt; {</span>
+<span class="a">+    // The measured defect in small form: a book of 20 pages with 5% OCR</span>
+<span class="a">+    // noise, and only pages 9 to 11 read. One diff of all cues against</span>
+<span class="a">+    // those pages matched cues to wrong places.</span>
+<span class="a">+    const [book] = fc.sample(</span>
+<span class="a">+      books({ cues: [220, 220], cueLength: [15, 40], pageLength: [300, 300], noise: 0.05 }),</span>
+<span class="a">+      { seed: 3, numRuns: 1 },</span>
+<span class="a">+    );</span>
+<span class="a">+    const read = book!.pages.map((_, p) =&gt; p &gt;= 9 &amp;&amp; p &lt;= 11);</span>
+<span class="a">+    const pages = readPages(book!, read);</span>
+<span class="a">+    const tokens = pages.flatMap((p) =&gt; p ?? []);</span>
+<span class="a">+    const spans = alignCuesToTokens(book!.cues, tokens);</span>
+<span class="a">+</span>
+<span class="a">+    const wrong: number[] = [];</span>
+<span class="a">+    const missed: number[] = [];</span>
+<span class="a">+    book!.cues.forEach((_, i) =&gt; {</span>
+<span class="a">+      const own = pagesOfCue(book!, i);</span>
+<span class="a">+      const span = spans[i]!;</span>
+<span class="a">+      const onOwnPages = tokens.slice(span.start, span.end).every((t) =&gt; own.has(t.page));</span>
+<span class="a">+      if (span.matched &amp;&amp; !onOwnPages) wrong.push(i);</span>
+<span class="a">+      if ([...own].every((p) =&gt; read[p]) &amp;&amp; !(span.matched &amp;&amp; onOwnPages)) missed.push(i);</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(wrong).toEqual([]);</span>
+<span class="a">+    expect(missed).toEqual([]);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;createAligner speed&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;aligns a book of 300 000 characters in under 3 s, and one more page in under 100 ms&#x27;, () =&gt; {</span>
+<span class="a">+    const LENGTH = 300_000;</span>
+<span class="a">+    const PAGE = 600;</span>
+<span class="a">+    // 5% noise: 3 codes in 60 are a drop, a substitution and an insertion.</span>
+<span class="a">+    const codes = [...&#x27;k&#x27;.repeat(57), &#x27;d&#x27;, &#x27;s&#x27;, &#x27;i&#x27;];</span>
+<span class="a">+    const [sample] = fc.sample(</span>
+<span class="a">+      fc.tuple(</span>
+<span class="a">+        fc.string({ unit: char, minLength: LENGTH, maxLength: LENGTH }),</span>
+<span class="a">+        fc.string({ unit: fc.constantFrom(...codes), minLength: LENGTH, maxLength: LENGTH }),</span>
+<span class="a">+      ),</span>
+<span class="a">+      { seed: 1, numRuns: 1 },</span>
+<span class="a">+    );</span>
+<span class="a">+    const [text, noise] = sample!;</span>
+<span class="a">+    const cues = text.match(/.{1,40}/g)!;</span>
+<span class="a">+    const pages: Token[][] = [];</span>
+<span class="a">+    for (let i = 0; i &lt; LENGTH; i++) {</span>
+<span class="a">+      const page = Math.floor(i / PAGE);</span>
+<span class="a">+      const tokens = (pages[page] ??= []);</span>
+<span class="a">+      const ch = text[i]!;</span>
+<span class="a">+      const other = text[(i + 1) % LENGTH]!;</span>
+<span class="a">+      if (noise[i] === &#x27;s&#x27;) tokens.push({ text: other, page });</span>
+<span class="a">+      else if (noise[i] === &#x27;i&#x27;) tokens.push({ text: other, page }, { text: ch, page });</span>
+<span class="a">+      else if (noise[i] !== &#x27;d&#x27;) tokens.push({ text: ch, page });</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    let t = performance.now();</span>
+<span class="a">+    const aligner = createAligner(cues);</span>
+<span class="a">+    const spans = aligner.spans(pages);</span>
+<span class="a">+    const all = performance.now() - t;</span>
+<span class="a">+    // Read one page again: a new token array, as after a change of the OCR language.</span>
+<span class="a">+    pages[250] = [...pages[250]!];</span>
+<span class="a">+    t = performance.now();</span>
+<span class="a">+    aligner.spans(pages);</span>
+<span class="a">+    const one = performance.now() - t;</span>
+<span class="a">+</span>
+<span class="a">+    expect(spans.filter((s) =&gt; s.matched).length).toBeGreaterThanOrEqual(0.99 * cues.length);</span>
+<span class="a">+    expect(all).toBeLessThan(3000);</span>
+<span class="a">+    expect(one).toBeLessThan(100);</span>
+<span class="a">+  }, 30_000);</span>
+ });
+diff --git a/test/book.ts b/test/book.ts
+new file mode 100644
+index 0000000..221f6ec
+--- /dev/null
++++ b/test/book.ts
+<span class="h">@@ -0,0 +1,114 @@</span>
+<span class="a">+// Synthetic books for the alignment tests: cue texts, pages of one token</span>
+<span class="a">+// per character, and OCR noise. All randomness comes from fast-check.</span>
+<span class="a">+</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { normalizeText, type OcrToken } from &#x27;../src/align&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** A small mixed alphabet: Latin, kana and kanji, so CJK is always covered. */</span>
+<span class="a">+export const ALPHABET = [...&#x27;abcdefghijklmnop&#x27;, ...&#x27;あいうえおかきくけこ&#x27;, ...&#x27;吾輩猫名前春夏秋冬&#x27;];</span>
+<span class="a">+</span>
+<span class="a">+export const char = fc.constantFrom(...ALPHABET);</span>
+<span class="a">+</span>
+<span class="a">+export const word = (min: number, max: number): fc.Arbitrary&lt;string&gt; =&gt;</span>
+<span class="a">+  fc.array(char, { minLength: min, maxLength: max }).map((cs) =&gt; cs.join(&#x27;&#x27;));</span>
+<span class="a">+</span>
+<span class="a">+export type Token = Pick&lt;OcrToken, &#x27;text&#x27; | &#x27;page&#x27;&gt;;</span>
+<span class="a">+</span>
+<span class="a">+export interface Book {</span>
+<span class="a">+  cues: string[];</span>
+<span class="a">+  /** The start of each cue in the book text, and the end of the text last. */</span>
+<span class="a">+  offsets: number[];</span>
+<span class="a">+  /** The page of each character of the book text. */</span>
+<span class="a">+  pageOf: number[];</span>
+<span class="a">+  /** The tokens of each page, one for each character, after the noise. */</span>
+<span class="a">+  pages: Token[][];</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * One noise draw for each character: a number in [0, 1) and a character</span>
+<span class="a">+ * for a substitution or an insertion. No bias, so the rate is exact.</span>
+<span class="a">+ */</span>
+<span class="a">+const draw = fc.tuple(</span>
+<span class="a">+  fc.noBias(fc.integer({ min: 0, max: 9999 })).map((n) =&gt; n / 10000),</span>
+<span class="a">+  char,</span>
+<span class="a">+);</span>
+<span class="a">+</span>
+<span class="a">+export interface BookShape {</span>
+<span class="a">+  /** The count of cues. */</span>
+<span class="a">+  cues: [number, number];</span>
+<span class="a">+  /** The length of a cue in characters. */</span>
+<span class="a">+  cueLength: [number, number];</span>
+<span class="a">+  /** The length of a page in characters. The last page takes the rest. */</span>
+<span class="a">+  pageLength: [number, number];</span>
+<span class="a">+  /** The share of characters with an edit: a drop, a substitution or an insertion. */</span>
+<span class="a">+  noise: number;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Books of the given shape. */</span>
+<span class="a">+export function books(shape: BookShape): fc.Arbitrary&lt;Book&gt; {</span>
+<span class="a">+  return fc</span>
+<span class="a">+    .record({</span>
+<span class="a">+      cues: fc.array(word(shape.cueLength[0], shape.cueLength[1]), {</span>
+<span class="a">+        minLength: shape.cues[0],</span>
+<span class="a">+        maxLength: shape.cues[1],</span>
+<span class="a">+      }),</span>
+<span class="a">+      pageLength: fc.integer({ min: shape.pageLength[0], max: shape.pageLength[1] }),</span>
+<span class="a">+    })</span>
+<span class="a">+    .chain(({ cues, pageLength }) =&gt; {</span>
+<span class="a">+      const length = shape.noise &gt; 0 ? cues.join(&#x27;&#x27;).length : 0;</span>
+<span class="a">+      return fc</span>
+<span class="a">+        .array(draw, { minLength: length, maxLength: length })</span>
+<span class="a">+        .map((draws) =&gt; makeBook(cues, pageLength, draws, shape.noise));</span>
+<span class="a">+    });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function makeBook(</span>
+<span class="a">+  cues: string[],</span>
+<span class="a">+  pageLength: number,</span>
+<span class="a">+  draws: readonly [number, string][],</span>
+<span class="a">+  noise: number,</span>
+<span class="a">+): Book {</span>
+<span class="a">+  const text = cues.join(&#x27;&#x27;);</span>
+<span class="a">+  const offsets: number[] = [];</span>
+<span class="a">+  let at = 0;</span>
+<span class="a">+  for (const cue of cues) {</span>
+<span class="a">+    offsets.push(at);</span>
+<span class="a">+    at += cue.length;</span>
+<span class="a">+  }</span>
+<span class="a">+  offsets.push(at);</span>
+<span class="a">+  const pageCount = Math.max(1, Math.floor(text.length / pageLength));</span>
+<span class="a">+  const pageOf = [...text].map((_, i) =&gt; Math.min(pageCount - 1, Math.floor(i / pageLength)));</span>
+<span class="a">+  const pages: Token[][] = Array.from({ length: pageCount }, () =&gt; []);</span>
+<span class="a">+  [...text].forEach((ch, i) =&gt; {</span>
+<span class="a">+    const page = pageOf[i]!;</span>
+<span class="a">+    const [r, other] = draws[i] ?? [1, ch];</span>
+<span class="a">+    // A third of the edits drop the character, a third put another in its</span>
+<span class="a">+    // place, and a third put another before it.</span>
+<span class="a">+    let read = [ch];</span>
+<span class="a">+    if (r &lt; noise / 3) read = [];</span>
+<span class="a">+    else if (r &lt; (2 * noise) / 3) read = [other];</span>
+<span class="a">+    else if (r &lt; noise) read = [other, ch];</span>
+<span class="a">+    for (const text of read) pages[page]!.push({ text, page });</span>
+<span class="a">+  });</span>
+<span class="a">+  return { cues, offsets, pageOf, pages };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The pages that hold the characters of cue `i`. */</span>
+<span class="a">+export function pagesOfCue(book: Book, i: number): Set&lt;number&gt; {</span>
+<span class="a">+  const pages = new Set&lt;number&gt;();</span>
+<span class="a">+  for (let k = book.offsets[i]!; k &lt; book.offsets[i + 1]!; k++) pages.add(book.pageOf[k]!);</span>
+<span class="a">+  return pages;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The runs of `k` characters in the normalized form of `text`. */</span>
+<span class="a">+export function grams(text: string, k = 8): Set&lt;string&gt; {</span>
+<span class="a">+  const norm = normalizeText(text);</span>
+<span class="a">+  const out = new Set&lt;string&gt;();</span>
+<span class="a">+  for (let i = 0; i + k &lt;= norm.length; i++) out.add(norm.slice(i, i + k));</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The read pages of a book: `read[p]` true keeps page p, else it is undefined. */</span>
+<span class="a">+export function readPages(book: Book, read: readonly boolean[]): (Token[] | undefined)[] {</span>
+<span class="a">+  return book.pages.map((tokens, p) =&gt; (read[p] ? tokens : undefined));</span>
+<span class="a">+}</span></pre>
+</div></body></html>

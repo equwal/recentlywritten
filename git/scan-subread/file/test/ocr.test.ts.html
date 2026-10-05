@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread/test/ocr.test.ts - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../../scan-subread/index.html">Log</a> | <a href="../../../scan-subread/files.html">Files</a> | <a href="../../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>test/ocr.test.ts (10750 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> import type Tesseract from &#x27;tesseract.js&#x27;;
+<a id="l2" href="#l2">2</a> import { afterEach, describe, expect, it, vi } from &#x27;vitest&#x27;;
+<a id="l3" href="#l3">3</a> import { createOcr, OcrStartError } from &#x27;../src/ocr&#x27;;
+<a id="l4" href="#l4">4</a> 
+<a id="l5" href="#l5">5</a> const { createWorker } = vi.hoisted(() =&gt; ({ createWorker: vi.fn() }));
+<a id="l6" href="#l6">6</a> vi.mock(&#x27;tesseract.js&#x27;, () =&gt; ({ createWorker, PSM: { SINGLE_BLOCK_VERT_TEXT: &#x27;5&#x27; } }));
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> /** The options that createOcr gave to createWorker. */
+<a id="l9" href="#l9">9</a> interface Options {
+<a id="l10" href="#l10">10</a>   workerPath?: string;
+<a id="l11" href="#l11">11</a>   corePath?: string;
+<a id="l12" href="#l12">12</a>   langPath?: string;
+<a id="l13" href="#l13">13</a>   logger?: (m: { status: string; progress: number }) =&gt; void;
+<a id="l14" href="#l14">14</a>   errorHandler?: (error: unknown) =&gt; void;
+<a id="l15" href="#l15">15</a> }
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> function options(): Options {
+<a id="l18" href="#l18">18</a>   return createWorker.mock.calls[0]?.[2] as Options;
+<a id="l19" href="#l19">19</a> }
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> function fakeWorker() {
+<a id="l22" href="#l22">22</a>   return {
+<a id="l23" href="#l23">23</a>     setParameters: vi.fn(() =&gt; Promise.resolve({})),
+<a id="l24" href="#l24">24</a>     recognize: vi.fn((_image: unknown): Promise&lt;{ data: Pick&lt;Tesseract.Page, &#x27;blocks&#x27;&gt; }&gt; =&gt;
+<a id="l25" href="#l25">25</a>       Promise.reject(new Error(&#x27;The image is empty.&#x27;)),
+<a id="l26" href="#l26">26</a>     ),
+<a id="l27" href="#l27">27</a>     terminate: vi.fn(() =&gt; Promise.resolve({})),
+<a id="l28" href="#l28">28</a>   };
+<a id="l29" href="#l29">29</a> }
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> /** A page canvas of 2 x 1 pixels: red, then blue with half alpha. */
+<a id="l32" href="#l32">32</a> function fakeCanvas(): HTMLCanvasElement {
+<a id="l33" href="#l33">33</a>   const data = new Uint8ClampedArray([255, 0, 0, 255, 0, 0, 255, 128]);
+<a id="l34" href="#l34">34</a>   const context = { getImageData: () =&gt; ({ width: 2, height: 1, data }) };
+<a id="l35" href="#l35">35</a>   return { width: 2, height: 1, getContext: () =&gt; context } as unknown as HTMLCanvasElement;
+<a id="l36" href="#l36">36</a> }
+<a id="l37" href="#l37">37</a> 
+<a id="l38" href="#l38">38</a> /** A path on the origin of the app, for example &quot;/assets/worker.min-abc.js&quot;. */
+<a id="l39" href="#l39">39</a> const LOCAL = /^\/(?!\/)/;
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> /** The Web Worker of the browser, for the tests. It keeps each worker that it makes. */
+<a id="l42" href="#l42">42</a> class FakeWebWorker extends EventTarget {
+<a id="l43" href="#l43">43</a>   static made: FakeWebWorker[] = [];
+<a id="l44" href="#l44">44</a>   terminate = vi.fn();
+<a id="l45" href="#l45">45</a>   constructor(readonly url: string | URL) {
+<a id="l46" href="#l46">46</a>     super();
+<a id="l47" href="#l47">47</a>     FakeWebWorker.made.push(this);
+<a id="l48" href="#l48">48</a>   }
+<a id="l49" href="#l49">49</a> }
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a> /**
+<a id="l52" href="#l52">52</a>  * createWorker as tesseract.js makes it in the browser: it makes its Web
+<a id="l53" href="#l53">53</a>  * Worker at once (src/worker/browser/spawnWorker.js). `start` gives the
+<a id="l54" href="#l54">54</a>  * promise of the start.
+<a id="l55" href="#l55">55</a>  */
+<a id="l56" href="#l56">56</a> function spawningCreateWorker(start: (opts: Options) =&gt; Promise&lt;unknown&gt;) {
+<a id="l57" href="#l57">57</a>   return (_lang: string, _oem: number, opts: Options): Promise&lt;unknown&gt; =&gt; {
+<a id="l58" href="#l58">58</a>     new Worker(&#x27;blob:tesseract-worker&#x27;);
+<a id="l59" href="#l59">59</a>     return start(opts);
+<a id="l60" href="#l60">60</a>   };
+<a id="l61" href="#l61">61</a> }
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> describe(&#x27;createOcr&#x27;, () =&gt; {
+<a id="l64" href="#l64">64</a>   afterEach(() =&gt; {
+<a id="l65" href="#l65">65</a>     createWorker.mockReset();
+<a id="l66" href="#l66">66</a>     vi.unstubAllGlobals();
+<a id="l67" href="#l67">67</a>     FakeWebWorker.made = [];
+<a id="l68" href="#l68">68</a>   });
+<a id="l69" href="#l69">69</a> 
+<a id="l70" href="#l70">70</a>   it(&#x27;loads the worker script and the core from the app, not from jsDelivr&#x27;, async () =&gt; {
+<a id="l71" href="#l71">71</a>     createWorker.mockResolvedValue(fakeWorker());
+<a id="l72" href="#l72">72</a>     const progress: number[] = [];
+<a id="l73" href="#l73">73</a>     await createOcr(&#x27;jpn&#x27;, (p) =&gt; progress.push(p));
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a>     expect(createWorker).toHaveBeenCalledTimes(1);
+<a id="l76" href="#l76">76</a>     expect(createWorker.mock.calls[0]?.slice(0, 2)).toEqual([&#x27;jpn&#x27;, 1]);
+<a id="l77" href="#l77">77</a>     const { workerPath, corePath, langPath, logger } = options();
+<a id="l78" href="#l78">78</a>     expect(workerPath).toMatch(LOCAL);
+<a id="l79" href="#l79">79</a>     expect(workerPath).toMatch(/\/worker\.min\.js$/);
+<a id="l80" href="#l80">80</a>     expect(corePath).toMatch(LOCAL);
+<a id="l81" href="#l81">81</a>     expect(corePath).toMatch(/\/tesseract-core-simd-lstm\.wasm\.js$/);
+<a id="l82" href="#l82">82</a>     expect(`${workerPath} ${corePath}`).not.toContain(&#x27;jsdelivr&#x27;);
+<a id="l83" href="#l83">83</a>     // The language data still comes from the default place of tesseract.js.
+<a id="l84" href="#l84">84</a>     expect(langPath).toBeUndefined();
+<a id="l85" href="#l85">85</a> 
+<a id="l86" href="#l86">86</a>     logger?.({ status: &#x27;loading language traineddata&#x27;, progress: 0.5 });
+<a id="l87" href="#l87">87</a>     logger?.({ status: &#x27;recognizing text&#x27;, progress: 0.25 });
+<a id="l88" href="#l88">88</a>     expect(progress).toEqual([0.25]);
+<a id="l89" href="#l89">89</a>   });
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a>   it(&#x27;sets the page mode of a vertical language&#x27;, async () =&gt; {
+<a id="l92" href="#l92">92</a>     const worker = fakeWorker();
+<a id="l93" href="#l93">93</a>     createWorker.mockResolvedValue(worker);
+<a id="l94" href="#l94">94</a>     await createOcr(&#x27;jpn_vert&#x27;, () =&gt; undefined);
+<a id="l95" href="#l95">95</a>     expect(worker.setParameters).toHaveBeenCalledWith({ tessedit_pageseg_mode: &#x27;5&#x27; });
+<a id="l96" href="#l96">96</a>   });
+<a id="l97" href="#l97">97</a> 
+<a id="l98" href="#l98">98</a>   it(&#x27;gives OcrStartError when the worker script does not load&#x27;, async () =&gt; {
+<a id="l99" href="#l99">99</a>     const cause =
+<a id="l100" href="#l100">100</a>       &quot;Uncaught NetworkError: Failed to execute &#x27;importScripts&#x27; on &#x27;WorkerGlobalScope&#x27;: failed to load.&quot;;
+<a id="l101" href="#l101">101</a>     createWorker.mockRejectedValue(cause);
+<a id="l102" href="#l102">102</a>     const error = await createOcr(&#x27;eng&#x27;, () =&gt; undefined).catch((e: unknown) =&gt; e);
+<a id="l103" href="#l103">103</a>     expect(error).toBeInstanceOf(OcrStartError);
+<a id="l104" href="#l104">104</a>     expect((error as OcrStartError).cause).toBe(cause);
+<a id="l105" href="#l105">105</a>     expect((error as OcrStartError).message).toContain(cause);
+<a id="l106" href="#l106">106</a>   });
+<a id="l107" href="#l107">107</a> 
+<a id="l108" href="#l108">108</a>   it(&#x27;gives OcrStartError when the language data does not load&#x27;, async () =&gt; {
+<a id="l109" href="#l109">109</a>     // tesseract.js gives the error to errorHandler, and its promise does not settle.
+<a id="l110" href="#l110">110</a>     createWorker.mockImplementation((_lang: string, _oem: number, opts: Options) =&gt; {
+<a id="l111" href="#l111">111</a>       opts.errorHandler?.(&#x27;TypeError: Failed to fetch&#x27;);
+<a id="l112" href="#l112">112</a>       return new Promise(() =&gt; undefined);
+<a id="l113" href="#l113">113</a>     });
+<a id="l114" href="#l114">114</a>     const error = await createOcr(&#x27;jpn&#x27;, () =&gt; undefined).catch((e: unknown) =&gt; e);
+<a id="l115" href="#l115">115</a>     expect(error).toBeInstanceOf(OcrStartError);
+<a id="l116" href="#l116">116</a>     expect((error as OcrStartError).cause).toBe(&#x27;TypeError: Failed to fetch&#x27;);
+<a id="l117" href="#l117">117</a>   });
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a>   it(&#x27;stops the Web Worker when the language data does not load&#x27;, async () =&gt; {
+<a id="l120" href="#l120">120</a>     // The finding: tesseract.js gives no handle to this worker, and it does
+<a id="l121" href="#l121">121</a>     // not stop it. Each Retry, book or setting left one more worker.
+<a id="l122" href="#l122">122</a>     vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);
+<a id="l123" href="#l123">123</a>     createWorker.mockImplementation(
+<a id="l124" href="#l124">124</a>       spawningCreateWorker((opts) =&gt; {
+<a id="l125" href="#l125">125</a>         setTimeout(() =&gt; opts.errorHandler?.(&#x27;TypeError: Failed to fetch&#x27;), 0);
+<a id="l126" href="#l126">126</a>         return new Promise(() =&gt; undefined);
+<a id="l127" href="#l127">127</a>       }),
+<a id="l128" href="#l128">128</a>     );
+<a id="l129" href="#l129">129</a>     const error = await createOcr(&#x27;jpn&#x27;, () =&gt; undefined).catch((e: unknown) =&gt; e);
+<a id="l130" href="#l130">130</a>     expect(error).toBeInstanceOf(OcrStartError);
+<a id="l131" href="#l131">131</a>     expect(FakeWebWorker.made).toHaveLength(1);
+<a id="l132" href="#l132">132</a>     expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);
+<a id="l133" href="#l133">133</a>     // The browser gets its own Worker constructor back.
+<a id="l134" href="#l134">134</a>     expect(globalThis.Worker).toBe(FakeWebWorker);
+<a id="l135" href="#l135">135</a>   });
+<a id="l136" href="#l136">136</a> 
+<a id="l137" href="#l137">137</a>   it(&#x27;stops the Web Worker when the start fails&#x27;, async () =&gt; {
+<a id="l138" href="#l138">138</a>     // tesseract.js rejects the start when its worker script does not load,
+<a id="l139" href="#l139">139</a>     // and it does not stop the Web Worker.
+<a id="l140" href="#l140">140</a>     vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);
+<a id="l141" href="#l141">141</a>     createWorker.mockImplementation(
+<a id="l142" href="#l142">142</a>       spawningCreateWorker(() =&gt; Promise.reject(&#x27;Uncaught NetworkError: failed to load.&#x27;)),
+<a id="l143" href="#l143">143</a>     );
+<a id="l144" href="#l144">144</a>     await expect(createOcr(&#x27;eng&#x27;, () =&gt; undefined)).rejects.toBeInstanceOf(OcrStartError);
+<a id="l145" href="#l145">145</a>     expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);
+<a id="l146" href="#l146">146</a>   });
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a>   it(&#x27;stops the Web Worker when the start is cut off&#x27;, async () =&gt; {
+<a id="l149" href="#l149">149</a>     // OcrJob cuts off a start that takes too long, for example a download
+<a id="l150" href="#l150">150</a>     // of the language data that stalls.
+<a id="l151" href="#l151">151</a>     vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);
+<a id="l152" href="#l152">152</a>     createWorker.mockImplementation(spawningCreateWorker(() =&gt; new Promise(() =&gt; undefined)));
+<a id="l153" href="#l153">153</a>     const controller = new AbortController();
+<a id="l154" href="#l154">154</a>     const start = createOcr(&#x27;jpn&#x27;, () =&gt; undefined, controller.signal);
+<a id="l155" href="#l155">155</a>     const reason = new OcrStartError(new Error(&#x27;The start took more than 120 s.&#x27;));
+<a id="l156" href="#l156">156</a>     controller.abort(reason);
+<a id="l157" href="#l157">157</a>     await expect(start).rejects.toBe(reason);
+<a id="l158" href="#l158">158</a>     expect(FakeWebWorker.made[0]!.terminate).toHaveBeenCalledTimes(1);
+<a id="l159" href="#l159">159</a>   }, 1000);
+<a id="l160" href="#l160">160</a> 
+<a id="l161" href="#l161">161</a>   it(&#x27;starts no worker when the start is cut off before it begins&#x27;, async () =&gt; {
+<a id="l162" href="#l162">162</a>     const controller = new AbortController();
+<a id="l163" href="#l163">163</a>     controller.abort(new Error(&#x27;OCR stopped.&#x27;));
+<a id="l164" href="#l164">164</a>     const error = await createOcr(&#x27;eng&#x27;, () =&gt; undefined, controller.signal).catch(
+<a id="l165" href="#l165">165</a>       (e: unknown) =&gt; e,
+<a id="l166" href="#l166">166</a>     );
+<a id="l167" href="#l167">167</a>     expect(error).toBeInstanceOf(OcrStartError);
+<a id="l168" href="#l168">168</a>     expect((error as OcrStartError).cause).toEqual(new Error(&#x27;OCR stopped.&#x27;));
+<a id="l169" href="#l169">169</a>     expect(createWorker).not.toHaveBeenCalled();
+<a id="l170" href="#l170">170</a>   });
+<a id="l171" href="#l171">171</a> 
+<a id="l172" href="#l172">172</a>   it(&#x27;does not stop the Web Worker for an error after the start&#x27;, async () =&gt; {
+<a id="l173" href="#l173">173</a>     // After the start, an error belongs to a page. OcrJob stops the worker then.
+<a id="l174" href="#l174">174</a>     vi.stubGlobal(&#x27;Worker&#x27;, FakeWebWorker);
+<a id="l175" href="#l175">175</a>     let handler: ((error: unknown) =&gt; void) | undefined;
+<a id="l176" href="#l176">176</a>     createWorker.mockImplementation(
+<a id="l177" href="#l177">177</a>       spawningCreateWorker((opts) =&gt; {
+<a id="l178" href="#l178">178</a>         handler = opts.errorHandler;
+<a id="l179" href="#l179">179</a>         return Promise.resolve(fakeWorker());
+<a id="l180" href="#l180">180</a>       }),
+<a id="l181" href="#l181">181</a>     );
+<a id="l182" href="#l182">182</a>     await createOcr(&#x27;eng&#x27;, () =&gt; undefined);
+<a id="l183" href="#l183">183</a>     handler?.(&#x27;The image is empty.&#x27;);
+<a id="l184" href="#l184">184</a>     expect(FakeWebWorker.made[0]!.terminate).not.toHaveBeenCalled();
+<a id="l185" href="#l185">185</a>   });
+<a id="l186" href="#l186">186</a> 
+<a id="l187" href="#l187">187</a>   it(&#x27;gives OcrStartError and stops the worker when the page mode cannot be set&#x27;, async () =&gt; {
+<a id="l188" href="#l188">188</a>     const worker = fakeWorker();
+<a id="l189" href="#l189">189</a>     worker.setParameters.mockRejectedValue(&#x27;The worker stopped.&#x27;);
+<a id="l190" href="#l190">190</a>     createWorker.mockResolvedValue(worker);
+<a id="l191" href="#l191">191</a>     await expect(createOcr(&#x27;jpn_vert&#x27;, () =&gt; undefined)).rejects.toBeInstanceOf(OcrStartError);
+<a id="l192" href="#l192">192</a>     expect(worker.terminate).toHaveBeenCalledTimes(1);
+<a id="l193" href="#l193">193</a>   });
+<a id="l194" href="#l194">194</a> 
+<a id="l195" href="#l195">195</a>   it(&#x27;rejects the page that runs when the OCR stops&#x27;, async () =&gt; {
+<a id="l196" href="#l196">196</a>     // tesseract.js does not settle a job when its worker stops. The web
+<a id="l197" href="#l197">197</a>     // finding: a new reading started while the old job still read its page.
+<a id="l198" href="#l198">198</a>     const worker = fakeWorker();
+<a id="l199" href="#l199">199</a>     worker.recognize.mockImplementation(() =&gt; new Promise(() =&gt; undefined));
+<a id="l200" href="#l200">200</a>     createWorker.mockResolvedValue(worker);
+<a id="l201" href="#l201">201</a>     const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);
+<a id="l202" href="#l202">202</a>     const page = ocr.recognize(fakeCanvas(), 0);
+<a id="l203" href="#l203">203</a>     await ocr.terminate();
+<a id="l204" href="#l204">204</a>     await expect(page).rejects.toThrow(&#x27;OCR stopped.&#x27;);
+<a id="l205" href="#l205">205</a>     expect(worker.terminate).toHaveBeenCalledTimes(1);
+<a id="l206" href="#l206">206</a>   }, 1000);
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a>   it(&#x27;rejects the page that runs when the worker fails&#x27;, async () =&gt; {
+<a id="l209" href="#l209">209</a>     // tesseract.js does not settle a job when its Web Worker fails. The
+<a id="l210" href="#l210">210</a>     // finding: after a crash of the worker, the reading waited for ever.
+<a id="l211" href="#l211">211</a>     const worker = { ...fakeWorker(), worker: new EventTarget() };
+<a id="l212" href="#l212">212</a>     worker.recognize.mockImplementation(() =&gt; new Promise(() =&gt; undefined));
+<a id="l213" href="#l213">213</a>     createWorker.mockResolvedValue(worker);
+<a id="l214" href="#l214">214</a>     const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);
+<a id="l215" href="#l215">215</a>     const page = ocr.recognize(fakeCanvas(), 0);
+<a id="l216" href="#l216">216</a>     const event = new Event(&#x27;error&#x27;);
+<a id="l217" href="#l217">217</a>     worker.worker.dispatchEvent(event);
+<a id="l218" href="#l218">218</a>     await expect(page).rejects.toThrow(&#x27;The OCR worker failed.&#x27;);
+<a id="l219" href="#l219">219</a>     await expect(page).rejects.toHaveProperty(&#x27;cause&#x27;, event);
+<a id="l220" href="#l220">220</a>   }, 1000);
+<a id="l221" href="#l221">221</a> 
+<a id="l222" href="#l222">222</a>   it(&#x27;gives the error of a page as it is, not as OcrStartError&#x27;, async () =&gt; {
+<a id="l223" href="#l223">223</a>     createWorker.mockResolvedValue(fakeWorker());
+<a id="l224" href="#l224">224</a>     const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);
+<a id="l225" href="#l225">225</a>     const error = await ocr.recognize(fakeCanvas(), 0).catch((e: unknown) =&gt; e);
+<a id="l226" href="#l226">226</a>     expect(error).toEqual(new Error(&#x27;The image is empty.&#x27;));
+<a id="l227" href="#l227">227</a>     expect(error).not.toBeInstanceOf(OcrStartError);
+<a id="l228" href="#l228">228</a>   });
+<a id="l229" href="#l229">229</a> 
+<a id="l230" href="#l230">230</a>   it(&#x27;gives tesseract.js a PPM file of the canvas pixels, not the canvas&#x27;, async () =&gt; {
+<a id="l231" href="#l231">231</a>     // tesseract.js makes a PNG file of a canvas with canvas.toBlob. The phone
+<a id="l232" href="#l232">232</a>     // finding: that took about 13 s for each page in the Android WebView.
+<a id="l233" href="#l233">233</a>     const worker = fakeWorker();
+<a id="l234" href="#l234">234</a>     worker.recognize.mockResolvedValue({ data: { blocks: [] } });
+<a id="l235" href="#l235">235</a>     createWorker.mockResolvedValue(worker);
+<a id="l236" href="#l236">236</a>     const ocr = await createOcr(&#x27;eng&#x27;, () =&gt; undefined);
+<a id="l237" href="#l237">237</a>     await expect(ocr.recognize(fakeCanvas(), 0)).resolves.toEqual([]);
+<a id="l238" href="#l238">238</a>     const image = worker.recognize.mock.calls[0]?.[0];
+<a id="l239" href="#l239">239</a>     expect(image).toBeInstanceOf(Uint8Array);
+<a id="l240" href="#l240">240</a>     // The header, then red and blue. The alpha is dropped.
+<a id="l241" href="#l241">241</a>     const header = [...Buffer.from(&#x27;P6\n2 1\n255\n&#x27;, &#x27;latin1&#x27;)];
+<a id="l242" href="#l242">242</a>     expect(Array.from(image as Uint8Array)).toEqual([...header, 255, 0, 0, 0, 0, 255]);
+<a id="l243" href="#l243">243</a>   });
+<a id="l244" href="#l244">244</a> });</pre>
+</div></body></html>

@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ai-config-render/src/ai_config_render/__init__.py - Recently Written</title>
+<link rel="stylesheet" href="../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
+<h1>ai-config-render</h1><span class="desc">Render one canonical AI-agent config (rules, skills, MCP servers) into Claude Code, Codex, Copilot CLI, Gemini and more</span><p class="url">git clone https://github.com/equwal/ai-config-render</p><p><a href="../../../../ai-config-render/index.html">Log</a> | <a href="../../../../ai-config-render/files.html">Files</a> | <a href="../../../../ai-config-render/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/ai_config_render/__init__.py (24327 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Render one canonical AI-agent config into many agents&#x27; native formats.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> It touches only what it owns:
+<a id="l4" href="#l4">4</a>   - instruction files: blocks between &lt;!-- aicr:NAME --&gt; and &lt;!-- /aicr:NAME --&gt;
+<a id="l5" href="#l5">5</a>   - MCP configs: the server names it renders now, and the ones it rendered last run
+<a id="l6" href="#l6">6</a>   - skills and plain files: paths it wrote last run (tracked in a state file)
+<a id="l7" href="#l7">7</a> Everything it overwrites is backed up first (one rolling &lt;file&gt;.aicr-bak).
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> It never clobbers a local edit. The state file keeps a hash of what aicr last
+<a id="l10" href="#l10">10</a> wrote to each owned file and block. If a target no longer matches that hash,
+<a id="l11" href="#l11">11</a> someone edited it there:
+<a id="l12" href="#l12">12</a>   - source unchanged -&gt; the edit is imported into the source folder
+<a id="l13" href="#l13">13</a>   - source changed too -&gt; conflict: the edit is saved next to its source as
+<a id="l14" href="#l14">14</a>     &lt;source&gt;.conflict-&lt;machine&gt;-&lt;date&gt;, then the source version is written
+<a id="l15" href="#l15">15</a> Text matching an [import] deny pattern is never imported.
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> `aicr watch` re-renders within seconds of a change to an owned file or the
+<a id="l18" href="#l18">18</a> source folder, and optionally runs a command after each render (commit, push).
+<a id="l19" href="#l19">19</a> &quot;&quot;&quot;
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> from __future__ import annotations
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> import argparse
+<a id="l24" href="#l24">24</a> import datetime as dt
+<a id="l25" href="#l25">25</a> import difflib
+<a id="l26" href="#l26">26</a> import hashlib
+<a id="l27" href="#l27">27</a> import json
+<a id="l28" href="#l28">28</a> import os
+<a id="l29" href="#l29">29</a> import re
+<a id="l30" href="#l30">30</a> import shutil
+<a id="l31" href="#l31">31</a> import subprocess
+<a id="l32" href="#l32">32</a> import sys
+<a id="l33" href="#l33">33</a> import time
+<a id="l34" href="#l34">34</a> import tomllib
+<a id="l35" href="#l35">35</a> from collections.abc import Callable
+<a id="l36" href="#l36">36</a> from dataclasses import dataclass, field
+<a id="l37" href="#l37">37</a> from pathlib import Path
+<a id="l38" href="#l38">38</a> from typing import Any
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a> __version__ = &quot;0.1.0&quot;
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> CONFIG_NAME = &quot;aicr.toml&quot;
+<a id="l43" href="#l43">43</a> DEFAULT_MACHINE = Path(&quot;~/.config/aicr/machine.toml&quot;)
+<a id="l44" href="#l44">44</a> DEFAULT_STATE = &quot;~/.config/aicr/state.json&quot;
+<a id="l45" href="#l45">45</a> VAR = re.compile(r&quot;\$\{(\w+)\}&quot;)
+<a id="l46" href="#l46">46</a> SKIP_NAMES = re.compile(r&quot;__pycache__|\.aicr-(bak|tmp)|\.conflict-&quot;)
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> # A target is data. `mcp.format` is &quot;json&quot; (servers under `mcp.key`, default
+<a id="l49" href="#l49">49</a> # &quot;mcpServers&quot;) or &quot;toml&quot; (servers under [mcp_servers.&lt;name&gt;]). Any field can be
+<a id="l50" href="#l50">50</a> # overridden, and new targets added, under [targets.&lt;name&gt;] in aicr.toml.
+<a id="l51" href="#l51">51</a> BUILTIN_TARGETS: dict[str, dict[str, Any]] = {
+<a id="l52" href="#l52">52</a>     &quot;claude&quot;: {
+<a id="l53" href="#l53">53</a>         &quot;instructions&quot;: &quot;${home}/.claude/CLAUDE.md&quot;,
+<a id="l54" href="#l54">54</a>         &quot;skills&quot;: [&quot;${home}/.claude/skills&quot;],
+<a id="l55" href="#l55">55</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;json&quot;, &quot;path&quot;: &quot;${home}/.claude.json&quot;},
+<a id="l56" href="#l56">56</a>     },
+<a id="l57" href="#l57">57</a>     &quot;codex&quot;: {
+<a id="l58" href="#l58">58</a>         &quot;instructions&quot;: &quot;${home}/.codex/AGENTS.md&quot;,
+<a id="l59" href="#l59">59</a>         &quot;skills&quot;: [&quot;${home}/.codex/skills&quot;],
+<a id="l60" href="#l60">60</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;toml&quot;, &quot;path&quot;: &quot;${home}/.codex/config.toml&quot;},
+<a id="l61" href="#l61">61</a>     },
+<a id="l62" href="#l62">62</a>     &quot;copilot&quot;: {
+<a id="l63" href="#l63">63</a>         &quot;instructions&quot;: &quot;${home}/.copilot/copilot-instructions.md&quot;,
+<a id="l64" href="#l64">64</a>         &quot;skills&quot;: [&quot;${home}/.copilot/skills&quot;],
+<a id="l65" href="#l65">65</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;json&quot;, &quot;path&quot;: &quot;${home}/.copilot/mcp-config.json&quot;, &quot;defaults&quot;: {&quot;tools&quot;: [&quot;*&quot;]}},
+<a id="l66" href="#l66">66</a>     },
+<a id="l67" href="#l67">67</a>     &quot;gemini&quot;: {
+<a id="l68" href="#l68">68</a>         &quot;instructions&quot;: &quot;${home}/.gemini/GEMINI.md&quot;,
+<a id="l69" href="#l69">69</a>         &quot;skills&quot;: [&quot;${home}/.gemini/skills&quot;],
+<a id="l70" href="#l70">70</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;json&quot;, &quot;path&quot;: &quot;${home}/.gemini/settings.json&quot;},
+<a id="l71" href="#l71">71</a>     },
+<a id="l72" href="#l72">72</a>     &quot;antigravity&quot;: {
+<a id="l73" href="#l73">73</a>         &quot;instructions&quot;: &quot;${home}/.gemini/GEMINI.md&quot;,
+<a id="l74" href="#l74">74</a>         &quot;skills&quot;: [&quot;${home}/.gemini/antigravity/skills&quot;],
+<a id="l75" href="#l75">75</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;json&quot;, &quot;path&quot;: &quot;${home}/.gemini/antigravity/mcp_config.json&quot;},
+<a id="l76" href="#l76">76</a>     },
+<a id="l77" href="#l77">77</a>     &quot;cursor&quot;: {
+<a id="l78" href="#l78">78</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;json&quot;, &quot;path&quot;: &quot;${home}/.cursor/mcp.json&quot;},
+<a id="l79" href="#l79">79</a>     },
+<a id="l80" href="#l80">80</a>     &quot;windsurf&quot;: {
+<a id="l81" href="#l81">81</a>         &quot;instructions&quot;: &quot;${home}/.codeium/windsurf/memories/global_rules.md&quot;,
+<a id="l82" href="#l82">82</a>         &quot;mcp&quot;: {&quot;format&quot;: &quot;json&quot;, &quot;path&quot;: &quot;${home}/.codeium/windsurf/mcp_config.json&quot;},
+<a id="l83" href="#l83">83</a>     },
+<a id="l84" href="#l84">84</a> }
+<a id="l85" href="#l85">85</a> 
+<a id="l86" href="#l86">86</a> 
+<a id="l87" href="#l87">87</a> class Missing(Exception):
+<a id="l88" href="#l88">88</a>     &quot;&quot;&quot;A ${var} has no value.&quot;&quot;&quot;
+<a id="l89" href="#l89">89</a> 
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a> def sub(value: Any, env: dict[str, str]) -&gt; Any:
+<a id="l92" href="#l92">92</a>     &quot;&quot;&quot;Expand ${var} in every string of a nested value. An unknown var raises Missing.&quot;&quot;&quot;
+<a id="l93" href="#l93">93</a>     if isinstance(value, str):
+<a id="l94" href="#l94">94</a> 
+<a id="l95" href="#l95">95</a>         def rep(m: re.Match[str]) -&gt; str:
+<a id="l96" href="#l96">96</a>             if m.group(1) not in env:
+<a id="l97" href="#l97">97</a>                 raise Missing(m.group(1))
+<a id="l98" href="#l98">98</a>             return env[m.group(1)]
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a>         return VAR.sub(rep, value)
+<a id="l101" href="#l101">101</a>     if isinstance(value, list):
+<a id="l102" href="#l102">102</a>         return [sub(v, env) for v in value]
+<a id="l103" href="#l103">103</a>     if isinstance(value, dict):
+<a id="l104" href="#l104">104</a>         return {k: sub(v, env) for k, v in value.items()}
+<a id="l105" href="#l105">105</a>     return value
+<a id="l106" href="#l106">106</a> 
+<a id="l107" href="#l107">107</a> 
+<a id="l108" href="#l108">108</a> def merge(a: dict[str, Any], b: dict[str, Any]) -&gt; dict[str, Any]:
+<a id="l109" href="#l109">109</a>     out = dict(a)
+<a id="l110" href="#l110">110</a>     for k, v in b.items():
+<a id="l111" href="#l111">111</a>         out[k] = merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+<a id="l112" href="#l112">112</a>     return out
+<a id="l113" href="#l113">113</a> 
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a> def applies(entry: dict[str, Any], target: str, machine: str) -&gt; bool:
+<a id="l116" href="#l116">116</a>     &quot;&quot;&quot;Filters: `targets` (default all), `machines` (default all).&quot;&quot;&quot;
+<a id="l117" href="#l117">117</a>     if target and &quot;targets&quot; in entry and target not in entry[&quot;targets&quot;]:
+<a id="l118" href="#l118">118</a>         return False
+<a id="l119" href="#l119">119</a>     return &quot;machines&quot; not in entry or machine in entry[&quot;machines&quot;]
+<a id="l120" href="#l120">120</a> 
+<a id="l121" href="#l121">121</a> 
+<a id="l122" href="#l122">122</a> def sha(b: bytes) -&gt; str:
+<a id="l123" href="#l123">123</a>     return hashlib.sha256(b).hexdigest()
+<a id="l124" href="#l124">124</a> 
+<a id="l125" href="#l125">125</a> 
+<a id="l126" href="#l126">126</a> @dataclass
+<a id="l127" href="#l127">127</a> class Writer:
+<a id="l128" href="#l128">128</a>     dry: bool
+<a id="l129" href="#l129">129</a>     last: dict[str, str] = field(default_factory=dict)  # key -&gt; hash of what we wrote last run
+<a id="l130" href="#l130">130</a>     host: str = &quot;machine&quot;
+<a id="l131" href="#l131">131</a>     deny: list[re.Pattern[str]] = field(default_factory=list)  # never import text that matches
+<a id="l132" href="#l132">132</a>     changes: list[tuple[Path, str | None, str | None]] = field(default_factory=list)
+<a id="l133" href="#l133">133</a>     pending: dict[Path, str] = field(default_factory=dict)  # what a dry run would have written
+<a id="l134" href="#l134">134</a>     rendered: dict[str, str] = field(default_factory=dict)
+<a id="l135" href="#l135">135</a>     imported: list[tuple[str, Path]] = field(default_factory=list)
+<a id="l136" href="#l136">136</a>     conflicts: list[tuple[str, Path]] = field(default_factory=list)
+<a id="l137" href="#l137">137</a>     flags: list[str] = field(default_factory=list)
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a>     def guard(self, key: str, cur: bytes | None, new: bytes, src: Path | None, label: str) -&gt; bytes:
+<a id="l140" href="#l140">140</a>         &quot;&quot;&quot;Return what the target should hold. A local edit is imported into src, or saved next to it as a conflict.&quot;&quot;&quot;
+<a id="l141" href="#l141">141</a>         last = self.last.get(key)
+<a id="l142" href="#l142">142</a>         if cur is None or cur == new or sha(cur) == last:
+<a id="l143" href="#l143">143</a>             self.rendered[key] = sha(new)
+<a id="l144" href="#l144">144</a>             return new
+<a id="l145" href="#l145">145</a>         denied = any(rx.search(cur.decode(&quot;utf-8&quot;, &quot;replace&quot;)) for rx in self.deny)
+<a id="l146" href="#l146">146</a>         if last is not None and sha(new) == last:  # only the target changed
+<a id="l147" href="#l147">147</a>             if src is None or denied:
+<a id="l148" href="#l148">148</a>                 self.flags.append(
+<a id="l149" href="#l149">149</a>                     f&quot;local edit to {label} not imported ({&#x27;denied text&#x27; if denied else &#x27;templated source&#x27;}); target kept&quot;
+<a id="l150" href="#l150">150</a>                 )
+<a id="l151" href="#l151">151</a>                 self.rendered[key] = last  # keep reporting it until someone resolves it
+<a id="l152" href="#l152">152</a>                 return cur
+<a id="l153" href="#l153">153</a>             self.imported.append((label, src))
+<a id="l154" href="#l154">154</a>             if not self.dry:
+<a id="l155" href="#l155">155</a>                 src.write_bytes(cur)
+<a id="l156" href="#l156">156</a>             self.rendered[key] = sha(cur)
+<a id="l157" href="#l157">157</a>             return cur
+<a id="l158" href="#l158">158</a>         # Both changed, or no record of what we wrote: keep the local copy next to the source, then write the source.
+<a id="l159" href="#l159">159</a>         if src is None or denied:
+<a id="l160" href="#l160">160</a>             self.flags.append(f&quot;local edit to {label} overwritten, not saved ({&#x27;denied text&#x27; if denied else &#x27;templated source&#x27;})&quot;)
+<a id="l161" href="#l161">161</a>         else:
+<a id="l162" href="#l162">162</a>             day = dt.datetime.now().astimezone().strftime(&quot;%Y%m%d&quot;)
+<a id="l163" href="#l163">163</a>             dst = src.with_name(f&quot;{src.name}.conflict-{self.host}-{day}&quot;)
+<a id="l164" href="#l164">164</a>             self.conflicts.append((label, dst))
+<a id="l165" href="#l165">165</a>             if not self.dry:
+<a id="l166" href="#l166">166</a>                 dst.write_bytes(cur)
+<a id="l167" href="#l167">167</a>         self.rendered[key] = sha(new)
+<a id="l168" href="#l168">168</a>         return new
+<a id="l169" href="#l169">169</a> 
+<a id="l170" href="#l170">170</a>     def read(self, p: Path) -&gt; str | None:
+<a id="l171" href="#l171">171</a>         return self.pending.get(p, p.read_text(encoding=&quot;utf-8&quot;) if p.exists() else None)
+<a id="l172" href="#l172">172</a> 
+<a id="l173" href="#l173">173</a>     def backup(self, p: Path) -&gt; None:
+<a id="l174" href="#l174">174</a>         if p.exists() and not self.dry:
+<a id="l175" href="#l175">175</a>             dst = p.with_name(f&quot;{p.name}.aicr-bak&quot;)
+<a id="l176" href="#l176">176</a>             if dst.is_dir():
+<a id="l177" href="#l177">177</a>                 shutil.rmtree(dst)
+<a id="l178" href="#l178">178</a>             if p.is_dir():
+<a id="l179" href="#l179">179</a>                 shutil.copytree(p, dst)
+<a id="l180" href="#l180">180</a>             else:
+<a id="l181" href="#l181">181</a>                 shutil.copy2(p, dst)
+<a id="l182" href="#l182">182</a> 
+<a id="l183" href="#l183">183</a>     def text(self, p: Path, new: str) -&gt; None:
+<a id="l184" href="#l184">184</a>         old = self.read(p)
+<a id="l185" href="#l185">185</a>         if old == new:
+<a id="l186" href="#l186">186</a>             return
+<a id="l187" href="#l187">187</a>         self.changes.append((p, old, new))
+<a id="l188" href="#l188">188</a>         self.pending[p] = new
+<a id="l189" href="#l189">189</a>         if self.dry:
+<a id="l190" href="#l190">190</a>             return
+<a id="l191" href="#l191">191</a>         self.backup(p)
+<a id="l192" href="#l192">192</a>         p.parent.mkdir(parents=True, exist_ok=True)
+<a id="l193" href="#l193">193</a>         tmp = p.with_name(p.name + &quot;.aicr-tmp&quot;)
+<a id="l194" href="#l194">194</a>         tmp.write_text(new, encoding=&quot;utf-8&quot;, newline=&quot;&quot;)
+<a id="l195" href="#l195">195</a>         os.replace(tmp, p)
+<a id="l196" href="#l196">196</a> 
+<a id="l197" href="#l197">197</a>     def copy(self, src: Path, dst: Path, label: str) -&gt; None:
+<a id="l198" href="#l198">198</a>         have = dst.read_bytes() if dst.exists() else None
+<a id="l199" href="#l199">199</a>         want = self.guard(str(dst), have, src.read_bytes(), src, label)
+<a id="l200" href="#l200">200</a>         if have == want:
+<a id="l201" href="#l201">201</a>             return
+<a id="l202" href="#l202">202</a>         self.changes.append((dst, None, None))
+<a id="l203" href="#l203">203</a>         if not self.dry:
+<a id="l204" href="#l204">204</a>             self.backup(dst)
+<a id="l205" href="#l205">205</a>             dst.parent.mkdir(parents=True, exist_ok=True)
+<a id="l206" href="#l206">206</a>             dst.write_bytes(want)
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a>     def remove(self, p: Path) -&gt; None:
+<a id="l209" href="#l209">209</a>         if not p.exists():
+<a id="l210" href="#l210">210</a>             return
+<a id="l211" href="#l211">211</a>         self.changes.append((p, &quot;&quot;, None))
+<a id="l212" href="#l212">212</a>         if not self.dry:
+<a id="l213" href="#l213">213</a>             self.backup(p)
+<a id="l214" href="#l214">214</a>             if p.is_dir():
+<a id="l215" href="#l215">215</a>                 shutil.rmtree(p)
+<a id="l216" href="#l216">216</a>             else:
+<a id="l217" href="#l217">217</a>                 p.unlink()
+<a id="l218" href="#l218">218</a> 
+<a id="l219" href="#l219">219</a> 
+<a id="l220" href="#l220">220</a> # ---------- instruction files ----------
+<a id="l221" href="#l221">221</a> 
+<a id="l222" href="#l222">222</a> 
+<a id="l223" href="#l223">223</a> def block_re(name: str) -&gt; re.Pattern[str]:
+<a id="l224" href="#l224">224</a>     n = re.escape(name)
+<a id="l225" href="#l225">225</a>     return re.compile(rf&quot;&lt;!-- aicr:{n} --&gt;\n.*?&lt;!-- /aicr:{n} --&gt;\n?&quot;, re.DOTALL)
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a> def block_body(text: str, name: str) -&gt; str | None:
+<a id="l229" href="#l229">229</a>     n = re.escape(name)
+<a id="l230" href="#l230">230</a>     m = re.search(rf&quot;&lt;!-- aicr:{n} --&gt;\n(.*?)&lt;!-- /aicr:{n} --&gt;&quot;, text, re.DOTALL)
+<a id="l231" href="#l231">231</a>     return m.group(1).rstrip() + &quot;\n&quot; if m else None
+<a id="l232" href="#l232">232</a> 
+<a id="l233" href="#l233">233</a> 
+<a id="l234" href="#l234">234</a> def render_instructions(text: str, blocks: dict[str, str], dropped: set[str]) -&gt; str:
+<a id="l235" href="#l235">235</a>     &quot;&quot;&quot;Replace or append each owned block; remove dropped ones; keep all other text.&quot;&quot;&quot;
+<a id="l236" href="#l236">236</a>     for name in dropped:
+<a id="l237" href="#l237">237</a>         text = block_re(name).sub(&quot;&quot;, text)
+<a id="l238" href="#l238">238</a>     for name, body in blocks.items():
+<a id="l239" href="#l239">239</a>         new = f&quot;&lt;!-- aicr:{name} --&gt;\n{body.rstrip()}\n&lt;!-- /aicr:{name} --&gt;\n&quot;
+<a id="l240" href="#l240">240</a>         rx = block_re(name)
+<a id="l241" href="#l241">241</a>         first = rx.search(text)
+<a id="l242" href="#l242">242</a>         if first:
+<a id="l243" href="#l243">243</a>             # Keep the first position, drop duplicates.
+<a id="l244" href="#l244">244</a>             text = text[: first.start()] + new + rx.sub(&quot;&quot;, text[first.end() :])
+<a id="l245" href="#l245">245</a>         else:
+<a id="l246" href="#l246">246</a>             text = text.rstrip(&quot;\n&quot;) + (&quot;\n\n&quot; if text.strip() else &quot;&quot;) + new
+<a id="l247" href="#l247">247</a>     return text
+<a id="l248" href="#l248">248</a> 
+<a id="l249" href="#l249">249</a> 
+<a id="l250" href="#l250">250</a> # ---------- MCP ----------
+<a id="l251" href="#l251">251</a> 
+<a id="l252" href="#l252">252</a> 
+<a id="l253" href="#l253">253</a> def toml_key(k: str) -&gt; str:
+<a id="l254" href="#l254">254</a>     return k if re.fullmatch(r&quot;[A-Za-z0-9_-]+&quot;, k) else json.dumps(k)
+<a id="l255" href="#l255">255</a> 
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> def toml_value(v: Any) -&gt; str:
+<a id="l258" href="#l258">258</a>     if isinstance(v, bool):
+<a id="l259" href="#l259">259</a>         return &quot;true&quot; if v else &quot;false&quot;
+<a id="l260" href="#l260">260</a>     if isinstance(v, (int, float)):
+<a id="l261" href="#l261">261</a>         return repr(v)
+<a id="l262" href="#l262">262</a>     if isinstance(v, str):
+<a id="l263" href="#l263">263</a>         return json.dumps(v, ensure_ascii=False).replace(chr(0x7F), &quot;\\u007f&quot;)  # TOML forbids a raw DEL
+<a id="l264" href="#l264">264</a>     if isinstance(v, list):
+<a id="l265" href="#l265">265</a>         return &quot;[&quot; + &quot;, &quot;.join(toml_value(x) for x in v) + &quot;]&quot;
+<a id="l266" href="#l266">266</a>     if isinstance(v, dict):
+<a id="l267" href="#l267">267</a>         return &quot;{ &quot; + &quot;, &quot;.join(f&quot;{toml_key(k)} = {toml_value(x)}&quot; for k, x in v.items()) + &quot; }&quot;
+<a id="l268" href="#l268">268</a>     raise TypeError(f&quot;cannot write {type(v).__name__} to TOML&quot;)
+<a id="l269" href="#l269">269</a> 
+<a id="l270" href="#l270">270</a> 
+<a id="l271" href="#l271">271</a> def render_toml(text: str, servers: dict[str, dict[str, Any]], owned: set[str]) -&gt; str:
+<a id="l272" href="#l272">272</a>     &quot;&quot;&quot;Drop every [mcp_servers.&lt;owned&gt;...] table, then append ours in one marked block.&quot;&quot;&quot;
+<a id="l273" href="#l273">273</a>     text = re.sub(r&quot;# aicr:mcp\n.*?# /aicr:mcp\n?&quot;, &quot;&quot;, text, flags=re.DOTALL)
+<a id="l274" href="#l274">274</a>     out: list[str] = []
+<a id="l275" href="#l275">275</a>     skip = False
+<a id="l276" href="#l276">276</a>     for line in text.splitlines(keepends=True):
+<a id="l277" href="#l277">277</a>         m = re.match(r&quot;\s*\[\[?\s*([^\]]+?)\s*\]\]?\s*(#.*)?$&quot;, line)
+<a id="l278" href="#l278">278</a>         if m:
+<a id="l279" href="#l279">279</a>             parts = [p.strip().strip(&quot;\&quot;&#x27;&quot;) for p in re.split(r&quot;\.(?=(?:[^\&quot;]*\&quot;[^\&quot;]*\&quot;)*[^\&quot;]*$)&quot;, m.group(1))]
+<a id="l280" href="#l280">280</a>             skip = len(parts) &gt;= 2 and parts[0] == &quot;mcp_servers&quot; and parts[1] in owned
+<a id="l281" href="#l281">281</a>         if not skip:
+<a id="l282" href="#l282">282</a>             out.append(line)
+<a id="l283" href="#l283">283</a>     text = &quot;&quot;.join(out).rstrip(&quot;\n&quot;)
+<a id="l284" href="#l284">284</a>     if servers:
+<a id="l285" href="#l285">285</a>         body = [&quot;# aicr:mcp&quot;]
+<a id="l286" href="#l286">286</a>         for name, cfg in servers.items():
+<a id="l287" href="#l287">287</a>             body.append(f&quot;[mcp_servers.{toml_key(name)}]&quot;)
+<a id="l288" href="#l288">288</a>             body += [f&quot;{toml_key(k)} = {toml_value(v)}&quot; for k, v in cfg.items()]
+<a id="l289" href="#l289">289</a>             body.append(&quot;&quot;)
+<a id="l290" href="#l290">290</a>         text += (&quot;\n\n&quot; if text else &quot;&quot;) + &quot;\n&quot;.join(body) + &quot;# /aicr:mcp\n&quot;
+<a id="l291" href="#l291">291</a>     tomllib.loads(text)  # refuse to write a broken config
+<a id="l292" href="#l292">292</a>     return text if not text or text.endswith(&quot;\n&quot;) else text + &quot;\n&quot;
+<a id="l293" href="#l293">293</a> 
+<a id="l294" href="#l294">294</a> 
+<a id="l295" href="#l295">295</a> def render_json(text: str, servers: dict[str, dict[str, Any]], owned: set[str], key: str) -&gt; str:
+<a id="l296" href="#l296">296</a>     data = json.loads(text) if text.strip() else {}
+<a id="l297" href="#l297">297</a>     cur = data.setdefault(key, {})
+<a id="l298" href="#l298">298</a>     for name in owned - servers.keys():
+<a id="l299" href="#l299">299</a>         cur.pop(name, None)
+<a id="l300" href="#l300">300</a>     cur.update(servers)
+<a id="l301" href="#l301">301</a>     return json.dumps(data, indent=2, ensure_ascii=False) + &quot;\n&quot;
+<a id="l302" href="#l302">302</a> 
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a> # ---------- render ----------
+<a id="l305" href="#l305">305</a> 
+<a id="l306" href="#l306">306</a> 
+<a id="l307" href="#l307">307</a> def load(source: Path, machine_file: Path) -&gt; tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+<a id="l308" href="#l308">308</a>     cfg = tomllib.loads((source / CONFIG_NAME).read_text(encoding=&quot;utf-8&quot;))
+<a id="l309" href="#l309">309</a>     mach = tomllib.loads(machine_file.read_text(encoding=&quot;utf-8&quot;)) if machine_file.exists() else {}
+<a id="l310" href="#l310">310</a>     env = {
+<a id="l311" href="#l311">311</a>         &quot;home&quot;: str(Path.home()),
+<a id="l312" href="#l312">312</a>         &quot;home_posix&quot;: Path.home().as_posix(),
+<a id="l313" href="#l313">313</a>         &quot;os&quot;: &quot;windows&quot; if os.name == &quot;nt&quot; else &quot;macos&quot; if sys.platform == &quot;darwin&quot; else &quot;linux&quot;,
+<a id="l314" href="#l314">314</a>         **{k: str(v) for k, v in cfg.get(&quot;vars&quot;, {}).items()},
+<a id="l315" href="#l315">315</a>         **{k: str(v) for k, v in mach.get(&quot;vars&quot;, {}).items()},
+<a id="l316" href="#l316">316</a>     }
+<a id="l317" href="#l317">317</a>     env[&quot;machine&quot;] = str(mach.get(&quot;name&quot;, env[&quot;os&quot;]))
+<a id="l318" href="#l318">318</a>     for k, v in env.items():  # one level of vars-in-vars, e.g. projects = &quot;${home}/code&quot;
+<a id="l319" href="#l319">319</a>         env[k] = VAR.sub(lambda m: env.get(m.group(1), m.group(0)), v)
+<a id="l320" href="#l320">320</a>     return cfg, mach, env
+<a id="l321" href="#l321">321</a> 
+<a id="l322" href="#l322">322</a> 
+<a id="l323" href="#l323">323</a> def targets(cfg: dict[str, Any]) -&gt; dict[str, dict[str, Any]]:
+<a id="l324" href="#l324">324</a>     &quot;&quot;&quot;Built-ins merged with [targets.*]. Without a [targets] table, no target is enabled.&quot;&quot;&quot;
+<a id="l325" href="#l325">325</a>     out = {}
+<a id="l326" href="#l326">326</a>     for name, t in cfg.get(&quot;targets&quot;, {}).items():
+<a id="l327" href="#l327">327</a>         spec = merge(BUILTIN_TARGETS.get(name, {}), t)
+<a id="l328" href="#l328">328</a>         if spec.pop(&quot;enabled&quot;, True):
+<a id="l329" href="#l329">329</a>             out[name] = spec
+<a id="l330" href="#l330">330</a>     return out
+<a id="l331" href="#l331">331</a> 
+<a id="l332" href="#l332">332</a> 
+<a id="l333" href="#l333">333</a> def render(source: Path, machine_file: Path, dry: bool) -&gt; tuple[Writer, list[str]]:
+<a id="l334" href="#l334">334</a>     cfg, mach, env = load(source, machine_file)
+<a id="l335" href="#l335">335</a>     machine = env[&quot;machine&quot;]
+<a id="l336" href="#l336">336</a>     state_file = Path(sub(mach.get(&quot;state&quot;, DEFAULT_STATE), env)).expanduser()
+<a id="l337" href="#l337">337</a>     state = json.loads(state_file.read_text(encoding=&quot;utf-8&quot;)) if state_file.exists() else {}
+<a id="l338" href="#l338">338</a>     new_state: dict[str, Any] = {}
+<a id="l339" href="#l339">339</a>     deny = [re.compile(p, re.IGNORECASE) for p in cfg.get(&quot;import&quot;, {}).get(&quot;deny&quot;, [])]
+<a id="l340" href="#l340">340</a>     w = Writer(dry, last=state.get(&quot;_rendered&quot;, {}), host=machine, deny=deny)
+<a id="l341" href="#l341">341</a>     notes: list[str] = []
+<a id="l342" href="#l342">342</a> 
+<a id="l343" href="#l343">343</a>     for tname, raw in targets(cfg).items():
+<a id="l344" href="#l344">344</a>         if tname in mach.get(&quot;skip_targets&quot;, []):
+<a id="l345" href="#l345">345</a>             continue
+<a id="l346" href="#l346">346</a>         try:
+<a id="l347" href="#l347">347</a>             t = sub(raw, env)
+<a id="l348" href="#l348">348</a>         except Missing as e:
+<a id="l349" href="#l349">349</a>             notes.append(f&quot;{tname}: skipped, no var {e}&quot;)
+<a id="l350" href="#l350">350</a>             continue
+<a id="l351" href="#l351">351</a>         prev = state.get(tname, {})
+<a id="l352" href="#l352">352</a>         cur = new_state.setdefault(tname, {})
+<a id="l353" href="#l353">353</a> 
+<a id="l354" href="#l354">354</a>         if &quot;instructions&quot; in t:
+<a id="l355" href="#l355">355</a>             blocks: dict[str, str] = {}
+<a id="l356" href="#l356">356</a>             p = Path(t[&quot;instructions&quot;]).expanduser()
+<a id="l357" href="#l357">357</a>             for name, r in cfg.get(&quot;rules&quot;, {}).items():
+<a id="l358" href="#l358">358</a>                 if not applies(r, tname, machine):
+<a id="l359" href="#l359">359</a>                     continue
+<a id="l360" href="#l360">360</a>                 src = source / &quot;rules&quot; / f&quot;{name}.{tname}.md&quot;
+<a id="l361" href="#l361">361</a>                 src = src if src.exists() else source / &quot;rules&quot; / f&quot;{name}.md&quot;
+<a id="l362" href="#l362">362</a>                 try:
+<a id="l363" href="#l363">363</a>                     rule_text = src.read_text(encoding=&quot;utf-8&quot;)
+<a id="l364" href="#l364">364</a>                     body = sub(rule_text, env).rstrip() + &quot;\n&quot;
+<a id="l365" href="#l365">365</a>                 except Missing as e:
+<a id="l366" href="#l366">366</a>                     notes.append(f&quot;{tname}: rule {name} skipped, no var {e}&quot;)
+<a id="l367" href="#l367">367</a>                     continue
+<a id="l368" href="#l368">368</a>                 have = block_body(w.read(p) or &quot;&quot;, name)
+<a id="l369" href="#l369">369</a>                 blocks[name] = w.guard(
+<a id="l370" href="#l370">370</a>                     f&quot;{p}#{name}&quot;,
+<a id="l371" href="#l371">371</a>                     have.encode(&quot;utf-8&quot;) if have is not None else None,
+<a id="l372" href="#l372">372</a>                     body.encode(&quot;utf-8&quot;),
+<a id="l373" href="#l373">373</a>                     None if VAR.search(rule_text) else src,
+<a id="l374" href="#l374">374</a>                     f&quot;{tname} rules/{name}&quot;,
+<a id="l375" href="#l375">375</a>                 ).decode(&quot;utf-8&quot;)
+<a id="l376" href="#l376">376</a>             # Two targets can share one file (gemini, antigravity): merge their blocks.
+<a id="l377" href="#l377">377</a>             file_state = new_state.setdefault(&quot;_instructions&quot;, {}).setdefault(str(p), [])
+<a id="l378" href="#l378">378</a>             dropped = set(prev.get(&quot;rules&quot;, [])) - blocks.keys() - set(file_state)
+<a id="l379" href="#l379">379</a>             file_state.extend(sorted(blocks))
+<a id="l380" href="#l380">380</a>             if blocks or dropped:
+<a id="l381" href="#l381">381</a>                 w.text(p, render_instructions(w.read(p) or &quot;&quot;, blocks, dropped))
+<a id="l382" href="#l382">382</a>             cur[&quot;rules&quot;] = sorted(blocks)
+<a id="l383" href="#l383">383</a> 
+<a id="l384" href="#l384">384</a>         if &quot;mcp&quot; in t:
+<a id="l385" href="#l385">385</a>             servers: dict[str, dict[str, Any]] = {}
+<a id="l386" href="#l386">386</a>             for name, s in cfg.get(&quot;mcp&quot;, {}).items():
+<a id="l387" href="#l387">387</a>                 if not applies(s, tname, machine):
+<a id="l388" href="#l388">388</a>                     continue
+<a id="l389" href="#l389">389</a>                 m = mach.get(&quot;mcp&quot;, {}).get(name, {})
+<a id="l390" href="#l390">390</a>                 # Precedence, low to high: target defaults, server, server.target.&lt;t&gt;, machine, machine.target.&lt;t&gt;
+<a id="l391" href="#l391">391</a>                 spec: dict[str, Any] = t[&quot;mcp&quot;].get(&quot;defaults&quot;, {})
+<a id="l392" href="#l392">392</a>                 for layer in (s, s.get(&quot;target&quot;, {}).get(tname, {}), m, m.get(&quot;target&quot;, {}).get(tname, {})):
+<a id="l393" href="#l393">393</a>                     spec = merge(spec, layer)
+<a id="l394" href="#l394">394</a>                 spec = {k: v for k, v in spec.items() if k not in (&quot;targets&quot;, &quot;machines&quot;, &quot;target&quot;)}
+<a id="l395" href="#l395">395</a>                 try:
+<a id="l396" href="#l396">396</a>                     servers[name] = sub(spec, env)
+<a id="l397" href="#l397">397</a>                 except Missing as e:
+<a id="l398" href="#l398">398</a>                     notes.append(f&quot;{tname}: mcp {name} skipped, no var {e}&quot;)
+<a id="l399" href="#l399">399</a>             p = Path(t[&quot;mcp&quot;][&quot;path&quot;]).expanduser()
+<a id="l400" href="#l400">400</a>             owned = set(servers) | set(prev.get(&quot;mcp&quot;, []))
+<a id="l401" href="#l401">401</a>             if servers or owned:
+<a id="l402" href="#l402">402</a>                 old = w.read(p) or &quot;&quot;
+<a id="l403" href="#l403">403</a>                 fmt = t[&quot;mcp&quot;][&quot;format&quot;]
+<a id="l404" href="#l404">404</a>                 if fmt == &quot;toml&quot;:
+<a id="l405" href="#l405">405</a>                     w.text(p, render_toml(old, servers, owned))
+<a id="l406" href="#l406">406</a>                 elif fmt == &quot;json&quot;:
+<a id="l407" href="#l407">407</a>                     w.text(p, render_json(old, servers, owned, t[&quot;mcp&quot;].get(&quot;key&quot;, &quot;mcpServers&quot;)))
+<a id="l408" href="#l408">408</a>                 else:
+<a id="l409" href="#l409">409</a>                     raise SystemExit(f&quot;{tname}: unknown mcp format {fmt!r} (use json or toml)&quot;)
+<a id="l410" href="#l410">410</a>             cur[&quot;mcp&quot;] = sorted(servers)
+<a id="l411" href="#l411">411</a> 
+<a id="l412" href="#l412">412</a>         names = [n for n, s in cfg.get(&quot;skills&quot;, {}).items() if applies(s, tname, machine)]
+<a id="l413" href="#l413">413</a>         for d in t.get(&quot;skills&quot;, []):
+<a id="l414" href="#l414">414</a>             root = Path(d).expanduser()
+<a id="l415" href="#l415">415</a>             for n in names:
+<a id="l416" href="#l416">416</a>                 skill = source / &quot;skills&quot; / n
+<a id="l417" href="#l417">417</a>                 for f in sorted(skill.rglob(&quot;*&quot;)) if skill.is_dir() else []:
+<a id="l418" href="#l418">418</a>                     if f.is_file() and not SKIP_NAMES.search(f.relative_to(skill).as_posix()):
+<a id="l419" href="#l419">419</a>                         w.copy(f, root / n / f.relative_to(skill), f&quot;{tname} skills/{n}/{f.relative_to(skill).as_posix()}&quot;)
+<a id="l420" href="#l420">420</a>             for n in set(prev.get(&quot;skills&quot;, [])) - set(names):
+<a id="l421" href="#l421">421</a>                 w.remove(root / n)
+<a id="l422" href="#l422">422</a>         cur[&quot;skills&quot;] = names
+<a id="l423" href="#l423">423</a> 
+<a id="l424" href="#l424">424</a>     owned_files: list[str] = []
+<a id="l425" href="#l425">425</a>     for dest, f in cfg.get(&quot;files&quot;, {}).items():
+<a id="l426" href="#l426">426</a>         if not applies(f, &quot;&quot;, machine):
+<a id="l427" href="#l427">427</a>             continue
+<a id="l428" href="#l428">428</a>         try:
+<a id="l429" href="#l429">429</a>             dest_p, src = Path(sub(dest, env)).expanduser(), source / sub(f[&quot;src&quot;], env)
+<a id="l430" href="#l430">430</a>             data = src.read_text(encoding=&quot;utf-8&quot;)
+<a id="l431" href="#l431">431</a>             templated = f.get(&quot;template&quot;, False)
+<a id="l432" href="#l432">432</a>             want = (sub(data, env) if templated else data).encode(&quot;utf-8&quot;)
+<a id="l433" href="#l433">433</a>             have = w.read(dest_p)
+<a id="l434" href="#l434">434</a>             got = w.guard(
+<a id="l435" href="#l435">435</a>                 str(dest_p),
+<a id="l436" href="#l436">436</a>                 have.encode(&quot;utf-8&quot;) if have is not None else None,
+<a id="l437" href="#l437">437</a>                 want,
+<a id="l438" href="#l438">438</a>                 None if templated else src,
+<a id="l439" href="#l439">439</a>                 f&quot;file {f[&#x27;src&#x27;]}&quot;,
+<a id="l440" href="#l440">440</a>             )
+<a id="l441" href="#l441">441</a>             w.text(dest_p, got.decode(&quot;utf-8&quot;))
+<a id="l442" href="#l442">442</a>         except Missing as e:
+<a id="l443" href="#l443">443</a>             notes.append(f&quot;file {dest} skipped, no var {e}&quot;)
+<a id="l444" href="#l444">444</a>             continue
+<a id="l445" href="#l445">445</a>         owned_files.append(str(dest_p))
+<a id="l446" href="#l446">446</a>     for gone in set(state.get(&quot;_files&quot;, [])) - set(owned_files):
+<a id="l447" href="#l447">447</a>         w.remove(Path(gone))
+<a id="l448" href="#l448">448</a>     new_state[&quot;_files&quot;] = owned_files
+<a id="l449" href="#l449">449</a>     new_state[&quot;_rendered&quot;] = w.rendered
+<a id="l450" href="#l450">450</a>     new_state.pop(&quot;_instructions&quot;, None)
+<a id="l451" href="#l451">451</a> 
+<a id="l452" href="#l452">452</a>     if not dry:
+<a id="l453" href="#l453">453</a>         state_file.parent.mkdir(parents=True, exist_ok=True)
+<a id="l454" href="#l454">454</a>         state_file.write_text(json.dumps(new_state, indent=1), encoding=&quot;utf-8&quot;)
+<a id="l455" href="#l455">455</a>     return w, notes
+<a id="l456" href="#l456">456</a> 
+<a id="l457" href="#l457">457</a> 
+<a id="l458" href="#l458">458</a> # ---------- watch ----------
+<a id="l459" href="#l459">459</a> 
+<a id="l460" href="#l460">460</a> 
+<a id="l461" href="#l461">461</a> def watched(source: Path, machine_file: Path) -&gt; list[Path]:
+<a id="l462" href="#l462">462</a>     &quot;&quot;&quot;Every file aicr owns on this machine, plus the source tree.&quot;&quot;&quot;
+<a id="l463" href="#l463">463</a>     _, mach, env = load(source, machine_file)
+<a id="l464" href="#l464">464</a>     state_file = Path(sub(mach.get(&quot;state&quot;, DEFAULT_STATE), env)).expanduser()
+<a id="l465" href="#l465">465</a>     state = json.loads(state_file.read_text(encoding=&quot;utf-8&quot;)) if state_file.exists() else {}
+<a id="l466" href="#l466">466</a>     files = {Path(k.split(&quot;#&quot;)[0]) for k in state.get(&quot;_rendered&quot;, {})}
+<a id="l467" href="#l467">467</a>     files |= {p for p in source.rglob(&quot;*&quot;) if &quot;.git&quot; not in p.relative_to(source).parts}
+<a id="l468" href="#l468">468</a>     return sorted(files)
+<a id="l469" href="#l469">469</a> 
+<a id="l470" href="#l470">470</a> 
+<a id="l471" href="#l471">471</a> def snapshot(files: list[Path]) -&gt; dict[Path, tuple[int, int]]:
+<a id="l472" href="#l472">472</a>     out = {}
+<a id="l473" href="#l473">473</a>     for f in files:
+<a id="l474" href="#l474">474</a>         try:
+<a id="l475" href="#l475">475</a>             st = f.stat()
+<a id="l476" href="#l476">476</a>             out[f] = (st.st_mtime_ns, st.st_size)
+<a id="l477" href="#l477">477</a>         except OSError:
+<a id="l478" href="#l478">478</a>             pass
+<a id="l479" href="#l479">479</a>     return out
+<a id="l480" href="#l480">480</a> 
+<a id="l481" href="#l481">481</a> 
+<a id="l482" href="#l482">482</a> def git(source: Path, *args: str) -&gt; str:
+<a id="l483" href="#l483">483</a>     r = subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(source), *args], capture_output=True, text=True, check=False)
+<a id="l484" href="#l484">484</a>     return r.stdout.strip() if r.returncode == 0 else &quot;&quot;
+<a id="l485" href="#l485">485</a> 
+<a id="l486" href="#l486">486</a> 
+<a id="l487" href="#l487">487</a> def watch(
+<a id="l488" href="#l488">488</a>     source: Path,
+<a id="l489" href="#l489">489</a>     machine_file: Path,
+<a id="l490" href="#l490">490</a>     run: Callable[[], None],
+<a id="l491" href="#l491">491</a>     interval: float = 1.0,
+<a id="l492" href="#l492">492</a>     settle: float = 2.0,
+<a id="l493" href="#l493">493</a>     remote_every: float = 0.0,
+<a id="l494" href="#l494">494</a>     rounds: int | None = None,
+<a id="l495" href="#l495">495</a> ) -&gt; None:
+<a id="l496" href="#l496">496</a>     &quot;&quot;&quot;Call `run` once a burst of changes to owned files or the source tree has been quiet for `settle` seconds.
+<a id="l497" href="#l497">497</a>     With remote_every &gt; 0 and a git source, also pull and run when the upstream branch moves.
+<a id="l498" href="#l498">498</a>     Our own writes do not loop: the snapshot is retaken after each run.
+<a id="l499" href="#l499">499</a>     ponytail: polls stat() of the owned files every `interval` s, identical on Windows, macOS and Linux;
+<a id="l500" href="#l500">500</a>     switch to inotify/FSEvents/ReadDirectoryChangesW if the owned set grows to many thousands of files.&quot;&quot;&quot;
+<a id="l501" href="#l501">501</a>     files = watched(source, machine_file)
+<a id="l502" href="#l502">502</a>     seen = snapshot(files)
+<a id="l503" href="#l503">503</a>     dirty_since: float | None = None
+<a id="l504" href="#l504">504</a>     next_remote = time.monotonic()
+<a id="l505" href="#l505">505</a>     n = 0
+<a id="l506" href="#l506">506</a>     while rounds is None or n &lt; rounds:
+<a id="l507" href="#l507">507</a>         n += 1
+<a id="l508" href="#l508">508</a>         time.sleep(interval)
+<a id="l509" href="#l509">509</a>         now = time.monotonic()
+<a id="l510" href="#l510">510</a>         cur = snapshot(files)
+<a id="l511" href="#l511">511</a>         if cur != seen:
+<a id="l512" href="#l512">512</a>             seen, dirty_since = cur, now
+<a id="l513" href="#l513">513</a>         trigger = dirty_since is not None and now - dirty_since &gt;= settle
+<a id="l514" href="#l514">514</a>         if not trigger and remote_every &gt; 0 and now &gt;= next_remote:
+<a id="l515" href="#l515">515</a>             next_remote = now + remote_every
+<a id="l516" href="#l516">516</a>             remote = git(source, &quot;ls-remote&quot;, &quot;origin&quot;, &quot;HEAD&quot;).split()
+<a id="l517" href="#l517">517</a>             if remote and remote[0] != git(source, &quot;rev-parse&quot;, &quot;HEAD&quot;):
+<a id="l518" href="#l518">518</a>                 trigger = bool(git(source, &quot;pull&quot;, &quot;--ff-only&quot;, &quot;-q&quot;) or True)
+<a id="l519" href="#l519">519</a>         if trigger:
+<a id="l520" href="#l520">520</a>             run()
+<a id="l521" href="#l521">521</a>             files = watched(source, machine_file)
+<a id="l522" href="#l522">522</a>             seen, dirty_since = snapshot(files), None
+<a id="l523" href="#l523">523</a> 
+<a id="l524" href="#l524">524</a> 
+<a id="l525" href="#l525">525</a> # ---------- CLI ----------
+<a id="l526" href="#l526">526</a> 
+<a id="l527" href="#l527">527</a> 
+<a id="l528" href="#l528">528</a> def main(argv: list[str] | None = None) -&gt; int:
+<a id="l529" href="#l529">529</a>     ap = argparse.ArgumentParser(prog=&quot;aicr&quot;, description=(__doc__ or &quot;&quot;).splitlines()[0])
+<a id="l530" href="#l530">530</a>     ap.add_argument(&quot;command&quot;, choices=[&quot;render&quot;, &quot;diff&quot;, &quot;check&quot;, &quot;list-targets&quot;, &quot;watch&quot;])
+<a id="l531" href="#l531">531</a>     ap.add_argument(&quot;--source&quot;, type=Path, default=Path(&quot;.&quot;), help=f&quot;folder with {CONFIG_NAME} (default: .)&quot;)
+<a id="l532" href="#l532">532</a>     ap.add_argument(&quot;--machine&quot;, type=Path, default=DEFAULT_MACHINE, help=&quot;per-machine vars file&quot;)
+<a id="l533" href="#l533">533</a>     ap.add_argument(
+<a id="l534" href="#l534">534</a>         &quot;--exec&quot;, dest=&quot;exec_cmd&quot;, help=&quot;watch: shell command to run after each render, e.g. a commit-and-push script&quot;
+<a id="l535" href="#l535">535</a>     )
+<a id="l536" href="#l536">536</a>     ap.add_argument(&quot;--remote-every&quot;, type=float, default=0.0, help=&quot;watch: seconds between upstream checks (0 = off)&quot;)
+<a id="l537" href="#l537">537</a>     a = ap.parse_args(argv)
+<a id="l538" href="#l538">538</a>     machine = a.machine.expanduser()
+<a id="l539" href="#l539">539</a> 
+<a id="l540" href="#l540">540</a>     if a.command == &quot;watch&quot;:
+<a id="l541" href="#l541">541</a> 
+<a id="l542" href="#l542">542</a>         def run() -&gt; None:
+<a id="l543" href="#l543">543</a>             stamp = dt.datetime.now().astimezone().isoformat(timespec=&quot;seconds&quot;)
+<a id="l544" href="#l544">544</a>             w, notes = render(a.source, machine, dry=False)
+<a id="l545" href="#l545">545</a>             for line in report(w, notes):
+<a id="l546" href="#l546">546</a>                 print(f&quot;{stamp} {line}&quot;, flush=True)
+<a id="l547" href="#l547">547</a>             if a.exec_cmd:
+<a id="l548" href="#l548">548</a>                 subprocess.run(a.exec_cmd, shell=True, cwd=a.source, check=False)  # noqa: S602 - the user&#x27;s own command
+<a id="l549" href="#l549">549</a> 
+<a id="l550" href="#l550">550</a>         watch(a.source, machine, run, remote_every=a.remote_every)
+<a id="l551" href="#l551">551</a>         return 0
+<a id="l552" href="#l552">552</a> 
+<a id="l553" href="#l553">553</a>     if a.command == &quot;list-targets&quot;:
+<a id="l554" href="#l554">554</a>         cfg = tomllib.loads((a.source / CONFIG_NAME).read_text(encoding=&quot;utf-8&quot;)) if (a.source / CONFIG_NAME).exists() else {}
+<a id="l555" href="#l555">555</a>         enabled = targets(cfg)
+<a id="l556" href="#l556">556</a>         for name in sorted(BUILTIN_TARGETS.keys() | enabled.keys()):
+<a id="l557" href="#l557">557</a>             spec = enabled.get(name, BUILTIN_TARGETS.get(name, {}))
+<a id="l558" href="#l558">558</a>             mark = &quot;*&quot; if name in enabled else &quot; &quot;
+<a id="l559" href="#l559">559</a>             print(f&quot;{mark} {name:12} {spec.get(&#x27;instructions&#x27;, &#x27;-&#x27;)}  mcp={spec.get(&#x27;mcp&#x27;, {}).get(&#x27;path&#x27;, &#x27;-&#x27;)}&quot;)
+<a id="l560" href="#l560">560</a>         return 0
+<a id="l561" href="#l561">561</a> 
+<a id="l562" href="#l562">562</a>     w, notes = render(a.source, machine, dry=a.command != &quot;render&quot;)
+<a id="l563" href="#l563">563</a>     for p, old, new in w.changes:
+<a id="l564" href="#l564">564</a>         if a.command == &quot;diff&quot; and new is not None:
+<a id="l565" href="#l565">565</a>             sys.stdout.writelines(difflib.unified_diff((old or &quot;&quot;).splitlines(True), new.splitlines(True), f&quot;a/{p}&quot;, f&quot;b/{p}&quot;))
+<a id="l566" href="#l566">566</a>         else:
+<a id="l567" href="#l567">567</a>             print(f&quot;{&#x27;removed&#x27; if old == &#x27;&#x27; and new is None else &#x27;changed&#x27;} {p}&quot;)
+<a id="l568" href="#l568">568</a>     for line in report(w, notes)[len(w.changes) :]:
+<a id="l569" href="#l569">569</a>         print(line, file=sys.stderr)
+<a id="l570" href="#l570">570</a>     return 1 if a.command == &quot;check&quot; and (w.changes or w.conflicts or w.flags) else 0
+<a id="l571" href="#l571">571</a> 
+<a id="l572" href="#l572">572</a> 
+<a id="l573" href="#l573">573</a> def report(w: Writer, notes: list[str]) -&gt; list[str]:
+<a id="l574" href="#l574">574</a>     return (
+<a id="l575" href="#l575">575</a>         [f&quot;{&#x27;removed&#x27; if old == &#x27;&#x27; and new is None else &#x27;changed&#x27;} {p}&quot; for p, old, new in w.changes]
+<a id="l576" href="#l576">576</a>         + [f&quot;imported: {label} -&gt; {p}&quot; for label, p in w.imported]
+<a id="l577" href="#l577">577</a>         + [f&quot;CONFLICT: {label}: local edit saved as {p}&quot; for label, p in w.conflicts]
+<a id="l578" href="#l578">578</a>         + [f&quot;FLAG: {f}&quot; for f in w.flags]
+<a id="l579" href="#l579">579</a>         + [f&quot;note: {n}&quot; for n in notes]
+<a id="l580" href="#l580">580</a>     )</pre>
+</div></body></html>

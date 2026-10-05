@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 6fd2375a - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 6fd2375ae1a5a995e2d087b626cd6a91399fdab9
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:10:14 -0700
+
+Let customers switch monthly plans, and ignore other products
+
+The owner wants customers to upgrade their plans in the Stripe customer
+portal. The portal switches a subscription only between prices of the
+Stripe catalogue:
+
+- tools/stripe_plans.py makes one monthly price for each plan, with the
+  plan id as lookup key (payments.ensure_plan_prices). It is safe to run
+  again.
+- A monthly plan checks out with its catalogue price when one exists and
+  matches the plan. Else it uses the inline price, as before.
+- The lookup key of the price names the plan, so a switch in the portal
+  changes the plan at once. The books used this month still count.
+
+The Stripe account also sells sbm Team, and its events reach this webhook.
+A subscription whose price or checkout metadata names no monthly plan of
+this site is now ignored, so it cannot change an account here.
+
+No test reaches the real Stripe API: conftest stubs stripe.Price.list.
+
+</pre><pre> README.md                   |   9 ++++
+ backend/payments.py         |  86 ++++++++++++++++++++++++++++++++++--
+ tests/conftest.py           |   8 ++++
+ tests/test_billing.py       |   2 +-
+ tests/test_subscriptions.py | 105 +++++++++++++++++++++++++++++++++++++++++---
+ tools/stripe_plans.py       |  37 ++++++++++++++++
+ 6 files changed, 236 insertions(+), 11 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index d59e6cc..33c5b09 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -372,6 +372,15 @@ The books of a month do not carry over: a new `current_period_end` from Stripe</span>
+ sets `subscription_credits_used` back to 0. Retire a plan that was sold
+ (`pricing.RETIRED_PLANS`); do not delete it, or its subscribers get nothing.
+ 
+<span class="a">+To let customers switch plans in the portal, make the Stripe prices once:</span>
+<span class="a">+`runuser -u subplz -- .venv/bin/python tools/stripe_plans.py` on the server.</span>
+<span class="a">+It makes one monthly price for each plan, with the plan id as lookup key, and</span>
+<span class="a">+it is safe to run again. Then, in Stripe (Settings -&gt; Billing -&gt; Customer</span>
+<span class="a">+portal), let customers switch plans between these three products. The lookup</span>
+<span class="a">+key of the price names the plan, so a switch changes the plan at once, and the</span>
+<span class="a">+books already used this month still count. A subscription whose price names</span>
+<span class="a">+no plan of this site (the Stripe account also sells other products) is ignored.</span>
+<span class="a">+</span>
+ A server job spends the credit that ends first: the daily credit, then a book
+ of this month&#x27;s plan, then a free credit, then a bought one. An unlimited plan
+ spends nothing. The account counts the free credits apart from the bought ones
+diff --git a/backend/payments.py b/backend/payments.py
+index a4790db..8a2f1b4 100644
+--- a/backend/payments.py
++++ b/backend/payments.py
+<span class="h">@@ -67,6 +67,57 @@ def _base() -&gt; str:</span>
+ # checkout
+ # ---------------------------------------------------------------------------
+ 
+<span class="a">+def _catalogue_price(stripe, plan: pricing.Plan) -&gt; str | None:</span>
+<span class="a">+    &quot;&quot;&quot;The id of the Stripe price of a monthly plan (lookup key = plan id).</span>
+<span class="a">+</span>
+<span class="a">+    The customer portal switches a subscription only between prices of the</span>
+<span class="a">+    Stripe catalogue, so a plan checks out with its catalogue price when one</span>
+<span class="a">+    exists. A price that does not match the plan is not used.</span>
+<span class="a">+    tools/stripe_plans.py makes the prices.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    try:</span>
+<span class="a">+        found = _plain(stripe.Price.list(lookup_keys=[plan.id], active=True, limit=1))</span>
+<span class="a">+    except stripe.StripeError as exc:</span>
+<span class="a">+        log.warning(&quot;could not read the Stripe price of %s: %s&quot;, plan.id, exc)</span>
+<span class="a">+        return None</span>
+<span class="a">+    for price in found.get(&quot;data&quot;) or []:</span>
+<span class="a">+        if (price.get(&quot;unit_amount&quot;) == plan.price_cents</span>
+<span class="a">+                and price.get(&quot;currency&quot;) == plan.currency</span>
+<span class="a">+                and (price.get(&quot;recurring&quot;) or {}).get(&quot;interval&quot;) == &quot;month&quot;):</span>
+<span class="a">+            return price[&quot;id&quot;]</span>
+<span class="a">+        log.warning(&quot;Stripe price %s does not match plan %s&quot;, price.get(&quot;id&quot;), plan.id)</span>
+<span class="a">+    return None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def ensure_plan_prices() -&gt; list[tuple[str, str, bool]]:</span>
+<span class="a">+    &quot;&quot;&quot;Make a Stripe price for each monthly plan that has none.</span>
+<span class="a">+</span>
+<span class="a">+    Safe to run again: a plan with a matching price keeps it. Returns</span>
+<span class="a">+    (plan id, price id, made now) for each monthly plan. tools/stripe_plans.py</span>
+<span class="a">+    runs this.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    stripe = _stripe()</span>
+<span class="a">+    out = []</span>
+<span class="a">+    for plan in pricing.plans():</span>
+<span class="a">+        if not plan.recurring:</span>
+<span class="a">+            continue</span>
+<span class="a">+        price_id = _catalogue_price(stripe, plan)</span>
+<span class="a">+        made = price_id is None</span>
+<span class="a">+        if made:</span>
+<span class="a">+            price = _plain(stripe.Price.create(</span>
+<span class="a">+                unit_amount=plan.price_cents,</span>
+<span class="a">+                currency=plan.currency,</span>
+<span class="a">+                recurring={&quot;interval&quot;: &quot;month&quot;},</span>
+<span class="a">+                lookup_key=plan.id,</span>
+<span class="a">+                # A price that does not match keeps its product; move the key.</span>
+<span class="a">+                transfer_lookup_key=True,</span>
+<span class="a">+                product_data={&quot;name&quot;: f&quot;{settings.site_name} - {plan.name}&quot;},</span>
+<span class="a">+            ))</span>
+<span class="a">+            price_id = price[&quot;id&quot;]</span>
+<span class="a">+        out.append((plan.id, price_id, made))</span>
+<span class="a">+    return out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; str:
+     &quot;&quot;&quot;Return the Stripe-hosted payment page for `plan`.&quot;&quot;&quot;
+     stripe = _stripe()
+<span class="h">@@ -84,10 +135,16 @@ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; st</span>
+     if plan.recurring:
+         price[&quot;recurring&quot;] = {&quot;interval&quot;: &quot;month&quot;}
+ 
+<span class="a">+    line: dict = {&quot;quantity&quot;: 1, &quot;price_data&quot;: price}</span>
+<span class="a">+    if plan.recurring:</span>
+<span class="a">+        price_id = _catalogue_price(stripe, plan)</span>
+<span class="a">+        if price_id:</span>
+<span class="a">+            line = {&quot;quantity&quot;: 1, &quot;price&quot;: price_id}</span>
+<span class="a">+</span>
+     meta = {&quot;account_id&quot;: account.id, &quot;plan_id&quot;: plan.id}
+     params: dict = {
+         &quot;mode&quot;: &quot;subscription&quot; if plan.recurring else &quot;payment&quot;,
+<span class="d">-        &quot;line_items&quot;: [{&quot;quantity&quot;: 1, &quot;price_data&quot;: price}],</span>
+<span class="a">+        &quot;line_items&quot;: [line],</span>
+         &quot;client_reference_id&quot;: account.id,
+         &quot;metadata&quot;: meta,
+         # Stripe substitutes the real id; the return handler re-reads the
+<span class="h">@@ -159,8 +216,30 @@ def _account_for(session: Session, account_id: str | None, customer: str | None)</span>
+     return accounts.resolve(session, account) if account else None
+ 
+ 
+<span class="a">+def _our_plan_id(sub: dict) -&gt; str | None:</span>
+<span class="a">+    &quot;&quot;&quot;The monthly plan of a subscription, or None if it is not one of ours.</span>
+<span class="a">+</span>
+<span class="a">+    The lookup key of the price names the plan, and it changes when the</span>
+<span class="a">+    customer switches plans in the portal. A subscription that started with</span>
+<span class="a">+    an inline price has no lookup key: its checkout metadata names the plan.</span>
+<span class="a">+    The Stripe account also sells other products, and their events come here</span>
+<span class="a">+    too. A subscription that names no monthly plan of this site is not ours.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    items = (sub.get(&quot;items&quot;) or {}).get(&quot;data&quot;) or []</span>
+<span class="a">+    price = (items[0].get(&quot;price&quot;) or {}) if items else {}</span>
+<span class="a">+    for plan_id in (price.get(&quot;lookup_key&quot;), (sub.get(&quot;metadata&quot;) or {}).get(&quot;plan_id&quot;)):</span>
+<span class="a">+        plan = pricing.get(plan_id or &quot;&quot;, retired=True)</span>
+<span class="a">+        if plan is not None and plan.recurring:</span>
+<span class="a">+            return plan.id</span>
+<span class="a">+    return None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def apply_subscription(session: Session, sub: dict) -&gt; None:
+     &quot;&quot;&quot;Mirror a Stripe subscription onto its account.&quot;&quot;&quot;
+<span class="a">+    plan_id = _our_plan_id(sub)</span>
+<span class="a">+    if plan_id is None:</span>
+<span class="a">+        log.info(&quot;subscription %s is not for a plan of this site; ignored&quot;, sub.get(&quot;id&quot;))</span>
+<span class="a">+        return</span>
+     meta = sub.get(&quot;metadata&quot;) or {}
+     account = _account_for(session, meta.get(&quot;account_id&quot;), sub.get(&quot;customer&quot;))
+     if account is None:
+<span class="h">@@ -179,8 +258,9 @@ def apply_subscription(session: Session, sub: dict) -&gt; None:</span>
+     account.subscription_id = sub.get(&quot;id&quot;)
+     account.subscription_status = sub.get(&quot;status&quot;)
+     account.subscription_period_end = period_end
+<span class="d">-    if meta.get(&quot;plan_id&quot;):</span>
+<span class="d">-        account.subscription_plan_id = meta[&quot;plan_id&quot;]</span>
+<span class="a">+    # A switch in the portal changes the plan and keeps the month: the books</span>
+<span class="a">+    # used this month still count against the new plan.</span>
+<span class="a">+    account.subscription_plan_id = plan_id</span>
+     if sub.get(&quot;customer&quot;) and not account.stripe_customer_id:
+         account.stripe_customer_id = sub[&quot;customer&quot;]
+     session.commit()
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 83be82a..8ed33c7 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+<span class="h">@@ -46,6 +46,14 @@ def _no_real_work(monkeypatch):</span>
+     monkeypatch.setattr(api.queue, &quot;enqueue&quot;, lambda job_id: None)
+ 
+ 
+<span class="a">+@pytest.fixture(autouse=True)</span>
+<span class="a">+def _no_stripe_prices(monkeypatch):</span>
+<span class="a">+    &quot;&quot;&quot;Stripe has no prices for the plans, unless a test says so. No test may</span>
+<span class="a">+    reach the real Stripe API.&quot;&quot;&quot;</span>
+<span class="a">+    import stripe</span>
+<span class="a">+    monkeypatch.setattr(stripe.Price, &quot;list&quot;, lambda **kw: FakeStripeObject({&quot;data&quot;: []}))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ @pytest.fixture
+ def client():
+     &quot;&quot;&quot;A browser: keeps its cookie, so it stays one account across requests.&quot;&quot;&quot;
+diff --git a/tests/test_billing.py b/tests/test_billing.py
+index 51b0fa1..5225721 100644
+--- a/tests/test_billing.py
++++ b/tests/test_billing.py
+<span class="h">@@ -294,7 +294,7 @@ def test_subscription_lifts_every_limit_then_lapses(client, monthly_plan):</span>
+     assert start(client, make_job(client)).status_code == 402
+ 
+ 
+<span class="d">-def test_subscription_past_its_paid_period_does_not_count(client):</span>
+<span class="a">+def test_subscription_past_its_paid_period_does_not_count(client, monthly_plan):</span>
+     acct = account_id(client)
+     post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;active&quot;, ends_in=-3 * 86400))
+     assert client.get(&quot;/api/account&quot;).json()[&quot;subscribed&quot;] is False
+diff --git a/tests/test_subscriptions.py b/tests/test_subscriptions.py
+index 586e9ba..750f0d3 100644
+--- a/tests/test_subscriptions.py
++++ b/tests/test_subscriptions.py
+<span class="h">@@ -7,7 +7,10 @@</span>
+   unlimited  no credit is spent while the plan is active.
+ 
+ Stripe tells the server about a plan with customer.subscription.* events. A
+<span class="d">-new month (a new current_period_end) starts the count again.</span>
+<span class="a">+new month (a new current_period_end) starts the count again. The lookup key</span>
+<span class="a">+of the price names the plan, so a switch in the customer portal changes the</span>
+<span class="a">+plan. The Stripe account also sells other products: a subscription that is</span>
+<span class="a">+not for a plan of this site is ignored.</span>
+ &quot;&quot;&quot;
+ 
+ from __future__ import annotations
+<span class="h">@@ -30,6 +33,8 @@ TEST_PLANS = [</span>
+     {&quot;id&quot;: &quot;pack10&quot;, &quot;name&quot;: &quot;10 books&quot;, &quot;credits&quot;: 10, &quot;price_cents&quot;: 499},
+     {&quot;id&quot;: &quot;month10&quot;, &quot;name&quot;: &quot;10 books a month&quot;, &quot;credits&quot;: 10, &quot;price_cents&quot;: 499,
+      &quot;recurring&quot;: True},
+<span class="a">+    {&quot;id&quot;: &quot;month30&quot;, &quot;name&quot;: &quot;30 books a month&quot;, &quot;credits&quot;: 30, &quot;price_cents&quot;: 999,</span>
+<span class="a">+     &quot;recurring&quot;: True},</span>
+     {&quot;id&quot;: &quot;forever&quot;, &quot;name&quot;: &quot;Unlimited&quot;, &quot;credits&quot;: None, &quot;price_cents&quot;: 5000,
+      &quot;recurring&quot;: True},
+ ]
+<span class="h">@@ -40,8 +45,14 @@ def catalogue(monkeypatch):</span>
+     monkeypatch.setenv(&quot;SUBPLZ_WEB_PLANS_JSON&quot;, json.dumps(TEST_PLANS))
+ 
+ 
+<span class="d">-def subscription_event(kind, account, plan_id, status=&quot;active&quot;, period_end=None):</span>
+<span class="a">+def subscription_event(kind, account, plan_id, status=&quot;active&quot;, period_end=None,</span>
+<span class="a">+                       price_key=None):</span>
+<span class="a">+    &quot;&quot;&quot;`plan_id` goes in the checkout metadata; `price_key` is the lookup key</span>
+<span class="a">+    of the price, which the portal changes when the customer switches plans.&quot;&quot;&quot;</span>
+     end = period_end or int(time.time()) + 30 * 86400
+<span class="a">+    item = {&quot;current_period_end&quot;: end}</span>
+<span class="a">+    if price_key is not None:</span>
+<span class="a">+        item[&quot;price&quot;] = {&quot;id&quot;: f&quot;price_{price_key}&quot;, &quot;lookup_key&quot;: price_key}</span>
+     return {
+         &quot;id&quot;: f&quot;evt_{kind}_{time.time_ns()}&quot;,
+         &quot;type&quot;: f&quot;customer.subscription.{kind}&quot;,
+<span class="h">@@ -49,7 +60,7 @@ def subscription_event(kind, account, plan_id, status=&quot;active&quot;, period_end=None)</span>
+             &quot;id&quot;: f&quot;sub_{account}&quot;, &quot;object&quot;: &quot;subscription&quot;, &quot;status&quot;: status,
+             &quot;customer&quot;: f&quot;cus_{account}&quot;,
+             &quot;metadata&quot;: {&quot;account_id&quot;: account, &quot;plan_id&quot;: plan_id},
+<span class="d">-            &quot;items&quot;: {&quot;data&quot;: [{&quot;current_period_end&quot;: end}]},</span>
+<span class="a">+            &quot;items&quot;: {&quot;data&quot;: [item]},</span>
+         }},
+     }
+ 
+<span class="h">@@ -146,11 +157,91 @@ def test_a_cancelled_plan_gives_nothing(client):</span>
+     assert start(client, make_job(client)).status_code == 402
+ 
+ 
+<span class="d">-def test_a_plan_that_is_not_in_the_catalogue_gives_nothing(client):</span>
+<span class="d">-    # Retire a sold plan (pricing.RETIRED_PLANS); do not delete it.</span>
+<span class="d">-    subscribe(client, &quot;gone&quot;)</span>
+<span class="a">+def test_a_subscription_to_another_product_is_ignored(client):</span>
+<span class="a">+    # The same Stripe account sells other products (sbm Team). Their events</span>
+<span class="a">+    # reach this webhook too, and must not touch an account here. This is also</span>
+<span class="a">+    # why a sold plan must be retired (pricing.RETIRED_PLANS), not deleted.</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    event = subscription_event(&quot;created&quot;, acct, None, price_key=&quot;sbm-team&quot;)</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+     a = account(client)
+<span class="d">-    assert a[&quot;unlimited&quot;] is False and a[&quot;plan_credits&quot;] == 0</span>
+<span class="a">+    assert a[&quot;subscribed&quot;] is False and a[&quot;plan_credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_plan_checks_out_with_its_stripe_price_when_one_exists(client, monkeypatch):</span>
+<span class="a">+    # The portal can switch a subscription only between catalogue prices.</span>
+<span class="a">+    monkeypatch.setattr(stripe.Price, &quot;list&quot;, lambda **kw: FakeStripeObject({&quot;data&quot;: [</span>
+<span class="a">+        {&quot;id&quot;: &quot;price_m10&quot;, &quot;lookup_key&quot;: &quot;month10&quot;, &quot;unit_amount&quot;: 499,</span>
+<span class="a">+         &quot;currency&quot;: &quot;usd&quot;, &quot;recurring&quot;: {&quot;interval&quot;: &quot;month&quot;}},</span>
+<span class="a">+    ]}))</span>
+<span class="a">+    seen = {}</span>
+<span class="a">+    monkeypatch.setattr(</span>
+<span class="a">+        stripe.checkout.Session, &quot;create&quot;,</span>
+<span class="a">+        lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),</span>
+<span class="a">+    )</span>
+<span class="a">+    assert client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 200</span>
+<span class="a">+    assert seen[&quot;line_items&quot;] == [{&quot;quantity&quot;: 1, &quot;price&quot;: &quot;price_m10&quot;}]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_stripe_price_that_does_not_match_the_plan_is_not_used(client, monkeypatch):</span>
+<span class="a">+    monkeypatch.setattr(stripe.Price, &quot;list&quot;, lambda **kw: FakeStripeObject({&quot;data&quot;: [</span>
+<span class="a">+        {&quot;id&quot;: &quot;price_old&quot;, &quot;lookup_key&quot;: &quot;month10&quot;, &quot;unit_amount&quot;: 999,</span>
+<span class="a">+         &quot;currency&quot;: &quot;usd&quot;, &quot;recurring&quot;: {&quot;interval&quot;: &quot;month&quot;}},</span>
+<span class="a">+    ]}))</span>
+<span class="a">+    seen = {}</span>
+<span class="a">+    monkeypatch.setattr(</span>
+<span class="a">+        stripe.checkout.Session, &quot;create&quot;,</span>
+<span class="a">+        lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),</span>
+<span class="a">+    )</span>
+<span class="a">+    assert client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 200</span>
+<span class="a">+    assert seen[&quot;line_items&quot;][0][&quot;price_data&quot;][&quot;unit_amount&quot;] == 499</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_plan_prices_are_made_once(monkeypatch):</span>
+<span class="a">+    from backend import payments</span>
+<span class="a">+</span>
+<span class="a">+    prices = []  # what Stripe has</span>
+<span class="a">+</span>
+<span class="a">+    def price_list(lookup_keys, **kw):</span>
+<span class="a">+        return FakeStripeObject({&quot;data&quot;: [p for p in prices if p[&quot;lookup_key&quot;] in lookup_keys]})</span>
+<span class="a">+</span>
+<span class="a">+    def price_create(**kw):</span>
+<span class="a">+        price = {&quot;id&quot;: f&quot;price_{kw[&#x27;lookup_key&#x27;]}&quot;, &quot;lookup_key&quot;: kw[&quot;lookup_key&quot;],</span>
+<span class="a">+                 &quot;unit_amount&quot;: kw[&quot;unit_amount&quot;], &quot;currency&quot;: kw[&quot;currency&quot;],</span>
+<span class="a">+                 &quot;recurring&quot;: kw[&quot;recurring&quot;]}</span>
+<span class="a">+        prices.append(price)</span>
+<span class="a">+        return FakeStripeObject(price)</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(stripe.Price, &quot;list&quot;, price_list)</span>
+<span class="a">+    monkeypatch.setattr(stripe.Price, &quot;create&quot;, price_create)</span>
+<span class="a">+</span>
+<span class="a">+    first = payments.ensure_plan_prices()</span>
+<span class="a">+    assert [(plan, made) for plan, _, made in first] == [</span>
+<span class="a">+        (&quot;month10&quot;, True), (&quot;month30&quot;, True), (&quot;forever&quot;, True)]</span>
+<span class="a">+    assert [p[&quot;unit_amount&quot;] for p in prices] == [499, 999, 5000]</span>
+<span class="a">+</span>
+<span class="a">+    second = payments.ensure_plan_prices()</span>
+<span class="a">+    assert [made for _, _, made in second] == [False, False, False]</span>
+<span class="a">+    assert len(prices) == 3</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_switching_plans_in_the_portal_changes_the_plan(client):</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    end = int(time.time()) + 30 * 86400</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;created&quot;, acct, &quot;month10&quot;,</span>
+<span class="a">+                                            period_end=end, price_key=&quot;month10&quot;))</span>
+<span class="a">+    for _ in range(8):</span>
+<span class="a">+        assert start(client, make_job(client)).status_code == 200</span>
+<span class="a">+    assert account(client)[&quot;plan_credits&quot;] == 2</span>
+<span class="a">+</span>
+<span class="a">+    # The portal changes the price; the checkout metadata still says month10.</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;,</span>
+<span class="a">+                                            period_end=end, price_key=&quot;month30&quot;))</span>
+<span class="a">+    assert account(client)[&quot;plan_credits&quot;] == 22  # 30 this month, 8 used</span>
+<span class="a">+</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;,</span>
+<span class="a">+                                            period_end=end, price_key=&quot;forever&quot;))</span>
+<span class="a">+    assert account(client)[&quot;unlimited&quot;] is True</span>
+ 
+ 
+ def test_a_second_plan_is_refused(client, monkeypatch):
+diff --git a/tools/stripe_plans.py b/tools/stripe_plans.py
+new file mode 100644
+index 0000000..f2aafa3
+--- /dev/null
++++ b/tools/stripe_plans.py
+<span class="h">@@ -0,0 +1,37 @@</span>
+<span class="a">+&quot;&quot;&quot;Make the Stripe prices of the monthly plans.</span>
+<span class="a">+</span>
+<span class="a">+The Stripe customer portal switches a subscription only between prices of the</span>
+<span class="a">+Stripe catalogue. This makes one monthly price, with its product, for each</span>
+<span class="a">+monthly plan in backend/pricing.py. The plan id is the lookup key of the price.</span>
+<span class="a">+It is safe to run again: a plan that has a matching price keeps it.</span>
+<span class="a">+</span>
+<span class="a">+    # on the server, from the checkout, with the server&#x27;s settings</span>
+<span class="a">+    runuser -u subplz -- .venv/bin/python tools/stripe_plans.py</span>
+<span class="a">+</span>
+<span class="a">+Then let the customer portal switch between these prices (Stripe: Settings -&gt;</span>
+<span class="a">+Billing -&gt; Customer portal -&gt; customers can switch plans).</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import sys</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))</span>
+<span class="a">+</span>
+<span class="a">+from backend import payments  # noqa: E402</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main() -&gt; int:</span>
+<span class="a">+    try:</span>
+<span class="a">+        rows = payments.ensure_plan_prices()</span>
+<span class="a">+    except payments.PaymentsUnavailable as exc:</span>
+<span class="a">+        print(exc)</span>
+<span class="a">+        return 1</span>
+<span class="a">+    for plan_id, price_id, made in rows:</span>
+<span class="a">+        print(f&quot;{plan_id}: {price_id} ({&#x27;made now&#x27; if made else &#x27;already there&#x27;})&quot;)</span>
+<span class="a">+    return 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    raise SystemExit(main())</span></pre>
+</div></body></html>

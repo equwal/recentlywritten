@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 7a10f92b - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 7a10f92b4fbfbcce806ca9f1edff8e34261b83ca
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:35:54 -0700
+
+Hold the follow after a page turn by the user
+
+While the audio played, a page turn by hand lasted only to the next
+cue: the follow turned the page back 0.8 seconds later. Now a page turn
+by the user (an arrow, a key, a swipe or the page jump) holds the
+follow. While it is held, the page does not turn by itself. The mark
+still shows when the cue of now is on the page shown. A Follow button
+shows in the top bar, and the strip says &quot;Follow paused&quot;.
+
+The hold ends when the user taps Follow, when the audio reaches the
+page shown, when the user moves the audio from this app (the cue list,
+&quot;move the audio to this page&quot;), or when the player jumps. A new
+alignment after a page is read is no seek: it has its own event, and
+it does not end the hold. So cueMoved is not necessary any more.
+
+follow() in follower.ts is now a function of the state: at each step
+it compares the page of the audio with the page shown. It gets the
+event (tick, realign, seek, follow) and the hold, and it gives the new
+hold. Property tests show that a held follow never turns a page
+without a seek or the Follow button, and that the hold ends when the
+audio is on the page shown. lastCueAt (subtitles.ts) gives the cue of
+now, also in the silence after a cue.
+
+</pre><pre> index.html             |   9 +++
+ src/follower.ts        |  80 ++++++++++----------
+ src/main.ts            | 106 ++++++++++++++++----------
+ src/style.css          |  15 +++-
+ src/subtitles.ts       |  13 +++-
+ test/follower.test.ts  | 197 +++++++++++++++++++++++++++----------------------
+ test/subtitles.test.ts |  34 ++++++++-
+ 7 files changed, 284 insertions(+), 170 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index fd3affe..df31fd5 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -55,10 +55,19 @@</span>
+           &lt;path class=&quot;solid&quot; d=&quot;M10 10v7l5.5-3.5z&quot; /&gt;
+         &lt;/svg&gt;
+       &lt;/button&gt;
+<span class="a">+      &lt;button</span>
+<span class="a">+        id=&quot;follow-now&quot;</span>
+<span class="a">+        aria-label=&quot;Follow the audio again&quot;</span>
+<span class="a">+        title=&quot;Follow the audio again: go to its page&quot;</span>
+<span class="a">+        hidden</span>
+<span class="a">+      &gt;</span>
+<span class="a">+        Follow</span>
+<span class="a">+      &lt;/button&gt;</span>
+     &lt;/header&gt;
+ 
+     &lt;div id=&quot;strip&quot;&gt;
+       &lt;span id=&quot;player-status&quot;&gt;&lt;/span&gt;
+<span class="a">+      &lt;span id=&quot;follow-note&quot; hidden&gt;Follow paused&lt;/span&gt;</span>
+       &lt;span id=&quot;pages-status&quot; hidden&gt;&lt;/span&gt;
+       &lt;span id=&quot;status&quot; aria-live=&quot;polite&quot;&gt;&lt;/span&gt;
+     &lt;/div&gt;
+diff --git a/src/follower.ts b/src/follower.ts
+index 654ea0a..ec2dd85 100644
+--- a/src/follower.ts
++++ b/src/follower.ts
+<span class="h">@@ -1,21 +1,37 @@</span>
+ // The reader follows the audio: which cue to mark, which page to show. Pure.
+ //
+<span class="d">-// The alignment gives each matched cue a page. This reducer turns a change</span>
+<span class="d">-// of the cue into at most one highlight and one page turn.</span>
+<span class="a">+// The alignment gives each matched cue a page. At each step the follow</span>
+<span class="a">+// compares the page of the audio with the page shown, and turns the page</span>
+<span class="a">+// when they differ. A page turn by the user holds the follow: the page</span>
+<span class="a">+// stays until the audio reaches it, the audio jumps, or the user asks to</span>
+<span class="a">+// follow again.</span>
+ 
+ export type FollowMode = &#x27;highlight&#x27; | &#x27;pages&#x27; | &#x27;off&#x27;;
+ 
+<span class="a">+/**</span>
+<span class="a">+ * Why the follow runs.</span>
+<span class="a">+ *</span>
+<span class="a">+ * - `tick`: a new state of the clock in the normal run.</span>
+<span class="a">+ * - `realign`: the alignment changed, because a page was read.</span>
+<span class="a">+ * - `seek`: the audio jumped. The player jumped, or the user moved the</span>
+<span class="a">+ *   audio from this app.</span>
+<span class="a">+ * - `follow`: the user asked to follow: the Follow button, or a new</span>
+<span class="a">+ *   follow mode.</span>
+<span class="a">+ */</span>
+<span class="a">+export type FollowEvent = &#x27;tick&#x27; | &#x27;realign&#x27; | &#x27;seek&#x27; | &#x27;follow&#x27;;</span>
+<span class="a">+</span>
+ export interface FollowInput {
+<span class="d">-  /** The page of each cue, from the alignment. Null for an unmatched cue. */</span>
+<span class="d">-  cuePages: readonly (number | null)[];</span>
+   mode: FollowMode;
+   currentPage: number;
+<span class="d">-  /** The cue of the last call, or -1. */</span>
+<span class="d">-  previousCue: number;</span>
+<span class="d">-  /** The cue of now, or -1 between cues. */</span>
+<span class="a">+  /** The cue of now, or -1 before the first cue. */</span>
+   cue: number;
+<span class="d">-  /** True when the audio jumped: a seek, not the normal run forward. */</span>
+<span class="d">-  seeked: boolean;</span>
+<span class="a">+  /** True when the cue of now is matched: it has tokens on a page. */</span>
+<span class="a">+  matched: boolean;</span>
+<span class="a">+  /** The page of the audio now, or null when no page stands for the cue of now. */</span>
+<span class="a">+  page: number | null;</span>
+<span class="a">+  /** True while a page turn by the user holds the follow. */</span>
+<span class="a">+  held: boolean;</span>
+<span class="a">+  event: FollowEvent;</span>
+ }
+ 
+ export interface FollowOutput {
+<span class="h">@@ -23,13 +39,13 @@ export interface FollowOutput {</span>
+   highlightCue: number | null;
+   /** The page to show, or null to stay. */
+   turnToPage: number | null;
+<span class="a">+  /** True when the follow stays held. */</span>
+<span class="a">+  held: boolean;</span>
+ }
+ 
+ /** How many cues back an unmatched cue borrows the page of a matched one. */
+ export const LOOKBACK = 5;
+ 
+<span class="d">-const NOTHING: FollowOutput = { highlightCue: null, turnToPage: null };</span>
+<span class="d">-</span>
+ /**
+  * The page that stands for `cue`: its own page when the cue is matched,
+  * else the page of the nearest matched cue before it, within LOOKBACK.
+<span class="h">@@ -43,40 +59,24 @@ export function pageForCue(cuePages: readonly (number | null)[], cue: number): n</span>
+   return null;
+ }
+ 
+<span class="d">-/**</span>
+<span class="d">- * True when a new alignment moves the cue: its own page changed (for</span>
+<span class="d">- * example, it became matched), or the page that stands for it changed.</span>
+<span class="d">- * Only then must the follow act again after an alignment. Else a page</span>
+<span class="d">- * that the user turned by hand stays.</span>
+<span class="d">- */</span>
+<span class="d">-export function cueMoved(</span>
+<span class="d">-  before: readonly (number | null)[],</span>
+<span class="d">-  after: readonly (number | null)[],</span>
+<span class="d">-  cue: number,</span>
+<span class="d">-): boolean {</span>
+<span class="d">-  if (cue &lt; 0) return false;</span>
+<span class="d">-  return (</span>
+<span class="d">-    (before[cue] ?? null) !== (after[cue] ?? null) ||</span>
+<span class="d">-    pageForCue(before, cue) !== pageForCue(after, cue)</span>
+<span class="d">-  );</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+ /**
+  * One step of the follow.
+  *
+<span class="d">- * `off` does nothing. The same cue as before, without a seek, does nothing</span>
+<span class="d">- * either: the user can turn pages by hand while a long cue plays. A page</span>
+<span class="d">- * turn happens when the page of the cue is not the current page. In</span>
+<span class="d">- * `highlight` mode a matched cue is marked; in `pages` mode nothing is.</span>
+<span class="a">+ * A seek or the Follow button ends the hold. The hold also ends when the</span>
+<span class="a">+ * audio is on the page shown. A tick or a new alignment does not end it.</span>
+<span class="a">+ * While the follow is held, the page does not turn. Else the page turns</span>
+<span class="a">+ * when the page of the audio is not the page shown. In `highlight` mode a</span>
+<span class="a">+ * matched cue is marked, also while the follow is held: the mark shows</span>
+<span class="a">+ * only on the page of the cue. `off` does nothing.</span>
+  */
+ export function follow(input: FollowInput): FollowOutput {
+<span class="d">-  const { cuePages, mode, currentPage, previousCue, cue, seeked } = input;</span>
+<span class="d">-  if (mode === &#x27;off&#x27; || cue &lt; 0 || cue &gt;= cuePages.length) return NOTHING;</span>
+<span class="d">-  if (cue === previousCue &amp;&amp; !seeked) return NOTHING;</span>
+<span class="d">-  const own = cuePages[cue] ?? null;</span>
+<span class="d">-  const page = pageForCue(cuePages, cue);</span>
+<span class="a">+  const { mode, currentPage, cue, matched, page, event } = input;</span>
+<span class="a">+  let held = input.held &amp;&amp; (event === &#x27;tick&#x27; || event === &#x27;realign&#x27;);</span>
+<span class="a">+  if (mode === &#x27;off&#x27; || cue &lt; 0) return { highlightCue: null, turnToPage: null, held };</span>
+<span class="a">+  if (page === currentPage) held = false;</span>
+   return {
+<span class="d">-    highlightCue: mode === &#x27;highlight&#x27; &amp;&amp; own !== null ? cue : null,</span>
+<span class="d">-    turnToPage: page !== null &amp;&amp; page !== currentPage ? page : null,</span>
+<span class="a">+    highlightCue: mode === &#x27;highlight&#x27; &amp;&amp; matched ? cue : null,</span>
+<span class="a">+    turnToPage: !held &amp;&amp; page !== null &amp;&amp; page !== currentPage ? page : null,</span>
+<span class="a">+    held,</span>
+   };
+ }
+diff --git a/src/main.ts b/src/main.ts
+index e0d6397..c501a6d 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -5,7 +5,7 @@</span>
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+<span class="d">-import { cueMoved, follow, type FollowMode } from &#x27;./follower&#x27;;</span>
+<span class="a">+import { follow, pageForCue, type FollowEvent, type FollowMode } from &#x27;./follower&#x27;;</span>
+ import { lookupText, tapTolerance, tokenAt } from &#x27;./hit-test&#x27;;
+ import { lineBoxes } from &#x27;./line-boxes&#x27;;
+ import {
+<span class="h">@@ -24,7 +24,7 @@ import { loadPdf, type PdfDoc } from &#x27;./pdf&#x27;;</span>
+ import { nextPage } from &#x27;./read-order&#x27;;
+ import { say, showPlayer, showReading } from &#x27;./status&#x27;;
+ import { isAndroid, SubRead } from &#x27;./subread&#x27;;
+<span class="d">-import { cueIndexAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;</span>
+<span class="a">+import { lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;</span>
+ import { createPageView, type Marks } from &#x27;./view&#x27;;
+ import {
+   bookKey,
+<span class="h">@@ -81,6 +81,8 @@ const ui = {</span>
+   syncPage: el&lt;HTMLButtonElement&gt;(&#x27;sync-page&#x27;),
+   pageLabel: el&lt;HTMLButtonElement&gt;(&#x27;page-label&#x27;),
+   pageInput: el&lt;HTMLInputElement&gt;(&#x27;page-input&#x27;),
+<span class="a">+  followNow: el&lt;HTMLButtonElement&gt;(&#x27;follow-now&#x27;),</span>
+<span class="a">+  followNote: el&lt;HTMLSpanElement&gt;(&#x27;follow-note&#x27;),</span>
+   rtl: el&lt;HTMLInputElement&gt;(&#x27;rtl&#x27;),
+   viewer: el&lt;HTMLDivElement&gt;(&#x27;viewer&#x27;),
+   empty: el&lt;HTMLElement&gt;(&#x27;empty&#x27;),
+<span class="h">@@ -113,6 +115,8 @@ const state = {</span>
+   srt: null as string | null,
+   /** True while the player waits for a dictionary lookup that this app paused. */
+   lookupPaused: false,
+<span class="a">+  /** True while a page turn by the user holds the follow. */</span>
+<span class="a">+  held: false,</span>
+ };
+ 
+ const view = createPageView(ui, marks);
+<span class="h">@@ -127,7 +131,7 @@ const nav = setupNav(</span>
+     rtl: () =&gt; ui.rtl.checked,
+     drawerOpen: () =&gt; !desktop.matches &amp;&amp; document.body.classList.contains(&#x27;menu-open&#x27;),
+   },
+<span class="d">-  (index) =&gt; void showPage(index),</span>
+<span class="a">+  turnByUser,</span>
+ );
+ 
+ // --- Settings ---
+<span class="h">@@ -173,11 +177,10 @@ ui.rtl.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+   nav.update();
+ });
+ 
+<span class="a">+// A new follow mode follows the audio at once.</span>
+ ui.follow.addEventListener(&#x27;change&#x27;, () =&gt; {
+   settings.set(&#x27;follow&#x27;, followMode());
+<span class="d">-  state.markedCue = -1;</span>
+<span class="d">-  view.mark();</span>
+<span class="d">-  if (state.clock) applyClock({ ...state.clock, seeked: true });</span>
+<span class="a">+  runFollow(&#x27;follow&#x27;);</span>
+ });
+ ui.pauseLookup.addEventListener(&#x27;change&#x27;, () =&gt;
+   settings.set(&#x27;pauseLookup&#x27;, ui.pauseLookup.checked ? &#x27;1&#x27; : &#x27;0&#x27;),
+<span class="h">@@ -237,6 +240,7 @@ ui.pdfFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+     state.cuePages = [];
+     state.activeCue = -1;
+     state.markedCue = -1;
+<span class="a">+    state.held = false;</span>
+     ui.makeSubs.disabled = false;
+     ui.empty.hidden = true;
+     ui.page.hidden = false;
+<span class="h">@@ -453,16 +457,13 @@ function align(): number | null {</span>
+   if (state.alignTimer) clearTimeout(state.alignTimer);
+   state.alignTimer = null;
+   if (!state.aligner || state.cues.length === 0 || state.tokens.length === 0) return null;
+<span class="d">-  const before = state.cuePages;</span>
+   state.spans = state.aligner.spans(state.pages.map((p) =&gt; p?.tokens));
+   state.cuePages = state.spans.map((s) =&gt; (s.matched ? state.tokens[s.start]!.page : null));
+   renderCueList();
+<span class="d">-  // Follow again only when the alignment moved the cue of now, for</span>
+<span class="d">-  // example when it became matched. A page read in the background must not</span>
+<span class="d">-  // undo a page turn by hand.</span>
+<span class="d">-  if (state.clock &amp;&amp; cueMoved(before, state.cuePages, clockCue(state.clock))) {</span>
+<span class="d">-    applyClock({ ...state.clock, seeked: true });</span>
+<span class="d">-  }</span>
+<span class="a">+  view.mark();</span>
+<span class="a">+  // The cue of now can have a new page. A new alignment is no seek, so a</span>
+<span class="a">+  // page that the user turned to stays.</span>
+<span class="a">+  runFollow(&#x27;realign&#x27;);</span>
+   return state.cuePages.filter((p) =&gt; p !== null).length;
+ }
+ 
+<span class="h">@@ -477,7 +478,7 @@ function renderCueList(): void {</span>
+       const span = state.spans[i];
+       if (span &amp;&amp; !span.matched) li.classList.add(&#x27;unmatched&#x27;);
+       if (i === state.activeCue) li.classList.add(&#x27;active&#x27;);
+<span class="d">-      li.addEventListener(&#x27;click&#x27;, () =&gt; void clock.seek(cue.start * 1000).catch(sayError));</span>
+<span class="a">+      li.addEventListener(&#x27;click&#x27;, () =&gt; seek(cue.start * 1000));</span>
+       return li;
+     }),
+   );
+<span class="h">@@ -507,33 +508,61 @@ function showPlayerStatus(s: ClockState): void {</span>
+   showPlayer(state.pdf ? playerMessage(s, isAndroid) : null);
+ }
+ 
+<span class="d">-/** The cue at the position of a clock state, or -1. */</span>
+<span class="d">-function clockCue(s: ClockState): number {</span>
+<span class="d">-  return s.positionMs === null ? -1 : cueIndexAt(state.cues, s.positionMs / 1000);</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-/** One state of the clock: mark the cue of now and turn the page. */</span>
+<span class="d">-function applyClock(s: ClockState): void {</span>
+<span class="d">-  state.clock = s;</span>
+<span class="d">-  showPlayerStatus(s);</span>
+<span class="d">-  const cue = clockCue(s);</span>
+<span class="d">-  // The last cue stays marked in the silence between two cues.</span>
+<span class="d">-  if (cue &lt; 0) return;</span>
+<span class="a">+/**</span>
+<span class="a">+ * The follow for the last state of the clock: mark the cue of now, and</span>
+<span class="a">+ * turn to its page unless the follow is held. In the silence between two</span>
+<span class="a">+ * cues, the cue before stays the cue of now.</span>
+<span class="a">+ */</span>
+<span class="a">+function runFollow(event: FollowEvent): void {</span>
+<span class="a">+  const s = state.clock;</span>
+<span class="a">+  const cue = s?.positionMs == null ? -1 : lastCueAt(state.cues, s.positionMs / 1000);</span>
+<span class="a">+  if (cue !== state.activeCue) {</span>
+<span class="a">+    markCueInList(cue);</span>
+<span class="a">+    state.activeCue = cue;</span>
+<span class="a">+  }</span>
+<span class="a">+  const mode = followMode();</span>
+<span class="a">+  const page = cue &lt; 0 ? null : pageForCue(state.cuePages, cue);</span>
+   const out = follow({
+<span class="d">-    cuePages: state.cuePages,</span>
+<span class="d">-    mode: followMode(),</span>
+<span class="a">+    mode,</span>
+     currentPage: state.currentPage,
+<span class="d">-    previousCue: state.activeCue,</span>
+     cue,
+<span class="d">-    seeked: s.seeked,</span>
+<span class="a">+    matched: cue &gt;= 0 &amp;&amp; state.cuePages[cue] != null,</span>
+<span class="a">+    page,</span>
+<span class="a">+    held: state.held,</span>
+<span class="a">+    event,</span>
+   });
+<span class="d">-  const changed = cue !== state.activeCue || s.seeked;</span>
+<span class="d">-  if (cue !== state.activeCue) markCueInList(cue);</span>
+<span class="d">-  state.activeCue = cue;</span>
+<span class="d">-  if (!changed || followMode() === &#x27;off&#x27;) return;</span>
+<span class="d">-  state.markedCue = out.highlightCue ?? -1;</span>
+<span class="a">+  state.held = out.held;</span>
+<span class="a">+  // The Follow button shows only when it has a page to go to.</span>
+<span class="a">+  const paused = out.held &amp;&amp; mode !== &#x27;off&#x27; &amp;&amp; page !== null;</span>
+<span class="a">+  ui.followNow.hidden = !paused;</span>
+<span class="a">+  ui.followNote.hidden = !paused;</span>
+<span class="a">+  const marked = out.highlightCue ?? -1;</span>
+<span class="a">+  const markMoved = marked !== state.markedCue;</span>
+<span class="a">+  state.markedCue = marked;</span>
+   if (out.turnToPage !== null) void showPage(out.turnToPage);
+<span class="d">-  else view.mark();</span>
+<span class="a">+  else if (markMoved) view.mark();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** One state of the clock. A jump of the audio is a seek. */</span>
+<span class="a">+function applyClock(s: ClockState): void {</span>
+<span class="a">+  state.clock = s;</span>
+<span class="a">+  showPlayerStatus(s);</span>
+<span class="a">+  runFollow(s.seeked ? &#x27;seek&#x27; : &#x27;tick&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A page turn by the user. It holds the follow, until the audio reaches the page. */</span>
+<span class="a">+function turnByUser(index: number): void {</span>
+<span class="a">+  state.held = true;</span>
+<span class="a">+  void showPage(index);</span>
+<span class="a">+  runFollow(&#x27;tick&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Moves the audio from this app. The follow is not held after it. */</span>
+<span class="a">+function seek(ms: number): void {</span>
+<span class="a">+  clock.seek(ms).then(() =&gt; {</span>
+<span class="a">+    state.held = false;</span>
+<span class="a">+    say(`Audio moved to ${clockText(ms)}.`);</span>
+<span class="a">+  }, sayError);</span>
+ }
+ 
+ const clock: ClockSource = isAndroid ? new OverlayClock(SubRead) : new LocalAudioClock(ui.audio);
+<span class="h">@@ -544,14 +573,15 @@ ui.play.addEventListener(&#x27;click&#x27;, () =&gt; {</span>
+   action.catch(sayError);
+ });
+ 
+<span class="a">+ui.followNow.addEventListener(&#x27;click&#x27;, () =&gt; runFollow(&#x27;follow&#x27;));</span>
+<span class="a">+</span>
+ ui.syncPage.addEventListener(&#x27;click&#x27;, () =&gt; {
+   const i = state.cuePages.indexOf(state.currentPage);
+   if (i &lt; 0) {
+     say(&#x27;No cue of the subtitles is on this page.&#x27;);
+     return;
+   }
+<span class="d">-  const ms = state.cues[i]!.start * 1000;</span>
+<span class="d">-  clock.seek(ms).then(() =&gt; say(`Audio moved to ${clockText(ms)}.`), sayError);</span>
+<span class="a">+  seek(state.cues[i]!.start * 1000);</span>
+ });
+ 
+ ui.audioFile.addEventListener(&#x27;change&#x27;, () =&gt; {
+diff --git a/src/style.css b/src/style.css
+index efa5215..f47e8db 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -2,6 +2,7 @@</span>
+   color-scheme: light dark;
+   font-family: system-ui, sans-serif;
+   --highlight: rgba(255, 200, 0, 0.45);
+<span class="a">+  --highlight-solid: rgb(255, 200, 0);</span>
+   --highlight-weak: rgba(120, 160, 255, 0.35);
+   --topbar: 2.75rem;
+   --panel-width: 22rem;
+<span class="h">@@ -104,6 +105,18 @@ body {</span>
+   font-variant-numeric: tabular-nums;
+ }
+ 
+<span class="a">+/* The Follow button shows while a page turn by the user holds the follow. */</span>
+<span class="a">+#topbar #follow-now {</span>
+<span class="a">+  padding: 0 0.6rem;</span>
+<span class="a">+  font-weight: 600;</span>
+<span class="a">+  color: #1a1a1a;</span>
+<span class="a">+  background: var(--highlight-solid);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#follow-note {</span>
+<span class="a">+  font-weight: 600;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /* The page jump takes the place of the page label. */
+ #page-input {
+   flex: 1 1 auto;
+<span class="h">@@ -339,7 +352,7 @@ body.zoomed #viewer {</span>
+   border-radius: 8px;
+   border: none;
+   color: #1a1a1a;
+<span class="d">-  background: rgb(255, 200, 0);</span>
+<span class="a">+  background: var(--highlight-solid);</span>
+   cursor: pointer;
+ }
+ 
+diff --git a/src/subtitles.ts b/src/subtitles.ts
+index a67e2c8..fc677ab 100644
+--- a/src/subtitles.ts
++++ b/src/subtitles.ts
+<span class="h">@@ -49,8 +49,11 @@ export function parseSubtitles(input: string): Cue[] {</span>
+   return cues;
+ }
+ 
+<span class="d">-/** Index of the cue active at time t, or -1. Cues must be sorted by start. */</span>
+<span class="d">-export function cueIndexAt(cues: readonly Cue[], t: number): number {</span>
+<span class="a">+/**</span>
+<span class="a">+ * Index of the last cue that starts at or before time t, or -1. In the</span>
+<span class="a">+ * silence after a cue, this is still that cue. Cues must be sorted by start.</span>
+<span class="a">+ */</span>
+<span class="a">+export function lastCueAt(cues: readonly Pick&lt;Cue, &#x27;start&#x27;&gt;[], t: number): number {</span>
+   let lo = 0;
+   let hi = cues.length - 1;
+   let found = -1;
+<span class="h">@@ -63,6 +66,12 @@ export function cueIndexAt(cues: readonly Cue[], t: number): number {</span>
+       hi = mid - 1;
+     }
+   }
+<span class="a">+  return found;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Index of the cue active at time t, or -1. Cues must be sorted by start. */</span>
+<span class="a">+export function cueIndexAt(cues: readonly Cue[], t: number): number {</span>
+<span class="a">+  const found = lastCueAt(cues, t);</span>
+   if (found &gt;= 0 &amp;&amp; t &lt; cues[found]!.end) return found;
+   return -1;
+ }
+diff --git a/test/follower.test.ts b/test/follower.test.ts
+index 5006a85..44d3216 100644
+--- a/test/follower.test.ts
++++ b/test/follower.test.ts
+<span class="h">@@ -1,10 +1,10 @@</span>
+ import fc from &#x27;fast-check&#x27;;
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+ import {
+<span class="d">-  cueMoved,</span>
+   follow,
+   LOOKBACK,
+   pageForCue,
+<span class="a">+  type FollowEvent,</span>
+   type FollowInput,
+   type FollowMode,
+ } from &#x27;../src/follower&#x27;;
+<span class="h">@@ -13,16 +13,27 @@ const pages: (number | null)[] = [0, 0, null, 1, 1, null, null, 2];</span>
+ 
+ function input(over: Partial&lt;FollowInput&gt;): FollowInput {
+   return {
+<span class="d">-    cuePages: pages,</span>
+     mode: &#x27;highlight&#x27;,
+     currentPage: 0,
+<span class="d">-    previousCue: -1,</span>
+     cue: 0,
+<span class="d">-    seeked: false,</span>
+<span class="a">+    matched: true,</span>
+<span class="a">+    page: 0,</span>
+<span class="a">+    held: false,</span>
+<span class="a">+    event: &#x27;tick&#x27;,</span>
+     ...over,
+   };
+ }
+ 
+<span class="a">+/** The input of the follow for cue `cue` of `cuePages`. */</span>
+<span class="a">+function at(cue: number, over: Partial&lt;FollowInput&gt; = {}): FollowInput {</span>
+<span class="a">+  return input({</span>
+<span class="a">+    cue,</span>
+<span class="a">+    matched: pages[cue] !== null &amp;&amp; pages[cue] !== undefined,</span>
+<span class="a">+    page: pageForCue(pages, cue),</span>
+<span class="a">+    ...over,</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ describe(&#x27;pageForCue&#x27;, () =&gt; {
+   it(&#x27;gives the page of a matched cue&#x27;, () =&gt; {
+     expect(pageForCue(pages, 3)).toBe(1);
+<span class="h">@@ -40,137 +51,146 @@ describe(&#x27;pageForCue&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="d">-describe(&#x27;cueMoved&#x27;, () =&gt; {</span>
+<span class="d">-  it(&#x27;is false when the new alignment keeps the page of the cue&#x27;, () =&gt; {</span>
+<span class="d">-    expect(cueMoved([0, 1, 1], [0, 1, 1], 2)).toBe(false);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;is false when only other cues change, as when a page is read in the background&#x27;, () =&gt; {</span>
+<span class="d">-    expect(cueMoved([0, 1, null, null], [0, 1, 2, 2], 1)).toBe(false);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;is true when the cue becomes matched&#x27;, () =&gt; {</span>
+<span class="d">-    expect(cueMoved([], [0, 1, 1], 1)).toBe(true);</span>
+<span class="d">-    expect(cueMoved([0, null, 1], [0, 1, 1], 1)).toBe(true);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;is true when the cue moves to another page&#x27;, () =&gt; {</span>
+<span class="d">-    expect(cueMoved([0, 1], [0, 2], 1)).toBe(true);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;is true when an unmatched cue borrows another page&#x27;, () =&gt; {</span>
+<span class="d">-    expect(cueMoved([0, null], [1, null], 1)).toBe(true);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;is false between cues&#x27;, () =&gt; {</span>
+<span class="d">-    expect(cueMoved([0], [1], -1)).toBe(false);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;is true whenever the new alignment changes what the follow does&#x27;, () =&gt; {</span>
+<span class="d">-    // Half of the cues are unmatched. The pages are few, so a change often</span>
+<span class="d">-    // gives the same page again.</span>
+<span class="d">-    const page = fc.option(fc.nat({ max: 3 }), { nil: null, freq: 2 });</span>
+<span class="d">-    const step = fc.array(page, { minLength: 1, maxLength: 30 }).chain((before) =&gt;</span>
+<span class="d">-      fc.record({</span>
+<span class="d">-        before: fc.constant(before),</span>
+<span class="d">-        cue: fc.integer({ min: -1, max: before.length - 1 }),</span>
+<span class="d">-        // Changes at the cue and in the cues that it can borrow a page from.</span>
+<span class="d">-        changes: fc.array(fc.tuple(fc.nat({ max: LOOKBACK + 1 }), page), { maxLength: 3 }),</span>
+<span class="d">-        mode: fc.constantFrom&lt;FollowMode&gt;(&#x27;highlight&#x27;, &#x27;pages&#x27;, &#x27;off&#x27;),</span>
+<span class="d">-        currentPage: fc.nat({ max: 3 }),</span>
+<span class="d">-        previousCue: fc.integer({ min: -1, max: 30 }),</span>
+<span class="d">-        seeked: fc.boolean(),</span>
+<span class="d">-      }),</span>
+<span class="d">-    );</span>
+<span class="d">-    fc.assert(</span>
+<span class="d">-      fc.property(step, ({ before, changes, ...i }) =&gt; {</span>
+<span class="d">-        const after = [...before];</span>
+<span class="d">-        for (const [back, p] of changes) if (i.cue - back &gt;= 0) after[i.cue - back] = p;</span>
+<span class="d">-        const old = follow({ ...i, cuePages: before });</span>
+<span class="d">-        const now = follow({ ...i, cuePages: after });</span>
+<span class="d">-        if (!cueMoved(before, after, i.cue)) expect(now).toEqual(old);</span>
+<span class="d">-      }),</span>
+<span class="d">-      { numRuns: 1000 },</span>
+<span class="d">-    );</span>
+<span class="d">-  });</span>
+<span class="d">-});</span>
+<span class="d">-</span>
+ describe(&#x27;follow&#x27;, () =&gt; {
+   it(&#x27;marks a matched cue and stays on its page&#x27;, () =&gt; {
+<span class="d">-    expect(follow(input({ cue: 1 }))).toEqual({ highlightCue: 1, turnToPage: null });</span>
+<span class="a">+    expect(follow(at(1))).toEqual({ highlightCue: 1, turnToPage: null, held: false });</span>
+   });
+ 
+   it(&#x27;turns to the page of a matched cue&#x27;, () =&gt; {
+<span class="d">-    expect(follow(input({ cue: 3 }))).toEqual({ highlightCue: 3, turnToPage: 1 });</span>
+<span class="a">+    expect(follow(at(3))).toEqual({ highlightCue: 3, turnToPage: 1, held: false });</span>
+   });
+ 
+   it(&#x27;turns for an unmatched cue with a matched cue before it, without a mark&#x27;, () =&gt; {
+<span class="d">-    expect(follow(input({ cue: 5, currentPage: 0 }))).toEqual({</span>
+<span class="a">+    expect(follow(at(5, { currentPage: 0 }))).toEqual({</span>
+       highlightCue: null,
+       turnToPage: 1,
+<span class="a">+      held: false,</span>
+     });
+<span class="d">-    expect(follow(input({ cue: 5, currentPage: 1 }))).toEqual({</span>
+<span class="a">+    expect(follow(at(5, { currentPage: 1 }))).toEqual({</span>
+       highlightCue: null,
+       turnToPage: null,
+<span class="a">+      held: false,</span>
+     });
+   });
+ 
+<span class="d">-  it(&#x27;does nothing for an unmatched cue with no matched cue near it&#x27;, () =&gt; {</span>
+<span class="d">-    const far = [0, ...new Array&lt;null&gt;(LOOKBACK + 1).fill(null)];</span>
+<span class="d">-    expect(follow(input({ cuePages: far, cue: far.length - 1, currentPage: 5 }))).toEqual({</span>
+<span class="a">+  it(&#x27;does nothing for a cue that has no page&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ cue: 9, matched: false, page: null, currentPage: 5 }))).toEqual({</span>
+       highlightCue: null,
+       turnToPage: null,
+<span class="a">+      held: false,</span>
+     });
+   });
+ 
+   it(&#x27;only turns pages in pages mode&#x27;, () =&gt; {
+<span class="d">-    expect(follow(input({ mode: &#x27;pages&#x27;, cue: 3 }))).toEqual({</span>
+<span class="a">+    expect(follow(at(3, { mode: &#x27;pages&#x27; }))).toEqual({</span>
+       highlightCue: null,
+       turnToPage: 1,
+<span class="a">+      held: false,</span>
+     });
+   });
+ 
+<span class="d">-  it(&#x27;does nothing when off&#x27;, () =&gt; {</span>
+<span class="d">-    expect(follow(input({ mode: &#x27;off&#x27;, cue: 3 }))).toEqual({</span>
+<span class="a">+  it(&#x27;does nothing when off, and before the first cue&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(at(3, { mode: &#x27;off&#x27; }))).toEqual({</span>
+       highlightCue: null,
+       turnToPage: null,
+<span class="a">+      held: false,</span>
+     });
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;does nothing for the same cue without a seek, and acts on a seek&#x27;, () =&gt; {</span>
+<span class="d">-    expect(follow(input({ cue: 3, previousCue: 3 }))).toEqual({</span>
+<span class="a">+    expect(follow(input({ cue: -1, page: null }))).toEqual({</span>
+       highlightCue: null,
+       turnToPage: null,
+<span class="d">-    });</span>
+<span class="d">-    expect(follow(input({ cue: 3, previousCue: 3, seeked: true }))).toEqual({</span>
+<span class="d">-      highlightCue: 3,</span>
+<span class="d">-      turnToPage: 1,</span>
+<span class="a">+      held: false,</span>
+     });
+   });
+ 
+<span class="d">-  it(&#x27;does nothing between cues&#x27;, () =&gt; {</span>
+<span class="d">-    expect(follow(input({ cue: -1 }))).toEqual({ highlightCue: null, turnToPage: null });</span>
+<span class="a">+  it(&#x27;turns again inside the same cue when the page of the audio changes&#x27;, () =&gt; {</span>
+<span class="a">+    // A cue on two pages: the page follows the time, so one cue gives two pages.</span>
+<span class="a">+    expect(follow(input({ cue: 7, page: 0, currentPage: 0 })).turnToPage).toBeNull();</span>
+<span class="a">+    expect(follow(input({ cue: 7, page: 1, currentPage: 0 })).turnToPage).toBe(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps a page that the user turned to while the audio plays on&#x27;, () =&gt; {</span>
+<span class="a">+    // The audio plays cue 1 on page 0. At 4.43 s the user turns to page 1.</span>
+<span class="a">+    // The next cue, on page 0, must not turn the page back.</span>
+<span class="a">+    let held = true;</span>
+<span class="a">+    let out = follow(at(1, { currentPage: 1, held }));</span>
+<span class="a">+    expect(out).toEqual({ highlightCue: 1, turnToPage: null, held: true });</span>
+<span class="a">+    held = out.held;</span>
+<span class="a">+    out = follow(at(2, { currentPage: 1, held }));</span>
+<span class="a">+    expect(out).toEqual({ highlightCue: null, turnToPage: null, held: true });</span>
+<span class="a">+    // A page that is read and aligned again does not end the hold either.</span>
+<span class="a">+    out = follow(at(2, { currentPage: 1, held, event: &#x27;realign&#x27; }));</span>
+<span class="a">+    expect(out.held).toBe(true);</span>
+<span class="a">+    expect(out.turnToPage).toBeNull();</span>
+<span class="a">+    // The audio reaches page 1: the hold ends, and the cue is marked.</span>
+<span class="a">+    out = follow(at(3, { currentPage: 1, held }));</span>
+<span class="a">+    expect(out).toEqual({ highlightCue: 3, turnToPage: null, held: false });</span>
+<span class="a">+    // From here the follow turns the page again.</span>
+<span class="a">+    expect(follow(at(7, { currentPage: 1, held: out.held })).turnToPage).toBe(2);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;ends the hold on a seek and on the Follow button, and turns at once&#x27;, () =&gt; {</span>
+<span class="a">+    for (const event of [&#x27;seek&#x27;, &#x27;follow&#x27;] as const) {</span>
+<span class="a">+      expect(follow(at(3, { currentPage: 0, held: true, event }))).toEqual({</span>
+<span class="a">+        highlightCue: 3,</span>
+<span class="a">+        turnToPage: 1,</span>
+<span class="a">+        held: false,</span>
+<span class="a">+      });</span>
+<span class="a">+    }</span>
+   });
+ 
+<span class="d">-  const cuePages = fc.array(fc.option(fc.nat({ max: 9 }), { nil: null }), { maxLength: 30 });</span>
+   const mode = fc.constantFrom&lt;FollowMode&gt;(&#x27;highlight&#x27;, &#x27;pages&#x27;, &#x27;off&#x27;);
+<span class="a">+  const event = fc.constantFrom&lt;FollowEvent&gt;(&#x27;tick&#x27;, &#x27;realign&#x27;, &#x27;seek&#x27;, &#x27;follow&#x27;);</span>
+   const any = fc.record({
+<span class="d">-    cuePages,</span>
+     mode,
+<span class="d">-    currentPage: fc.nat({ max: 9 }),</span>
+<span class="d">-    previousCue: fc.integer({ min: -1, max: 30 }),</span>
+<span class="a">+    currentPage: fc.nat({ max: 5 }),</span>
+     cue: fc.integer({ min: -1, max: 30 }),
+<span class="d">-    seeked: fc.boolean(),</span>
+<span class="a">+    matched: fc.boolean(),</span>
+<span class="a">+    page: fc.option(fc.nat({ max: 5 }), { nil: null }),</span>
+<span class="a">+    held: fc.boolean(),</span>
+<span class="a">+    event,</span>
+   });
+ 
+<span class="d">-  it(&#x27;never turns to a page that no cue maps to&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;never turns a page while held, without a seek or the Follow button&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(any, fc.constantFrom&lt;FollowEvent&gt;(&#x27;tick&#x27;, &#x27;realign&#x27;), (i, quiet) =&gt; {</span>
+<span class="a">+        const out = follow({ ...i, held: true, event: quiet });</span>
+<span class="a">+        if (out.held) expect(out.turnToPage).toBeNull();</span>
+<span class="a">+        // A held follow that ends without a seek ends because the audio is on the page shown.</span>
+<span class="a">+        if (!out.held) expect(i.page).toBe(i.currentPage);</span>
+<span class="a">+        expect(out.turnToPage).toBeNull();</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;ends the hold when the audio is on the page shown&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(any, (i) =&gt; {</span>
+<span class="a">+        const out = follow({ ...i, page: i.currentPage });</span>
+<span class="a">+        if (i.mode !== &#x27;off&#x27; &amp;&amp; i.cue &gt;= 0) expect(out.held).toBe(false);</span>
+<span class="a">+        expect(out.turnToPage).toBeNull();</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;ends the hold on a seek and on the Follow button&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(any, fc.constantFrom&lt;FollowEvent&gt;(&#x27;seek&#x27;, &#x27;follow&#x27;), (i, loud) =&gt; {</span>
+<span class="a">+        expect(follow({ ...i, event: loud }).held).toBe(false);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;shows the page of the audio when the follow is not held&#x27;, () =&gt; {</span>
+     fc.assert(
+       fc.property(any, (i) =&gt; {
+         const out = follow(i);
+         if (out.turnToPage !== null) {
+<span class="d">-          expect(i.cuePages).toContain(out.turnToPage);</span>
+<span class="a">+          expect(out.turnToPage).toBe(i.page);</span>
+           expect(out.turnToPage).not.toBe(i.currentPage);
+         }
+<span class="a">+        if (!out.held &amp;&amp; i.mode !== &#x27;off&#x27; &amp;&amp; i.cue &gt;= 0 &amp;&amp; i.page !== null) {</span>
+<span class="a">+          expect(out.turnToPage ?? i.currentPage).toBe(i.page);</span>
+<span class="a">+        }</span>
+       }),
+     );
+   });
+<span class="h">@@ -182,7 +202,7 @@ describe(&#x27;follow&#x27;, () =&gt; {</span>
+         if (out.highlightCue !== null) {
+           expect(out.highlightCue).toBe(i.cue);
+           expect(i.mode).toBe(&#x27;highlight&#x27;);
+<span class="d">-          expect(i.cuePages[i.cue]).not.toBeNull();</span>
+<span class="a">+          expect(i.matched).toBe(true);</span>
+         }
+       }),
+     );
+<span class="h">@@ -192,7 +212,8 @@ describe(&#x27;follow&#x27;, () =&gt; {</span>
+     fc.assert(
+       fc.property(any, (i) =&gt; {
+         const out = follow({ ...i, mode: &#x27;off&#x27; });
+<span class="d">-        expect(out).toEqual({ highlightCue: null, turnToPage: null });</span>
+<span class="a">+        expect(out.highlightCue).toBeNull();</span>
+<span class="a">+        expect(out.turnToPage).toBeNull();</span>
+         expect(follow({ ...i, mode: &#x27;pages&#x27; }).highlightCue).toBeNull();
+       }),
+     );
+diff --git a/test/subtitles.test.ts b/test/subtitles.test.ts
+index 4a39c19..e25e4ca 100644
+--- a/test/subtitles.test.ts
++++ b/test/subtitles.test.ts
+<span class="h">@@ -1,6 +1,6 @@</span>
+ import fc from &#x27;fast-check&#x27;;
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import { cueIndexAt, parseSubtitles } from &#x27;../src/subtitles&#x27;;</span>
+<span class="a">+import { cueIndexAt, lastCueAt, parseSubtitles } from &#x27;../src/subtitles&#x27;;</span>
+ 
+ const SRT = `1
+ 00:00:01,000 --&gt; 00:00:03,500
+<span class="h">@@ -81,3 +81,35 @@ describe(&#x27;cueIndexAt&#x27;, () =&gt; {</span>
+     );
+   });
+ });
+<span class="a">+</span>
+<span class="a">+describe(&#x27;lastCueAt&#x27;, () =&gt; {</span>
+<span class="a">+  const cues = [</span>
+<span class="a">+    { start: 1, end: 2 },</span>
+<span class="a">+    { start: 3, end: 4 },</span>
+<span class="a">+  ];</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the last cue that started, also in the silence after it&#x27;, () =&gt; {</span>
+<span class="a">+    expect(lastCueAt(cues, 0.5)).toBe(-1);</span>
+<span class="a">+    expect(lastCueAt(cues, 1)).toBe(0);</span>
+<span class="a">+    expect(lastCueAt(cues, 2.5)).toBe(0);</span>
+<span class="a">+    expect(lastCueAt(cues, 3)).toBe(1);</span>
+<span class="a">+    expect(lastCueAt(cues, 99)).toBe(1);</span>
+<span class="a">+    expect(lastCueAt([], 1)).toBe(-1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;agrees with a linear scan&#x27;, () =&gt; {</span>
+<span class="a">+    const starts = fc</span>
+<span class="a">+      .array(fc.nat({ max: 100 }), { maxLength: 30 })</span>
+<span class="a">+      .map((s) =&gt; s.sort((a, b) =&gt; a - b));</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(starts, fc.integer({ min: -5, max: 110 }), (sorted, t) =&gt; {</span>
+<span class="a">+        const list = sorted.map((start) =&gt; ({ start }));</span>
+<span class="a">+        let linear = -1;</span>
+<span class="a">+        list.forEach((c, i) =&gt; {</span>
+<span class="a">+          if (c.start &lt;= t) linear = i;</span>
+<span class="a">+        });</span>
+<span class="a">+        expect(lastCueAt(list, t)).toBe(linear);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

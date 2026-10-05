@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>bd-plugin-profiler/00PluginProfiler.plugin.js - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>bd-plugin-profiler</h1><span class="desc">BetterDiscord plugin that measures the main-thread time of each plugin</span><p class="url">git clone https://github.com/equwal/bd-plugin-profiler</p><p><a href="../../bd-plugin-profiler/index.html">Log</a> | <a href="../../bd-plugin-profiler/files.html">Files</a> | <a href="../../bd-plugin-profiler/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>00PluginProfiler.plugin.js (24277 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> /**
+<a id="l2" href="#l2">2</a>  * @name PluginProfiler
+<a id="l3" href="#l3">3</a>  * @description Measures the main-thread time of each plugin and shows the CPU and memory use of Discord. Open the plugin settings to see the report.
+<a id="l4" href="#l4">4</a>  * @version 1.0.0
+<a id="l5" href="#l5">5</a>  */
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> &quot;use strict&quot;;
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> const NAME = &quot;PluginProfiler&quot;;
+<a id="l10" href="#l10">10</a> const VERSION = &quot;1.0.0&quot;;
+<a id="l11" href="#l11">11</a> // BetterDiscord gives each plugin file this source URL. Old versions do not have &quot;betterdiscord/&quot;.
+<a id="l12" href="#l12">12</a> const PLUGIN_URL = /^betterdiscord:\/\/(?:betterdiscord\/)?plugins\/(.+)$/;
+<a id="l13" href="#l13">13</a> // A timer that a library makes for a plugin belongs to that plugin, not to the library.
+<a id="l14" href="#l14">14</a> const LIBRARY_FILES = new Set([&quot;0BDFDB.plugin.js&quot;, &quot;0PluginLibrary.plugin.js&quot;, &quot;1XenoLib.plugin.js&quot;]);
+<a id="l15" href="#l15">15</a> // BetterDiscord and BDFDB call these plugin methods by name, so a wrapper on the instance sees each call.
+<a id="l16" href="#l16">16</a> const INSTANCE_HOOKS = /^(observer|onSwitch|process[A-Z]\w*)$/;
+<a id="l17" href="#l17">17</a> const OBSERVERS = [
+<a id="l18" href="#l18">18</a>     [&quot;MutationObserver&quot;, &quot;mutation observer&quot;],
+<a id="l19" href="#l19">19</a>     [&quot;ResizeObserver&quot;, &quot;resize observer&quot;],
+<a id="l20" href="#l20">20</a>     [&quot;IntersectionObserver&quot;, &quot;intersection observer&quot;]
+<a id="l21" href="#l21">21</a> ];
+<a id="l22" href="#l22">22</a> const ORIGINAL = Symbol(&quot;PluginProfiler.original&quot;);
+<a id="l23" href="#l23">23</a> const SAMPLE_MS = 1000;
+<a id="l24" href="#l24">24</a> const RESCAN_EVERY = 5;
+<a id="l25" href="#l25">25</a> const MAX_SCRIPTS = 500;
+<a id="l26" href="#l26">26</a> const NOTE = &quot;The table counts synchronous work in patches, plugin hooks, timers, and observers. &quot;
+<a id="l27" href="#l27">27</a>     + &quot;Plugin time is wall time on the main thread. It includes waits for disk and for paged-out memory, so it can be more than the CPU time. &quot;
+<a id="l28" href="#l28">28</a>     + &quot;It does not count event listeners, async work, CSS, or memory per plugin. &quot;
+<a id="l29" href="#l29">29</a>     + &quot;Reload Discord (Ctrl+R) to also count the timers that plugins make when they start.&quot;;
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> /** Adds up the self time of each owner. The time of a nested call goes to the nested owner only. */
+<a id="l32" href="#l32">32</a> class Recorder {
+<a id="l33" href="#l33">33</a>     constructor(now) {
+<a id="l34" href="#l34">34</a>         this.now = now;
+<a id="l35" href="#l35">35</a>         this.active = true;
+<a id="l36" href="#l36">36</a>         this.reset();
+<a id="l37" href="#l37">37</a>     }
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a>     reset() {
+<a id="l40" href="#l40">40</a>         this.startedAt = this.now();
+<a id="l41" href="#l41">41</a>         this.owners = new Map();
+<a id="l42" href="#l42">42</a>         this.unattributedMs = 0;
+<a id="l43" href="#l43">43</a>         this.stack = [];
+<a id="l44" href="#l44">44</a>     }
+<a id="l45" href="#l45">45</a> 
+<a id="l46" href="#l46">46</a>     /** Calls fn and adds its self time to owner. A null owner marks time that no plugin owns. */
+<a id="l47" href="#l47">47</a>     run(owner, kind, fn, thisArg, args) {
+<a id="l48" href="#l48">48</a>         if (!this.active) return Reflect.apply(fn, thisArg, args);
+<a id="l49" href="#l49">49</a>         const stack = this.stack;
+<a id="l50" href="#l50">50</a>         const frame = {start: this.now(), child: 0};
+<a id="l51" href="#l51">51</a>         stack.push(frame);
+<a id="l52" href="#l52">52</a>         try {
+<a id="l53" href="#l53">53</a>             return Reflect.apply(fn, thisArg, args);
+<a id="l54" href="#l54">54</a>         }
+<a id="l55" href="#l55">55</a>         finally {
+<a id="l56" href="#l56">56</a>             const total = this.now() - frame.start;
+<a id="l57" href="#l57">57</a>             stack.pop();
+<a id="l58" href="#l58">58</a>             if (stack.length) stack[stack.length - 1].child += total;
+<a id="l59" href="#l59">59</a>             const self = total - frame.child;
+<a id="l60" href="#l60">60</a>             if (owner === null) this.unattributedMs += self;
+<a id="l61" href="#l61">61</a>             else this.add(owner, kind, self);
+<a id="l62" href="#l62">62</a>         }
+<a id="l63" href="#l63">63</a>     }
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a>     add(owner, kind, ms) {
+<a id="l66" href="#l66">66</a>         let entry = this.owners.get(owner);
+<a id="l67" href="#l67">67</a>         if (!entry) this.owners.set(owner, entry = {ms: 0, calls: 0, maxMs: 0, kinds: new Map()});
+<a id="l68" href="#l68">68</a>         entry.ms += ms;
+<a id="l69" href="#l69">69</a>         entry.calls += 1;
+<a id="l70" href="#l70">70</a>         if (ms &gt; entry.maxMs) entry.maxMs = ms;
+<a id="l71" href="#l71">71</a>         entry.kinds.set(kind, (entry.kinds.get(kind) || 0) + ms);
+<a id="l72" href="#l72">72</a>     }
+<a id="l73" href="#l73">73</a> 
+<a id="l74" href="#l74">74</a>     /** Returns one row for each owner. The row with the most CPU time is first. */
+<a id="l75" href="#l75">75</a>     rows() {
+<a id="l76" href="#l76">76</a>         const elapsed = Math.max(1, this.now() - this.startedAt);
+<a id="l77" href="#l77">77</a>         return [...this.owners].map(([name, entry]) =&gt; ({
+<a id="l78" href="#l78">78</a>             name,
+<a id="l79" href="#l79">79</a>             ms: entry.ms,
+<a id="l80" href="#l80">80</a>             calls: entry.calls,
+<a id="l81" href="#l81">81</a>             maxMs: entry.maxMs,
+<a id="l82" href="#l82">82</a>             percent: entry.ms / elapsed * 100,
+<a id="l83" href="#l83">83</a>             topKind: [...entry.kinds].sort((a, b) =&gt; b[1] - a[1])[0][0]
+<a id="l84" href="#l84">84</a>         })).sort((a, b) =&gt; b.ms - a.ms);
+<a id="l85" href="#l85">85</a>     }
+<a id="l86" href="#l86">86</a> }
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a> function timed(recorder, owner, kind, fn) {
+<a id="l89" href="#l89">89</a>     const wrapper = function (...args) {
+<a id="l90" href="#l90">90</a>         return recorder.run(owner, kind, fn, this, args);
+<a id="l91" href="#l91">91</a>     };
+<a id="l92" href="#l92">92</a>     wrapper[ORIGINAL] = fn;
+<a id="l93" href="#l93">93</a>     return wrapper;
+<a id="l94" href="#l94">94</a> }
+<a id="l95" href="#l95">95</a> 
+<a id="l96" href="#l96">96</a> /** Returns the file of each plugin frame on the stack, innermost first. */
+<a id="l97" href="#l97">97</a> function pluginFilesOnStack() {
+<a id="l98" href="#l98">98</a>     const prepare = Error.prepareStackTrace;
+<a id="l99" href="#l99">99</a>     const limit = Error.stackTraceLimit;
+<a id="l100" href="#l100">100</a>     const holder = {};
+<a id="l101" href="#l101">101</a>     let sites;
+<a id="l102" href="#l102">102</a>     try {
+<a id="l103" href="#l103">103</a>         // Call sites cost less than a formatted stack string.
+<a id="l104" href="#l104">104</a>         Error.prepareStackTrace = (_, callSites) =&gt; callSites;
+<a id="l105" href="#l105">105</a>         Error.stackTraceLimit = 40;
+<a id="l106" href="#l106">106</a>         Error.captureStackTrace(holder, pluginFilesOnStack);
+<a id="l107" href="#l107">107</a>         sites = holder.stack;
+<a id="l108" href="#l108">108</a>     }
+<a id="l109" href="#l109">109</a>     finally {
+<a id="l110" href="#l110">110</a>         Error.prepareStackTrace = prepare;
+<a id="l111" href="#l111">111</a>         Error.stackTraceLimit = limit;
+<a id="l112" href="#l112">112</a>     }
+<a id="l113" href="#l113">113</a>     const files = [];
+<a id="l114" href="#l114">114</a>     if (!Array.isArray(sites)) return files;
+<a id="l115" href="#l115">115</a>     for (const site of sites) {
+<a id="l116" href="#l116">116</a>         const match = PLUGIN_URL.exec(site.getScriptNameOrSourceURL() || &quot;&quot;);
+<a id="l117" href="#l117">117</a>         if (match) files.push(match[1]);
+<a id="l118" href="#l118">118</a>     }
+<a id="l119" href="#l119">119</a>     return files;
+<a id="l120" href="#l120">120</a> }
+<a id="l121" href="#l121">121</a> 
+<a id="l122" href="#l122">122</a> /** Picks the innermost plugin that is not a library. If only libraries are on the stack, picks the innermost library. */
+<a id="l123" href="#l123">123</a> function ownerFile(files, ownFile) {
+<a id="l124" href="#l124">124</a>     let library = null;
+<a id="l125" href="#l125">125</a>     for (const file of files) {
+<a id="l126" href="#l126">126</a>         if (file === ownFile) continue;
+<a id="l127" href="#l127">127</a>         if (!LIBRARY_FILES.has(file)) return file;
+<a id="l128" href="#l128">128</a>         if (!library) library = file;
+<a id="l129" href="#l129">129</a>     }
+<a id="l130" href="#l130">130</a>     return library;
+<a id="l131" href="#l131">131</a> }
+<a id="l132" href="#l132">132</a> 
+<a id="l133" href="#l133">133</a> function hookTimers(scope, recorder, resolveOwner, undo) {
+<a id="l134" href="#l134">134</a>     for (const name of [&quot;setTimeout&quot;, &quot;setInterval&quot;]) {
+<a id="l135" href="#l135">135</a>         const original = scope[name];
+<a id="l136" href="#l136">136</a>         if (typeof original !== &quot;function&quot;) continue;
+<a id="l137" href="#l137">137</a>         const hooked = function (handler, ...rest) {
+<a id="l138" href="#l138">138</a>             if (typeof handler === &quot;function&quot; &amp;&amp; recorder.active) {
+<a id="l139" href="#l139">139</a>                 const owner = recorder.run(NAME, &quot;stack capture&quot;, resolveOwner, null, []);
+<a id="l140" href="#l140">140</a>                 if (owner) handler = timed(recorder, owner, &quot;timer&quot;, handler);
+<a id="l141" href="#l141">141</a>             }
+<a id="l142" href="#l142">142</a>             return Reflect.apply(original, scope, [handler, ...rest]);
+<a id="l143" href="#l143">143</a>         };
+<a id="l144" href="#l144">144</a>         hooked[ORIGINAL] = original;
+<a id="l145" href="#l145">145</a>         scope[name] = hooked;
+<a id="l146" href="#l146">146</a>         undo.push(() =&gt; {
+<a id="l147" href="#l147">147</a>             if (scope[name] === hooked) scope[name] = original;
+<a id="l148" href="#l148">148</a>         });
+<a id="l149" href="#l149">149</a>     }
+<a id="l150" href="#l150">150</a> }
+<a id="l151" href="#l151">151</a> 
+<a id="l152" href="#l152">152</a> function hookObservers(scope, recorder, resolveOwner, undo) {
+<a id="l153" href="#l153">153</a>     for (const [name, kind] of OBSERVERS) {
+<a id="l154" href="#l154">154</a>         const Original = scope[name];
+<a id="l155" href="#l155">155</a>         if (typeof Original !== &quot;function&quot;) continue;
+<a id="l156" href="#l156">156</a>         const Hooked = class extends Original {
+<a id="l157" href="#l157">157</a>             constructor(callback, ...rest) {
+<a id="l158" href="#l158">158</a>                 if (typeof callback === &quot;function&quot; &amp;&amp; recorder.active) {
+<a id="l159" href="#l159">159</a>                     const owner = recorder.run(NAME, &quot;stack capture&quot;, resolveOwner, null, []);
+<a id="l160" href="#l160">160</a>                     if (owner) callback = timed(recorder, owner, kind, callback);
+<a id="l161" href="#l161">161</a>                 }
+<a id="l162" href="#l162">162</a>                 super(callback, ...rest);
+<a id="l163" href="#l163">163</a>             }
+<a id="l164" href="#l164">164</a>         };
+<a id="l165" href="#l165">165</a>         Object.defineProperty(Hooked, &quot;name&quot;, {value: name});
+<a id="l166" href="#l166">166</a>         scope[name] = Hooked;
+<a id="l167" href="#l167">167</a>         undo.push(() =&gt; {
+<a id="l168" href="#l168">168</a>             if (scope[name] === Hooked) scope[name] = Original;
+<a id="l169" href="#l169">169</a>         });
+<a id="l170" href="#l170">170</a>     }
+<a id="l171" href="#l171">171</a> }
+<a id="l172" href="#l172">172</a> 
+<a id="l173" href="#l173">173</a> /** Wraps the plugin methods that BetterDiscord and BDFDB call by name. */
+<a id="l174" href="#l174">174</a> function hookInstance(recorder, instance, owner, undo) {
+<a id="l175" href="#l175">175</a>     const seen = new Set();
+<a id="l176" href="#l176">176</a>     for (let proto = instance; proto &amp;&amp; proto !== Object.prototype; proto = Object.getPrototypeOf(proto)) {
+<a id="l177" href="#l177">177</a>         for (const key of Object.getOwnPropertyNames(proto)) {
+<a id="l178" href="#l178">178</a>             if (seen.has(key) || !INSTANCE_HOOKS.test(key)) continue;
+<a id="l179" href="#l179">179</a>             seen.add(key);
+<a id="l180" href="#l180">180</a>             const current = Object.getOwnPropertyDescriptor(proto, key).value;
+<a id="l181" href="#l181">181</a>             if (typeof current !== &quot;function&quot; || current[ORIGINAL]) continue;
+<a id="l182" href="#l182">182</a>             const wrapper = timed(recorder, owner, key.startsWith(&quot;process&quot;) ? &quot;BDFDB process&quot; : key, current);
+<a id="l183" href="#l183">183</a>             const hadOwn = proto === instance;
+<a id="l184" href="#l184">184</a>             try {
+<a id="l185" href="#l185">185</a>                 instance[key] = wrapper;
+<a id="l186" href="#l186">186</a>             }
+<a id="l187" href="#l187">187</a>             catch {
+<a id="l188" href="#l188">188</a>                 continue;
+<a id="l189" href="#l189">189</a>             }
+<a id="l190" href="#l190">190</a>             undo.push(() =&gt; {
+<a id="l191" href="#l191">191</a>                 if (instance[key] !== wrapper) return;
+<a id="l192" href="#l192">192</a>                 if (hadOwn) instance[key] = current;
+<a id="l193" href="#l193">193</a>                 else delete instance[key];
+<a id="l194" href="#l194">194</a>             });
+<a id="l195" href="#l195">195</a>         }
+<a id="l196" href="#l196">196</a>     }
+<a id="l197" href="#l197">197</a> }
+<a id="l198" href="#l198">198</a> 
+<a id="l199" href="#l199">199</a> /** Wraps the callback of one BetterDiscord patch. BetterDiscord reads the callback on each call. */
+<a id="l200" href="#l200">200</a> function wrapPatchChild(recorder, child, owner) {
+<a id="l201" href="#l201">201</a>     const original = child.callback;
+<a id="l202" href="#l202">202</a>     if (typeof original !== &quot;function&quot; || original[ORIGINAL]) return false;
+<a id="l203" href="#l203">203</a>     const kind = `patch ${child.type}`;
+<a id="l204" href="#l204">204</a>     const wrapper = child.type === &quot;instead&quot;
+<a id="l205" href="#l205">205</a>         ? function (thisObject, args, next) {
+<a id="l206" href="#l206">206</a>             // &quot;next&quot; runs the original function or the next plugin. That time is not the time of this plugin.
+<a id="l207" href="#l207">207</a>             const timedNext = typeof next === &quot;function&quot; ? timed(recorder, null, &quot;original&quot;, next) : next;
+<a id="l208" href="#l208">208</a>             return recorder.run(owner, kind, original, this, [thisObject, args, timedNext]);
+<a id="l209" href="#l209">209</a>         }
+<a id="l210" href="#l210">210</a>         : function (...args) {
+<a id="l211" href="#l211">211</a>             return recorder.run(owner, kind, original, this, args);
+<a id="l212" href="#l212">212</a>         };
+<a id="l213" href="#l213">213</a>     wrapper[ORIGINAL] = original;
+<a id="l214" href="#l214">214</a>     child.callback = wrapper;
+<a id="l215" href="#l215">215</a>     return true;
+<a id="l216" href="#l216">216</a> }
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a> function unwrapPatchChild(child) {
+<a id="l219" href="#l219">219</a>     const original = child.callback &amp;&amp; child.callback[ORIGINAL];
+<a id="l220" href="#l220">220</a>     if (original) child.callback = original;
+<a id="l221" href="#l221">221</a> }
+<a id="l222" href="#l222">222</a> 
+<a id="l223" href="#l223">223</a> /**
+<a id="l224" href="#l224">224</a>  * BDFDB puts all its plugins behind one BetterDiscord patch. It calls each plugin callback
+<a id="l225" href="#l225">225</a>  * through TimeUtils.suppress with the plugin name, so a hook there splits the time per plugin.
+<a id="l226" href="#l226">226</a>  */
+<a id="l227" href="#l227">227</a> function hookSuppress(recorder, bdfdb, canonicalName, undo) {
+<a id="l228" href="#l228">228</a>     const timeUtils = bdfdb &amp;&amp; bdfdb.TimeUtils;
+<a id="l229" href="#l229">229</a>     const original = timeUtils &amp;&amp; timeUtils.suppress;
+<a id="l230" href="#l230">230</a>     if (typeof original !== &quot;function&quot; || original[ORIGINAL]) return false;
+<a id="l231" href="#l231">231</a>     const hooked = function (callback, strings, config) {
+<a id="l232" href="#l232">232</a>         const inner = Reflect.apply(original, this, [callback, strings, config]);
+<a id="l233" href="#l233">233</a>         const name = config &amp;&amp; typeof config.name === &quot;string&quot; ? config.name : &quot;&quot;;
+<a id="l234" href="#l234">234</a>         if (!name || typeof inner !== &quot;function&quot;) return inner;
+<a id="l235" href="#l235">235</a>         // BDFDB uses the name &quot;Discord&quot; when it calls the original Discord function.
+<a id="l236" href="#l236">236</a>         return timed(recorder, name === &quot;Discord&quot; ? null : canonicalName(name), &quot;BDFDB hook&quot;, inner);
+<a id="l237" href="#l237">237</a>     };
+<a id="l238" href="#l238">238</a>     hooked[ORIGINAL] = original;
+<a id="l239" href="#l239">239</a>     timeUtils.suppress = hooked;
+<a id="l240" href="#l240">240</a>     undo.push(() =&gt; {
+<a id="l241" href="#l241">241</a>         if (timeUtils.suppress === hooked) timeUtils.suppress = original;
+<a id="l242" href="#l242">242</a>     });
+<a id="l243" href="#l243">243</a>     return true;
+<a id="l244" href="#l244">244</a> }
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a> /** Returns the names that a plugin can use as the caller of its patches. */
+<a id="l247" href="#l247">247</a> function callerNames(addon) {
+<a id="l248" href="#l248">248</a>     const names = new Set([addon.name, addon.id]);
+<a id="l249" href="#l249">249</a>     if (typeof addon.name === &quot;string&quot;) names.add(addon.name.replace(/\s+/g, &quot;&quot;));
+<a id="l250" href="#l250">250</a>     if (typeof addon.filename === &quot;string&quot;) names.add(addon.filename.replace(/\.plugin\.js$/, &quot;&quot;));
+<a id="l251" href="#l251">251</a>     try {
+<a id="l252" href="#l252">252</a>         if (addon.instance &amp;&amp; typeof addon.instance.getName === &quot;function&quot;) names.add(addon.instance.getName());
+<a id="l253" href="#l253">253</a>     }
+<a id="l254" href="#l254">254</a>     catch {
+<a id="l255" href="#l255">255</a>         // A broken getName does not stop the scan.
+<a id="l256" href="#l256">256</a>     }
+<a id="l257" href="#l257">257</a>     return [...names].filter(name =&gt; typeof name === &quot;string&quot; &amp;&amp; name);
+<a id="l258" href="#l258">258</a> }
+<a id="l259" href="#l259">259</a> 
+<a id="l260" href="#l260">260</a> function formatDuration(ms) {
+<a id="l261" href="#l261">261</a>     const seconds = Math.floor(ms / 1000);
+<a id="l262" href="#l262">262</a>     return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+<a id="l263" href="#l263">263</a> }
+<a id="l264" href="#l264">264</a> 
+<a id="l265" href="#l265">265</a> function percent(value, digits = 1) {
+<a id="l266" href="#l266">266</a>     return `${value.toFixed(digits)}%`;
+<a id="l267" href="#l267">267</a> }
+<a id="l268" href="#l268">268</a> 
+<a id="l269" href="#l269">269</a> function megabytes(bytes) {
+<a id="l270" href="#l270">270</a>     return `${(bytes / 1048576).toFixed(0)} MB`;
+<a id="l271" href="#l271">271</a> }
+<a id="l272" href="#l272">272</a> 
+<a id="l273" href="#l273">273</a> const COLUMNS = [
+<a id="l274" href="#l274">274</a>     {label: &quot;Plugin&quot;, align: &quot;left&quot;, value: row =&gt; row.name},
+<a id="l275" href="#l275">275</a>     {label: &quot;Main thread ms&quot;, align: &quot;right&quot;, value: row =&gt; row.ms.toFixed(1)},
+<a id="l276" href="#l276">276</a>     {label: &quot;% of time&quot;, align: &quot;right&quot;, value: row =&gt; row.percent.toFixed(2)},
+<a id="l277" href="#l277">277</a>     {label: &quot;Calls&quot;, align: &quot;right&quot;, value: row =&gt; String(row.calls)},
+<a id="l278" href="#l278">278</a>     {label: &quot;Worst call ms&quot;, align: &quot;right&quot;, value: row =&gt; row.maxMs.toFixed(1)},
+<a id="l279" href="#l279">279</a>     {label: &quot;Main source&quot;, align: &quot;left&quot;, value: row =&gt; row.topKind}
+<a id="l280" href="#l280">280</a> ];
+<a id="l281" href="#l281">281</a> 
+<a id="l282" href="#l282">282</a> function summaryLines(snap) {
+<a id="l283" href="#l283">283</a>     const samples = snap.samples;
+<a id="l284" href="#l284">284</a>     const frames = snap.frames;
+<a id="l285" href="#l285">285</a>     const lines = [`Session: ${formatDuration(snap.elapsedMs)}. All plugins: ${snap.pluginMs.toFixed(0)} ms on the main thread, ${percent(snap.pluginMs / snap.elapsedMs * 100, 2)} of the time.`];
+<a id="l286" href="#l286">286</a>     if (samples.count) {
+<a id="l287" href="#l287">287</a>         lines.push(`Discord CPU, all processes: now ${percent(samples.cpuNow)}, average ${percent(samples.cpuSum / samples.count)}, max ${percent(samples.cpuMax)} of one core.`);
+<a id="l288" href="#l288">288</a>         const types = [...samples.types].map(([type, sum]) =&gt; `${type} ${percent(sum / samples.count)}`).join(&quot;, &quot;);
+<a id="l289" href="#l289">289</a>         if (types) lines.push(`Average CPU by process type: ${types}.`);
+<a id="l290" href="#l290">290</a>     }
+<a id="l291" href="#l291">291</a>     else {
+<a id="l292" href="#l292">292</a>         lines.push(&quot;Discord CPU: no data yet.&quot;);
+<a id="l293" href="#l293">293</a>     }
+<a id="l294" href="#l294">294</a>     if (samples.heapNow !== null) {
+<a id="l295" href="#l295">295</a>         const blink = samples.blinkKB ? ` Blink memory: ${megabytes(samples.blinkKB * 1024)}.` : &quot;&quot;;
+<a id="l296" href="#l296">296</a>         lines.push(`Renderer JS heap: ${megabytes(samples.heapNow)} (max ${megabytes(samples.heapMax)}).${blink}`);
+<a id="l297" href="#l297">297</a>     }
+<a id="l298" href="#l298">298</a>     if (snap.framesSupported) {
+<a id="l299" href="#l299">299</a>         lines.push(`Long frames (over 50 ms): ${frames.count}, worst ${frames.worstMs.toFixed(0)} ms, blocking time ${frames.blockingMs.toFixed(0)} ms.`);
+<a id="l300" href="#l300">300</a>     }
+<a id="l301" href="#l301">301</a>     return lines;
+<a id="l302" href="#l302">302</a> }
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a> const STYLE = {
+<a id="l305" href="#l305">305</a>     root: {color: &quot;var(--text-default, var(--text-normal, #dbdee1))&quot;, fontSize: 14, lineHeight: 1.45, userSelect: &quot;text&quot;},
+<a id="l306" href="#l306">306</a>     buttons: {display: &quot;flex&quot;, gap: 8, marginBottom: 12},
+<a id="l307" href="#l307">307</a>     button: {padding: &quot;6px 14px&quot;, borderRadius: 4, border: 0, cursor: &quot;pointer&quot;, color: &quot;#fff&quot;, background: &quot;var(--button-secondary-background, #4e5058)&quot;},
+<a id="l308" href="#l308">308</a>     scroll: {overflowX: &quot;auto&quot;, marginTop: 12},
+<a id="l309" href="#l309">309</a>     table: {width: &quot;100%&quot;, borderCollapse: &quot;collapse&quot;, fontVariantNumeric: &quot;tabular-nums&quot;},
+<a id="l310" href="#l310">310</a>     th: {padding: &quot;4px 8px&quot;, fontWeight: 600, whiteSpace: &quot;nowrap&quot;, borderBottom: &quot;1px solid var(--background-modifier-accent, #4e5058)&quot;},
+<a id="l311" href="#l311">311</a>     td: {padding: &quot;4px 8px&quot;, whiteSpace: &quot;nowrap&quot;, borderBottom: &quot;1px solid var(--background-modifier-accent, #3f4147)&quot;},
+<a id="l312" href="#l312">312</a>     heading: {fontWeight: 600, marginTop: 14},
+<a id="l313" href="#l313">313</a>     note: {opacity: 0.7, fontSize: 12, marginTop: 14}
+<a id="l314" href="#l314">314</a> };
+<a id="l315" href="#l315">315</a> 
+<a id="l316" href="#l316">316</a> function Panel({plugin}) {
+<a id="l317" href="#l317">317</a>     const {createElement: h, useEffect, useState} = BdApi.React;
+<a id="l318" href="#l318">318</a>     const [, setTick] = useState(0);
+<a id="l319" href="#l319">319</a>     useEffect(() =&gt; {
+<a id="l320" href="#l320">320</a>         const id = setInterval(() =&gt; setTick(n =&gt; n + 1), SAMPLE_MS);
+<a id="l321" href="#l321">321</a>         return () =&gt; clearInterval(id);
+<a id="l322" href="#l322">322</a>     }, []);
+<a id="l323" href="#l323">323</a>     const snap = plugin.snapshot();
+<a id="l324" href="#l324">324</a>     if (!snap) return h(&quot;div&quot;, {style: STYLE.root}, &quot;Enable the plugin to start the profiler.&quot;);
+<a id="l325" href="#l325">325</a>     const cell = (column, content, base) =&gt; h(base === STYLE.th ? &quot;th&quot; : &quot;td&quot;, {key: column.label, style: {...base, textAlign: column.align}}, content);
+<a id="l326" href="#l326">326</a>     return h(&quot;div&quot;, {style: STYLE.root},
+<a id="l327" href="#l327">327</a>         h(&quot;div&quot;, {style: STYLE.buttons},
+<a id="l328" href="#l328">328</a>             h(&quot;button&quot;, {style: STYLE.button, onClick: () =&gt; { plugin.reset(); setTick(n =&gt; n + 1); }}, &quot;Reset&quot;),
+<a id="l329" href="#l329">329</a>             h(&quot;button&quot;, {style: STYLE.button, onClick: () =&gt; plugin.copyReport()}, &quot;Copy report&quot;)),
+<a id="l330" href="#l330">330</a>         summaryLines(snap).map((line, i) =&gt; h(&quot;div&quot;, {key: i}, line)),
+<a id="l331" href="#l331">331</a>         h(&quot;div&quot;, {style: STYLE.scroll},
+<a id="l332" href="#l332">332</a>             h(&quot;table&quot;, {style: STYLE.table},
+<a id="l333" href="#l333">333</a>                 h(&quot;thead&quot;, null, h(&quot;tr&quot;, null, COLUMNS.map(column =&gt; cell(column, column.label, STYLE.th)))),
+<a id="l334" href="#l334">334</a>                 h(&quot;tbody&quot;, null, snap.rows.map(row =&gt; h(&quot;tr&quot;, {key: row.name}, COLUMNS.map(column =&gt; cell(column, column.value(row), STYLE.td))))))),
+<a id="l335" href="#l335">335</a>         snap.scripts.length ? h(&quot;div&quot;, {style: STYLE.heading}, &quot;Scripts in long frames&quot;) : null,
+<a id="l336" href="#l336">336</a>         snap.scripts.map(([label, ms]) =&gt; h(&quot;div&quot;, {key: label}, `${ms.toFixed(0)} ms: ${label}`)),
+<a id="l337" href="#l337">337</a>         h(&quot;div&quot;, {style: STYLE.note}, NOTE));
+<a id="l338" href="#l338">338</a> }
+<a id="l339" href="#l339">339</a> 
+<a id="l340" href="#l340">340</a> class PluginProfiler {
+<a id="l341" href="#l341">341</a>     constructor(meta) {
+<a id="l342" href="#l342">342</a>         this.meta = meta || {};
+<a id="l343" href="#l343">343</a>         this.ownFile = this.meta.filename || pluginFilesOnStack()[0] || &quot;&quot;;
+<a id="l344" href="#l344">344</a>         this.recorder = null;
+<a id="l345" href="#l345">345</a>     }
+<a id="l346" href="#l346">346</a> 
+<a id="l347" href="#l347">347</a>     start() {
+<a id="l348" href="#l348">348</a>         const recorder = this.recorder = new Recorder(() =&gt; performance.now());
+<a id="l349" href="#l349">349</a>         this.undo = [];
+<a id="l350" href="#l350">350</a>         this.callers = new Set();
+<a id="l351" href="#l351">351</a>         this.fileOwners = new Map();
+<a id="l352" href="#l352">352</a>         this.names = new Map();
+<a id="l353" href="#l353">353</a>         this.bdfdbGlobal = null;
+<a id="l354" href="#l354">354</a>         this.ticks = 0;
+<a id="l355" href="#l355">355</a>         this.resetStats();
+<a id="l356" href="#l356">356</a>         const resolveOwner = () =&gt; {
+<a id="l357" href="#l357">357</a>             const file = ownerFile(pluginFilesOnStack(), this.ownFile);
+<a id="l358" href="#l358">358</a>             return file ? this.fileOwners.get(file) || file : null;
+<a id="l359" href="#l359">359</a>         };
+<a id="l360" href="#l360">360</a>         try {
+<a id="l361" href="#l361">361</a>             recorder.run(NAME, &quot;setup&quot;, () =&gt; {
+<a id="l362" href="#l362">362</a>                 hookTimers(window, recorder, resolveOwner, this.undo);
+<a id="l363" href="#l363">363</a>                 hookObservers(window, recorder, resolveOwner, this.undo);
+<a id="l364" href="#l364">364</a>                 this.rescan();
+<a id="l365" href="#l365">365</a>                 this.observeFrames();
+<a id="l366" href="#l366">366</a>             }, null, []);
+<a id="l367" href="#l367">367</a>         }
+<a id="l368" href="#l368">368</a>         catch (error) {
+<a id="l369" href="#l369">369</a>             // BetterDiscord does not call stop() after a failed start(), so remove the hooks here.
+<a id="l370" href="#l370">370</a>             this.stop();
+<a id="l371" href="#l371">371</a>             throw error;
+<a id="l372" href="#l372">372</a>         }
+<a id="l373" href="#l373">373</a>         this.timer = setInterval(() =&gt; recorder.run(NAME, &quot;sampling&quot;, () =&gt; this.tick(), null, []), SAMPLE_MS);
+<a id="l374" href="#l374">374</a>     }
+<a id="l375" href="#l375">375</a> 
+<a id="l376" href="#l376">376</a>     stop() {
+<a id="l377" href="#l377">377</a>         if (!this.recorder) return;
+<a id="l378" href="#l378">378</a>         clearInterval(this.timer);
+<a id="l379" href="#l379">379</a>         if (this.frameObserver) this.frameObserver.disconnect();
+<a id="l380" href="#l380">380</a>         this.frameObserver = null;
+<a id="l381" href="#l381">381</a>         this.recorder.active = false;
+<a id="l382" href="#l382">382</a>         for (const caller of this.callers) {
+<a id="l383" href="#l383">383</a>             for (const child of BdApi.Patcher.getPatchesByCaller(caller)) unwrapPatchChild(child);
+<a id="l384" href="#l384">384</a>         }
+<a id="l385" href="#l385">385</a>         while (this.undo.length) {
+<a id="l386" href="#l386">386</a>             try {
+<a id="l387" href="#l387">387</a>                 this.undo.pop()();
+<a id="l388" href="#l388">388</a>             }
+<a id="l389" href="#l389">389</a>             catch (error) {
+<a id="l390" href="#l390">390</a>                 console.error(NAME, &quot;could not remove a hook&quot;, error);
+<a id="l391" href="#l391">391</a>             }
+<a id="l392" href="#l392">392</a>         }
+<a id="l393" href="#l393">393</a>         this.recorder = null;
+<a id="l394" href="#l394">394</a>     }
+<a id="l395" href="#l395">395</a> 
+<a id="l396" href="#l396">396</a>     getSettingsPanel() {
+<a id="l397" href="#l397">397</a>         return BdApi.React.createElement(Panel, {plugin: this});
+<a id="l398" href="#l398">398</a>     }
+<a id="l399" href="#l399">399</a> 
+<a id="l400" href="#l400">400</a>     resetStats() {
+<a id="l401" href="#l401">401</a>         this.samples = {count: 0, cpuNow: 0, cpuSum: 0, cpuMax: 0, types: new Map(), heapNow: null, heapMax: 0, blinkKB: 0};
+<a id="l402" href="#l402">402</a>         this.frames = {count: 0, totalMs: 0, blockingMs: 0, worstMs: 0, scripts: new Map()};
+<a id="l403" href="#l403">403</a>     }
+<a id="l404" href="#l404">404</a> 
+<a id="l405" href="#l405">405</a>     reset() {
+<a id="l406" href="#l406">406</a>         if (!this.recorder) return;
+<a id="l407" href="#l407">407</a>         this.recorder.reset();
+<a id="l408" href="#l408">408</a>         this.resetStats();
+<a id="l409" href="#l409">409</a>     }
+<a id="l410" href="#l410">410</a> 
+<a id="l411" href="#l411">411</a>     tick() {
+<a id="l412" href="#l412">412</a>         this.ticks += 1;
+<a id="l413" href="#l413">413</a>         if (this.ticks % RESCAN_EVERY === 0) this.rescan();
+<a id="l414" href="#l414">414</a>         this.sample();
+<a id="l415" href="#l415">415</a>     }
+<a id="l416" href="#l416">416</a> 
+<a id="l417" href="#l417">417</a>     /** Finds new patches, plugin instances, and a new BDFDB. Plugins can patch at any time. */
+<a id="l418" href="#l418">418</a>     rescan() {
+<a id="l419" href="#l419">419</a>         this.fileOwners = new Map();
+<a id="l420" href="#l420">420</a>         this.names = new Map();
+<a id="l421" href="#l421">421</a>         for (const addon of BdApi.Plugins.getAll()) {
+<a id="l422" href="#l422">422</a>             if (!addon || addon.name === NAME) continue;
+<a id="l423" href="#l423">423</a>             if (addon.filename) this.fileOwners.set(addon.filename, addon.name);
+<a id="l424" href="#l424">424</a>             this.names.set(String(addon.name).toLowerCase(), addon.name);
+<a id="l425" href="#l425">425</a>             for (const caller of callerNames(addon)) {
+<a id="l426" href="#l426">426</a>                 this.callers.add(caller);
+<a id="l427" href="#l427">427</a>                 for (const child of BdApi.Patcher.getPatchesByCaller(caller)) wrapPatchChild(this.recorder, child, addon.name);
+<a id="l428" href="#l428">428</a>             }
+<a id="l429" href="#l429">429</a>             if (addon.instance) hookInstance(this.recorder, addon.instance, addon.name, this.undo);
+<a id="l430" href="#l430">430</a>         }
+<a id="l431" href="#l431">431</a>         this.hookBdfdb();
+<a id="l432" href="#l432">432</a>     }
+<a id="l433" href="#l433">433</a> 
+<a id="l434" href="#l434">434</a>     hookBdfdb() {
+<a id="l435" href="#l435">435</a>         const global = window.BDFDB_Global;
+<a id="l436" href="#l436">436</a>         if (!global || !global.loaded || global === this.bdfdbGlobal) return;
+<a id="l437" href="#l437">437</a>         this.bdfdbGlobal = global;
+<a id="l438" href="#l438">438</a>         let bdfdb;
+<a id="l439" href="#l439">439</a>         try {
+<a id="l440" href="#l440">440</a>             // buildPlugin only makes a class and returns it with the library object.
+<a id="l441" href="#l441">441</a>             bdfdb = global.PluginUtils.buildPlugin({})[1];
+<a id="l442" href="#l442">442</a>         }
+<a id="l443" href="#l443">443</a>         catch {
+<a id="l444" href="#l444">444</a>             return;
+<a id="l445" href="#l445">445</a>         }
+<a id="l446" href="#l446">446</a>         hookSuppress(this.recorder, bdfdb, name =&gt; this.names.get(name.toLowerCase()) || name, this.undo);
+<a id="l447" href="#l447">447</a>     }
+<a id="l448" href="#l448">448</a> 
+<a id="l449" href="#l449">449</a>     sample() {
+<a id="l450" href="#l450">450</a>         const samples = this.samples;
+<a id="l451" href="#l451">451</a>         const utils = window.DiscordNative &amp;&amp; window.DiscordNative.processUtils;
+<a id="l452" href="#l452">452</a>         if (utils &amp;&amp; typeof utils.getCurrentCPUUsagePercent === &quot;function&quot;) {
+<a id="l453" href="#l453">453</a>             // Discord adds up the CPU of all its processes. 100 means one full core.
+<a id="l454" href="#l454">454</a>             const cpu = Number(utils.getCurrentCPUUsagePercent());
+<a id="l455" href="#l455">455</a>             if (Number.isFinite(cpu)) {
+<a id="l456" href="#l456">456</a>                 samples.count += 1;
+<a id="l457" href="#l457">457</a>                 samples.cpuNow = cpu;
+<a id="l458" href="#l458">458</a>                 samples.cpuSum += cpu;
+<a id="l459" href="#l459">459</a>                 samples.cpuMax = Math.max(samples.cpuMax, cpu);
+<a id="l460" href="#l460">460</a>                 const types = typeof utils.getCpuUsageElectronProcessTypeDetails === &quot;function&quot; ? utils.getCpuUsageElectronProcessTypeDetails() : null;
+<a id="l461" href="#l461">461</a>                 for (const [type, detail] of Object.entries(types || {})) {
+<a id="l462" href="#l462">462</a>                     const value = Number(detail &amp;&amp; detail.percent_cpu);
+<a id="l463" href="#l463">463</a>                     if (Number.isFinite(value)) samples.types.set(type, (samples.types.get(type) || 0) + value);
+<a id="l464" href="#l464">464</a>                 }
+<a id="l465" href="#l465">465</a>             }
+<a id="l466" href="#l466">466</a>         }
+<a id="l467" href="#l467">467</a>         if (performance.memory) {
+<a id="l468" href="#l468">468</a>             samples.heapNow = performance.memory.usedJSHeapSize;
+<a id="l469" href="#l469">469</a>             samples.heapMax = Math.max(samples.heapMax, samples.heapNow);
+<a id="l470" href="#l470">470</a>         }
+<a id="l471" href="#l471">471</a>         if (utils &amp;&amp; typeof utils.getBlinkMemoryInfo === &quot;function&quot;) {
+<a id="l472" href="#l472">472</a>             const blink = utils.getBlinkMemoryInfo();
+<a id="l473" href="#l473">473</a>             if (blink &amp;&amp; Number.isFinite(blink.allocated)) samples.blinkKB = blink.allocated;
+<a id="l474" href="#l474">474</a>         }
+<a id="l475" href="#l475">475</a>     }
+<a id="l476" href="#l476">476</a> 
+<a id="l477" href="#l477">477</a>     observeFrames() {
+<a id="l478" href="#l478">478</a>         const types = typeof PerformanceObserver === &quot;function&quot; ? PerformanceObserver.supportedEntryTypes || [] : [];
+<a id="l479" href="#l479">479</a>         this.framesSupported = types.includes(&quot;long-animation-frame&quot;);
+<a id="l480" href="#l480">480</a>         if (!this.framesSupported) return;
+<a id="l481" href="#l481">481</a>         const recorder = this.recorder;
+<a id="l482" href="#l482">482</a>         this.frameObserver = new PerformanceObserver(list =&gt; recorder.run(NAME, &quot;frame stats&quot;, () =&gt; this.addFrames(list.getEntries()), null, []));
+<a id="l483" href="#l483">483</a>         this.frameObserver.observe({type: &quot;long-animation-frame&quot;});
+<a id="l484" href="#l484">484</a>     }
+<a id="l485" href="#l485">485</a> 
+<a id="l486" href="#l486">486</a>     addFrames(entries) {
+<a id="l487" href="#l487">487</a>         const frames = this.frames;
+<a id="l488" href="#l488">488</a>         for (const entry of entries) {
+<a id="l489" href="#l489">489</a>             frames.count += 1;
+<a id="l490" href="#l490">490</a>             frames.totalMs += entry.duration;
+<a id="l491" href="#l491">491</a>             frames.blockingMs += entry.blockingDuration || 0;
+<a id="l492" href="#l492">492</a>             frames.worstMs = Math.max(frames.worstMs, entry.duration);
+<a id="l493" href="#l493">493</a>             for (const script of entry.scripts || []) {
+<a id="l494" href="#l494">494</a>                 const label = this.scriptLabel(script);
+<a id="l495" href="#l495">495</a>                 if (frames.scripts.has(label) || frames.scripts.size &lt; MAX_SCRIPTS) {
+<a id="l496" href="#l496">496</a>                     frames.scripts.set(label, (frames.scripts.get(label) || 0) + script.duration);
+<a id="l497" href="#l497">497</a>                 }
+<a id="l498" href="#l498">498</a>             }
+<a id="l499" href="#l499">499</a>         }
+<a id="l500" href="#l500">500</a>     }
+<a id="l501" href="#l501">501</a> 
+<a id="l502" href="#l502">502</a>     scriptLabel(script) {
+<a id="l503" href="#l503">503</a>         const url = script.sourceURL || &quot;&quot;;
+<a id="l504" href="#l504">504</a>         const match = PLUGIN_URL.exec(url);
+<a id="l505" href="#l505">505</a>         const file = url.split(/[?#]/)[0].split(&quot;/&quot;).pop();
+<a id="l506" href="#l506">506</a>         // A URL that is not a .js file is the page itself. It can hold a channel ID, so the label does not show it.
+<a id="l507" href="#l507">507</a>         const where = match ? this.fileOwners.get(match[1]) || match[1] : /\.js$/.test(file) ? file : &quot;page&quot;;
+<a id="l508" href="#l508">508</a>         const invoker = script.sourceFunctionName || script.invoker || &quot;&quot;;
+<a id="l509" href="#l509">509</a>         const what = invoker.includes(&quot;://&quot;) ? &quot;&quot; : invoker;
+<a id="l510" href="#l510">510</a>         return what ? `${where} (${what})` : where;
+<a id="l511" href="#l511">511</a>     }
+<a id="l512" href="#l512">512</a> 
+<a id="l513" href="#l513">513</a>     snapshot() {
+<a id="l514" href="#l514">514</a>         if (!this.recorder) return null;
+<a id="l515" href="#l515">515</a>         const elapsedMs = Math.max(1, this.recorder.now() - this.recorder.startedAt);
+<a id="l516" href="#l516">516</a>         const rows = this.recorder.rows();
+<a id="l517" href="#l517">517</a>         const pluginMs = rows.filter(row =&gt; row.name !== NAME).reduce((sum, row) =&gt; sum + row.ms, 0);
+<a id="l518" href="#l518">518</a>         const scripts = [...this.frames.scripts].sort((a, b) =&gt; b[1] - a[1]).slice(0, 5);
+<a id="l519" href="#l519">519</a>         return {elapsedMs, rows, pluginMs, samples: this.samples, frames: this.frames, framesSupported: this.framesSupported, scripts};
+<a id="l520" href="#l520">520</a>     }
+<a id="l521" href="#l521">521</a> 
+<a id="l522" href="#l522">522</a>     report() {
+<a id="l523" href="#l523">523</a>         const snap = this.snapshot();
+<a id="l524" href="#l524">524</a>         if (!snap) return `${NAME}: the plugin is not running.`;
+<a id="l525" href="#l525">525</a>         const table = [COLUMNS.map(column =&gt; column.label), ...snap.rows.map(row =&gt; COLUMNS.map(column =&gt; column.value(row)))];
+<a id="l526" href="#l526">526</a>         const widths = COLUMNS.map((_, i) =&gt; Math.max(...table.map(cells =&gt; cells[i].length)));
+<a id="l527" href="#l527">527</a>         const lines = [`${NAME} ${VERSION} report`, ...summaryLines(snap), &quot;&quot;];
+<a id="l528" href="#l528">528</a>         for (const cells of table) {
+<a id="l529" href="#l529">529</a>             lines.push(cells.map((text, i) =&gt; COLUMNS[i].align === &quot;right&quot; ? text.padStart(widths[i]) : text.padEnd(widths[i])).join(&quot;  &quot;).trimEnd());
+<a id="l530" href="#l530">530</a>         }
+<a id="l531" href="#l531">531</a>         if (snap.scripts.length) {
+<a id="l532" href="#l532">532</a>             lines.push(&quot;&quot;, &quot;Scripts in long frames:&quot;);
+<a id="l533" href="#l533">533</a>             for (const [label, ms] of snap.scripts) lines.push(`${ms.toFixed(0).padStart(7)} ms  ${label}`);
+<a id="l534" href="#l534">534</a>         }
+<a id="l535" href="#l535">535</a>         lines.push(&quot;&quot;, NOTE);
+<a id="l536" href="#l536">536</a>         return lines.join(&quot;\n&quot;);
+<a id="l537" href="#l537">537</a>     }
+<a id="l538" href="#l538">538</a> 
+<a id="l539" href="#l539">539</a>     copyReport() {
+<a id="l540" href="#l540">540</a>         const text = this.report();
+<a id="l541" href="#l541">541</a>         const done = () =&gt; BdApi.UI.showToast(&quot;Profiler report copied.&quot;, {type: &quot;success&quot;});
+<a id="l542" href="#l542">542</a>         const fail = error =&gt; {
+<a id="l543" href="#l543">543</a>             console.error(NAME, &quot;could not copy the report&quot;, error);
+<a id="l544" href="#l544">544</a>             BdApi.UI.showToast(&quot;Could not copy the report. The console has the error.&quot;, {type: &quot;error&quot;});
+<a id="l545" href="#l545">545</a>         };
+<a id="l546" href="#l546">546</a>         try {
+<a id="l547" href="#l547">547</a>             const clipboard = window.DiscordNative &amp;&amp; window.DiscordNative.clipboard;
+<a id="l548" href="#l548">548</a>             if (clipboard &amp;&amp; typeof clipboard.copy === &quot;function&quot;) {
+<a id="l549" href="#l549">549</a>                 clipboard.copy(text);
+<a id="l550" href="#l550">550</a>                 done();
+<a id="l551" href="#l551">551</a>             }
+<a id="l552" href="#l552">552</a>             else {
+<a id="l553" href="#l553">553</a>                 navigator.clipboard.writeText(text).then(done, fail);
+<a id="l554" href="#l554">554</a>             }
+<a id="l555" href="#l555">555</a>         }
+<a id="l556" href="#l556">556</a>         catch (error) {
+<a id="l557" href="#l557">557</a>             fail(error);
+<a id="l558" href="#l558">558</a>         }
+<a id="l559" href="#l559">559</a>     }
+<a id="l560" href="#l560">560</a> }
+<a id="l561" href="#l561">561</a> 
+<a id="l562" href="#l562">562</a> PluginProfiler.internals = {
+<a id="l563" href="#l563">563</a>     Recorder, timed, pluginFilesOnStack, ownerFile, hookTimers, hookObservers, hookInstance,
+<a id="l564" href="#l564">564</a>     wrapPatchChild, unwrapPatchChild, hookSuppress, callerNames, ORIGINAL
+<a id="l565" href="#l565">565</a> };
+<a id="l566" href="#l566">566</a> 
+<a id="l567" href="#l567">567</a> module.exports = PluginProfiler;</pre>
+</div></body></html>

@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync 46e904b6 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 46e904b6669488ca9e309410248b07e4ae967d7c
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 18:28:17 -0700
+
+Billing API for the add-on, and a page with the terms of sale
+
+The add-on shows the plan of the account and starts payments through
+three new API calls with the token of the device:
+
+- GET /api/account gives the state of the account, the subscriptions
+  that it can start, and the payment links of the server, as JSON.
+- POST /api/checkout gives the address of a Stripe Checkout page. It
+  refuses a second subscription, so that no customer pays twice.
+- POST /api/portal gives the address of the Stripe customer portal.
+
+After a payment, Stripe sends the customer to the new page /done. The
+website does not know the sign-in of the add-on, so the page tells the
+customer to go back to the add-on.
+
+The new page /terms gives the terms of sale: the seller, what a
+customer can buy, how to cancel, and a full refund within 30 days. The
+Chrome Web Store asks for them when an add-on leads to payments. All
+pages link to it.
+
+SBM_MANAGE_URL is the page where supporters manage or cancel their
+subscription, for example the login link of the Stripe customer
+portal. The home page, the account page and the API give it together
+with the supporter link.
+
+</pre><pre> README.md      |  29 +++++++++-
+ main.go        | 164 +++++++++++++++++++++++++++++++++++++++++++++++++++------
+ pages.html     |  36 ++++++++++++-
+ server_test.go | 131 ++++++++++++++++++++++++++++++++++++++++++++-
+ stripe.go      |  16 +++---
+ 5 files changed, 348 insertions(+), 28 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 64ec000..7ec036b 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -46,10 +46,28 @@ Plain HTTP, for any client with curl.</span>
+                            body: the bookmark file
+                            200: the merged file; header Sbm-Version: &lt;new V&gt;
+     POST /api/logout       Authorization: Bearer &lt;token&gt;
+<span class="a">+    GET  /api/account      Authorization: Bearer &lt;token&gt;</span>
+<span class="a">+                           200: JSON: email; state, one sentence; plans,</span>
+<span class="a">+                           the subscriptions that the account can start,</span>
+<span class="a">+                           each with id and label; portal, true when</span>
+<span class="a">+                           /api/portal works; terms, the address of the</span>
+<span class="a">+                           terms of sale; the payment links support,</span>
+<span class="a">+                           manage, teams and teams_large, when the server</span>
+<span class="a">+                           has them</span>
+<span class="a">+    POST /api/checkout     Authorization: Bearer &lt;token&gt;; form field plan</span>
+<span class="a">+                           (an id from plans)</span>
+<span class="a">+                           200: the address of a Stripe Checkout page</span>
+<span class="a">+    POST /api/portal       Authorization: Bearer &lt;token&gt;</span>
+<span class="a">+                           200: the address of the Stripe customer portal</span>
+ 
+ Errors come as text: 401 (sign in again), 402 (the subscription or the
+<span class="d">-trial has ended), 403 (confirm the email address first), 413 (the file is</span>
+<span class="d">-larger than 4 MB), 429 (too many sign-in attempts).</span>
+<span class="a">+trial has ended), 403 (confirm the email address first), 404 (the server</span>
+<span class="a">+has no billing), 409 (a subscription exists already, or no billing exists</span>
+<span class="a">+yet), 413 (the file is larger than 4 MB), 429 (too many sign-in attempts).</span>
+<span class="a">+</span>
+<span class="a">+The add-on opens the Stripe pages in a new tab. After them, Stripe shows</span>
+<span class="a">+the page `/done` of the server, which tells the user to go back to the</span>
+<span class="a">+add-on.</span>
+ 
+     curl -d email=me@example.org --data-urlencode password=... https://sbm.subread.space/api/login
+     curl -H &quot;Authorization: Bearer $token&quot; --data-binary @bookmarks \
+<span class="h">@@ -104,6 +122,9 @@ All settings come from the environment. With Docker, put them in `.env`.</span>
+     SBM_TEAMS_LARGE_URL  the same for teams of 11 people or more
+     SBM_SUPPORT_URL page of a supporter subscription (optional): the home
+                     page and the account page link to it
+<span class="a">+    SBM_MANAGE_URL  page where supporters manage or cancel their</span>
+<span class="a">+                    subscription, such as the login link of the Stripe</span>
+<span class="a">+                    customer portal (optional, with SBM_SUPPORT_URL)</span>
+     SBM_TRIAL_DAYS  days of sync before payment, with billing on (default 30)
+     SBM_BILLING_START  date when billing starts, as 2026-10-01: accounts
+                     from before it get the full trial from that date
+<span class="h">@@ -145,6 +166,10 @@ is free for all accounts. To turn it on:</span>
+ 
+ Keep the keys out of git: put them in the environment file of the service.
+ 
+<span class="a">+The page `/terms` shows the terms of sale, for all payments of the server.</span>
+<span class="a">+The Chrome Web Store asks for them. To change them, edit the template</span>
+<span class="a">+`terms` in `pages.html`.</span>
+<span class="a">+</span>
+ ## Data
+ 
+     data/accounts.json            accounts: email, bcrypt hash, token hashes,
+diff --git a/main.go b/main.go
+index 9f4584d..8084f8a 100644
+--- a/main.go
++++ b/main.go
+<span class="h">@@ -42,11 +42,12 @@ type server struct {</span>
+ 	since   time.Time // start of billing: no trial ends before since + trial
+ 	contact string
+ 	// Payment pages, or &quot;&quot;: the pre-order of team bookmarks for up to 10
+<span class="d">-	// people, the same for 11 people or more, and a supporter subscription.</span>
+<span class="d">-	teams, teamsLarge, support string</span>
+<span class="d">-	prices                     map[string]string // plan (&quot;month&quot;, &quot;year&quot;): Stripe price ID</span>
+<span class="d">-	labels                     map[string]string // plan: price as text</span>
+<span class="d">-	limit                      limiter</span>
+<span class="a">+	// people, the same for 11 people or more, a supporter subscription, and</span>
+<span class="a">+	// the page where supporters manage or cancel their subscription.</span>
+<span class="a">+	teams, teamsLarge, support, manage string</span>
+<span class="a">+	prices                             map[string]string // plan (&quot;month&quot;, &quot;year&quot;): Stripe price ID</span>
+<span class="a">+	labels                             map[string]string // plan: price as text</span>
+<span class="a">+	limit                              limiter</span>
+ 	// mail sends an email. It is nil when the server has no SMTP server:
+ 	// then accounts need no email check.
+ 	mail func(to, subject, body string) error
+<span class="h">@@ -83,6 +84,7 @@ func main() {</span>
+ 		teams:      link(&quot;SBM_TEAMS_URL&quot;),
+ 		teamsLarge: link(&quot;SBM_TEAMS_LARGE_URL&quot;),
+ 		support:    link(&quot;SBM_SUPPORT_URL&quot;),
+<span class="a">+		manage:     link(&quot;SBM_MANAGE_URL&quot;),</span>
+ 		prices:     map[string]string{&quot;month&quot;: os.Getenv(&quot;STRIPE_PRICE_MONTH&quot;), &quot;year&quot;: os.Getenv(&quot;STRIPE_PRICE_YEAR&quot;)},
+ 		labels:     map[string]string{&quot;month&quot;: &quot;monthly&quot;, &quot;year&quot;: &quot;yearly&quot;},
+ 	}
+<span class="h">@@ -148,6 +150,7 @@ func (s *server) routes() http.Handler {</span>
+ 	m := http.NewServeMux()
+ 	m.HandleFunc(&quot;GET /{$}&quot;, s.home)
+ 	m.HandleFunc(&quot;GET /privacy&quot;, s.privacy)
+<span class="a">+	m.HandleFunc(&quot;GET /terms&quot;, s.terms)</span>
+ 	m.HandleFunc(&quot;GET /signup&quot;, s.form(&quot;signup&quot;))
+ 	m.HandleFunc(&quot;POST /signup&quot;, s.signup)
+ 	m.HandleFunc(&quot;GET /login&quot;, s.form(&quot;login&quot;))
+<span class="h">@@ -159,10 +162,14 @@ func (s *server) routes() http.Handler {</span>
+ 	m.HandleFunc(&quot;POST /account/checkout&quot;, s.checkout)
+ 	m.HandleFunc(&quot;POST /account/portal&quot;, s.portal)
+ 	m.HandleFunc(&quot;POST /account/delete&quot;, s.remove)
+<span class="a">+	m.HandleFunc(&quot;GET /done&quot;, s.done)</span>
+ 	m.HandleFunc(&quot;POST /stripe&quot;, s.webhook)
+ 	m.HandleFunc(&quot;POST /api/login&quot;, s.apiLogin)
+ 	m.HandleFunc(&quot;POST /api/logout&quot;, s.apiLogout)
+ 	m.HandleFunc(&quot;POST /api/sync&quot;, s.sync)
+<span class="a">+	m.HandleFunc(&quot;GET /api/account&quot;, s.apiAccount)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /api/checkout&quot;, s.apiCheckout)</span>
+<span class="a">+	m.HandleFunc(&quot;POST /api/portal&quot;, s.apiPortal)</span>
+ 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		h := w.Header()
+ 		h.Set(&quot;Content-Security-Policy&quot;, &quot;default-src &#x27;none&#x27;; style-src &#x27;unsafe-inline&#x27;; &quot;+
+<span class="h">@@ -181,7 +188,7 @@ func (s *server) routes() http.Handler {</span>
+ 
+ type page struct {
+ 	Title, Error, Email, State, URL, Contact string
+<span class="d">-	Teams, TeamsLarge, Support               string // addresses of payment pages</span>
+<span class="a">+	Teams, TeamsLarge, Support, Manage       string // addresses of payment pages</span>
+ 	Month, Year                              string
+ 	TrialDays                                int
+ 	Billing, CanSubscribe, Unconfirmed       bool
+<span class="h">@@ -190,7 +197,7 @@ type page struct {</span>
+ 
+ func (s *server) page(title string) page {
+ 	return page{Title: title, URL: s.site, Contact: s.contact, Billing: s.stripe != nil,
+<span class="d">-		Teams: s.teams, TeamsLarge: s.teamsLarge, Support: s.support,</span>
+<span class="a">+		Teams: s.teams, TeamsLarge: s.teamsLarge, Support: s.support, Manage: s.manage,</span>
+ 		Month: s.labels[&quot;month&quot;], Year: s.labels[&quot;year&quot;], TrialDays: int(s.trial.Hours() / 24)}
+ }
+ 
+<span class="h">@@ -214,6 +221,12 @@ func (s *server) privacy(w http.ResponseWriter, r *http.Request) {</span>
+ 	s.render(w, http.StatusOK, &quot;privacy&quot;, s.page(&quot;Privacy&quot;))
+ }
+ 
+<span class="a">+// terms shows the terms of sale. The Chrome Web Store asks for them when an</span>
+<span class="a">+// add-on leads to payments.</span>
+<span class="a">+func (s *server) terms(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;terms&quot;, s.page(&quot;Terms of sale&quot;))</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func (s *server) form(name string) http.HandlerFunc {
+ 	title := map[string]string{&quot;signup&quot;: &quot;Create an account&quot;, &quot;login&quot;: &quot;Sign in&quot;}[name]
+ 	return func(w http.ResponseWriter, r *http.Request) {
+<span class="h">@@ -420,25 +433,30 @@ func (s *server) showAccount(w http.ResponseWriter, status int, a Account, probl</span>
+ 	p := s.page(&quot;Your account&quot;)
+ 	p.Email, p.Error, p.Customer = a.Email, problem, a.Customer
+ 	p.Unconfirmed = !s.verified(a)
+<span class="a">+	p.State = s.state(a)</span>
+<span class="a">+	p.CanSubscribe = s.stripe != nil &amp;&amp; !paid(a.Status)</span>
+<span class="a">+	s.render(w, status, &quot;account&quot;, p)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// state tells in one sentence if sync works for the account, and why.</span>
+<span class="a">+func (s *server) state(a Account) string {</span>
+ 	left := s.trialLeft(a)
+ 	switch {
+ 	case s.stripe == nil:
+<span class="d">-		p.State = &quot;Sync is on.&quot;</span>
+<span class="a">+		return &quot;Sync is on.&quot;</span>
+ 	case a.Status == &quot;past_due&quot;:
+<span class="d">-		p.State = &quot;Your last payment failed. Update your card in Manage billing.&quot;</span>
+<span class="a">+		return &quot;Your last payment failed. Update your card in Manage billing.&quot;</span>
+ 	case paid(a.Status):
+<span class="d">-		p.State = &quot;Your subscription is active.&quot;</span>
+<span class="a">+		return &quot;Your subscription is active.&quot;</span>
+ 	case left &gt; 0:
+ 		days := int(left.Hours()/24) + 1
+<span class="d">-		p.State = &quot;Free trial: &quot; + strconv.Itoa(days) + &quot; days left.&quot;</span>
+ 		if days == 1 {
+<span class="d">-			p.State = &quot;Free trial: 1 day left.&quot;</span>
+<span class="a">+			return &quot;Free trial: 1 day left.&quot;</span>
+ 		}
+<span class="a">+		return &quot;Free trial: &quot; + strconv.Itoa(days) + &quot; days left.&quot;</span>
+ 	default:
+<span class="d">-		p.State = &quot;Your free trial has ended. Sync is paused until you subscribe.&quot;</span>
+<span class="a">+		return &quot;Your free trial has ended. Sync is paused until you subscribe.&quot;</span>
+ 	}
+<span class="d">-	p.CanSubscribe = s.stripe != nil &amp;&amp; !paid(a.Status)</span>
+<span class="d">-	s.render(w, status, &quot;account&quot;, p)</span>
+ }
+ 
+ func (s *server) checkout(w http.ResponseWriter, r *http.Request) {
+<span class="h">@@ -455,7 +473,7 @@ func (s *server) checkout(w http.ResponseWriter, r *http.Request) {</span>
+ 		http.Error(w, &quot;no such plan&quot;, http.StatusBadRequest)
+ 		return
+ 	}
+<span class="d">-	to, err := s.stripe.checkout(s.store.view(u), price, s.site)</span>
+<span class="a">+	to, err := s.stripe.checkout(s.store.view(u), price, s.site+&quot;/account&quot;)</span>
+ 	if err != nil {
+ 		log.Printf(&quot;checkout for %s: %v&quot;, u.ID, err)
+ 		s.showAccount(w, http.StatusBadGateway, s.store.view(u), &quot;Stripe did not answer. Try again later.&quot;)
+<span class="h">@@ -478,7 +496,7 @@ func (s *server) portal(w http.ResponseWriter, r *http.Request) {</span>
+ 		http.Redirect(w, r, &quot;/account&quot;, http.StatusSeeOther)
+ 		return
+ 	}
+<span class="d">-	to, err := s.stripe.portal(a.Customer, s.site)</span>
+<span class="a">+	to, err := s.stripe.portal(a.Customer, s.site+&quot;/account&quot;)</span>
+ 	if err != nil {
+ 		log.Printf(&quot;portal for %s: %v&quot;, u.ID, err)
+ 		s.showAccount(w, http.StatusBadGateway, a, &quot;Stripe did not answer. Try again later.&quot;)
+<span class="h">@@ -518,6 +536,13 @@ func (s *server) remove(w http.ResponseWriter, r *http.Request) {</span>
+ 	http.Redirect(w, r, &quot;/&quot;, http.StatusSeeOther)
+ }
+ 
+<span class="a">+// done is the page where Stripe sends a customer after a payment that the</span>
+<span class="a">+// add-on started. This website does not know the sign-in of the add-on, so</span>
+<span class="a">+// the page tells the customer to go back to the add-on.</span>
+<span class="a">+func (s *server) done(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;done&quot;, s.page(&quot;Back to sbm&quot;))</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // webhook takes the events of Stripe that change a subscription.
+ func (s *server) webhook(w http.ResponseWriter, r *http.Request) {
+ 	if s.stripe == nil {
+<span class="h">@@ -664,6 +689,111 @@ func (s *server) sync(w http.ResponseWriter, r *http.Request) {</span>
+ 	io.WriteString(w, text)
+ }
+ 
+<span class="a">+// accountInfo is the answer of GET /api/account: the state of the account</span>
+<span class="a">+// and the payments that it can start. The add-on shows it.</span>
+<span class="a">+type accountInfo struct {</span>
+<span class="a">+	Email      string     `json:&quot;email&quot;`</span>
+<span class="a">+	State      string     `json:&quot;state&quot;`</span>
+<span class="a">+	Plans      []planInfo `json:&quot;plans&quot;`  // subscriptions that the account can start</span>
+<span class="a">+	Portal     bool       `json:&quot;portal&quot;` // POST /api/portal works: the account is a Stripe customer</span>
+<span class="a">+	Terms      string     `json:&quot;terms&quot;`  // address of the terms of sale</span>
+<span class="a">+	Support    string     `json:&quot;support,omitempty&quot;`</span>
+<span class="a">+	Manage     string     `json:&quot;manage,omitempty&quot;`</span>
+<span class="a">+	Teams      string     `json:&quot;teams,omitempty&quot;`</span>
+<span class="a">+	TeamsLarge string     `json:&quot;teams_large,omitempty&quot;`</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+type planInfo struct {</span>
+<span class="a">+	ID    string `json:&quot;id&quot;`    // value of the form field plan of POST /api/checkout</span>
+<span class="a">+	Label string `json:&quot;label&quot;` // price as text, such as &quot;$30 a year&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func (s *server) apiAccount(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.apiUser(r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		http.Error(w, &quot;not signed in: sign in again&quot;, http.StatusUnauthorized)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	a := s.store.view(u)</span>
+<span class="a">+	info := accountInfo{Email: a.Email, State: s.state(a), Plans: []planInfo{},</span>
+<span class="a">+		Portal: s.stripe != nil &amp;&amp; a.Customer != &quot;&quot;, Terms: s.site + &quot;/terms&quot;, Support: s.support, Teams: s.teams}</span>
+<span class="a">+	if s.stripe != nil &amp;&amp; !paid(a.Status) {</span>
+<span class="a">+		for _, id := range []string{&quot;year&quot;, &quot;month&quot;} {</span>
+<span class="a">+			info.Plans = append(info.Plans, planInfo{id, s.labels[id]})</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	// As on the web pages: a link that needs another link goes without it.</span>
+<span class="a">+	if s.support != &quot;&quot; {</span>
+<span class="a">+		info.Manage = s.manage</span>
+<span class="a">+	}</span>
+<span class="a">+	if s.teams != &quot;&quot; {</span>
+<span class="a">+		info.TeamsLarge = s.teamsLarge</span>
+<span class="a">+	}</span>
+<span class="a">+	w.Header().Set(&quot;Content-Type&quot;, &quot;application/json&quot;)</span>
+<span class="a">+	json.NewEncoder(w).Encode(info)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// apiCheckout starts a subscription to the plan in the form field plan. It</span>
+<span class="a">+// gives the address of the Stripe Checkout page as text.</span>
+<span class="a">+func (s *server) apiCheckout(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	a, ok := s.apiBilling(w, r)</span>
+<span class="a">+	if !ok {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	price := s.prices[r.PostFormValue(&quot;plan&quot;)]</span>
+<span class="a">+	if price == &quot;&quot; {</span>
+<span class="a">+		http.Error(w, &quot;no such plan&quot;, http.StatusBadRequest)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if paid(a.Status) {</span>
+<span class="a">+		http.Error(w, &quot;you have a subscription already: see Manage billing&quot;, http.StatusConflict)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	to, err := s.stripe.checkout(a, price, s.site+&quot;/done&quot;)</span>
+<span class="a">+	s.sendAddress(w, a, to, err)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// apiPortal gives the address of the Stripe customer portal as text.</span>
+<span class="a">+func (s *server) apiPortal(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	a, ok := s.apiBilling(w, r)</span>
+<span class="a">+	if !ok {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if a.Customer == &quot;&quot; {</span>
+<span class="a">+		http.Error(w, &quot;you have no billing yet: subscribe first&quot;, http.StatusConflict)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	to, err := s.stripe.portal(a.Customer, s.site+&quot;/done&quot;)</span>
+<span class="a">+	s.sendAddress(w, a, to, err)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// apiBilling gives the account of a billing request. It answers the request</span>
+<span class="a">+// itself, and gives false, when it is not signed in or the server has no</span>
+<span class="a">+// billing.</span>
+<span class="a">+func (s *server) apiBilling(w http.ResponseWriter, r *http.Request) (Account, bool) {</span>
+<span class="a">+	u := s.apiUser(r)</span>
+<span class="a">+	if u == nil {</span>
+<span class="a">+		http.Error(w, &quot;not signed in: sign in again&quot;, http.StatusUnauthorized)</span>
+<span class="a">+		return Account{}, false</span>
+<span class="a">+	}</span>
+<span class="a">+	if s.stripe == nil {</span>
+<span class="a">+		http.Error(w, &quot;this server has no billing&quot;, http.StatusNotFound)</span>
+<span class="a">+		return Account{}, false</span>
+<span class="a">+	}</span>
+<span class="a">+	return s.store.view(u), true</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// sendAddress answers with the address of a Stripe page, as text.</span>
+<span class="a">+func (s *server) sendAddress(w http.ResponseWriter, a Account, to string, err error) {</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		log.Printf(&quot;billing for %s: %v&quot;, a.ID, err)</span>
+<span class="a">+		http.Error(w, &quot;Stripe did not answer: try again later&quot;, http.StatusBadGateway)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	w.Header().Set(&quot;Content-Type&quot;, &quot;text/plain; charset=utf-8&quot;)</span>
+<span class="a">+	io.WriteString(w, to+&quot;\n&quot;)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func (s *server) fail(w http.ResponseWriter, err error) {
+ 	log.Print(err)
+ 	http.Error(w, &quot;server error: try again later&quot;, http.StatusInternalServerError)
+diff --git a/pages.html b/pages.html
+index 4f83bd2..c00082f 100644
+--- a/pages.html
++++ b/pages.html
+<span class="h">@@ -33,6 +33,7 @@ button { font: inherit; padding: .4em 1em; margin: .2em .5em .2em 0; }</span>
+ &lt;footer&gt;
+ &lt;a href=&quot;https://github.com/equwal/sbm-sync&quot;&gt;Source code&lt;/a&gt; ·
+ &lt;a href=&quot;/privacy&quot;&gt;Privacy&lt;/a&gt; ·
+<span class="a">+&lt;a href=&quot;/terms&quot;&gt;Terms of sale&lt;/a&gt; ·</span>
+ &lt;a href=&quot;https://ko-fi.com/truex&quot;&gt;Support sbm on Ko-fi&lt;/a&gt;
+ &lt;/footer&gt;
+ &lt;/body&gt;
+<span class="h">@@ -40,7 +41,8 @@ button { font: inherit; padding: .4em 1em; margin: .2em .5em .2em 0; }</span>
+ {{end}}
+ 
+ {{define &quot;support&quot;}}{{with .Support}}&lt;p&gt;sbm Sync is free. To pay for the server and the work on sbm,
+<span class="d">-&lt;a href=&quot;{{.}}&quot;&gt;become a supporter&lt;/a&gt;.&lt;/p&gt;{{end}}{{end}}</span>
+<span class="a">+&lt;a href=&quot;{{.}}&quot;&gt;become a supporter&lt;/a&gt;.{{with $.Manage}} Supporters can</span>
+<span class="a">+&lt;a href=&quot;{{.}}&quot;&gt;manage or cancel&lt;/a&gt; their subscription.{{end}}&lt;/p&gt;{{end}}{{end}}</span>
+ 
+ {{define &quot;home&quot;}}{{template &quot;head&quot; .}}
+ &lt;h1&gt;Your bookmarks, the same everywhere&lt;/h1&gt;
+<span class="h">@@ -122,6 +124,38 @@ their bookmark files.&lt;/p&gt;</span>
+ &lt;p&gt;&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt;&lt;/p&gt;
+ {{template &quot;foot&quot; .}}{{end}}
+ 
+<span class="a">+{{define &quot;done&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+&lt;h1&gt;Back to sbm&lt;/h1&gt;</span>
+<span class="a">+&lt;p&gt;You can close this tab. The options page of the sbm add-on shows the new</span>
+<span class="a">+state of your account.&lt;/p&gt;</span>
+<span class="a">+&lt;p class=&quot;note&quot;&gt;&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt; on this website&lt;/p&gt;</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+<span class="a">+{{define &quot;terms&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+&lt;h1&gt;Terms of sale&lt;/h1&gt;</span>
+<span class="a">+&lt;p&gt;The operator of this sbm Sync server sells the paid plans on it,</span>
+<span class="a">+not Google, Mozilla or Stripe.{{with .Contact}} Contact: &lt;a href=&quot;mailto:{{.}}&quot;&gt;{{.}}&lt;/a&gt;.{{end}}</span>
+<span class="a">+Stripe takes the payments. This server never sees your card.&lt;/p&gt;</span>
+<span class="a">+&lt;h2&gt;What you can buy&lt;/h2&gt;</span>
+<span class="a">+&lt;ul&gt;</span>
+<span class="a">+{{if .Billing}}&lt;li&gt;Sync on this server: {{.Year}} or {{.Month}}, after a free trial of {{.TrialDays}} days.&lt;/li&gt;{{end}}</span>
+<span class="a">+{{with .Support}}&lt;li&gt;A supporter subscription. It pays for the server and the work on sbm. It adds no features.&lt;/li&gt;{{end}}</span>
+<span class="a">+{{with .Teams}}&lt;li&gt;A pre-order of team bookmarks. You pay now for a plan that comes later.&lt;/li&gt;{{end}}</span>
+<span class="a">+{{if not (or .Billing .Support .Teams)}}&lt;li&gt;Nothing: sync on this server is free.&lt;/li&gt;{{end}}</span>
+<span class="a">+&lt;/ul&gt;</span>
+<span class="a">+&lt;h2&gt;Cancel&lt;/h2&gt;</span>
+<span class="a">+&lt;p&gt;You can cancel a subscription at any time.{{if .Billing}} For sync, use</span>
+<span class="a">+Manage billing on your account page or in the add-on.{{end}}{{with .Manage}}</span>
+<span class="a">+For a supporter subscription, use &lt;a href=&quot;{{.}}&quot;&gt;this page&lt;/a&gt;.{{end}}{{with .Contact}}</span>
+<span class="a">+You can also write to &lt;a href=&quot;mailto:{{.}}&quot;&gt;{{.}}&lt;/a&gt;.{{end}} A subscription</span>
+<span class="a">+that you cancel stays active to the end of the period that you paid for.</span>
+<span class="a">+Then the charges stop.&lt;/p&gt;</span>
+<span class="a">+&lt;h2&gt;Refunds&lt;/h2&gt;</span>
+<span class="a">+&lt;p&gt;For a full refund, write {{with .Contact}}to &lt;a href=&quot;mailto:{{.}}&quot;&gt;{{.}}&lt;/a&gt;</span>
+<span class="a">+{{end}}within 30 days of a charge.{{if .Teams}} A pre-order gets a full</span>
+<span class="a">+refund at any time before the team plan starts.{{end}}&lt;/p&gt;</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+ {{define &quot;privacy&quot;}}{{template &quot;head&quot; .}}
+ &lt;h1&gt;Privacy&lt;/h1&gt;
+ &lt;p&gt;This policy is for this sbm Sync server, the sbm app for Android and the
+diff --git a/server_test.go b/server_test.go
+index 50cda29..82a5836 100644
+--- a/server_test.go
++++ b/server_test.go
+<span class="h">@@ -332,7 +332,8 @@ func TestTrialAndSubscription(t *testing.T) {</span>
+ 		t.Fatalf(&quot;checkout: %s to %q&quot;, resp.Status, resp.Header.Get(&quot;Location&quot;))
+ 	}
+ 	call := e.stripe.called(&quot;POST /v1/checkout/sessions&quot;)
+<span class="d">-	for _, want := range []string{&quot;client_reference_id=&quot; + a.ID, &quot;price%5D=price_y&quot;, &quot;customer_email=me%40example.org&quot;, &quot;mode=subscription&quot;} {</span>
+<span class="a">+	for _, want := range []string{&quot;client_reference_id=&quot; + a.ID, &quot;price%5D=price_y&quot;, &quot;customer_email=me%40example.org&quot;, &quot;mode=subscription&quot;,</span>
+<span class="a">+		&quot;success_url=&quot; + url.QueryEscape(e.web.URL+&quot;/account&quot;)} {</span>
+ 		if !strings.Contains(call, want) {
+ 			t.Errorf(&quot;checkout call %q lacks %q&quot;, call, want)
+ 		}
+<span class="h">@@ -523,6 +524,134 @@ func TestPaymentLinks(t *testing.T) {</span>
+ 	if !strings.Contains(e.body(c, &quot;/account&quot;), `&lt;a href=&quot;https://buy.stripe.com/support&quot;&gt;become a supporter&lt;/a&gt;`) {
+ 		t.Error(&quot;the account page has no supporter link&quot;)
+ 	}
+<span class="a">+	e.s.manage = &quot;https://billing.stripe.com/p/login/x&quot;</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/account&quot;), `&lt;a href=&quot;https://billing.stripe.com/p/login/x&quot;&gt;manage or cancel&lt;/a&gt;`) {</span>
+<span class="a">+		t.Error(&quot;the account page does not tell supporters where to cancel&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestTerms(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, true)</span>
+<span class="a">+	e.s.contact, e.s.support, e.s.manage = &quot;me@example.org&quot;, &quot;https://buy.stripe.com/support&quot;, &quot;https://billing.stripe.com/p/login/x&quot;</span>
+<span class="a">+	page := e.body(http.DefaultClient, &quot;/terms&quot;)</span>
+<span class="a">+	for _, want := range []string{&quot;Terms of sale&quot;, &quot;not Google&quot;, &quot;$30 a year&quot;, &quot;supporter subscription&quot;,</span>
+<span class="a">+		`&lt;a href=&quot;https://billing.stripe.com/p/login/x&quot;&gt;`, &quot;within 30 days&quot;, `&lt;a href=&quot;mailto:me@example.org&quot;&gt;`} {</span>
+<span class="a">+		if !strings.Contains(page, want) {</span>
+<span class="a">+			t.Errorf(&quot;the terms lack %q&quot;, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(http.DefaultClient, &quot;/&quot;), `&lt;a href=&quot;/terms&quot;&gt;Terms of sale&lt;/a&gt;`) {</span>
+<span class="a">+		t.Error(&quot;the home page does not link to the terms&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// api sends a request with the token of a device, as the add-on does, and</span>
+<span class="a">+// gives the status and the body of the answer.</span>
+<span class="a">+func (e *harness) api(method, token, path string, form url.Values) (int, string) {</span>
+<span class="a">+	req, _ := http.NewRequest(method, e.web.URL+path, strings.NewReader(form.Encode()))</span>
+<span class="a">+	req.Header.Set(&quot;Authorization&quot;, &quot;Bearer &quot;+token)</span>
+<span class="a">+	req.Header.Set(&quot;Content-Type&quot;, &quot;application/x-www-form-urlencoded&quot;)</span>
+<span class="a">+	resp, err := http.DefaultClient.Do(req)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	defer resp.Body.Close()</span>
+<span class="a">+	b, _ := io.ReadAll(resp.Body)</span>
+<span class="a">+	return resp.StatusCode, string(b)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestAccountAPIWithoutBilling(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	tok := e.token(&quot;me@example.org&quot;)</span>
+<span class="a">+	if code, _ := e.api(&quot;GET&quot;, &quot;wrong&quot;, &quot;/api/account&quot;, nil); code != http.StatusUnauthorized {</span>
+<span class="a">+		t.Errorf(&quot;bad token: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	start := `{&quot;email&quot;:&quot;me@example.org&quot;,&quot;state&quot;:&quot;Sync is on.&quot;,&quot;plans&quot;:[],&quot;portal&quot;:false,&quot;terms&quot;:&quot;` + e.web.URL + `/terms&quot;`</span>
+<span class="a">+	if code, body := e.api(&quot;GET&quot;, tok, &quot;/api/account&quot;, nil); code != http.StatusOK || body != start+&quot;}\n&quot; {</span>
+<span class="a">+		t.Errorf(&quot;account: %d %s&quot;, code, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	// The link for large teams needs the link for small teams, and the page</span>
+<span class="a">+	// that manages a supporter subscription needs the supporter link, as on</span>
+<span class="a">+	// the web pages.</span>
+<span class="a">+	e.s.manage, e.s.teamsLarge = &quot;https://billing.stripe.com/p/login/x&quot;, &quot;https://buy.stripe.com/large&quot;</span>
+<span class="a">+	if _, body := e.api(&quot;GET&quot;, tok, &quot;/api/account&quot;, nil); body != start+&quot;}\n&quot; {</span>
+<span class="a">+		t.Errorf(&quot;account with links that need other links: %s&quot;, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.s.support = &quot;https://buy.stripe.com/support&quot;</span>
+<span class="a">+	want := start + `,&quot;support&quot;:&quot;https://buy.stripe.com/support&quot;,&quot;manage&quot;:&quot;https://billing.stripe.com/p/login/x&quot;}` + &quot;\n&quot;</span>
+<span class="a">+	if _, body := e.api(&quot;GET&quot;, tok, &quot;/api/account&quot;, nil); body != want {</span>
+<span class="a">+		t.Errorf(&quot;account with a supporter link: %s&quot;, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.s.teams = &quot;https://buy.stripe.com/small&quot;</span>
+<span class="a">+	_, body := e.api(&quot;GET&quot;, tok, &quot;/api/account&quot;, nil)</span>
+<span class="a">+	if !strings.HasSuffix(body, `&quot;teams&quot;:&quot;https://buy.stripe.com/small&quot;,&quot;teams_large&quot;:&quot;https://buy.stripe.com/large&quot;}`+&quot;\n&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;account with team links: %s&quot;, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, path := range []string{&quot;/api/checkout&quot;, &quot;/api/portal&quot;} {</span>
+<span class="a">+		if code, _ := e.api(&quot;POST&quot;, tok, path, url.Values{&quot;plan&quot;: {&quot;year&quot;}}); code != http.StatusNotFound {</span>
+<span class="a">+			t.Errorf(&quot;%s without billing: %d&quot;, path, code)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestBillingAPI(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, true)</span>
+<span class="a">+	e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	tok := e.token(&quot;me@example.org&quot;)</span>
+<span class="a">+	a := e.s.store.byTok(tok)</span>
+<span class="a">+	terms := `&quot;terms&quot;:&quot;` + e.web.URL + `/terms&quot;`</span>
+<span class="a">+	want := `{&quot;email&quot;:&quot;me@example.org&quot;,&quot;state&quot;:&quot;Free trial: 30 days left.&quot;,` +</span>
+<span class="a">+		`&quot;plans&quot;:[{&quot;id&quot;:&quot;year&quot;,&quot;label&quot;:&quot;$30 a year&quot;},{&quot;id&quot;:&quot;month&quot;,&quot;label&quot;:&quot;$3 a month&quot;}],&quot;portal&quot;:false,` + terms + &quot;}\n&quot;</span>
+<span class="a">+	if _, body := e.api(&quot;GET&quot;, tok, &quot;/api/account&quot;, nil); body != want {</span>
+<span class="a">+		t.Errorf(&quot;account in the trial: %s&quot;, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _ := e.api(&quot;POST&quot;, &quot;wrong&quot;, &quot;/api/checkout&quot;, url.Values{&quot;plan&quot;: {&quot;year&quot;}}); code != http.StatusUnauthorized {</span>
+<span class="a">+		t.Errorf(&quot;checkout with a bad token: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _ := e.api(&quot;POST&quot;, tok, &quot;/api/checkout&quot;, url.Values{&quot;plan&quot;: {&quot;week&quot;}}); code != http.StatusBadRequest {</span>
+<span class="a">+		t.Errorf(&quot;checkout for no such plan: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _ := e.api(&quot;POST&quot;, tok, &quot;/api/portal&quot;, nil); code != http.StatusConflict {</span>
+<span class="a">+		t.Errorf(&quot;portal before a subscription: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	code, body := e.api(&quot;POST&quot;, tok, &quot;/api/checkout&quot;, url.Values{&quot;plan&quot;: {&quot;month&quot;}})</span>
+<span class="a">+	if code != http.StatusOK || body != &quot;https://checkout.stripe.test/s1\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;checkout: %d %q&quot;, code, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	// Stripe sends the customer to a page that says to go back to the add-on:</span>
+<span class="a">+	// the website does not know the add-on&#x27;s sign-in.</span>
+<span class="a">+	call := e.stripe.called(&quot;POST /v1/checkout/sessions&quot;)</span>
+<span class="a">+	for _, want := range []string{&quot;client_reference_id=&quot; + a.ID, &quot;price%5D=price_m&quot;,</span>
+<span class="a">+		&quot;success_url=&quot; + url.QueryEscape(e.web.URL+&quot;/done&quot;), &quot;cancel_url=&quot; + url.QueryEscape(e.web.URL+&quot;/done&quot;)} {</span>
+<span class="a">+		if !strings.Contains(call, want) {</span>
+<span class="a">+			t.Errorf(&quot;checkout call %q lacks %q&quot;, call, want)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(http.DefaultClient, &quot;/done&quot;), &quot;You can close this tab.&quot;) {</span>
+<span class="a">+		t.Error(&quot;the page after Stripe does not say to close it&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	now := time.Now().Unix()</span>
+<span class="a">+	e.event(now, &quot;checkout.session.completed&quot;, fmt.Sprintf(`{&quot;customer&quot;:&quot;cus_9&quot;,&quot;client_reference_id&quot;:%q}`, a.ID))</span>
+<span class="a">+	e.event(now+1, &quot;customer.subscription.created&quot;, `{&quot;customer&quot;:&quot;cus_9&quot;,&quot;status&quot;:&quot;active&quot;}`)</span>
+<span class="a">+	want = `{&quot;email&quot;:&quot;me@example.org&quot;,&quot;state&quot;:&quot;Your subscription is active.&quot;,&quot;plans&quot;:[],&quot;portal&quot;:true,` + terms + &quot;}\n&quot;</span>
+<span class="a">+	if _, body := e.api(&quot;GET&quot;, tok, &quot;/api/account&quot;, nil); body != want {</span>
+<span class="a">+		t.Errorf(&quot;account with a subscription: %s&quot;, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	// A second subscription would charge the customer twice.</span>
+<span class="a">+	if code, _ := e.api(&quot;POST&quot;, tok, &quot;/api/checkout&quot;, url.Values{&quot;plan&quot;: {&quot;year&quot;}}); code != http.StatusConflict {</span>
+<span class="a">+		t.Errorf(&quot;second checkout: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	code, body = e.api(&quot;POST&quot;, tok, &quot;/api/portal&quot;, nil)</span>
+<span class="a">+	if code != http.StatusOK || body != &quot;https://billing.stripe.test/p1\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;portal: %d %q&quot;, code, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	call = e.stripe.called(&quot;POST /v1/billing_portal/sessions&quot;)</span>
+<span class="a">+	if !strings.Contains(call, &quot;customer=cus_9&quot;) || !strings.Contains(call, &quot;return_url=&quot;+url.QueryEscape(e.web.URL+&quot;/done&quot;)) {</span>
+<span class="a">+		t.Errorf(&quot;portal call: %q&quot;, call)</span>
+<span class="a">+	}</span>
+ }
+ 
+ func TestEmailCheck(t *testing.T) {
+diff --git a/stripe.go b/stripe.go
+index 7e73a4b..02ea652 100644
+--- a/stripe.go
++++ b/stripe.go
+<span class="h">@@ -50,16 +50,17 @@ func (s *Stripe) call(method, path string, form url.Values) (map[string]any, err</span>
+ }
+ 
+ // checkout starts a Stripe Checkout session for a subscription to price and
+<span class="d">-// gives the address of its page.</span>
+<span class="d">-func (s *Stripe) checkout(a Account, price, site string) (string, error) {</span>
+<span class="a">+// gives the address of its page. After the payment, or without it, Stripe</span>
+<span class="a">+// sends the customer to back.</span>
+<span class="a">+func (s *Stripe) checkout(a Account, price, back string) (string, error) {</span>
+ 	form := url.Values{
+ 		&quot;mode&quot;:                                 {&quot;subscription&quot;},
+ 		&quot;line_items[0][price]&quot;:                 {price},
+ 		&quot;line_items[0][quantity]&quot;:              {&quot;1&quot;},
+ 		&quot;client_reference_id&quot;:                  {a.ID},
+ 		&quot;subscription_data[metadata][account]&quot;: {a.ID},
+<span class="d">-		&quot;success_url&quot;:                          {site + &quot;/account&quot;},</span>
+<span class="d">-		&quot;cancel_url&quot;:                           {site + &quot;/account&quot;},</span>
+<span class="a">+		&quot;success_url&quot;:                          {back},</span>
+<span class="a">+		&quot;cancel_url&quot;:                           {back},</span>
+ 	}
+ 	if a.Customer != &quot;&quot; {
+ 		form.Set(&quot;customer&quot;, a.Customer)
+<span class="h">@@ -78,10 +79,11 @@ func (s *Stripe) checkout(a Account, price, site string) (string, error) {</span>
+ }
+ 
+ // portal gives the address of a Stripe customer portal session, where the
+<span class="d">-// customer changes the card, sees invoices or cancels.</span>
+<span class="d">-func (s *Stripe) portal(customer, site string) (string, error) {</span>
+<span class="a">+// customer changes the card, sees invoices or cancels. The portal links</span>
+<span class="a">+// back to back.</span>
+<span class="a">+func (s *Stripe) portal(customer, back string) (string, error) {</span>
+ 	out, err := s.call(&quot;POST&quot;, &quot;/v1/billing_portal/sessions&quot;,
+<span class="d">-		url.Values{&quot;customer&quot;: {customer}, &quot;return_url&quot;: {site + &quot;/account&quot;}})</span>
+<span class="a">+		url.Values{&quot;customer&quot;: {customer}, &quot;return_url&quot;: {back}})</span>
+ 	if err != nil {
+ 		return &quot;&quot;, err
+ 	}</pre>
+</div></body></html>

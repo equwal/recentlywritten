@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sad c541e898 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sad</h1><span class="desc">sad (2f30.org simple audio daemon) with a Cygwin/OSS port on branch cygwin</span><p class="url">git clone https://github.com/equwal/sad</p><p><a href="../../sad/index.html">Log</a> | <a href="../../sad/files.html">Files</a> | <a href="../../sad/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c541e89831fc9acdac8115454d2923f0fa820fdb
+sin &lt;sin@2f30.org&gt;
+2014-12-28 20:11:12 +0000
+
+Add initial implementation of the notifier API
+
+</pre><pre> Makefile |   3 +-
+ PROTOCOL |   8 +
+ cmd.c    |  16 ++
+ notify.c | 107 +++++++++++
+ queue.h  | 648 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ sad.c    |   8 +-
+ sad.h    |  18 ++
+ 7 files changed, 805 insertions(+), 3 deletions(-)
+</pre><pre>diff --git a/Makefile b/Makefile
+index bb16556..b778bfd 100644
+--- a/Makefile
++++ b/Makefile
+<span class="h">@@ -14,6 +14,7 @@ OBJ =\</span>
+ 	fifo.o\
+ 	library.o\
+ 	mp3.o\
+<span class="a">+	notify.o\</span>
+ 	output.o\
+ 	playlist.o\
+ 	sad.o\
+<span class="h">@@ -35,7 +36,7 @@ all: $(BIN)</span>
+ $(BIN): $(OBJ)
+ 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
+ 
+<span class="d">-$(OBJ): arg.h compat.h config.h sad.h</span>
+<span class="a">+$(OBJ): arg.h compat.h config.h queue.h sad.h</span>
+ 
+ install: all
+ 	mkdir -p $(DESTDIR)$(PREFIX)/bin
+diff --git a/PROTOCOL b/PROTOCOL
+index 86cd034..06c5652 100644
+--- a/PROTOCOL
++++ b/PROTOCOL
+<span class="h">@@ -101,3 +101,11 @@ Possible states:</span>
+ 	volume: 0-100
+ 	elapsed: total time elapsed within current song in seconds
+ 	duration: total song duration in seconds
+<span class="a">+</span>
+<span class="a">+wait event-name</span>
+<span class="a">+Subscribe to the provided event.  When the event triggers, a reply will</span>
+<span class="a">+be sent back to the client.  The reply has the form:</span>
+<span class="a">+&quot;event: %s\n&quot;, eventname</span>
+<span class="a">+</span>
+<span class="a">+Events are not queued.  It is not an error to wait on the same event</span>
+<span class="a">+more than once, however, be prepared to receive a single event reply.</span>
+diff --git a/cmd.c b/cmd.c
+index 923c661..b108150 100644
+--- a/cmd.c
++++ b/cmd.c
+<span class="h">@@ -342,6 +342,21 @@ cmddisable(int fd, char *arg)</span>
+ 	dprintf(fd, &quot;OK\n&quot;);
+ }
+ 
+<span class="a">+static void</span>
+<span class="a">+cmdwait(int fd, char *arg)</span>
+<span class="a">+{</span>
+<span class="a">+	if (!arg[0]) {</span>
+<span class="a">+		dprintf(fd, &quot;ERR expected event name\n&quot;);</span>
+<span class="a">+		return;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	if (addsubscribername(fd, arg) &lt; 0) {</span>
+<span class="a">+		dprintf(fd, &quot;ERR unknown event type\n&quot;);</span>
+<span class="a">+		return;</span>
+<span class="a">+	}</span>
+<span class="a">+	dprintf(fd, &quot;OK\n&quot;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ static Cmd cmds[] = {
+ 	{ &quot;status&quot;,     cmdstatus     },
+ 	{ &quot;volume&quot;,     cmdvolume     },
+<span class="h">@@ -364,6 +379,7 @@ static Cmd cmds[] = {</span>
+ 	{ &quot;version&quot;,    cmdversion    },
+ 	{ &quot;enable&quot;,     cmdenable     },
+ 	{ &quot;disable&quot;,    cmddisable    },
+<span class="a">+	{ &quot;wait&quot;,       cmdwait       },</span>
+ };
+ 
+ /* shamelessly taken from isakmpd ui.c */
+diff --git a/notify.c b/notify.c
+new file mode 100644
+index 0000000..46f795c
+--- /dev/null
++++ b/notify.c
+<span class="h">@@ -0,0 +1,107 @@</span>
+<span class="a">+#include &lt;sys/select.h&gt;</span>
+<span class="a">+</span>
+<span class="a">+#include &lt;err.h&gt;</span>
+<span class="a">+#include &lt;limits.h&gt;</span>
+<span class="a">+#include &lt;stdio.h&gt;</span>
+<span class="a">+#include &lt;stdlib.h&gt;</span>
+<span class="a">+</span>
+<span class="a">+#include &quot;queue.h&quot;</span>
+<span class="a">+#include &quot;sad.h&quot;</span>
+<span class="a">+</span>
+<span class="a">+Eventdesc Eventmap[] = {</span>
+<span class="a">+	{ EVSONGFINISHED, &quot;songfinished&quot; },</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+struct subscriber {</span>
+<span class="a">+	int clifd;</span>
+<span class="a">+	int event;</span>
+<span class="a">+	TAILQ_ENTRY(subscriber) entry;</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+<span class="a">+static TAILQ_HEAD(subscribers, subscriber) subscribers;</span>
+<span class="a">+</span>
+<span class="a">+int</span>
+<span class="a">+initnotifier(void)</span>
+<span class="a">+{</span>
+<span class="a">+	TAILQ_INIT(&amp;subscribers);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+int</span>
+<span class="a">+addsubscriber(int clifd, int event)</span>
+<span class="a">+{</span>
+<span class="a">+	struct subscriber *s;</span>
+<span class="a">+	int    i;</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; LEN(Eventmap); i++)</span>
+<span class="a">+		if (Eventmap[i].event == event)</span>
+<span class="a">+			break;</span>
+<span class="a">+	if (i == LEN(Eventmap))</span>
+<span class="a">+		return -1;</span>
+<span class="a">+</span>
+<span class="a">+	TAILQ_FOREACH(s, &amp;subscribers, entry)</span>
+<span class="a">+		if (s-&gt;clifd == clifd &amp;&amp;</span>
+<span class="a">+		    s-&gt;event == event)</span>
+<span class="a">+			return 0; /* do not queue events */</span>
+<span class="a">+</span>
+<span class="a">+	s = malloc(sizeof(*s));</span>
+<span class="a">+	if (!s)</span>
+<span class="a">+		err(1, &quot;malloc&quot;);</span>
+<span class="a">+</span>
+<span class="a">+	s-&gt;clifd = clifd;</span>
+<span class="a">+	s-&gt;event = event;</span>
+<span class="a">+	TAILQ_INSERT_TAIL(&amp;subscribers, s, entry);</span>
+<span class="a">+</span>
+<span class="a">+	return 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+int</span>
+<span class="a">+addsubscribername(int clifd, const char *name)</span>
+<span class="a">+{</span>
+<span class="a">+	int i;</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; LEN(Eventmap); i++)</span>
+<span class="a">+		if (!strcmp(Eventmap[i].name, name))</span>
+<span class="a">+			return addsubscriber(clifd, Eventmap[i].event);</span>
+<span class="a">+	return -1;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+int</span>
+<span class="a">+notify(int event)</span>
+<span class="a">+{</span>
+<span class="a">+	struct subscriber *s, *tmp;</span>
+<span class="a">+	int    i;</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; LEN(Eventmap); i++)</span>
+<span class="a">+		if (Eventmap[i].event == event)</span>
+<span class="a">+			break;</span>
+<span class="a">+	if (i == LEN(Eventmap))</span>
+<span class="a">+		return -1;</span>
+<span class="a">+</span>
+<span class="a">+	TAILQ_FOREACH_SAFE(s, &amp;subscribers, entry, tmp) {</span>
+<span class="a">+		if (s-&gt;event != event)</span>
+<span class="a">+			continue;</span>
+<span class="a">+		for (i = 0; i &lt; LEN(Eventmap); i++) {</span>
+<span class="a">+			if (Eventmap[i].event == s-&gt;event) {</span>
+<span class="a">+				dprintf(s-&gt;clifd, &quot;event: %s\n&quot;, Eventmap[i].name);</span>
+<span class="a">+				dprintf(s-&gt;clifd, &quot;OK\n&quot;);</span>
+<span class="a">+				TAILQ_REMOVE(&amp;subscribers, s, entry);</span>
+<span class="a">+				free(s);</span>
+<span class="a">+				break;</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+void</span>
+<span class="a">+removesubscriber(int clifd)</span>
+<span class="a">+{</span>
+<span class="a">+	struct subscriber *s, *tmp;</span>
+<span class="a">+</span>
+<span class="a">+	TAILQ_FOREACH_SAFE(s, &amp;subscribers, entry, tmp) {</span>
+<span class="a">+		if (s-&gt;clifd == clifd) {</span>
+<span class="a">+			TAILQ_REMOVE(&amp;subscribers, s, entry);</span>
+<span class="a">+			free(s);</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+diff --git a/queue.h b/queue.h
+new file mode 100644
+index 0000000..f8f09bf
+--- /dev/null
++++ b/queue.h
+<span class="h">@@ -0,0 +1,648 @@</span>
+<span class="a">+/*	$OpenBSD: queue.h,v 1.38 2013/07/03 15:05:21 fgsch Exp $	*/</span>
+<span class="a">+/*	$NetBSD: queue.h,v 1.11 1996/05/16 05:17:14 mycroft Exp $	*/</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Copyright (c) 1991, 1993</span>
+<span class="a">+ *	The Regents of the University of California.  All rights reserved.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Redistribution and use in source and binary forms, with or without</span>
+<span class="a">+ * modification, are permitted provided that the following conditions</span>
+<span class="a">+ * are met:</span>
+<span class="a">+ * 1. Redistributions of source code must retain the above copyright</span>
+<span class="a">+ *    notice, this list of conditions and the following disclaimer.</span>
+<span class="a">+ * 2. Redistributions in binary form must reproduce the above copyright</span>
+<span class="a">+ *    notice, this list of conditions and the following disclaimer in the</span>
+<span class="a">+ *    documentation and/or other materials provided with the distribution.</span>
+<span class="a">+ * 3. Neither the name of the University nor the names of its contributors</span>
+<span class="a">+ *    may be used to endorse or promote products derived from this software</span>
+<span class="a">+ *    without specific prior written permission.</span>
+<span class="a">+ *</span>
+<span class="a">+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS&#x27;&#x27; AND</span>
+<span class="a">+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE</span>
+<span class="a">+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE</span>
+<span class="a">+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE</span>
+<span class="a">+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL</span>
+<span class="a">+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS</span>
+<span class="a">+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)</span>
+<span class="a">+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT</span>
+<span class="a">+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY</span>
+<span class="a">+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF</span>
+<span class="a">+ * SUCH DAMAGE.</span>
+<span class="a">+ *</span>
+<span class="a">+ *	@(#)queue.h	8.5 (Berkeley) 8/20/94</span>
+<span class="a">+ */</span>
+<span class="a">+</span>
+<span class="a">+#ifndef	_SYS_QUEUE_H_</span>
+<span class="a">+#define	_SYS_QUEUE_H_</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * This file defines five types of data structures: singly-linked lists, </span>
+<span class="a">+ * lists, simple queues, tail queues, and circular queues.</span>
+<span class="a">+ *</span>
+<span class="a">+ *</span>
+<span class="a">+ * A singly-linked list is headed by a single forward pointer. The elements</span>
+<span class="a">+ * are singly linked for minimum space and pointer manipulation overhead at</span>
+<span class="a">+ * the expense of O(n) removal for arbitrary elements. New elements can be</span>
+<span class="a">+ * added to the list after an existing element or at the head of the list.</span>
+<span class="a">+ * Elements being removed from the head of the list should use the explicit</span>
+<span class="a">+ * macro for this purpose for optimum efficiency. A singly-linked list may</span>
+<span class="a">+ * only be traversed in the forward direction.  Singly-linked lists are ideal</span>
+<span class="a">+ * for applications with large datasets and few or no removals or for</span>
+<span class="a">+ * implementing a LIFO queue.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A list is headed by a single forward pointer (or an array of forward</span>
+<span class="a">+ * pointers for a hash table header). The elements are doubly linked</span>
+<span class="a">+ * so that an arbitrary element can be removed without a need to</span>
+<span class="a">+ * traverse the list. New elements can be added to the list before</span>
+<span class="a">+ * or after an existing element or at the head of the list. A list</span>
+<span class="a">+ * may only be traversed in the forward direction.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A simple queue is headed by a pair of pointers, one the head of the</span>
+<span class="a">+ * list and the other to the tail of the list. The elements are singly</span>
+<span class="a">+ * linked to save space, so elements can only be removed from the</span>
+<span class="a">+ * head of the list. New elements can be added to the list before or after</span>
+<span class="a">+ * an existing element, at the head of the list, or at the end of the</span>
+<span class="a">+ * list. A simple queue may only be traversed in the forward direction.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A tail queue is headed by a pair of pointers, one to the head of the</span>
+<span class="a">+ * list and the other to the tail of the list. The elements are doubly</span>
+<span class="a">+ * linked so that an arbitrary element can be removed without a need to</span>
+<span class="a">+ * traverse the list. New elements can be added to the list before or</span>
+<span class="a">+ * after an existing element, at the head of the list, or at the end of</span>
+<span class="a">+ * the list. A tail queue may be traversed in either direction.</span>
+<span class="a">+ *</span>
+<span class="a">+ * A circle queue is headed by a pair of pointers, one to the head of the</span>
+<span class="a">+ * list and the other to the tail of the list. The elements are doubly</span>
+<span class="a">+ * linked so that an arbitrary element can be removed without a need to</span>
+<span class="a">+ * traverse the list. New elements can be added to the list before or after</span>
+<span class="a">+ * an existing element, at the head of the list, or at the end of the list.</span>
+<span class="a">+ * A circle queue may be traversed in either direction, but has a more</span>
+<span class="a">+ * complex end of list detection.</span>
+<span class="a">+ *</span>
+<span class="a">+ * For details on the use of these macros, see the queue(3) manual page.</span>
+<span class="a">+ */</span>
+<span class="a">+</span>
+<span class="a">+#if defined(QUEUE_MACRO_DEBUG) || (defined(_KERNEL) &amp;&amp; defined(DIAGNOSTIC))</span>
+<span class="a">+#define _Q_INVALIDATE(a) (a) = ((void *)-1)</span>
+<span class="a">+#else</span>
+<span class="a">+#define _Q_INVALIDATE(a)</span>
+<span class="a">+#endif</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Singly-linked List definitions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define SLIST_HEAD(name, type)						\</span>
+<span class="a">+struct name {								\</span>
+<span class="a">+	struct type *slh_first;	/* first element */			\</span>
+<span class="a">+}</span>
+<span class="a">+ </span>
+<span class="a">+#define	SLIST_HEAD_INITIALIZER(head)					\</span>
+<span class="a">+	{ NULL }</span>
+<span class="a">+ </span>
+<span class="a">+#define SLIST_ENTRY(type)						\</span>
+<span class="a">+struct {								\</span>
+<span class="a">+	struct type *sle_next;	/* next element */			\</span>
+<span class="a">+}</span>
+<span class="a">+ </span>
+<span class="a">+/*</span>
+<span class="a">+ * Singly-linked List access methods.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	SLIST_FIRST(head)	((head)-&gt;slh_first)</span>
+<span class="a">+#define	SLIST_END(head)		NULL</span>
+<span class="a">+#define	SLIST_EMPTY(head)	(SLIST_FIRST(head) == SLIST_END(head))</span>
+<span class="a">+#define	SLIST_NEXT(elm, field)	((elm)-&gt;field.sle_next)</span>
+<span class="a">+</span>
+<span class="a">+#define	SLIST_FOREACH(var, head, field)					\</span>
+<span class="a">+	for((var) = SLIST_FIRST(head);					\</span>
+<span class="a">+	    (var) != SLIST_END(head);					\</span>
+<span class="a">+	    (var) = SLIST_NEXT(var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	SLIST_FOREACH_SAFE(var, head, field, tvar)			\</span>
+<span class="a">+	for ((var) = SLIST_FIRST(head);				\</span>
+<span class="a">+	    (var) &amp;&amp; ((tvar) = SLIST_NEXT(var, field), 1);		\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Singly-linked List functions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	SLIST_INIT(head) {						\</span>
+<span class="a">+	SLIST_FIRST(head) = SLIST_END(head);				\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define	SLIST_INSERT_AFTER(slistelm, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.sle_next = (slistelm)-&gt;field.sle_next;		\</span>
+<span class="a">+	(slistelm)-&gt;field.sle_next = (elm);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define	SLIST_INSERT_HEAD(head, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.sle_next = (head)-&gt;slh_first;			\</span>
+<span class="a">+	(head)-&gt;slh_first = (elm);					\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define	SLIST_REMOVE_AFTER(elm, field) do {				\</span>
+<span class="a">+	(elm)-&gt;field.sle_next = (elm)-&gt;field.sle_next-&gt;field.sle_next;	\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define	SLIST_REMOVE_HEAD(head, field) do {				\</span>
+<span class="a">+	(head)-&gt;slh_first = (head)-&gt;slh_first-&gt;field.sle_next;		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define SLIST_REMOVE(head, elm, type, field) do {			\</span>
+<span class="a">+	if ((head)-&gt;slh_first == (elm)) {				\</span>
+<span class="a">+		SLIST_REMOVE_HEAD((head), field);			\</span>
+<span class="a">+	} else {							\</span>
+<span class="a">+		struct type *curelm = (head)-&gt;slh_first;		\</span>
+<span class="a">+									\</span>
+<span class="a">+		while (curelm-&gt;field.sle_next != (elm))			\</span>
+<span class="a">+			curelm = curelm-&gt;field.sle_next;		\</span>
+<span class="a">+		curelm-&gt;field.sle_next =				\</span>
+<span class="a">+		    curelm-&gt;field.sle_next-&gt;field.sle_next;		\</span>
+<span class="a">+		_Q_INVALIDATE((elm)-&gt;field.sle_next);			\</span>
+<span class="a">+	}								\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * List definitions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define LIST_HEAD(name, type)						\</span>
+<span class="a">+struct name {								\</span>
+<span class="a">+	struct type *lh_first;	/* first element */			\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_HEAD_INITIALIZER(head)					\</span>
+<span class="a">+	{ NULL }</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_ENTRY(type)						\</span>
+<span class="a">+struct {								\</span>
+<span class="a">+	struct type *le_next;	/* next element */			\</span>
+<span class="a">+	struct type **le_prev;	/* address of previous next element */	\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * List access methods</span>
+<span class="a">+ */</span>
+<span class="a">+#define	LIST_FIRST(head)		((head)-&gt;lh_first)</span>
+<span class="a">+#define	LIST_END(head)			NULL</span>
+<span class="a">+#define	LIST_EMPTY(head)		(LIST_FIRST(head) == LIST_END(head))</span>
+<span class="a">+#define	LIST_NEXT(elm, field)		((elm)-&gt;field.le_next)</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_FOREACH(var, head, field)					\</span>
+<span class="a">+	for((var) = LIST_FIRST(head);					\</span>
+<span class="a">+	    (var)!= LIST_END(head);					\</span>
+<span class="a">+	    (var) = LIST_NEXT(var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	LIST_FOREACH_SAFE(var, head, field, tvar)			\</span>
+<span class="a">+	for ((var) = LIST_FIRST(head);				\</span>
+<span class="a">+	    (var) &amp;&amp; ((tvar) = LIST_NEXT(var, field), 1);		\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * List functions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	LIST_INIT(head) do {						\</span>
+<span class="a">+	LIST_FIRST(head) = LIST_END(head);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_INSERT_AFTER(listelm, elm, field) do {			\</span>
+<span class="a">+	if (((elm)-&gt;field.le_next = (listelm)-&gt;field.le_next) != NULL)	\</span>
+<span class="a">+		(listelm)-&gt;field.le_next-&gt;field.le_prev =		\</span>
+<span class="a">+		    &amp;(elm)-&gt;field.le_next;				\</span>
+<span class="a">+	(listelm)-&gt;field.le_next = (elm);				\</span>
+<span class="a">+	(elm)-&gt;field.le_prev = &amp;(listelm)-&gt;field.le_next;		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define	LIST_INSERT_BEFORE(listelm, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.le_prev = (listelm)-&gt;field.le_prev;		\</span>
+<span class="a">+	(elm)-&gt;field.le_next = (listelm);				\</span>
+<span class="a">+	*(listelm)-&gt;field.le_prev = (elm);				\</span>
+<span class="a">+	(listelm)-&gt;field.le_prev = &amp;(elm)-&gt;field.le_next;		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_INSERT_HEAD(head, elm, field) do {				\</span>
+<span class="a">+	if (((elm)-&gt;field.le_next = (head)-&gt;lh_first) != NULL)		\</span>
+<span class="a">+		(head)-&gt;lh_first-&gt;field.le_prev = &amp;(elm)-&gt;field.le_next;\</span>
+<span class="a">+	(head)-&gt;lh_first = (elm);					\</span>
+<span class="a">+	(elm)-&gt;field.le_prev = &amp;(head)-&gt;lh_first;			\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_REMOVE(elm, field) do {					\</span>
+<span class="a">+	if ((elm)-&gt;field.le_next != NULL)				\</span>
+<span class="a">+		(elm)-&gt;field.le_next-&gt;field.le_prev =			\</span>
+<span class="a">+		    (elm)-&gt;field.le_prev;				\</span>
+<span class="a">+	*(elm)-&gt;field.le_prev = (elm)-&gt;field.le_next;			\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.le_prev);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.le_next);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define LIST_REPLACE(elm, elm2, field) do {				\</span>
+<span class="a">+	if (((elm2)-&gt;field.le_next = (elm)-&gt;field.le_next) != NULL)	\</span>
+<span class="a">+		(elm2)-&gt;field.le_next-&gt;field.le_prev =			\</span>
+<span class="a">+		    &amp;(elm2)-&gt;field.le_next;				\</span>
+<span class="a">+	(elm2)-&gt;field.le_prev = (elm)-&gt;field.le_prev;			\</span>
+<span class="a">+	*(elm2)-&gt;field.le_prev = (elm2);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.le_prev);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.le_next);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Simple queue definitions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define SIMPLEQ_HEAD(name, type)					\</span>
+<span class="a">+struct name {								\</span>
+<span class="a">+	struct type *sqh_first;	/* first element */			\</span>
+<span class="a">+	struct type **sqh_last;	/* addr of last next element */		\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_HEAD_INITIALIZER(head)					\</span>
+<span class="a">+	{ NULL, &amp;(head).sqh_first }</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_ENTRY(type)						\</span>
+<span class="a">+struct {								\</span>
+<span class="a">+	struct type *sqe_next;	/* next element */			\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Simple queue access methods.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	SIMPLEQ_FIRST(head)	    ((head)-&gt;sqh_first)</span>
+<span class="a">+#define	SIMPLEQ_END(head)	    NULL</span>
+<span class="a">+#define	SIMPLEQ_EMPTY(head)	    (SIMPLEQ_FIRST(head) == SIMPLEQ_END(head))</span>
+<span class="a">+#define	SIMPLEQ_NEXT(elm, field)    ((elm)-&gt;field.sqe_next)</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_FOREACH(var, head, field)				\</span>
+<span class="a">+	for((var) = SIMPLEQ_FIRST(head);				\</span>
+<span class="a">+	    (var) != SIMPLEQ_END(head);					\</span>
+<span class="a">+	    (var) = SIMPLEQ_NEXT(var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	SIMPLEQ_FOREACH_SAFE(var, head, field, tvar)			\</span>
+<span class="a">+	for ((var) = SIMPLEQ_FIRST(head);				\</span>
+<span class="a">+	    (var) &amp;&amp; ((tvar) = SIMPLEQ_NEXT(var, field), 1);		\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Simple queue functions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	SIMPLEQ_INIT(head) do {						\</span>
+<span class="a">+	(head)-&gt;sqh_first = NULL;					\</span>
+<span class="a">+	(head)-&gt;sqh_last = &amp;(head)-&gt;sqh_first;				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_INSERT_HEAD(head, elm, field) do {			\</span>
+<span class="a">+	if (((elm)-&gt;field.sqe_next = (head)-&gt;sqh_first) == NULL)	\</span>
+<span class="a">+		(head)-&gt;sqh_last = &amp;(elm)-&gt;field.sqe_next;		\</span>
+<span class="a">+	(head)-&gt;sqh_first = (elm);					\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_INSERT_TAIL(head, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.sqe_next = NULL;					\</span>
+<span class="a">+	*(head)-&gt;sqh_last = (elm);					\</span>
+<span class="a">+	(head)-&gt;sqh_last = &amp;(elm)-&gt;field.sqe_next;			\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_INSERT_AFTER(head, listelm, elm, field) do {		\</span>
+<span class="a">+	if (((elm)-&gt;field.sqe_next = (listelm)-&gt;field.sqe_next) == NULL)\</span>
+<span class="a">+		(head)-&gt;sqh_last = &amp;(elm)-&gt;field.sqe_next;		\</span>
+<span class="a">+	(listelm)-&gt;field.sqe_next = (elm);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_REMOVE_HEAD(head, field) do {			\</span>
+<span class="a">+	if (((head)-&gt;sqh_first = (head)-&gt;sqh_first-&gt;field.sqe_next) == NULL) \</span>
+<span class="a">+		(head)-&gt;sqh_last = &amp;(head)-&gt;sqh_first;			\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define SIMPLEQ_REMOVE_AFTER(head, elm, field) do {			\</span>
+<span class="a">+	if (((elm)-&gt;field.sqe_next = (elm)-&gt;field.sqe_next-&gt;field.sqe_next) \</span>
+<span class="a">+	    == NULL)							\</span>
+<span class="a">+		(head)-&gt;sqh_last = &amp;(elm)-&gt;field.sqe_next;		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * XOR Simple queue definitions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define XSIMPLEQ_HEAD(name, type)					\</span>
+<span class="a">+struct name {								\</span>
+<span class="a">+	struct type *sqx_first;	/* first element */			\</span>
+<span class="a">+	struct type **sqx_last;	/* addr of last next element */		\</span>
+<span class="a">+	unsigned long sqx_cookie;					\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_ENTRY(type)						\</span>
+<span class="a">+struct {								\</span>
+<span class="a">+	struct type *sqx_next;	/* next element */			\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * XOR Simple queue access methods.</span>
+<span class="a">+ */</span>
+<span class="a">+#define XSIMPLEQ_XOR(head, ptr)	    ((__typeof(ptr))((head)-&gt;sqx_cookie ^ \</span>
+<span class="a">+					(unsigned long)(ptr)))</span>
+<span class="a">+#define	XSIMPLEQ_FIRST(head)	    XSIMPLEQ_XOR(head, ((head)-&gt;sqx_first))</span>
+<span class="a">+#define	XSIMPLEQ_END(head)	    NULL</span>
+<span class="a">+#define	XSIMPLEQ_EMPTY(head)	    (XSIMPLEQ_FIRST(head) == XSIMPLEQ_END(head))</span>
+<span class="a">+#define	XSIMPLEQ_NEXT(head, elm, field)    XSIMPLEQ_XOR(head, ((elm)-&gt;field.sqx_next))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_FOREACH(var, head, field)				\</span>
+<span class="a">+	for ((var) = XSIMPLEQ_FIRST(head);				\</span>
+<span class="a">+	    (var) != XSIMPLEQ_END(head);				\</span>
+<span class="a">+	    (var) = XSIMPLEQ_NEXT(head, var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	XSIMPLEQ_FOREACH_SAFE(var, head, field, tvar)			\</span>
+<span class="a">+	for ((var) = XSIMPLEQ_FIRST(head);				\</span>
+<span class="a">+	    (var) &amp;&amp; ((tvar) = XSIMPLEQ_NEXT(head, var, field), 1);	\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * XOR Simple queue functions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	XSIMPLEQ_INIT(head) do {					\</span>
+<span class="a">+	arc4random_buf(&amp;(head)-&gt;sqx_cookie, sizeof((head)-&gt;sqx_cookie)); \</span>
+<span class="a">+	(head)-&gt;sqx_first = XSIMPLEQ_XOR(head, NULL);			\</span>
+<span class="a">+	(head)-&gt;sqx_last = XSIMPLEQ_XOR(head, &amp;(head)-&gt;sqx_first);	\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_INSERT_HEAD(head, elm, field) do {			\</span>
+<span class="a">+	if (((elm)-&gt;field.sqx_next = (head)-&gt;sqx_first) ==		\</span>
+<span class="a">+	    XSIMPLEQ_XOR(head, NULL))					\</span>
+<span class="a">+		(head)-&gt;sqx_last = XSIMPLEQ_XOR(head, &amp;(elm)-&gt;field.sqx_next); \</span>
+<span class="a">+	(head)-&gt;sqx_first = XSIMPLEQ_XOR(head, (elm));			\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_INSERT_TAIL(head, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.sqx_next = XSIMPLEQ_XOR(head, NULL);		\</span>
+<span class="a">+	*(XSIMPLEQ_XOR(head, (head)-&gt;sqx_last)) = XSIMPLEQ_XOR(head, (elm)); \</span>
+<span class="a">+	(head)-&gt;sqx_last = XSIMPLEQ_XOR(head, &amp;(elm)-&gt;field.sqx_next);	\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_INSERT_AFTER(head, listelm, elm, field) do {		\</span>
+<span class="a">+	if (((elm)-&gt;field.sqx_next = (listelm)-&gt;field.sqx_next) ==	\</span>
+<span class="a">+	    XSIMPLEQ_XOR(head, NULL))					\</span>
+<span class="a">+		(head)-&gt;sqx_last = XSIMPLEQ_XOR(head, &amp;(elm)-&gt;field.sqx_next); \</span>
+<span class="a">+	(listelm)-&gt;field.sqx_next = XSIMPLEQ_XOR(head, (elm));		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_REMOVE_HEAD(head, field) do {				\</span>
+<span class="a">+	if (((head)-&gt;sqx_first = XSIMPLEQ_XOR(head,			\</span>
+<span class="a">+	    (head)-&gt;sqx_first)-&gt;field.sqx_next) == XSIMPLEQ_XOR(head, NULL)) \</span>
+<span class="a">+		(head)-&gt;sqx_last = XSIMPLEQ_XOR(head, &amp;(head)-&gt;sqx_first); \</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define XSIMPLEQ_REMOVE_AFTER(head, elm, field) do {			\</span>
+<span class="a">+	if (((elm)-&gt;field.sqx_next = XSIMPLEQ_XOR(head,			\</span>
+<span class="a">+	    (elm)-&gt;field.sqx_next)-&gt;field.sqx_next)			\</span>
+<span class="a">+	    == XSIMPLEQ_XOR(head, NULL))				\</span>
+<span class="a">+		(head)-&gt;sqx_last = 					\</span>
+<span class="a">+		    XSIMPLEQ_XOR(head, &amp;(elm)-&gt;field.sqx_next);		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+		    </span>
+<span class="a">+/*</span>
+<span class="a">+ * Tail queue definitions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define TAILQ_HEAD(name, type)						\</span>
+<span class="a">+struct name {								\</span>
+<span class="a">+	struct type *tqh_first;	/* first element */			\</span>
+<span class="a">+	struct type **tqh_last;	/* addr of last next element */		\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_HEAD_INITIALIZER(head)					\</span>
+<span class="a">+	{ NULL, &amp;(head).tqh_first }</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_ENTRY(type)						\</span>
+<span class="a">+struct {								\</span>
+<span class="a">+	struct type *tqe_next;	/* next element */			\</span>
+<span class="a">+	struct type **tqe_prev;	/* address of previous next element */	\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/* </span>
+<span class="a">+ * tail queue access methods </span>
+<span class="a">+ */</span>
+<span class="a">+#define	TAILQ_FIRST(head)		((head)-&gt;tqh_first)</span>
+<span class="a">+#define	TAILQ_END(head)			NULL</span>
+<span class="a">+#define	TAILQ_NEXT(elm, field)		((elm)-&gt;field.tqe_next)</span>
+<span class="a">+#define TAILQ_LAST(head, headname)					\</span>
+<span class="a">+	(*(((struct headname *)((head)-&gt;tqh_last))-&gt;tqh_last))</span>
+<span class="a">+/* XXX */</span>
+<span class="a">+#define TAILQ_PREV(elm, headname, field)				\</span>
+<span class="a">+	(*(((struct headname *)((elm)-&gt;field.tqe_prev))-&gt;tqh_last))</span>
+<span class="a">+#define	TAILQ_EMPTY(head)						\</span>
+<span class="a">+	(TAILQ_FIRST(head) == TAILQ_END(head))</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_FOREACH(var, head, field)					\</span>
+<span class="a">+	for((var) = TAILQ_FIRST(head);					\</span>
+<span class="a">+	    (var) != TAILQ_END(head);					\</span>
+<span class="a">+	    (var) = TAILQ_NEXT(var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	TAILQ_FOREACH_SAFE(var, head, field, tvar)			\</span>
+<span class="a">+	for ((var) = TAILQ_FIRST(head);					\</span>
+<span class="a">+	    (var) != TAILQ_END(head) &amp;&amp;					\</span>
+<span class="a">+	    ((tvar) = TAILQ_NEXT(var, field), 1);			\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_FOREACH_REVERSE(var, head, headname, field)		\</span>
+<span class="a">+	for((var) = TAILQ_LAST(head, headname);				\</span>
+<span class="a">+	    (var) != TAILQ_END(head);					\</span>
+<span class="a">+	    (var) = TAILQ_PREV(var, headname, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	TAILQ_FOREACH_REVERSE_SAFE(var, head, headname, field, tvar)	\</span>
+<span class="a">+	for ((var) = TAILQ_LAST(head, headname);			\</span>
+<span class="a">+	    (var) != TAILQ_END(head) &amp;&amp;					\</span>
+<span class="a">+	    ((tvar) = TAILQ_PREV(var, headname, field), 1);		\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Tail queue functions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	TAILQ_INIT(head) do {						\</span>
+<span class="a">+	(head)-&gt;tqh_first = NULL;					\</span>
+<span class="a">+	(head)-&gt;tqh_last = &amp;(head)-&gt;tqh_first;				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_INSERT_HEAD(head, elm, field) do {			\</span>
+<span class="a">+	if (((elm)-&gt;field.tqe_next = (head)-&gt;tqh_first) != NULL)	\</span>
+<span class="a">+		(head)-&gt;tqh_first-&gt;field.tqe_prev =			\</span>
+<span class="a">+		    &amp;(elm)-&gt;field.tqe_next;				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(head)-&gt;tqh_last = &amp;(elm)-&gt;field.tqe_next;		\</span>
+<span class="a">+	(head)-&gt;tqh_first = (elm);					\</span>
+<span class="a">+	(elm)-&gt;field.tqe_prev = &amp;(head)-&gt;tqh_first;			\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_INSERT_TAIL(head, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.tqe_next = NULL;					\</span>
+<span class="a">+	(elm)-&gt;field.tqe_prev = (head)-&gt;tqh_last;			\</span>
+<span class="a">+	*(head)-&gt;tqh_last = (elm);					\</span>
+<span class="a">+	(head)-&gt;tqh_last = &amp;(elm)-&gt;field.tqe_next;			\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_INSERT_AFTER(head, listelm, elm, field) do {		\</span>
+<span class="a">+	if (((elm)-&gt;field.tqe_next = (listelm)-&gt;field.tqe_next) != NULL)\</span>
+<span class="a">+		(elm)-&gt;field.tqe_next-&gt;field.tqe_prev =			\</span>
+<span class="a">+		    &amp;(elm)-&gt;field.tqe_next;				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(head)-&gt;tqh_last = &amp;(elm)-&gt;field.tqe_next;		\</span>
+<span class="a">+	(listelm)-&gt;field.tqe_next = (elm);				\</span>
+<span class="a">+	(elm)-&gt;field.tqe_prev = &amp;(listelm)-&gt;field.tqe_next;		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define	TAILQ_INSERT_BEFORE(listelm, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.tqe_prev = (listelm)-&gt;field.tqe_prev;		\</span>
+<span class="a">+	(elm)-&gt;field.tqe_next = (listelm);				\</span>
+<span class="a">+	*(listelm)-&gt;field.tqe_prev = (elm);				\</span>
+<span class="a">+	(listelm)-&gt;field.tqe_prev = &amp;(elm)-&gt;field.tqe_next;		\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_REMOVE(head, elm, field) do {				\</span>
+<span class="a">+	if (((elm)-&gt;field.tqe_next) != NULL)				\</span>
+<span class="a">+		(elm)-&gt;field.tqe_next-&gt;field.tqe_prev =			\</span>
+<span class="a">+		    (elm)-&gt;field.tqe_prev;				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(head)-&gt;tqh_last = (elm)-&gt;field.tqe_prev;		\</span>
+<span class="a">+	*(elm)-&gt;field.tqe_prev = (elm)-&gt;field.tqe_next;			\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.tqe_prev);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.tqe_next);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define TAILQ_REPLACE(head, elm, elm2, field) do {			\</span>
+<span class="a">+	if (((elm2)-&gt;field.tqe_next = (elm)-&gt;field.tqe_next) != NULL)	\</span>
+<span class="a">+		(elm2)-&gt;field.tqe_next-&gt;field.tqe_prev =		\</span>
+<span class="a">+		    &amp;(elm2)-&gt;field.tqe_next;				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(head)-&gt;tqh_last = &amp;(elm2)-&gt;field.tqe_next;		\</span>
+<span class="a">+	(elm2)-&gt;field.tqe_prev = (elm)-&gt;field.tqe_prev;			\</span>
+<span class="a">+	*(elm2)-&gt;field.tqe_prev = (elm2);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.tqe_prev);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.tqe_next);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Circular queue definitions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define CIRCLEQ_HEAD(name, type)					\</span>
+<span class="a">+struct name {								\</span>
+<span class="a">+	struct type *cqh_first;		/* first element */		\</span>
+<span class="a">+	struct type *cqh_last;		/* last element */		\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_HEAD_INITIALIZER(head)					\</span>
+<span class="a">+	{ CIRCLEQ_END(&amp;head), CIRCLEQ_END(&amp;head) }</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_ENTRY(type)						\</span>
+<span class="a">+struct {								\</span>
+<span class="a">+	struct type *cqe_next;		/* next element */		\</span>
+<span class="a">+	struct type *cqe_prev;		/* previous element */		\</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Circular queue access methods </span>
+<span class="a">+ */</span>
+<span class="a">+#define	CIRCLEQ_FIRST(head)		((head)-&gt;cqh_first)</span>
+<span class="a">+#define	CIRCLEQ_LAST(head)		((head)-&gt;cqh_last)</span>
+<span class="a">+#define	CIRCLEQ_END(head)		((void *)(head))</span>
+<span class="a">+#define	CIRCLEQ_NEXT(elm, field)	((elm)-&gt;field.cqe_next)</span>
+<span class="a">+#define	CIRCLEQ_PREV(elm, field)	((elm)-&gt;field.cqe_prev)</span>
+<span class="a">+#define	CIRCLEQ_EMPTY(head)						\</span>
+<span class="a">+	(CIRCLEQ_FIRST(head) == CIRCLEQ_END(head))</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_FOREACH(var, head, field)				\</span>
+<span class="a">+	for((var) = CIRCLEQ_FIRST(head);				\</span>
+<span class="a">+	    (var) != CIRCLEQ_END(head);					\</span>
+<span class="a">+	    (var) = CIRCLEQ_NEXT(var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	CIRCLEQ_FOREACH_SAFE(var, head, field, tvar)			\</span>
+<span class="a">+	for ((var) = CIRCLEQ_FIRST(head);				\</span>
+<span class="a">+	    (var) != CIRCLEQ_END(head) &amp;&amp;				\</span>
+<span class="a">+	    ((tvar) = CIRCLEQ_NEXT(var, field), 1);			\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_FOREACH_REVERSE(var, head, field)			\</span>
+<span class="a">+	for((var) = CIRCLEQ_LAST(head);					\</span>
+<span class="a">+	    (var) != CIRCLEQ_END(head);					\</span>
+<span class="a">+	    (var) = CIRCLEQ_PREV(var, field))</span>
+<span class="a">+</span>
+<span class="a">+#define	CIRCLEQ_FOREACH_REVERSE_SAFE(var, head, headname, field, tvar)	\</span>
+<span class="a">+	for ((var) = CIRCLEQ_LAST(head, headname);			\</span>
+<span class="a">+	    (var) != CIRCLEQ_END(head) &amp;&amp; 				\</span>
+<span class="a">+	    ((tvar) = CIRCLEQ_PREV(var, headname, field), 1);		\</span>
+<span class="a">+	    (var) = (tvar))</span>
+<span class="a">+</span>
+<span class="a">+/*</span>
+<span class="a">+ * Circular queue functions.</span>
+<span class="a">+ */</span>
+<span class="a">+#define	CIRCLEQ_INIT(head) do {						\</span>
+<span class="a">+	(head)-&gt;cqh_first = CIRCLEQ_END(head);				\</span>
+<span class="a">+	(head)-&gt;cqh_last = CIRCLEQ_END(head);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_INSERT_AFTER(head, listelm, elm, field) do {		\</span>
+<span class="a">+	(elm)-&gt;field.cqe_next = (listelm)-&gt;field.cqe_next;		\</span>
+<span class="a">+	(elm)-&gt;field.cqe_prev = (listelm);				\</span>
+<span class="a">+	if ((listelm)-&gt;field.cqe_next == CIRCLEQ_END(head))		\</span>
+<span class="a">+		(head)-&gt;cqh_last = (elm);				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(listelm)-&gt;field.cqe_next-&gt;field.cqe_prev = (elm);	\</span>
+<span class="a">+	(listelm)-&gt;field.cqe_next = (elm);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_INSERT_BEFORE(head, listelm, elm, field) do {		\</span>
+<span class="a">+	(elm)-&gt;field.cqe_next = (listelm);				\</span>
+<span class="a">+	(elm)-&gt;field.cqe_prev = (listelm)-&gt;field.cqe_prev;		\</span>
+<span class="a">+	if ((listelm)-&gt;field.cqe_prev == CIRCLEQ_END(head))		\</span>
+<span class="a">+		(head)-&gt;cqh_first = (elm);				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(listelm)-&gt;field.cqe_prev-&gt;field.cqe_next = (elm);	\</span>
+<span class="a">+	(listelm)-&gt;field.cqe_prev = (elm);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_INSERT_HEAD(head, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.cqe_next = (head)-&gt;cqh_first;			\</span>
+<span class="a">+	(elm)-&gt;field.cqe_prev = CIRCLEQ_END(head);			\</span>
+<span class="a">+	if ((head)-&gt;cqh_last == CIRCLEQ_END(head))			\</span>
+<span class="a">+		(head)-&gt;cqh_last = (elm);				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(head)-&gt;cqh_first-&gt;field.cqe_prev = (elm);		\</span>
+<span class="a">+	(head)-&gt;cqh_first = (elm);					\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_INSERT_TAIL(head, elm, field) do {			\</span>
+<span class="a">+	(elm)-&gt;field.cqe_next = CIRCLEQ_END(head);			\</span>
+<span class="a">+	(elm)-&gt;field.cqe_prev = (head)-&gt;cqh_last;			\</span>
+<span class="a">+	if ((head)-&gt;cqh_first == CIRCLEQ_END(head))			\</span>
+<span class="a">+		(head)-&gt;cqh_first = (elm);				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(head)-&gt;cqh_last-&gt;field.cqe_next = (elm);		\</span>
+<span class="a">+	(head)-&gt;cqh_last = (elm);					\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define	CIRCLEQ_REMOVE(head, elm, field) do {				\</span>
+<span class="a">+	if ((elm)-&gt;field.cqe_next == CIRCLEQ_END(head))			\</span>
+<span class="a">+		(head)-&gt;cqh_last = (elm)-&gt;field.cqe_prev;		\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(elm)-&gt;field.cqe_next-&gt;field.cqe_prev =			\</span>
+<span class="a">+		    (elm)-&gt;field.cqe_prev;				\</span>
+<span class="a">+	if ((elm)-&gt;field.cqe_prev == CIRCLEQ_END(head))			\</span>
+<span class="a">+		(head)-&gt;cqh_first = (elm)-&gt;field.cqe_next;		\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(elm)-&gt;field.cqe_prev-&gt;field.cqe_next =			\</span>
+<span class="a">+		    (elm)-&gt;field.cqe_next;				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.cqe_prev);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.cqe_next);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#define CIRCLEQ_REPLACE(head, elm, elm2, field) do {			\</span>
+<span class="a">+	if (((elm2)-&gt;field.cqe_next = (elm)-&gt;field.cqe_next) ==		\</span>
+<span class="a">+	    CIRCLEQ_END(head))						\</span>
+<span class="a">+		(head)-&gt;cqh_last = (elm2);				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(elm2)-&gt;field.cqe_next-&gt;field.cqe_prev = (elm2);	\</span>
+<span class="a">+	if (((elm2)-&gt;field.cqe_prev = (elm)-&gt;field.cqe_prev) ==		\</span>
+<span class="a">+	    CIRCLEQ_END(head))						\</span>
+<span class="a">+		(head)-&gt;cqh_first = (elm2);				\</span>
+<span class="a">+	else								\</span>
+<span class="a">+		(elm2)-&gt;field.cqe_prev-&gt;field.cqe_next = (elm2);	\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.cqe_prev);				\</span>
+<span class="a">+	_Q_INVALIDATE((elm)-&gt;field.cqe_next);				\</span>
+<span class="a">+} while (0)</span>
+<span class="a">+</span>
+<span class="a">+#endif	/* !_SYS_QUEUE_H_ */</span>
+diff --git a/sad.c b/sad.c
+index 747be17..b86090e 100644
+--- a/sad.c
++++ b/sad.c
+<span class="h">@@ -82,10 +82,12 @@ playaudio(void)</span>
+ 		s-&gt;state = PLAYING;
+ 		break;
+ 	case PLAYING:
+<span class="d">-		if ((nbytes = s-&gt;decoder-&gt;decode(buf, sizeof(buf))) &lt;= 0)</span>
+<span class="a">+		if ((nbytes = s-&gt;decoder-&gt;decode(buf, sizeof(buf))) &lt;= 0) {</span>
+ 			playnextsong();
+<span class="d">-		else</span>
+<span class="a">+			notify(EVSONGFINISHED);</span>
+<span class="a">+		} else {</span>
+ 			playoutput(buf, nbytes);
+<span class="a">+		}</span>
+ 		break;
+ 	}
+ }
+<span class="h">@@ -121,6 +123,7 @@ main(int argc, char *argv[])</span>
+ 
+ 	initdecoders();
+ 	openoutputs();
+<span class="a">+	initnotifier();</span>
+ 
+ 	while (1) {
+ 		rfds = master;
+<span class="h">@@ -144,6 +147,7 @@ main(int argc, char *argv[])</span>
+ 				if (docmd(i) &lt; 0) {
+ 					close(i);
+ 					FD_CLR(i, &amp;master);
+<span class="a">+					removesubscriber(i);</span>
+ 				}
+ 			}
+ 		}
+diff --git a/sad.h b/sad.h
+index 6833a46..8e78363 100644
+--- a/sad.h
++++ b/sad.h
+<span class="h">@@ -17,6 +17,10 @@ enum {</span>
+ 	PAUSED
+ };
+ 
+<span class="a">+enum {</span>
+<span class="a">+	EVSONGFINISHED,</span>
+<span class="a">+};</span>
+<span class="a">+</span>
+ typedef struct {
+ 	int (*init)(void);
+ 	int (*open)(const char *);
+<span class="h">@@ -52,6 +56,11 @@ typedef struct {</span>
+ 	size_t maxsongs;
+ } Library;
+ 
+<span class="a">+typedef struct eventdesc {</span>
+<span class="a">+	int   event;</span>
+<span class="a">+	char *name;</span>
+<span class="a">+} Eventdesc;</span>
+<span class="a">+</span>
+ /* sad.c */
+ extern fd_set   master;
+ extern fd_set   rfds;
+<span class="h">@@ -116,3 +125,12 @@ int enableoutput(const char *);</span>
+ int disableoutput(const char *);
+ int playoutput(void *, size_t);
+ int setvol(int);
+<span class="a">+</span>
+<span class="a">+/* notify.c */</span>
+<span class="a">+extern Eventdesc Eventmap[];</span>
+<span class="a">+</span>
+<span class="a">+int initnotifier(void);</span>
+<span class="a">+int addsubscriber(int, int);</span>
+<span class="a">+int addsubscribername(int, const char *);</span>
+<span class="a">+int notify(int);</span>
+<span class="a">+void removesubscriber(int);</span></pre>
+</div></body></html>

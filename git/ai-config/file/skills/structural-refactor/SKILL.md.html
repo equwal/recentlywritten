@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ai-config/skills/structural-refactor/SKILL.md - Recently Written</title>
+<link rel="stylesheet" href="../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
+<h1>ai-config</h1><span class="desc">One canonical AI agent config (rules, skills, MCP servers) rendered into Claude Code, Codex, Copilot CLI and Antigravity by acsync</span><p class="url">git clone https://github.com/equwal/ai-config</p><p><a href="../../../../ai-config/index.html">Log</a> | <a href="../../../../ai-config/files.html">Files</a> | <a href="../../../../ai-config/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>skills/structural-refactor/SKILL.md (5043 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> ---
+<a id="l2" href="#l2">2</a> name: structural-refactor
+<a id="l3" href="#l3">3</a> description: AST-aware structural search and replace across a codebase using ast-grep. Use for renames, function signature changes, API migrations, deprecation sweeps, or codemods spanning more than two files; for finding all call sites of a pattern rather than a string; and for writing project-specific lint rules that encode team conventions. Use instead of sed, awk, or regex whenever the target is code rather than plain text.
+<a id="l4" href="#l4">4</a> ---
+<a id="l5" href="#l5">5</a> 
+<a id="l6" href="#l6">6</a> # Structural refactor
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> Regex does not understand code. It matches inside strings, comments, and
+<a id="l9" href="#l9">9</a> unrelated identifiers, and it misses anything reformatted across lines. That is
+<a id="l10" href="#l10">10</a> how half-finished renames ship. `ast-grep` matches on the syntax tree.
+<a id="l11" href="#l11">11</a> 
+<a id="l12" href="#l12">12</a> Order of preference for a rename or signature change:
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> 1. **LSP rename** (`rename_symbol`) if the language server supports it — it
+<a id="l15" href="#l15">15</a>    understands scope and imports, and is always correct.
+<a id="l16" href="#l16">16</a> 2. **ast-grep** for anything the LSP cannot express: cross-language sweeps,
+<a id="l17" href="#l17">17</a>    call-pattern rewrites, argument reordering, API migrations.
+<a id="l18" href="#l18">18</a> 3. **sed** never, for code.
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> ## Preflight
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> ```bash
+<a id="l23" href="#l23">23</a> command -v ast-grep || command -v sg
+<a id="l24" href="#l24">24</a> ast-grep --version
+<a id="l25" href="#l25">25</a> ```
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> Install: `cargo install ast-grep`, `npm i -g @ast-grep/cli`, `brew install
+<a id="l28" href="#l28">28</a> ast-grep`. The binary is `ast-grep`, aliased `sg` (which collides with
+<a id="l29" href="#l29">29</a> `sg(1)` on some Linux systems — prefer the full name in scripts).
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> ## Pattern syntax
+<a id="l32" href="#l32">32</a> 
+<a id="l33" href="#l33">33</a> | Token | Matches |
+<a id="l34" href="#l34">34</a> |---|---|
+<a id="l35" href="#l35">35</a> | `$VAR` | exactly one named node, captured |
+<a id="l36" href="#l36">36</a> | `$$$ARGS` | zero or more nodes (argument lists, statement bodies), captured |
+<a id="l37" href="#l37">37</a> | `$_` | one node, not captured |
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a> Patterns are written as code, not as regex. Whitespace and formatting are
+<a id="l40" href="#l40">40</a> irrelevant; structure is what matters.
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> ## Workflow — always in this order
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> **1. Search first. Read the matches before rewriting anything.**
+<a id="l45" href="#l45">45</a> 
+<a id="l46" href="#l46">46</a> ```bash
+<a id="l47" href="#l47">47</a> ast-grep run -p &#x27;db.query($SQL, $$$ARGS)&#x27; -l python
+<a id="l48" href="#l48">48</a> ```
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a> Count them, and check for false positives:
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> ```bash
+<a id="l53" href="#l53">53</a> ast-grep run -p &#x27;db.query($SQL, $$$ARGS)&#x27; -l python --json=compact | jq length
+<a id="l54" href="#l54">54</a> ```
+<a id="l55" href="#l55">55</a> 
+<a id="l56" href="#l56">56</a> **2. Preview the rewrite as a diff.** `run` with `--rewrite` prints a diff and
+<a id="l57" href="#l57">57</a> changes nothing until told to apply.
+<a id="l58" href="#l58">58</a> 
+<a id="l59" href="#l59">59</a> ```bash
+<a id="l60" href="#l60">60</a> ast-grep run -p &#x27;db.query($SQL, $$$ARGS)&#x27; \
+<a id="l61" href="#l61">61</a>              --rewrite &#x27;db.execute($SQL, params=[$$$ARGS])&#x27; \
+<a id="l62" href="#l62">62</a>              -l python
+<a id="l63" href="#l63">63</a> ```
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a> **3. Apply.** Use `--interactive` to accept or reject each hunk when the pattern
+<a id="l66" href="#l66">66</a> is loose, or `--update-all` for a bulk apply once the diff has been reviewed.
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> ```bash
+<a id="l69" href="#l69">69</a> ast-grep run -p &#x27;...&#x27; --rewrite &#x27;...&#x27; -l python --update-all
+<a id="l70" href="#l70">70</a> ```
+<a id="l71" href="#l71">71</a> 
+<a id="l72" href="#l72">72</a> **4. Verify.** Formatter, type checker, tests. A structural rewrite that
+<a id="l73" href="#l73">73</a> type-checks is usually correct; one that does not, is not. Commit the codemod
+<a id="l74" href="#l74">74</a> separately from any behavioural change so the diff stays reviewable.
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a> Work on a clean tree — `git status` before, `git diff` after. `--update-all`
+<a id="l77" href="#l77">77</a> edits files in place with no undo.
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a> ## Rule files
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a> Anything run more than once, or enforced on every PR, belongs in a rule file
+<a id="l82" href="#l82">82</a> rather than a shell command. Rules support constraints patterns cannot express:
+<a id="l83" href="#l83">83</a> `inside`, `has`, `not`, `follows`, and metavariable regex filters.
+<a id="l84" href="#l84">84</a> 
+<a id="l85" href="#l85">85</a> ```yaml
+<a id="l86" href="#l86">86</a> # rules/no-bare-except.yml
+<a id="l87" href="#l87">87</a> id: no-bare-except
+<a id="l88" href="#l88">88</a> language: python
+<a id="l89" href="#l89">89</a> severity: error
+<a id="l90" href="#l90">90</a> message: Bare except swallows KeyboardInterrupt and SystemExit.
+<a id="l91" href="#l91">91</a> note: Catch a specific exception type, or `except Exception` if truly generic.
+<a id="l92" href="#l92">92</a> rule:
+<a id="l93" href="#l93">93</a>   pattern: |
+<a id="l94" href="#l94">94</a>     try:
+<a id="l95" href="#l95">95</a>       $$$BODY
+<a id="l96" href="#l96">96</a>     except:
+<a id="l97" href="#l97">97</a>       $$$HANDLER
+<a id="l98" href="#l98">98</a> ```
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> ```bash
+<a id="l101" href="#l101">101</a> ast-grep scan --rule rules/no-bare-except.yml
+<a id="l102" href="#l102">102</a> ast-grep scan                      # all rules, via sgconfig.yml
+<a id="l103" href="#l103">103</a> ```
+<a id="l104" href="#l104">104</a> 
+<a id="l105" href="#l105">105</a> `sgconfig.yml` at the repo root registers the rule directories:
+<a id="l106" href="#l106">106</a> 
+<a id="l107" href="#l107">107</a> ```yaml
+<a id="l108" href="#l108">108</a> ruleDirs:
+<a id="l109" href="#l109">109</a>   - rules
+<a id="l110" href="#l110">110</a> ```
+<a id="l111" href="#l111">111</a> 
+<a id="l112" href="#l112">112</a> Verify exact rule schema fields against `ast-grep scan --help` and the
+<a id="l113" href="#l113">113</a> installed version&#x27;s docs — the YAML schema has evolved.
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a> This is the cheapest way to encode a convention that keeps recurring in review.
+<a id="l116" href="#l116">116</a> When the same correction is made twice, write a rule instead of a third comment.
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a> ## Common patterns
+<a id="l119" href="#l119">119</a> 
+<a id="l120" href="#l120">120</a> ```bash
+<a id="l121" href="#l121">121</a> # Find all callers of a method, regardless of receiver name
+<a id="l122" href="#l122">122</a> ast-grep run -p &#x27;$OBJ.deprecated_method($$$)&#x27; -l ts
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a> # Add an argument to every call
+<a id="l125" href="#l125">125</a> ast-grep run -p &#x27;connect($HOST, $PORT)&#x27; \
+<a id="l126" href="#l126">126</a>              --rewrite &#x27;connect($HOST, $PORT, timeout=30)&#x27; -l python
+<a id="l127" href="#l127">127</a> 
+<a id="l128" href="#l128">128</a> # Unwrap a redundant wrapper
+<a id="l129" href="#l129">129</a> ast-grep run -p &#x27;str($X)&#x27; --rewrite &#x27;$X&#x27; -l python     # review each: too loose
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a> # Locate every unsafe block in a Rust crate
+<a id="l132" href="#l132">132</a> ast-grep run -p &#x27;unsafe { $$$BODY }&#x27; -l rust
+<a id="l133" href="#l133">133</a> ```
+<a id="l134" href="#l134">134</a> 
+<a id="l135" href="#l135">135</a> The `str($X)` example is deliberately included as a warning: it matches cases
+<a id="l136" href="#l136">136</a> where the conversion is load-bearing. Loose patterns need `--interactive`, not
+<a id="l137" href="#l137">137</a> `--update-all`.
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a> ## Limits
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a> - ast-grep is syntactic, not semantic. It cannot resolve imports, aliases, or
+<a id="l142" href="#l142">142</a>   types. `foo.bar()` and `from x import bar; bar()` are different patterns.
+<a id="l143" href="#l143">143</a> - For type-directed refactors, use the language&#x27;s own tooling: `cargo fix`,
+<a id="l144" href="#l144">144</a>   `tsc` codemods via ts-morph, `gofmt -r` or `gopls rename`.
+<a id="l145" href="#l145">145</a> - After any large sweep, grep for the old name anyway to catch what the pattern
+<a id="l146" href="#l146">146</a>   missed — string literals, docs, config, comments. Those are text, and text
+<a id="l147" href="#l147">147</a>   tools are correct for them.</pre>
+</div></body></html>

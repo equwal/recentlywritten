@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>forthlisp-z80/kernel.lisp - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>forthlisp-z80</h1><span class="desc">Z80 target for forthlisp: Z80 Forth kernel built by an SBCL assembler, z80pack cpmsim</span><p class="url">git clone https://github.com/equwal/forthlisp-z80</p><p><a href="../../forthlisp-z80/index.html">Log</a> | <a href="../../forthlisp-z80/files.html">Files</a> | <a href="../../forthlisp-z80/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>kernel.lisp (14810 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> ;;; kernel.lisp -- layer 3: the Forth kernel, as data for asm.lisp.
+<a id="l2" href="#l2">2</a> ;;; Indirect-threaded. BC = IP, SP = data stack, IX = return stack, HL/DE/A scratch.
+<a id="l3" href="#l3">3</a> ;;; Header: link(2) | flags+len(1) | name | CFA(2) | body.  Flags: #x80 immediate, #x40 hidden.
+<a id="l4" href="#l4">4</a> ;;; Run: sbcl --script kernel.lisp OUT.mos   writes the image with a Mostek header (load at 0).
+<a id="l5" href="#l5">5</a> (load (merge-pathnames &quot;asm.lisp&quot; *load-truename*))
+<a id="l6" href="#l6">6</a> (in-package :z80)
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> ;;; Memory map (64 KiB): image + dictionary 0000-E7FF, TIB E800-EBFF,
+<a id="l9" href="#l9">9</a> ;;; return stack EC00-F7FF (IX starts at F800), data stack F800-FFFF (SP starts at 0000).
+<a id="l10" href="#l10">10</a> (defconstant +tib+ #xE800)
+<a id="l11" href="#l11">11</a> (defconstant +tib-size+ 1023)
+<a id="l12" href="#l12">12</a> (defconstant +r0+ #xF800)
+<a id="l13" href="#l13">13</a> (defconstant +console-status+ 40)  ; z80pack cpmsim: TCP console 1 status (bit0 rx, bit1 tx)
+<a id="l14" href="#l14">14</a> (defconstant +console-data+ 41)
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> (defvar *forms* &#x27;())
+<a id="l17" href="#l17">17</a> (defvar *link* 0)
+<a id="l18" href="#l18">18</a> (defvar *current* nil)
+<a id="l19" href="#l19">19</a> (defun emit (&amp;rest forms) (dolist (f forms) (push f *forms*)))
+<a id="l20" href="#l20">20</a> (defun wlabel (name) (intern (format nil &quot;W:~a&quot; name) :z80))
+<a id="l21" href="#l21">21</a> (defun name-of (x) (if (stringp x) x (string-downcase (symbol-name x))))
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> (defun header (name &amp;optional immediate)
+<a id="l24" href="#l24">24</a>   (let ((hdr (gensym &quot;HDR&quot;)))
+<a id="l25" href="#l25">25</a>     (setf *current* name)
+<a id="l26" href="#l26">26</a>     (emit hdr `(dw ,*link*) `(db ,(+ (length name) (if immediate #x80 0))) `(db ,name) (wlabel name))
+<a id="l27" href="#l27">27</a>     (setf *link* hdr)))
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> (defun code (name &amp;rest asm)
+<a id="l30" href="#l30">30</a>   &quot;A primitive: CFA points at the code that follows it.&quot;
+<a id="l31" href="#l31">31</a>   (let ((body (gensym &quot;CODE&quot;)))
+<a id="l32" href="#l32">32</a>     (header (name-of name))
+<a id="l33" href="#l33">33</a>     (emit `(dw ,body) body)
+<a id="l34" href="#l34">34</a>     (apply #&#x27;emit asm)
+<a id="l35" href="#l35">35</a>     (emit &#x27;(jp next))))
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a> (defun compile-tokens (tokens)
+<a id="l38" href="#l38">38</a>   &quot;Thread TOKENS, resolving control words at build time like a Forth compiler would.&quot;
+<a id="l39" href="#l39">39</a>   (let ((cs &#x27;()))
+<a id="l40" href="#l40">40</a>     (dolist (tk tokens)
+<a id="l41" href="#l41">41</a>       (let ((s (and (symbolp tk) (symbol-name tk))))
+<a id="l42" href="#l42">42</a>         (flet ((label () (let ((l (gensym &quot;L&quot;))) (emit l) l))
+<a id="l43" href="#l43">43</a>                (fwd (op) (let ((l (gensym &quot;F&quot;))) (emit `(dw ,(wlabel op) ,l)) l)))
+<a id="l44" href="#l44">44</a>           (cond ((integerp tk) (emit `(dw ,(wlabel &quot;lit&quot;) ,(logand tk #xFFFF))))
+<a id="l45" href="#l45">45</a>                 ((equal s &quot;IF&quot;) (push (fwd &quot;0branch&quot;) cs))
+<a id="l46" href="#l46">46</a>                 ((equal s &quot;ELSE&quot;) (let ((f (fwd &quot;branch&quot;))) (emit (pop cs)) (push f cs)))
+<a id="l47" href="#l47">47</a>                 ((equal s &quot;THEN&quot;) (emit (pop cs)))
+<a id="l48" href="#l48">48</a>                 ((equal s &quot;BEGIN&quot;) (push (label) cs))
+<a id="l49" href="#l49">49</a>                 ((equal s &quot;WHILE&quot;) (let ((f (fwd &quot;0branch&quot;))) (push f (cdr cs))))
+<a id="l50" href="#l50">50</a>                 ((equal s &quot;REPEAT&quot;) (emit `(dw ,(wlabel &quot;branch&quot;) ,(pop cs))) (emit (pop cs)))
+<a id="l51" href="#l51">51</a>                 ((equal s &quot;UNTIL&quot;) (emit `(dw ,(wlabel &quot;0branch&quot;) ,(pop cs))))
+<a id="l52" href="#l52">52</a>                 ((equal s &quot;AGAIN&quot;) (emit `(dw ,(wlabel &quot;branch&quot;) ,(pop cs))))
+<a id="l53" href="#l53">53</a>                 ((equal s &quot;RECURSE&quot;) (emit `(dw ,(wlabel *current*))))
+<a id="l54" href="#l54">54</a>                 ((and (consp tk) (eq (car tk) &#x27;quote)) (emit `(dw ,(wlabel &quot;lit&quot;) ,(wlabel (name-of (cadr tk))))))
+<a id="l55" href="#l55">55</a>                 ((and (consp tk) (symbolp (car tk)) (equal (symbol-name (car tk)) &quot;ADDR&quot;)) (emit `(dw ,(wlabel &quot;lit&quot;) ,(cadr tk))))
+<a id="l56" href="#l56">56</a>                 ((and (consp tk) (member (car tk) &#x27;(&quot;s\&quot;&quot; &quot;.\&quot;&quot;) :test #&#x27;equal))
+<a id="l57" href="#l57">57</a>                  (emit `(dw ,(wlabel &quot;(s\&quot;)&quot;)) `(db ,(length (cadr tk))) `(db ,(cadr tk)))
+<a id="l58" href="#l58">58</a>                  (when (equal (car tk) &quot;.\&quot;&quot;) (emit `(dw ,(wlabel &quot;type&quot;)))))
+<a id="l59" href="#l59">59</a>                 (t (emit `(dw ,(wlabel (name-of tk)))))))))
+<a id="l60" href="#l60">60</a>     (when cs (error &quot;unbalanced control flow in ~a&quot; *current*))))
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> (defun xt (name) (list &#x27;quote name))
+<a id="l63" href="#l63">63</a> (defun dq (s) (list &quot;.\&quot;&quot; s))
+<a id="l64" href="#l64">64</a> (defun colon (name &amp;rest tokens)
+<a id="l65" href="#l65">65</a>   (let ((imm (eq (car tokens) :immediate)))
+<a id="l66" href="#l66">66</a>     (header (name-of name) imm)
+<a id="l67" href="#l67">67</a>     (emit &#x27;(dw docol))
+<a id="l68" href="#l68">68</a>     (compile-tokens (if imm (cdr tokens) tokens))
+<a id="l69" href="#l69">69</a>     (emit `(dw ,(wlabel &quot;exit&quot;)))))
+<a id="l70" href="#l70">70</a> 
+<a id="l71" href="#l71">71</a> (defun var (name &amp;optional (init 0))
+<a id="l72" href="#l72">72</a>   (header (name-of name)) (emit &#x27;(dw dovar) `(dw ,init)))
+<a id="l73" href="#l73">73</a> (defun const (name value)
+<a id="l74" href="#l74">74</a>   (header (name-of name)) (emit &#x27;(dw docon) `(dw ,value)))
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a> (defun flag-code (test)
+<a id="l77" href="#l77">77</a>   &quot;Push -1 when the condition jump TEST (e.g. z, c) is taken, else 0.&quot;
+<a id="l78" href="#l78">78</a>   (let ((l (gensym)))
+<a id="l79" href="#l79">79</a>     `((ld hl 0) (jr ,(if (eq test &#x27;z) &#x27;nz &#x27;nc) ,l) (dec hl) ,l (push hl))))
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a> (defun build ()
+<a id="l82" href="#l82">82</a>   (setf *forms* &#x27;() *link* 0)
+<a id="l83" href="#l83">83</a>   ;; boot and inner interpreter
+<a id="l84" href="#l84">84</a>   (emit &#x27;(jp start)
+<a id="l85" href="#l85">85</a>         &#x27;next &#x27;(ld a (@ bc)) &#x27;(ld l a) &#x27;(inc bc) &#x27;(ld a (@ bc)) &#x27;(ld h a) &#x27;(inc bc)
+<a id="l86" href="#l86">86</a>         &#x27;(ld e (@ hl)) &#x27;(inc hl) &#x27;(ld d (@ hl)) &#x27;(inc hl) &#x27;(ex de hl) &#x27;(jp (@ hl))
+<a id="l87" href="#l87">87</a>         &#x27;docol &#x27;(dec ix) &#x27;(ld (@ ix 0) b) &#x27;(dec ix) &#x27;(ld (@ ix 0) c) &#x27;(ld b d) &#x27;(ld c e) &#x27;(jp next)
+<a id="l88" href="#l88">88</a>         &#x27;dovar &#x27;(push de) &#x27;(jp next)
+<a id="l89" href="#l89">89</a>         &#x27;docon &#x27;(ex de hl) &#x27;(ld e (@ hl)) &#x27;(inc hl) &#x27;(ld d (@ hl)) &#x27;(push de) &#x27;(jp next)
+<a id="l90" href="#l90">90</a>         &#x27;ipsave &#x27;(dw 0)
+<a id="l91" href="#l91">91</a>         &#x27;start `(ld sp 0) `(ld ix ,+r0+) &#x27;(ld bc cold) &#x27;(jp next)
+<a id="l92" href="#l92">92</a>         &#x27;cold `(dw ,(wlabel &quot;cold&quot;)))
+<a id="l93" href="#l93">93</a>   ;; primitives
+<a id="l94" href="#l94">94</a>   (code &#x27;exit &#x27;(ld c (@ ix 0)) &#x27;(inc ix) &#x27;(ld b (@ ix 0)) &#x27;(inc ix))
+<a id="l95" href="#l95">95</a>   (code &#x27;lit &#x27;(ld a (@ bc)) &#x27;(ld l a) &#x27;(inc bc) &#x27;(ld a (@ bc)) &#x27;(ld h a) &#x27;(inc bc) &#x27;(push hl))
+<a id="l96" href="#l96">96</a>   (code &#x27;branch &#x27;branch &#x27;(ld a (@ bc)) &#x27;(ld l a) &#x27;(inc bc) &#x27;(ld a (@ bc)) &#x27;(ld b a) &#x27;(ld c l))
+<a id="l97" href="#l97">97</a>   (code &#x27;0branch &#x27;(pop hl) &#x27;(ld a h) &#x27;(or l) &#x27;(jr z branch) &#x27;(inc bc) &#x27;(inc bc))
+<a id="l98" href="#l98">98</a>   (header &quot;execute&quot;) (emit &#x27;(dw execute) &#x27;execute &#x27;(pop hl) &#x27;(ld e (@ hl)) &#x27;(inc hl) &#x27;(ld d (@ hl)) &#x27;(inc hl) &#x27;(ex de hl) &#x27;(jp (@ hl)))
+<a id="l99" href="#l99">99</a>   (code &#x27;dup &#x27;(pop hl) &#x27;(push hl) &#x27;(push hl))
+<a id="l100" href="#l100">100</a>   (code &#x27;drop &#x27;(pop hl))
+<a id="l101" href="#l101">101</a>   (code &#x27;swap &#x27;(pop hl) &#x27;(ex (@ sp) hl) &#x27;(push hl))
+<a id="l102" href="#l102">102</a>   (code &#x27;over &#x27;(pop hl) &#x27;(pop de) &#x27;(push de) &#x27;(push hl) &#x27;(push de))
+<a id="l103" href="#l103">103</a>   (code &#x27;rot &#x27;(pop de) &#x27;(pop hl) &#x27;(ex (@ sp) hl) &#x27;(push de) &#x27;(push hl))
+<a id="l104" href="#l104">104</a>   (code &#x27;nip &#x27;(pop hl) &#x27;(pop de) &#x27;(push hl))
+<a id="l105" href="#l105">105</a>   (code &#x27;&gt;r &#x27;(pop hl) &#x27;(dec ix) &#x27;(ld (@ ix 0) h) &#x27;(dec ix) &#x27;(ld (@ ix 0) l))
+<a id="l106" href="#l106">106</a>   (code &#x27;r&gt; &#x27;(ld l (@ ix 0)) &#x27;(inc ix) &#x27;(ld h (@ ix 0)) &#x27;(inc ix) &#x27;(push hl))
+<a id="l107" href="#l107">107</a>   (code &#x27;r@ &#x27;(ld l (@ ix 0)) &#x27;(ld h (@ ix 1)) &#x27;(push hl))
+<a id="l108" href="#l108">108</a>   (code &#x27;sp@ &#x27;(ld hl 0) &#x27;(add hl sp) &#x27;(push hl))
+<a id="l109" href="#l109">109</a>   (code &#x27;sp! &#x27;(pop hl) &#x27;(ld sp hl))
+<a id="l110" href="#l110">110</a>   (code &#x27;rp@ &#x27;(push ix))
+<a id="l111" href="#l111">111</a>   (code &#x27;rp! &#x27;(pop ix))
+<a id="l112" href="#l112">112</a>   (code &#x27;pick &#x27;(pop hl) &#x27;(add hl hl) &#x27;(add hl sp) &#x27;(ld e (@ hl)) &#x27;(inc hl) &#x27;(ld d (@ hl)) &#x27;(push de))
+<a id="l113" href="#l113">113</a>   (code &#x27;@ &#x27;(pop hl) &#x27;(ld e (@ hl)) &#x27;(inc hl) &#x27;(ld d (@ hl)) &#x27;(push de))
+<a id="l114" href="#l114">114</a>   (code &#x27;! &#x27;(pop hl) &#x27;(pop de) &#x27;(ld (@ hl) e) &#x27;(inc hl) &#x27;(ld (@ hl) d))
+<a id="l115" href="#l115">115</a>   (code &#x27;c@ &#x27;(pop hl) &#x27;(ld l (@ hl)) &#x27;(ld h 0) &#x27;(push hl))
+<a id="l116" href="#l116">116</a>   (code &#x27;c! &#x27;(pop hl) &#x27;(pop de) &#x27;(ld (@ hl) e))
+<a id="l117" href="#l117">117</a>   (code &#x27;+! &#x27;(pop hl) &#x27;(pop de) &#x27;(ld a (@ hl)) &#x27;(add a e) &#x27;(ld (@ hl) a) &#x27;(inc hl) &#x27;(ld a (@ hl)) &#x27;(adc a d) &#x27;(ld (@ hl) a))
+<a id="l118" href="#l118">118</a>   (code &#x27;+ &#x27;(pop hl) &#x27;(pop de) &#x27;(add hl de) &#x27;(push hl))
+<a id="l119" href="#l119">119</a>   (code &#x27;- &#x27;(pop de) &#x27;(pop hl) &#x27;(or a) &#x27;(sbc hl de) &#x27;(push hl))
+<a id="l120" href="#l120">120</a>   (dolist (op &#x27;(and or xor))
+<a id="l121" href="#l121">121</a>     (code op &#x27;(pop hl) &#x27;(pop de) &#x27;(ld a l) (list op &#x27;e) &#x27;(ld l a) &#x27;(ld a h) (list op &#x27;d) &#x27;(ld h a) &#x27;(push hl)))
+<a id="l122" href="#l122">122</a>   (code &#x27;d+ &#x27;(ld (@ ipsave) bc) &#x27;(pop bc) &#x27;(pop de) &#x27;(pop hl) &#x27;(ex (@ sp) hl) &#x27;(add hl de) &#x27;(ex (@ sp) hl) &#x27;(adc hl bc) &#x27;(push hl) &#x27;(ld bc (@ ipsave)))
+<a id="l123" href="#l123">123</a>   (code &#x27;invert &#x27;(pop hl) &#x27;(ld a l) &#x27;(cpl) &#x27;(ld l a) &#x27;(ld a h) &#x27;(cpl) &#x27;(ld h a) &#x27;(push hl))
+<a id="l124" href="#l124">124</a>   (code &#x27;negate &#x27;(pop de) &#x27;(ld hl 0) &#x27;(or a) &#x27;(sbc hl de) &#x27;(push hl))
+<a id="l125" href="#l125">125</a>   (code &#x27;2* &#x27;(pop hl) &#x27;(add hl hl) &#x27;(push hl))
+<a id="l126" href="#l126">126</a>   (code &#x27;2/ &#x27;(pop hl) &#x27;(sra h) &#x27;(rr l) &#x27;(push hl))
+<a id="l127" href="#l127">127</a>   (code &#x27;u2/ &#x27;(pop hl) &#x27;(srl h) &#x27;(rr l) &#x27;(push hl))
+<a id="l128" href="#l128">128</a>   (code &#x27;1+ &#x27;(pop hl) &#x27;(inc hl) &#x27;(push hl))
+<a id="l129" href="#l129">129</a>   (code &#x27;1- &#x27;(pop hl) &#x27;(dec hl) &#x27;(push hl))
+<a id="l130" href="#l130">130</a>   (apply #&#x27;code &#x27;= &#x27;(pop hl) &#x27;(pop de) &#x27;(or a) &#x27;(sbc hl de) (flag-code &#x27;z))
+<a id="l131" href="#l131">131</a>   (apply #&#x27;code &#x27;0= &#x27;(pop hl) &#x27;(ld a h) &#x27;(or l) (flag-code &#x27;z))
+<a id="l132" href="#l132">132</a>   (apply #&#x27;code &#x27;0&lt; &#x27;(pop hl) &#x27;(add hl hl) (flag-code &#x27;c))
+<a id="l133" href="#l133">133</a>   (apply #&#x27;code &#x27;u&lt; &#x27;(pop de) &#x27;(pop hl) &#x27;(or a) &#x27;(sbc hl de) (flag-code &#x27;c))
+<a id="l134" href="#l134">134</a>   (let ((same (gensym)) (done (gensym)))
+<a id="l135" href="#l135">135</a>     (apply #&#x27;code &#x27;&lt; &#x27;(pop de) &#x27;(pop hl) &#x27;(ld a h) &#x27;(xor d) `(jp p ,same) &#x27;(ld a h) &#x27;(rla) `(jr ,done)
+<a id="l136" href="#l136">136</a>            same &#x27;(or a) &#x27;(sbc hl de) done (flag-code &#x27;c)))
+<a id="l137" href="#l137">137</a>   (let ((l (gensym)) (s (gensym)))
+<a id="l138" href="#l138">138</a>     (code &#x27;um* &#x27;(ld (@ ipsave) bc) &#x27;(pop bc) &#x27;(pop de) &#x27;(ld hl 0) &#x27;(ld a 16)
+<a id="l139" href="#l139">139</a>           l &#x27;(add hl hl) &#x27;(rl e) &#x27;(rl d) `(jr nc ,s) &#x27;(add hl bc) `(jr nc ,s) &#x27;(inc de)
+<a id="l140" href="#l140">140</a>           s &#x27;(dec a) `(jr nz ,l) &#x27;(push hl) &#x27;(push de) &#x27;(ld bc (@ ipsave))))
+<a id="l141" href="#l141">141</a>   (let ((l (gensym)) (big (gensym)) (set (gensym)) (nx (gensym)))
+<a id="l142" href="#l142">142</a>     (code &#x27;um/mod &#x27;(ld (@ ipsave) bc) &#x27;(pop bc) &#x27;(pop hl) &#x27;(pop de) &#x27;(ld a 16)
+<a id="l143" href="#l143">143</a>           l &#x27;(sla e) &#x27;(rl d) &#x27;(adc hl hl) `(jr c ,big) &#x27;(or a) &#x27;(sbc hl bc) `(jr nc ,set) &#x27;(add hl bc) `(jr ,nx)
+<a id="l144" href="#l144">144</a>           big &#x27;(or a) &#x27;(sbc hl bc) set &#x27;(inc e) nx &#x27;(dec a) `(jr nz ,l) &#x27;(push hl) &#x27;(push de) &#x27;(ld bc (@ ipsave))))
+<a id="l145" href="#l145">145</a>   (let ((l (gensym)))
+<a id="l146" href="#l146">146</a>     (code &#x27;key l `(in a (@ ,+console-status+)) &#x27;(and 1) `(jr z ,l) `(in a (@ ,+console-data+)) &#x27;(ld l a) &#x27;(ld h 0) &#x27;(push hl)))
+<a id="l147" href="#l147">147</a>   (let ((l (gensym)))
+<a id="l148" href="#l148">148</a>     (code &#x27;emit &#x27;(pop hl) l `(in a (@ ,+console-status+)) &#x27;(and 2) `(jr z ,l) &#x27;(ld a l) `(out (@ ,+console-data+) a)))
+<a id="l149" href="#l149">149</a>   (apply #&#x27;code &#x27;key? `(in a (@ ,+console-status+)) &#x27;(and 1) &#x27;(xor 1) (flag-code &#x27;z))
+<a id="l150" href="#l150">150</a>   (let ((s (gensym)))
+<a id="l151" href="#l151">151</a>     (code &#x27;cmove &#x27;(ld (@ ipsave) bc) &#x27;(pop bc) &#x27;(pop de) &#x27;(pop hl) &#x27;(ld a b) &#x27;(or c) `(jr z ,s) &#x27;(ldir) s &#x27;(ld bc (@ ipsave))))
+<a id="l152" href="#l152">152</a>   (let ((l (gensym)) (d (gensym)))
+<a id="l153" href="#l153">153</a>     (code &#x27;fill &#x27;(ld (@ ipsave) bc) &#x27;(pop de) &#x27;(pop bc) &#x27;(pop hl) l &#x27;(ld a b) &#x27;(or c) `(jr z ,d)
+<a id="l154" href="#l154">154</a>           &#x27;(ld (@ hl) e) &#x27;(inc hl) &#x27;(dec bc) `(jr ,l) d &#x27;(ld bc (@ ipsave))))
+<a id="l155" href="#l155">155</a>   (let ((l (gensym)) (eq (gensym)) (ne (gensym)) (out (gensym)))
+<a id="l156" href="#l156">156</a>     (code &#x27;s= &#x27;(ld (@ ipsave) bc) &#x27;(pop bc) &#x27;(pop de) &#x27;(pop hl) l &#x27;(ld a b) &#x27;(or c) `(jr z ,eq)
+<a id="l157" href="#l157">157</a>           &#x27;(ld a (@ de)) &#x27;(cp (@ hl)) `(jr nz ,ne) &#x27;(inc hl) &#x27;(inc de) &#x27;(dec bc) `(jr ,l)
+<a id="l158" href="#l158">158</a>           eq &#x27;(ld hl -1) `(jr ,out) ne &#x27;(ld hl 0) out &#x27;(push hl) &#x27;(ld bc (@ ipsave))))
+<a id="l159" href="#l159">159</a>   (code &#x27;bye &#x27;(halt))
+<a id="l160" href="#l160">160</a>   ;; variables and constants
+<a id="l161" href="#l161">161</a>   (var &#x27;state) (var &#x27;&gt;in) (var &quot;#tib&quot;) (var &#x27;handler) (var &#x27;erraddr) (var &#x27;errlen) (var &#x27;lastc)
+<a id="l162" href="#l162">162</a>   (var &#x27;dp &#x27;dict-end)
+<a id="l163" href="#l163">163</a>   (var &#x27;latest &#x27;last-header)
+<a id="l164" href="#l164">164</a>   (const &#x27;tib +tib+) (const &#x27;r0 +r0+) (const &#x27;s0 0) (const &#x27;bl 32)
+<a id="l165" href="#l165">165</a>   (const &#x27;docol &#x27;docol) (const &#x27;dovar &#x27;dovar) (const &#x27;docon &#x27;docon)
+<a id="l166" href="#l166">166</a>   ;; high-level words
+<a id="l167" href="#l167">167</a>   (colon &#x27;2drop &#x27;drop &#x27;drop)
+<a id="l168" href="#l168">168</a>   (colon &#x27;2dup &#x27;over &#x27;over)
+<a id="l169" href="#l169">169</a>   (colon &#x27;?dup &#x27;dup &#x27;if &#x27;dup &#x27;then)
+<a id="l170" href="#l170">170</a>   (colon &#x27;&lt;&gt; &#x27;= &#x27;0=)
+<a id="l171" href="#l171">171</a>   (colon &#x27;&gt; &#x27;swap &#x27;&lt;)
+<a id="l172" href="#l172">172</a>   (colon &#x27;* &#x27;um* &#x27;drop)
+<a id="l173" href="#l173">173</a>   (colon &#x27;here &#x27;dp &#x27;@)
+<a id="l174" href="#l174">174</a>   (colon &#x27;allot &#x27;dp &#x27;+!)
+<a id="l175" href="#l175">175</a>   (colon &quot;,&quot; &#x27;here &#x27;! 2 &#x27;allot)
+<a id="l176" href="#l176">176</a>   (colon &#x27;c\, &#x27;here &#x27;c! 1 &#x27;allot)
+<a id="l177" href="#l177">177</a>   (colon &#x27;count &#x27;dup &#x27;1+ &#x27;swap &#x27;c@)
+<a id="l178" href="#l178">178</a>   (colon &#x27;type &#x27;begin &#x27;dup &#x27;while &#x27;swap &#x27;dup &#x27;c@ &#x27;emit &#x27;1+ &#x27;swap &#x27;1- &#x27;repeat &#x27;2drop)
+<a id="l179" href="#l179">179</a>   (colon &#x27;cr 13 &#x27;emit 10 &#x27;emit)
+<a id="l180" href="#l180">180</a>   (colon &#x27;space 32 &#x27;emit)
+<a id="l181" href="#l181">181</a>   (colon &quot;(u.)&quot; 0 10 &#x27;um/mod &#x27;?dup &#x27;if &#x27;recurse &#x27;then 48 &#x27;+ &#x27;emit)
+<a id="l182" href="#l182">182</a>   (colon &#x27;u. &quot;(u.)&quot; &#x27;space)
+<a id="l183" href="#l183">183</a>   (colon &quot;.&quot; &#x27;dup &#x27;0&lt; &#x27;if 45 &#x27;emit &#x27;negate &#x27;then &#x27;u.)
+<a id="l184" href="#l184">184</a>   (colon &#x27;depth &#x27;sp@ &#x27;negate &#x27;2/)
+<a id="l185" href="#l185">185</a>   (colon &#x27;catch &#x27;sp@ &#x27;&gt;r &#x27;handler &#x27;@ &#x27;&gt;r &#x27;rp@ &#x27;handler &#x27;! &#x27;execute &#x27;r&gt; &#x27;handler &#x27;! &#x27;r&gt; &#x27;drop 0)
+<a id="l186" href="#l186">186</a>   (colon &#x27;throw &#x27;?dup &#x27;if &#x27;handler &#x27;@ &#x27;rp! &#x27;r&gt; &#x27;handler &#x27;! &#x27;r&gt; &#x27;swap &#x27;&gt;r &#x27;sp! &#x27;drop &#x27;r&gt; &#x27;then)
+<a id="l187" href="#l187">187</a>   ;; line input: echo, backspace, CR/LF/CRLF all end a line
+<a id="l188" href="#l188">188</a>   (colon &#x27;eol? &#x27;dup 13 &#x27;= &#x27;over 10 &#x27;= &#x27;or)
+<a id="l189" href="#l189">189</a>   (colon &#x27;refill 0 &quot;#tib&quot; &#x27;! 0 &#x27;&gt;in &#x27;!
+<a id="l190" href="#l190">190</a>          &#x27;begin &#x27;key &#x27;dup 10 &#x27;= &#x27;lastc &#x27;@ 13 &#x27;= &#x27;and &#x27;if &#x27;drop 0 &#x27;lastc &#x27;! &#x27;key &#x27;then &#x27;dup &#x27;lastc &#x27;!
+<a id="l191" href="#l191">191</a>                 &#x27;eol? &#x27;0= &#x27;while
+<a id="l192" href="#l192">192</a>                 &#x27;dup 8 &#x27;= &#x27;over 127 &#x27;= &#x27;or
+<a id="l193" href="#l193">193</a>                 &#x27;if &#x27;drop &quot;#tib&quot; &#x27;@ &#x27;if -1 &quot;#tib&quot; &#x27;+! 8 &#x27;emit &#x27;space 8 &#x27;emit &#x27;then
+<a id="l194" href="#l194">194</a>                 &#x27;else &quot;#tib&quot; &#x27;@ +tib-size+ &#x27;&lt; &#x27;if &#x27;dup &#x27;emit &#x27;tib &quot;#tib&quot; &#x27;@ &#x27;+ &#x27;c! 1 &quot;#tib&quot; &#x27;+! &#x27;else &#x27;drop &#x27;then &#x27;then
+<a id="l195" href="#l195">195</a>          &#x27;repeat &#x27;drop)
+<a id="l196" href="#l196">196</a>   (colon &#x27;in-char &#x27;&gt;in &#x27;@ &quot;#tib&quot; &#x27;@ &#x27;&lt; &#x27;if &#x27;tib &#x27;&gt;in &#x27;@ &#x27;+ &#x27;c@ &#x27;else 0 &#x27;then)
+<a id="l197" href="#l197">197</a>   (colon &#x27;more? &#x27;&gt;in &#x27;@ &quot;#tib&quot; &#x27;@ &#x27;&lt;)
+<a id="l198" href="#l198">198</a>   (colon &#x27;parse-name
+<a id="l199" href="#l199">199</a>          &#x27;begin &#x27;more? &#x27;if &#x27;in-char 33 &#x27;&lt; &#x27;else 0 &#x27;then &#x27;while 1 &#x27;&gt;in &#x27;+! &#x27;repeat
+<a id="l200" href="#l200">200</a>          &#x27;tib &#x27;&gt;in &#x27;@ &#x27;+ 0
+<a id="l201" href="#l201">201</a>          &#x27;begin &#x27;in-char 32 &#x27;&gt; &#x27;while &#x27;1+ 1 &#x27;&gt;in &#x27;+! &#x27;repeat)
+<a id="l202" href="#l202">202</a>   (colon &#x27;parse &#x27;&gt;r &#x27;tib &#x27;&gt;in &#x27;@ &#x27;+ 0
+<a id="l203" href="#l203">203</a>          &#x27;begin &#x27;more? &#x27;if &#x27;in-char &#x27;r@ &#x27;&lt;&gt; &#x27;else 0 &#x27;then &#x27;while &#x27;1+ 1 &#x27;&gt;in &#x27;+! &#x27;repeat
+<a id="l204" href="#l204">204</a>          &#x27;r&gt; &#x27;drop &#x27;more? &#x27;if 1 &#x27;&gt;in &#x27;+! &#x27;then)
+<a id="l205" href="#l205">205</a>   (colon &#x27;find &#x27;latest &#x27;@
+<a id="l206" href="#l206">206</a>          &#x27;begin &#x27;dup &#x27;while
+<a id="l207" href="#l207">207</a>            &#x27;dup 2 &#x27;+ &#x27;c@ 95 &#x27;and 2 &#x27;pick &#x27;=
+<a id="l208" href="#l208">208</a>            &#x27;if &#x27;dup 3 &#x27;+ 3 &#x27;pick 3 &#x27;pick &#x27;s=
+<a id="l209" href="#l209">209</a>              &#x27;if &#x27;nip &#x27;nip &#x27;dup 2 &#x27;+ &#x27;c@ 128 &#x27;and &#x27;if 1 &#x27;else -1 &#x27;then &#x27;swap
+<a id="l210" href="#l210">210</a>                  &#x27;dup 2 &#x27;+ &#x27;c@ 31 &#x27;and &#x27;+ 3 &#x27;+ &#x27;swap &#x27;exit &#x27;then &#x27;then
+<a id="l211" href="#l211">211</a>            &#x27;@ &#x27;repeat)
+<a id="l212" href="#l212">212</a>   (colon &#x27;digit? 48 &#x27;- &#x27;dup 10 &#x27;u&lt;)
+<a id="l213" href="#l213">213</a>   (colon &#x27;number &#x27;over &#x27;c@ 45 &#x27;= &#x27;dup &#x27;&gt;r &#x27;if &#x27;1- &#x27;swap &#x27;1+ &#x27;swap &#x27;then
+<a id="l214" href="#l214">214</a>          &#x27;dup &#x27;0= &#x27;if &#x27;2drop &#x27;r&gt; &#x27;drop 0 &#x27;exit &#x27;then
+<a id="l215" href="#l215">215</a>          0 &#x27;&gt;r &#x27;begin &#x27;dup &#x27;while &#x27;over &#x27;c@ &#x27;digit? &#x27;0= &#x27;if &#x27;drop &#x27;2drop &#x27;r&gt; &#x27;r&gt; &#x27;2drop 0 &#x27;exit &#x27;then
+<a id="l216" href="#l216">216</a>                    &#x27;r&gt; 10 &#x27;* &#x27;+ &#x27;&gt;r &#x27;1- &#x27;swap &#x27;1+ &#x27;swap &#x27;repeat
+<a id="l217" href="#l217">217</a>          &#x27;2drop &#x27;r&gt; &#x27;r&gt; &#x27;if &#x27;negate &#x27;then -1)
+<a id="l218" href="#l218">218</a>   (colon &#x27;undefined &#x27;errlen &#x27;! &#x27;erraddr &#x27;! -13 &#x27;throw)
+<a id="l219" href="#l219">219</a>   (colon &#x27;interpret
+<a id="l220" href="#l220">220</a>          &#x27;begin &#x27;parse-name &#x27;dup &#x27;while
+<a id="l221" href="#l221">221</a>            &#x27;find &#x27;?dup
+<a id="l222" href="#l222">222</a>            &#x27;if -1 &#x27;= &#x27;state &#x27;@ &#x27;and &#x27;if &quot;,&quot; &#x27;else &#x27;execute &#x27;then
+<a id="l223" href="#l223">223</a>            &#x27;else &#x27;2dup &#x27;number &#x27;if &#x27;&gt;r &#x27;2drop &#x27;r&gt; &#x27;state &#x27;@ &#x27;if &#x27;&#x27;lit &quot;,&quot; &quot;,&quot; &#x27;then &#x27;else &#x27;undefined &#x27;then &#x27;then
+<a id="l224" href="#l224">224</a>          &#x27;repeat &#x27;2drop)
+<a id="l225" href="#l225">225</a>   (colon &#x27;.error &#x27;dup -13 &#x27;= &#x27;if &#x27;drop &#x27;space &#x27;erraddr &#x27;@ &#x27;errlen &#x27;@ &#x27;type (dq &quot; ?&quot;)
+<a id="l226" href="#l226">226</a>          &#x27;else (dq &quot; error &quot;) &quot;.&quot; &#x27;then)
+<a id="l227" href="#l227">227</a>   (colon &#x27;quit &#x27;r0 &#x27;rp! 0 &#x27;state &#x27;! 0 &#x27;handler &#x27;!
+<a id="l228" href="#l228">228</a>          &#x27;begin &#x27;refill &#x27;&#x27;interpret &#x27;catch &#x27;?dup &#x27;if &#x27;.error &#x27;s0 &#x27;sp! 0 &#x27;state &#x27;! &#x27;else (dq &quot; ok&quot;) &#x27;then &#x27;cr &#x27;again)
+<a id="l229" href="#l229">229</a>   ;; compiler
+<a id="l230" href="#l230">230</a>   (colon &#x27;header &#x27;parse-name &#x27;here &#x27;latest &#x27;@ &quot;,&quot; &#x27;latest &#x27;! &#x27;dup &#x27;c\, &#x27;here &#x27;swap &#x27;dup &#x27;allot &#x27;cmove)
+<a id="l231" href="#l231">231</a>   (colon &#x27;create &#x27;header &#x27;dovar &quot;,&quot;)
+<a id="l232" href="#l232">232</a>   (colon &#x27;variable &#x27;create 0 &quot;,&quot;)
+<a id="l233" href="#l233">233</a>   (colon &#x27;constant &#x27;header &#x27;docon &quot;,&quot; &quot;,&quot;)
+<a id="l234" href="#l234">234</a>   (colon &#x27;flags! &#x27;latest &#x27;@ 2 &#x27;+ &#x27;dup &#x27;c@ &#x27;rot &#x27;xor &#x27;swap &#x27;c!)  ; toggle header flag bits
+<a id="l235" href="#l235">235</a>   (colon &quot;]&quot; -1 &#x27;state &#x27;!)
+<a id="l236" href="#l236">236</a>   (colon &quot;[&quot; :immediate 0 &#x27;state &#x27;!)
+<a id="l237" href="#l237">237</a>   (colon &quot;:&quot; &#x27;header &#x27;docol &quot;,&quot; 64 &#x27;flags! &quot;]&quot;)
+<a id="l238" href="#l238">238</a>   (colon &quot;;&quot; :immediate &#x27;&#x27;exit &quot;,&quot; 64 &#x27;flags! &quot;[&quot;)
+<a id="l239" href="#l239">239</a>   (colon &#x27;immediate 128 &#x27;flags!)
+<a id="l240" href="#l240">240</a>   (colon &quot;&#x27;&quot; &#x27;parse-name &#x27;find &#x27;0= &#x27;if &#x27;undefined &#x27;then)
+<a id="l241" href="#l241">241</a>   (colon &quot;[&#x27;]&quot; :immediate &quot;&#x27;&quot; &#x27;&#x27;lit &quot;,&quot; &quot;,&quot;)
+<a id="l242" href="#l242">242</a>   (colon &#x27;literal :immediate &#x27;&#x27;lit &quot;,&quot; &quot;,&quot;)
+<a id="l243" href="#l243">243</a>   (colon &#x27;if :immediate &#x27;&#x27;0branch &quot;,&quot; &#x27;here 0 &quot;,&quot;)
+<a id="l244" href="#l244">244</a>   (colon &#x27;then :immediate &#x27;here &#x27;swap &#x27;!)
+<a id="l245" href="#l245">245</a>   (colon &#x27;else :immediate &#x27;&#x27;branch &quot;,&quot; &#x27;here 0 &quot;,&quot; &#x27;swap &#x27;here &#x27;swap &#x27;!)
+<a id="l246" href="#l246">246</a>   (colon &#x27;begin :immediate &#x27;here)
+<a id="l247" href="#l247">247</a>   (colon &#x27;until :immediate &#x27;&#x27;0branch &quot;,&quot; &quot;,&quot;)
+<a id="l248" href="#l248">248</a>   (colon &#x27;again :immediate &#x27;&#x27;branch &quot;,&quot; &quot;,&quot;)
+<a id="l249" href="#l249">249</a>   (colon &#x27;while :immediate &#x27;&#x27;0branch &quot;,&quot; &#x27;here 0 &quot;,&quot; &#x27;swap)
+<a id="l250" href="#l250">250</a>   (colon &#x27;repeat :immediate &#x27;&#x27;branch &quot;,&quot; &quot;,&quot; &#x27;here &#x27;swap &#x27;!)
+<a id="l251" href="#l251">251</a>   (colon &#x27;recurse :immediate &#x27;latest &#x27;@ &#x27;dup 2 &#x27;+ &#x27;c@ 31 &#x27;and &#x27;+ 3 &#x27;+ &quot;,&quot;)
+<a id="l252" href="#l252">252</a>   (colon &quot;(&quot; :immediate 41 &#x27;parse &#x27;2drop)
+<a id="l253" href="#l253">253</a>   (colon &quot;\\&quot; :immediate &quot;#tib&quot; &#x27;@ &#x27;&gt;in &#x27;!)
+<a id="l254" href="#l254">254</a>   (colon &quot;(s\&quot;)&quot; &#x27;r&gt; &#x27;count &#x27;2dup &#x27;+ &#x27;&gt;r)
+<a id="l255" href="#l255">255</a>   (colon &quot;,str&quot; 1 &#x27;&gt;in &#x27;+! 34 &#x27;parse &#x27;dup &#x27;c\, &#x27;here &#x27;swap &#x27;dup &#x27;allot &#x27;cmove)
+<a id="l256" href="#l256">256</a>   (colon &quot;s\&quot;&quot; :immediate &#x27;state &#x27;@ &#x27;if (xt &quot;(s\&quot;)&quot;) &quot;,&quot; &quot;,str&quot; &#x27;else 1 &#x27;&gt;in &#x27;+! 34 &#x27;parse &#x27;then)
+<a id="l257" href="#l257">257</a>   (colon &quot;.\&quot;&quot; :immediate (xt &quot;(s\&quot;)&quot;) &quot;,&quot; &quot;,str&quot; &#x27;&#x27;type &quot;,&quot;)
+<a id="l258" href="#l258">258</a>   (colon &#x27;char &#x27;parse-name &#x27;drop &#x27;c@)
+<a id="l259" href="#l259">259</a>   (colon &quot;[char]&quot; :immediate &#x27;char &#x27;&#x27;lit &quot;,&quot; &quot;,&quot;)
+<a id="l260" href="#l260">260</a>   (colon &#x27;words &#x27;latest &#x27;@ &#x27;begin &#x27;dup &#x27;while &#x27;dup 3 &#x27;+ &#x27;over 2 &#x27;+ &#x27;c@ 31 &#x27;and &#x27;type &#x27;space &#x27;@ &#x27;repeat &#x27;drop)
+<a id="l261" href="#l261">261</a>   (colon &#x27;cold (dq &quot;Z80 Forth&quot;) &#x27;cr &#x27;quit)
+<a id="l262" href="#l262">262</a>   (emit `(equ last-header ,*link*) &#x27;dict-end)
+<a id="l263" href="#l263">263</a>   (assemble (reverse *forms*)))
+<a id="l264" href="#l264">264</a> 
+<a id="l265" href="#l265">265</a> (let ((out (second sb-ext:*posix-argv*)))
+<a id="l266" href="#l266">266</a>   (when out
+<a id="l267" href="#l267">267</a>     (let ((bytes (build)))
+<a id="l268" href="#l268">268</a>       (with-open-file (s out :direction :output :element-type &#x27;(unsigned-byte 8) :if-exists :supersede)
+<a id="l269" href="#l269">269</a>         (write-sequence #(#xFF 0 0) s) (write-sequence bytes s))
+<a id="l270" href="#l270">270</a>       (format t &quot;kernel: ~d bytes~%&quot; (length bytes)))))</pre>
+</div></body></html>

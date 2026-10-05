@@ -1,0 +1,1768 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 29e67302 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 29e67302f4d53c7ad7a1d7febf792e5cf8fed1a5
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 17:08:43 -0700
+
+Start each burst worker on the cloud that is cheapest now
+
+The burst controller becomes the package tools/burst, and replaces
+tools/burst_controller.py. Each time paid jobs wait, it reads the live
+offers of each cloud that has credentials: the newest AWS spot prices,
+and the Hetzner prices of the server types in stock. A new worker goes
+to the offer with the lowest cost per book (the hourly price times the
+hours of a book, plus any transfer fee). When the apply of one cloud
+fails, that cloud rests for 30 minutes and the next offer gets the
+worker.
+
+A spend cap limits the workers. The cap is 30% of the net server
+revenue of the last 30 days (packs for 30 days, active subscriptions,
+after the Stripe fees), at least $5 and at most $100. The controller
+counts what each machine cost, and keeps 2.5 hours of each running
+worker in reserve. At the cap it starts no worker and stops no job.
+A machine that a cloud bills by the started hour stops only late in
+its paid hour.
+
+Property tests check that new workers go to the cheapest offer that
+fits, that the spend cap and the worker cap hold, and that a worker
+known to rq is never destroyed. Three deliberate bugs in the offer
+choice were caught.
+
+</pre><pre> tests/test_burst.py            | 403 +++++++++++++++++++++++++++++++++++++++++
+ tests/test_burst_controller.py | 251 -------------------------
+ tools/burst/__init__.py        |   1 +
+ tools/burst/__main__.py        | 303 +++++++++++++++++++++++++++++++
+ tools/burst/core.py            | 252 ++++++++++++++++++++++++++
+ tools/burst/offers.py          |  95 ++++++++++
+ tools/burst/revenue.py         |  55 ++++++
+ tools/burst_controller.py      | 313 --------------------------------
+ 8 files changed, 1109 insertions(+), 564 deletions(-)
+</pre><pre>diff --git a/tests/test_burst.py b/tests/test_burst.py
+new file mode 100644
+index 0000000..eb407d2
+--- /dev/null
++++ b/tests/test_burst.py
+<span class="h">@@ -0,0 +1,403 @@</span>
+<span class="a">+&quot;&quot;&quot;The burst controller (tools/burst): which workers it starts, where, and when it stops.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import json</span>
+<span class="a">+import math</span>
+<span class="a">+import sys</span>
+<span class="a">+import time</span>
+<span class="a">+from datetime import datetime, timedelta, timezone</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+import fakeredis</span>
+<span class="a">+import pytest</span>
+<span class="a">+from hypothesis import given, settings</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+from rq import Queue, Worker</span>
+<span class="a">+</span>
+<span class="a">+from backend.db import Account, Purchase, SessionLocal</span>
+<span class="a">+from tools.burst import __main__ as run_mod</span>
+<span class="a">+from tools.burst import offers as offers_mod</span>
+<span class="a">+from tools.burst.core import (</span>
+<span class="a">+    NAME_PREFIX, Config, Memory, Offer, decide, machine_cost, spend_30d, spend_cap_usd,</span>
+<span class="a">+)</span>
+<span class="a">+from tools.burst.revenue import net_pack_cents, net_subscription_cents, revenue_30d_usd</span>
+<span class="a">+</span>
+<span class="a">+REF = &quot;new&quot;</span>
+<span class="a">+NOW = 1_000_000.0</span>
+<span class="a">+MIN = 60.0</span>
+<span class="a">+AWS = Offer(&quot;aws&quot;, &quot;c6a.xlarge&quot;, &quot;us-west-2a&quot;, 4, 0.07)</span>
+<span class="a">+HETZNER = Offer(&quot;hetzner&quot;, &quot;cx33&quot;, &quot;fsn1&quot;, 4, 0.0164, per_started_hour=True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def worker(created_ago: float, ref: str = REF, offer: Offer = AWS) -&gt; dict:</span>
+<span class="a">+    return {&quot;created&quot;: NOW - created_ago, &quot;ref&quot;: ref, &quot;provider&quot;: offer.provider,</span>
+<span class="a">+            &quot;machine&quot;: offer.machine, &quot;zone&quot;: offer.zone, &quot;usd_per_hour&quot;: offer.usd_per_hour,</span>
+<span class="a">+            &quot;per_started_hour&quot;: offer.per_started_hour}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- invariants over any state -------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+names = st.sampled_from([f&quot;{NAME_PREFIX}{i}&quot; for i in range(8)])</span>
+<span class="a">+offer_st = st.builds(</span>
+<span class="a">+    Offer, provider=st.sampled_from([&quot;aws&quot;, &quot;hetzner&quot;]), machine=st.sampled_from([&quot;a&quot;, &quot;b&quot;]),</span>
+<span class="a">+    zone=st.sampled_from([&quot;z1&quot;, &quot;z2&quot;]), vcpus=st.sampled_from([2, 4, 8]),</span>
+<span class="a">+    usd_per_hour=st.floats(0.005, 0.2), per_started_hour=st.booleans(),</span>
+<span class="a">+    capacity=st.integers(0, 3),</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@st.composite</span>
+<span class="a">+def states(draw):</span>
+<span class="a">+    pool = draw(st.sets(names, max_size=8))</span>
+<span class="a">+    workers = {n: worker(draw(st.floats(0, 60 * MIN)), draw(st.sampled_from([&quot;old&quot;, REF])),</span>
+<span class="a">+                         draw(st.sampled_from([AWS, HETZNER]))) for n in pool}</span>
+<span class="a">+    live = {n: draw(st.sampled_from([&quot;busy&quot;, &quot;idle&quot;])) for n in pool if draw(st.booleans())}</span>
+<span class="a">+    registered = {n for n in pool if n in live or draw(st.booleans())}</span>
+<span class="a">+    draining = {n for n in registered if draw(st.booleans())}</span>
+<span class="a">+    idle_since = {n: NOW - draw(st.floats(0, 30 * MIN)) for n in live if live[n] == &quot;idle&quot;}</span>
+<span class="a">+    memory = Memory(workers=workers, registered=registered, idle_since=idle_since,</span>
+<span class="a">+                    draining=draining, cooldown=draw(st.sampled_from([{}, {&quot;aws&quot;: NOW + 60}])))</span>
+<span class="a">+    offers = draw(st.lists(offer_st, max_size=4, unique=True))</span>
+<span class="a">+    cap = draw(st.sampled_from([math.inf, 0.0, 0.5, 5.0]))</span>
+<span class="a">+    return (draw(st.integers(0, 12)), live, memory, Config(max_workers=draw(st.integers(0, 6))),</span>
+<span class="a">+            offers, cap)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=500)</span>
+<span class="a">+@given(states())</span>
+<span class="a">+def test_invariants(state):</span>
+<span class="a">+    waiting, live, memory, config, offers, cap = state</span>
+<span class="a">+    d, after = decide(NOW, waiting, live, memory, config, REF, offers, cap)</span>
+<span class="a">+    added = [n for n, _ in d.add]</span>
+<span class="a">+</span>
+<span class="a">+    # A worker that rq knows is never destroyed: it must stop by itself first.</span>
+<span class="a">+    assert not d.remove &amp; set(live)</span>
+<span class="a">+    assert set(after.workers) == (set(memory.workers) - d.remove) | set(added)</span>
+<span class="a">+    assert all(n.startswith(NAME_PREFIX) and n not in memory.workers and n not in live for n in added)</span>
+<span class="a">+    # The cap on workers holds, and no more new workers than waiting jobs.</span>
+<span class="a">+    assert len([n for n in after.workers if n not in after.draining]) &lt;= config.max_workers</span>
+<span class="a">+    assert len(added) &lt;= waiting</span>
+<span class="a">+    # Only a worker that rq knows gets the shutdown command.</span>
+<span class="a">+    assert d.drain &lt;= set(live)</span>
+<span class="a">+    # New workers come from offers that have room, from a cloud that is not resting.</span>
+<span class="a">+    for offer in {o for _, o in d.add}:</span>
+<span class="a">+        assert offer in offers and memory.cooldown.get(offer.provider, 0) &lt;= NOW</span>
+<span class="a">+        assert sum(1 for _, o in d.add if o == offer) &lt;= offer.capacity</span>
+<span class="a">+    # Each machine that ends goes to the ledger, once.</span>
+<span class="a">+    assert sorted(e[&quot;name&quot;] for e in after.ledger if e[&quot;end&quot;] == NOW) == sorted(d.remove)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=500)</span>
+<span class="a">+@given(states())</span>
+<span class="a">+def test_a_new_worker_goes_to_the_cheapest_offer_that_fits(state):</span>
+<span class="a">+    waiting, live, memory, config, offers, cap = state</span>
+<span class="a">+    d, _ = decide(NOW, waiting, live, memory, config, REF, offers, cap)</span>
+<span class="a">+    if not d.add:</span>
+<span class="a">+        return</span>
+<span class="a">+    first = d.add[0][1]</span>
+<span class="a">+    fitting = [o for o in offers if o.capacity &gt; 0 and memory.cooldown.get(o.provider, 0) &lt;= NOW]</span>
+<span class="a">+    cheaper = [o for o in fitting if o.usd_per_book(config) &lt; first.usd_per_book(config)]</span>
+<span class="a">+    # A cheaper offer is left out only when the spend cap has no room for its</span>
+<span class="a">+    # reserve, which is its hourly price: so it must cost more by the hour.</span>
+<span class="a">+    # (A counterexample of 2026-09-22: 8 vCPU at $0.30/h is cheaper by the book</span>
+<span class="a">+    # than 2 vCPU at $0.125/h, and a small cap takes only the second.)</span>
+<span class="a">+    for o in cheaper:</span>
+<span class="a">+        assert o.usd_per_hour &gt; first.usd_per_hour</span>
+<span class="a">+    if cap == math.inf:</span>
+<span class="a">+        assert not cheaper</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=300)</span>
+<span class="a">+@given(states())</span>
+<span class="a">+def test_the_spend_cap_holds(state):</span>
+<span class="a">+    waiting, live, memory, config, offers, cap = state</span>
+<span class="a">+    d, after = decide(NOW, waiting, live, memory, config, REF, offers, cap)</span>
+<span class="a">+    if d.add:</span>
+<span class="a">+        reserve = sum(config.reserve_hours * w[&quot;usd_per_hour&quot;] for n, w in after.workers.items()</span>
+<span class="a">+                      if n not in after.draining)</span>
+<span class="a">+        assert spend_30d(NOW, after) + reserve &lt;= cap + 1e-9</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- scenarios -------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_a_backlog_adds_workers_on_the_cheapest_cloud_up_to_the_cap():</span>
+<span class="a">+    d, after = decide(NOW, 5, {}, Memory(), Config(max_workers=3), REF, [AWS, HETZNER])</span>
+<span class="a">+    assert [o for _, o in d.add] == [HETZNER, HETZNER, HETZNER]</span>
+<span class="a">+    assert all(after.workers[n][&quot;provider&quot;] == &quot;hetzner&quot; for n, _ in d.add)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_when_the_cheapest_cloud_is_full_the_next_one_gets_the_worker():</span>
+<span class="a">+    small = Offer(&quot;hetzner&quot;, &quot;cx33&quot;, &quot;fsn1&quot;, 4, 0.0164, per_started_hour=True, capacity=1)</span>
+<span class="a">+    d, _ = decide(NOW, 3, {}, Memory(), Config(max_workers=3), REF, [AWS, small])</span>
+<span class="a">+    assert [o.provider for _, o in d.add] == [&quot;hetzner&quot;, &quot;aws&quot;, &quot;aws&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_resting_cloud_gets_no_worker():</span>
+<span class="a">+    memory = Memory(cooldown={&quot;hetzner&quot;: NOW + 10 * MIN})</span>
+<span class="a">+    d, _ = decide(NOW, 1, {}, memory, Config(max_workers=3), REF, [AWS, HETZNER])</span>
+<span class="a">+    assert [o.provider for _, o in d.add] == [&quot;aws&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_small_cap_takes_the_offer_with_the_lower_hourly_price():</span>
+<span class="a">+    # Found by the property test: the big machine is cheaper by the book, but</span>
+<span class="a">+    # the cap has room only for the reserve of the small one.</span>
+<span class="a">+    small = Offer(&quot;aws&quot;, &quot;small&quot;, &quot;z1&quot;, 2, 0.125)  # $0.52 a book, $0.31 reserve</span>
+<span class="a">+    big = Offer(&quot;hetzner&quot;, &quot;big&quot;, &quot;z1&quot;, 8, 0.35)  # $0.40 a book, $0.88 reserve</span>
+<span class="a">+    d, _ = decide(NOW, 1, {}, Memory(), Config(max_workers=1), REF, [small, big], cap_usd=0.5)</span>
+<span class="a">+    assert [o for _, o in d.add] == [small]</span>
+<span class="a">+    d, _ = decide(NOW, 1, {}, Memory(), Config(max_workers=1), REF, [small, big])</span>
+<span class="a">+    assert [o for _, o in d.add] == [big]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_egress_can_make_the_cheaper_machine_the_dearer_book():</span>
+<span class="a">+    aws_with_egress = Offer(&quot;aws&quot;, &quot;c6a.xlarge&quot;, &quot;us-west-2a&quot;, 4, 0.03, extra_usd_per_book=0.2)</span>
+<span class="a">+    d, _ = decide(NOW, 1, {}, Memory(), Config(max_workers=1), REF, [aws_with_egress, HETZNER])</span>
+<span class="a">+    assert d.add[0][1] == HETZNER</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_spend_cap_stops_new_workers_but_not_running_ones():</span>
+<span class="a">+    memory = Memory(workers={&quot;subplz-burst-a&quot;: worker(60 * MIN)}, registered={&quot;subplz-burst-a&quot;},</span>
+<span class="a">+                    ledger=[{&quot;name&quot;: &quot;old&quot;, &quot;provider&quot;: &quot;aws&quot;, &quot;start&quot;: NOW - 50 * 3600,</span>
+<span class="a">+                             &quot;end&quot;: NOW - 10 * 3600, &quot;usd_per_hour&quot;: 0.07, &quot;per_started_hour&quot;: False}])</span>
+<span class="a">+    # 40 h at $0.07 = $2.80 spent, plus 1 h of the running worker, and its reserve.</span>
+<span class="a">+    d, after = decide(NOW, 3, {&quot;subplz-burst-a&quot;: &quot;busy&quot;}, memory, Config(max_workers=3), REF,</span>
+<span class="a">+                      [AWS], cap_usd=3.2)</span>
+<span class="a">+    assert d.add == () and not d.drain and &quot;subplz-burst-a&quot; in after.workers</span>
+<span class="a">+    d, _ = decide(NOW, 3, {&quot;subplz-burst-a&quot;: &quot;busy&quot;}, memory, Config(max_workers=3), REF,</span>
+<span class="a">+                  [AWS], cap_usd=10.0)</span>
+<span class="a">+    assert len(d.add) == 2</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_hourly_machine_stops_late_in_its_paid_hour():</span>
+<span class="a">+    name = &quot;subplz-burst-h&quot;</span>
+<span class="a">+    for age, stops in ((70 * MIN, False), (115 * MIN, True)):</span>
+<span class="a">+        memory = Memory(workers={name: worker(age, offer=HETZNER)}, registered={name},</span>
+<span class="a">+                        idle_since={name: NOW - 20 * MIN})</span>
+<span class="a">+        d, _ = decide(NOW, 0, {name: &quot;idle&quot;}, memory, Config(max_workers=3), REF)</span>
+<span class="a">+        assert (name in d.drain) is stops, age</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_idle_worker_stops_after_the_grace_time_then_its_machine_goes():</span>
+<span class="a">+    name = &quot;subplz-burst-a&quot;</span>
+<span class="a">+    memory = Memory(workers={name: worker(60 * MIN)}, registered={name},</span>
+<span class="a">+                    idle_since={name: NOW - 11 * MIN})</span>
+<span class="a">+    d, after = decide(NOW, 0, {name: &quot;idle&quot;}, memory, Config(max_workers=3), REF)</span>
+<span class="a">+    assert d.drain == {name} and not d.remove</span>
+<span class="a">+    d, after = decide(NOW + MIN, 0, {}, after, Config(max_workers=3), REF)</span>
+<span class="a">+    assert d.remove == {name} and after.workers == {}</span>
+<span class="a">+    assert after.ledger[-1][&quot;name&quot;] == name and after.ledger[-1][&quot;end&quot;] == NOW + MIN</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_machine_that_never_starts_its_worker_is_destroyed_and_replaced():</span>
+<span class="a">+    memory = Memory(workers={&quot;subplz-burst-a&quot;: worker(21 * MIN)})</span>
+<span class="a">+    d, _ = decide(NOW, 1, {}, memory, Config(max_workers=1), REF, [AWS])</span>
+<span class="a">+    assert d.remove == {&quot;subplz-burst-a&quot;} and len(d.add) == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_after_a_deploy_the_workers_of_the_old_commit_are_replaced():</span>
+<span class="a">+    memory = Memory(</span>
+<span class="a">+        workers={&quot;subplz-burst-idle&quot;: worker(60 * MIN, &quot;old&quot;), &quot;subplz-burst-busy&quot;: worker(60 * MIN, &quot;old&quot;),</span>
+<span class="a">+                 &quot;subplz-burst-boot&quot;: worker(2 * MIN, &quot;old&quot;)},</span>
+<span class="a">+        registered={&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;},</span>
+<span class="a">+    )</span>
+<span class="a">+    live = {&quot;subplz-burst-idle&quot;: &quot;idle&quot;, &quot;subplz-burst-busy&quot;: &quot;busy&quot;}</span>
+<span class="a">+    d, after = decide(NOW, 2, live, memory, Config(max_workers=3), REF, [AWS])</span>
+<span class="a">+    assert d.drain == {&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;}</span>
+<span class="a">+    assert d.remove == {&quot;subplz-burst-boot&quot;}</span>
+<span class="a">+    assert len(d.add) == 2 and all(after.workers[n][&quot;ref&quot;] == REF for n, _ in d.add)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_cap_of_zero_stops_every_worker_and_starts_none():</span>
+<span class="a">+    memory = Memory(</span>
+<span class="a">+        workers={&quot;subplz-burst-boot&quot;: worker(MIN), &quot;subplz-burst-idle&quot;: worker(60 * MIN),</span>
+<span class="a">+                 &quot;subplz-burst-busy&quot;: worker(60 * MIN)},</span>
+<span class="a">+        registered={&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;},</span>
+<span class="a">+    )</span>
+<span class="a">+    live = {&quot;subplz-burst-idle&quot;: &quot;idle&quot;, &quot;subplz-burst-busy&quot;: &quot;busy&quot;}</span>
+<span class="a">+    d, _ = decide(NOW, 4, live, memory, Config(max_workers=0), REF, [AWS])</span>
+<span class="a">+    assert d.remove == {&quot;subplz-burst-boot&quot;}</span>
+<span class="a">+    assert d.drain == {&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;} and d.add == ()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_machine_cost_and_spend():</span>
+<span class="a">+    assert machine_cost(0, 5400, 0.1, False) == pytest.approx(0.15)</span>
+<span class="a">+    assert machine_cost(0, 5400, 0.1, True) == pytest.approx(0.2)  # 2 started hours</span>
+<span class="a">+    memory = Memory(workers={&quot;w&quot;: worker(3600)},</span>
+<span class="a">+                    ledger=[{&quot;name&quot;: &quot;x&quot;, &quot;provider&quot;: &quot;aws&quot;, &quot;start&quot;: 0, &quot;end&quot;: NOW - 31 * 86400,</span>
+<span class="a">+                             &quot;usd_per_hour&quot;: 9.0, &quot;per_started_hour&quot;: False}])</span>
+<span class="a">+    assert spend_30d(NOW, memory) == pytest.approx(0.07)  # the old machine is out of the window</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_spend_cap():</span>
+<span class="a">+    assert spend_cap_usd(0.0) == 5.0  # the floor serves the first buyer</span>
+<span class="a">+    assert spend_cap_usd(115.85) == pytest.approx(34.755)</span>
+<span class="a">+    assert spend_cap_usd(1000.0) == 100.0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- live offers --------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_aws_offers_take_the_newest_price_and_skip_a_price_above_the_maximum():</span>
+<span class="a">+    items = [</span>
+<span class="a">+        {&quot;InstanceType&quot;: &quot;c6a.xlarge&quot;, &quot;AvailabilityZone&quot;: &quot;us-west-2a&quot;, &quot;SpotPrice&quot;: &quot;0.090&quot;,</span>
+<span class="a">+         &quot;Timestamp&quot;: &quot;2026-09-22T10:00:00Z&quot;},</span>
+<span class="a">+        {&quot;InstanceType&quot;: &quot;c6a.xlarge&quot;, &quot;AvailabilityZone&quot;: &quot;us-west-2a&quot;, &quot;SpotPrice&quot;: &quot;0.050&quot;,</span>
+<span class="a">+         &quot;Timestamp&quot;: &quot;2026-09-22T11:00:00Z&quot;},</span>
+<span class="a">+        {&quot;InstanceType&quot;: &quot;c7a.xlarge&quot;, &quot;AvailabilityZone&quot;: &quot;us-west-2b&quot;, &quot;SpotPrice&quot;: &quot;0.080&quot;,</span>
+<span class="a">+         &quot;Timestamp&quot;: &quot;2026-09-22T11:00:00Z&quot;},</span>
+<span class="a">+        {&quot;InstanceType&quot;: &quot;x9.huge&quot;, &quot;AvailabilityZone&quot;: &quot;us-west-2b&quot;, &quot;SpotPrice&quot;: &quot;0.001&quot;,</span>
+<span class="a">+         &quot;Timestamp&quot;: &quot;2026-09-22T11:00:00Z&quot;},</span>
+<span class="a">+    ]</span>
+<span class="a">+    found = offers_mod.aws_offers(items, max_price=0.0625, extra_usd_per_hour=0.0072,</span>
+<span class="a">+                                  extra_usd_per_book=0.0, capacity=1)</span>
+<span class="a">+    assert found == [Offer(&quot;aws&quot;, &quot;c6a.xlarge&quot;, &quot;us-west-2a&quot;, 4, pytest.approx(0.0572), False, 0.0, 1)]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_hetzner_offers_come_from_stock_at_the_net_price():</span>
+<span class="a">+    api = {</span>
+<span class="a">+        &quot;/server_types?per_page=50&quot;: {&quot;server_types&quot;: [</span>
+<span class="a">+            {&quot;id&quot;: 1, &quot;name&quot;: &quot;cx33&quot;, &quot;cores&quot;: 4, &quot;architecture&quot;: &quot;x86&quot;, &quot;deprecation&quot;: None,</span>
+<span class="a">+             &quot;prices&quot;: [{&quot;location&quot;: &quot;fsn1&quot;, &quot;price_hourly&quot;: {&quot;net&quot;: &quot;0.0136&quot;, &quot;gross&quot;: &quot;0.0162&quot;}},</span>
+<span class="a">+                        {&quot;location&quot;: &quot;nbg1&quot;, &quot;price_hourly&quot;: {&quot;net&quot;: &quot;0.0136&quot;, &quot;gross&quot;: &quot;0.0162&quot;}}]},</span>
+<span class="a">+            {&quot;id&quot;: 2, &quot;name&quot;: &quot;cax21&quot;, &quot;cores&quot;: 4, &quot;architecture&quot;: &quot;arm&quot;, &quot;deprecation&quot;: None,</span>
+<span class="a">+             &quot;prices&quot;: [{&quot;location&quot;: &quot;fsn1&quot;, &quot;price_hourly&quot;: {&quot;net&quot;: &quot;0.0100&quot;, &quot;gross&quot;: &quot;0.0119&quot;}}]},</span>
+<span class="a">+            {&quot;id&quot;: 3, &quot;name&quot;: &quot;cpx31&quot;, &quot;cores&quot;: 4, &quot;architecture&quot;: &quot;x86&quot;, &quot;deprecation&quot;: None,</span>
+<span class="a">+             &quot;prices&quot;: [{&quot;location&quot;: &quot;hil&quot;, &quot;price_hourly&quot;: {&quot;net&quot;: &quot;0.0997&quot;, &quot;gross&quot;: &quot;0.0997&quot;}}]},</span>
+<span class="a">+        ]},</span>
+<span class="a">+        &quot;/datacenters?per_page=50&quot;: {&quot;datacenters&quot;: [</span>
+<span class="a">+            {&quot;location&quot;: {&quot;name&quot;: &quot;fsn1&quot;}, &quot;server_types&quot;: {&quot;available&quot;: [1, 2]}},</span>
+<span class="a">+            {&quot;location&quot;: {&quot;name&quot;: &quot;nbg1&quot;}, &quot;server_types&quot;: {&quot;available&quot;: []}},  # sold out</span>
+<span class="a">+            {&quot;location&quot;: {&quot;name&quot;: &quot;hil&quot;}, &quot;server_types&quot;: {&quot;available&quot;: [3]}},</span>
+<span class="a">+        ]},</span>
+<span class="a">+    }</span>
+<span class="a">+    found = offers_mod.hetzner_offers(api.__getitem__, machines={&quot;cx33&quot;, &quot;cax21&quot;, &quot;cpx31&quot;},</span>
+<span class="a">+                                      usd_per_eur=1.15, ipv4_eur_per_hour=0.0007, capacity=2)</span>
+<span class="a">+    assert [(o.machine, o.zone) for o in found] == [(&quot;cpx31&quot;, &quot;hil&quot;), (&quot;cx33&quot;, &quot;fsn1&quot;)]</span>
+<span class="a">+    assert found[1].usd_per_hour == pytest.approx((0.0136 + 0.0007) * 1.15)</span>
+<span class="a">+    assert all(o.per_started_hour and o.capacity == 2 for o in found)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- revenue -------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_net_after_stripe():</span>
+<span class="a">+    assert [net_pack_cents(a) for a in (499, 3999, 17499)] == [454, 3853, 16961]</span>
+<span class="a">+    assert [net_subscription_cents(a) for a in (499, 999, 5000)] == [451, 933, 4790]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_revenue_counts_recent_packs_and_active_subscriptions():</span>
+<span class="a">+    now = datetime(2026, 9, 22, tzinfo=timezone.utc)</span>
+<span class="a">+    tag = str(time.time_ns())</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        base = revenue_30d_usd(s, now)</span>
+<span class="a">+        s.add(Account(id=f&quot;acct_a{tag}&quot;, device_token=f&quot;a{tag}&quot;))</span>
+<span class="a">+        s.add(Account(id=f&quot;acct_b{tag}&quot;, device_token=f&quot;b{tag}&quot;, subscription_plan_id=&quot;month30&quot;,</span>
+<span class="a">+                      subscription_status=&quot;active&quot;, subscription_period_end=now + timedelta(days=9)))</span>
+<span class="a">+        s.add(Account(id=f&quot;acct_c{tag}&quot;, device_token=f&quot;c{tag}&quot;, subscription_plan_id=&quot;unlimited&quot;,</span>
+<span class="a">+                      subscription_status=&quot;canceled&quot;, subscription_period_end=now + timedelta(days=9)))</span>
+<span class="a">+        s.add(Purchase(account_id=f&quot;acct_a{tag}&quot;, plan_id=&quot;pack100&quot;, credits=100, amount_cents=3999,</span>
+<span class="a">+                       stripe_session_id=f&quot;cs_new{tag}&quot;, created_at=now - timedelta(days=3)))</span>
+<span class="a">+        s.add(Purchase(account_id=f&quot;acct_a{tag}&quot;, plan_id=&quot;pack10&quot;, credits=10, amount_cents=499,</span>
+<span class="a">+                       stripe_session_id=f&quot;cs_old{tag}&quot;, created_at=now - timedelta(days=40)))</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        assert revenue_30d_usd(s, now) - base == pytest.approx((3853 + 933) / 100)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- one run, with fake clouds and a fake Terraform ------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def register(conn, rq_name: str, host: str, state: str) -&gt; None:</span>
+<span class="a">+    w = Worker([Queue(run_mod.QUEUE_NAME, connection=conn)], connection=conn, name=rq_name)</span>
+<span class="a">+    w.hostname = host</span>
+<span class="a">+    w.register_birth()</span>
+<span class="a">+    w.set_state(state)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_controller_counts_the_paid_queue_of_the_app():</span>
+<span class="a">+    from backend.queue import PAID_QUEUE</span>
+<span class="a">+    assert run_mod.QUEUE_NAME == PAID_QUEUE</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_read_queue_reports_burst_workers_only():</span>
+<span class="a">+    conn = fakeredis.FakeRedis()</span>
+<span class="a">+    register(conn, &quot;rq-1&quot;, &quot;subplz-burst-1-0&quot;, &quot;busy&quot;)</span>
+<span class="a">+    register(conn, &quot;rq-web&quot;, &quot;racknerd-655a1e9&quot;, &quot;busy&quot;)  # the web server&#x27;s own worker</span>
+<span class="a">+    Queue(run_mod.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="a">+    waiting, live, rq_names = run_mod.read_queue(conn)</span>
+<span class="a">+    assert (waiting, live, rq_names) == (1, {&quot;subplz-burst-1-0&quot;: &quot;busy&quot;}, {&quot;subplz-burst-1-0&quot;: &quot;rq-1&quot;})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_terraform_gets_the_burst_keys_not_the_storage_keys(monkeypatch):</span>
+<span class="a">+    monkeypatch.setenv(&quot;AWS_ACCESS_KEY_ID&quot;, &quot;r2-key&quot;)</span>
+<span class="a">+    monkeypatch.setenv(&quot;AWS_ENDPOINT_URL_S3&quot;, &quot;https://r2.example&quot;)</span>
+<span class="a">+    monkeypatch.setenv(&quot;SUBPLZ_WEB_DATABASE_URL&quot;, &quot;postgresql://secret&quot;)</span>
+<span class="a">+    monkeypatch.setenv(&quot;SUBPLZ_BURST_AWS_ACCESS_KEY_ID&quot;, &quot;ec2-key&quot;)</span>
+<span class="a">+    monkeypatch.setenv(&quot;HCLOUD_TOKEN&quot;, &quot;hz&quot;)</span>
+<span class="a">+    aws = run_mod.terraform_env(&quot;aws&quot;)</span>
+<span class="a">+    assert aws[&quot;AWS_ACCESS_KEY_ID&quot;] == &quot;ec2-key&quot; and &quot;AWS_ENDPOINT_URL_S3&quot; not in aws</span>
+<span class="a">+    assert &quot;SUBPLZ_WEB_DATABASE_URL&quot; not in aws</span>
+<span class="a">+    hetzner = run_mod.terraform_env(&quot;hetzner&quot;)</span>
+<span class="a">+    assert hetzner[&quot;HCLOUD_TOKEN&quot;] == &quot;hz&quot; and &quot;AWS_ACCESS_KEY_ID&quot; not in hetzner</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def world(tmp_path, monkeypatch):</span>
+<span class="a">+    conn = fakeredis.FakeRedis()</span>
+<span class="a">+    monkeypatch.setattr(&quot;redis.Redis.from_url&quot;, lambda url: conn)</span>
+<span class="a">+    released = []</span>
+<span class="a">+    monkeypatch.setattr(run_mod, &quot;ensure_release&quot;, lambda app_dir, ref, bucket: released.append(ref))</span>
+<span class="a">+    monkeypatch.setattr(run_mod, &quot;revenue_30d&quot;, lambda: 0.0)  # the floor: $5</span>
+<span class="a">+    offers = [AWS, HETZNER]</span>
+<span class="a">+    monkeypatch.setattr(run_mod, &quot;gather_offers&quot;, lambda memory: list(offers))</span>
+<span class="a">+    calls = tmp_path / &quot;calls.txt&quot;</span>
+<span class="a">+    fake = tmp_path / &quot;fake_terraform.py&quot;</span>
+<span class="a">+    fake.write_text(</span>
+<span class="a">+        &quot;import sys, pathlib\n&quot;</span>
+<span class="a">+        f&quot;pathlib.Path({str(calls)!r}).open(&#x27;a&#x27;).write(&#x27; &#x27;.join(sys.argv[1:]) + &#x27;\\n&#x27;)\n&quot;</span>
+<span class="a">+        f&quot;bad = pathlib.Path({str(tmp_path / &#x27;fail&#x27;)!r}).read_text()\n&quot;</span>
+<span class="a">+        &quot;sys.exit(1 if bad and bad in &#x27; &#x27;.join(sys.argv) else 0)\n&quot;</span>
+<span class="a">+    )</span>
+<span class="a">+    (tmp_path / &quot;fail&quot;).write_text(&quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    def run(extra=()):</span>
+<span class="a">+        argv = [&quot;--redis-url&quot;, &quot;redis://x&quot;, &quot;--bucket&quot;, &quot;b&quot;, &quot;--max-workers&quot;, &quot;2&quot;,</span>
+<span class="a">+                &quot;--app-dir&quot;, str(Path(__file__).resolve().parents[1]),</span>
+<span class="a">+                &quot;--modules-dir&quot;, str(tmp_path / &quot;modules&quot;), &quot;--state-dir&quot;, str(tmp_path / &quot;state&quot;),</span>
+<span class="a">+                &quot;--terraform&quot;, sys.executable, str(fake), *extra]</span>
+<span class="a">+        return run_mod.main(argv)</span>
+<span class="a">+</span>
+<span class="a">+    return conn, run, tmp_path, calls, released</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def enqueue(conn, n: int) -&gt; None:</span>
+<span class="a">+    for _ in range(n):</span>
+<span class="a">+        Queue(run_mod.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_run_starts_workers_on_the_cheapest_cloud(world):</span>
+<span class="a">+    conn, run, tmp, calls, released = world</span>
+<span class="a">+    enqueue(conn, 3)</span>
+<span class="a">+    assert run() == 0</span>
+<span class="a">+    hetzner = json.loads((tmp / &quot;state&quot; / &quot;workers-hetzner.tfvars.json&quot;).read_text())[&quot;workers&quot;]</span>
+<span class="a">+    assert len(hetzner) == 2 and all(w[&quot;machine&quot;] == &quot;cx33&quot; for w in hetzner.values())</span>
+<span class="a">+    assert &quot;modules&quot; in calls.read_text() and &quot;hetzner&quot; in calls.read_text()</span>
+<span class="a">+    assert not (tmp / &quot;state&quot; / &quot;workers-aws.tfvars.json&quot;).exists()  # nothing changed there</span>
+<span class="a">+    assert len(released) == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_failed_apply_rests_the_cloud_and_the_next_run_uses_another(world):</span>
+<span class="a">+    conn, run, tmp, calls, released = world</span>
+<span class="a">+    enqueue(conn, 1)</span>
+<span class="a">+    (tmp / &quot;fail&quot;).write_text(&quot;hetzner&quot;)</span>
+<span class="a">+    assert run() == 1</span>
+<span class="a">+    state = json.loads((tmp / &quot;state&quot; / &quot;controller.json&quot;).read_text())</span>
+<span class="a">+    assert state[&quot;workers&quot;] == {} and state[&quot;cooldown&quot;][&quot;hetzner&quot;] &gt; time.time()</span>
+<span class="a">+    assert json.loads((tmp / &quot;state&quot; / &quot;workers-hetzner.tfvars.json&quot;).read_text()) == {&quot;workers&quot;: {}}</span>
+<span class="a">+    assert run() == 0  # Hetzner rests: AWS gets the worker</span>
+<span class="a">+    aws = json.loads((tmp / &quot;state&quot; / &quot;workers-aws.tfvars.json&quot;).read_text())[&quot;workers&quot;]</span>
+<span class="a">+    assert [w[&quot;machine&quot;] for w in aws.values()] == [&quot;c6a.xlarge&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_dry_run_changes_nothing(world):</span>
+<span class="a">+    conn, run, tmp, calls, released = world</span>
+<span class="a">+    enqueue(conn, 1)</span>
+<span class="a">+    assert run([&quot;--dry-run&quot;]) == 0</span>
+<span class="a">+    assert not calls.exists() and not (tmp / &quot;state&quot;).exists() and not released</span>
+diff --git a/tests/test_burst_controller.py b/tests/test_burst_controller.py
+deleted file mode 100644
+index 4613764..0000000
+--- a/tests/test_burst_controller.py
++++ /dev/null
+<span class="h">@@ -1,251 +0,0 @@</span>
+<span class="d">-&quot;&quot;&quot;The burst controller: when it adds, stops and destroys burst workers.&quot;&quot;&quot;</span>
+<span class="d">-</span>
+<span class="d">-from __future__ import annotations</span>
+<span class="d">-</span>
+<span class="d">-import json</span>
+<span class="d">-import sys</span>
+<span class="d">-from pathlib import Path</span>
+<span class="d">-</span>
+<span class="d">-import fakeredis</span>
+<span class="d">-import pytest</span>
+<span class="d">-from hypothesis import given, settings</span>
+<span class="d">-from hypothesis import strategies as st</span>
+<span class="d">-from rq import Queue, Worker</span>
+<span class="d">-</span>
+<span class="d">-from tools import burst_controller as bc</span>
+<span class="d">-from tools.burst_controller import Config, Memory, decide</span>
+<span class="d">-</span>
+<span class="d">-REF = &quot;new&quot;</span>
+<span class="d">-NOW = 1_000_000.0</span>
+<span class="d">-MIN = 60.0</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def worker(created_ago: float, ref: str = REF) -&gt; dict:</span>
+<span class="d">-    return {&quot;created&quot;: NOW - created_ago, &quot;ref&quot;: ref}</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-# --- invariants over any state -------------------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-names = st.sampled_from([f&quot;{bc.NAME_PREFIX}{i}&quot; for i in range(8)])</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@st.composite</span>
+<span class="d">-def states(draw):</span>
+<span class="d">-    pool = draw(st.sets(names, max_size=8))</span>
+<span class="d">-    workers = {</span>
+<span class="d">-        n: {&quot;created&quot;: NOW - draw(st.floats(0, 60 * MIN)), &quot;ref&quot;: draw(st.sampled_from([&quot;old&quot;, REF]))}</span>
+<span class="d">-        for n in pool</span>
+<span class="d">-    }</span>
+<span class="d">-    live = {n: draw(st.sampled_from([&quot;busy&quot;, &quot;idle&quot;])) for n in pool if draw(st.booleans())}</span>
+<span class="d">-    registered = {n for n in pool if n in live or draw(st.booleans())}</span>
+<span class="d">-    draining = {n for n in registered if draw(st.booleans())}</span>
+<span class="d">-    idle_since = {n: NOW - draw(st.floats(0, 30 * MIN)) for n in live if live[n] == &quot;idle&quot;}</span>
+<span class="d">-    memory = Memory(workers=workers, registered=registered, idle_since=idle_since, draining=draining)</span>
+<span class="d">-    return draw(st.integers(0, 12)), live, memory, Config(max_workers=draw(st.integers(0, 6)))</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@settings(max_examples=500)</span>
+<span class="d">-@given(states())</span>
+<span class="d">-def test_invariants(state):</span>
+<span class="d">-    waiting, live, memory, config = state</span>
+<span class="d">-    d, after = decide(NOW, waiting, live, memory, config, REF)</span>
+<span class="d">-</span>
+<span class="d">-    # A worker that rq knows is never destroyed: it must stop by itself first.</span>
+<span class="d">-    assert not d.remove &amp; set(live)</span>
+<span class="d">-    # Every old worker is kept or destroyed, never both; new ones are new.</span>
+<span class="d">-    assert set(after.workers) == (set(memory.workers) - d.remove) | set(d.add)</span>
+<span class="d">-    assert not d.remove &amp; set(after.workers)</span>
+<span class="d">-    assert all(n.startswith(bc.NAME_PREFIX) and n not in memory.workers and n not in live</span>
+<span class="d">-               for n in d.add)</span>
+<span class="d">-    # Never more workers at work than the cap, and never more new ones than waiting jobs.</span>
+<span class="d">-    assert len([n for n in after.workers if n not in after.draining]) &lt;= config.max_workers</span>
+<span class="d">-    assert len(d.add) &lt;= waiting</span>
+<span class="d">-    # Only a worker that rq knows can get the shutdown command.</span>
+<span class="d">-    assert d.drain &lt;= set(live)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@settings(max_examples=500)</span>
+<span class="d">-@given(states())</span>
+<span class="d">-def test_a_fresh_busy_worker_under_the_cap_is_never_stopped(state):</span>
+<span class="d">-    waiting, live, memory, config = state</span>
+<span class="d">-    d, _ = decide(NOW, waiting, live, memory, config, REF)</span>
+<span class="d">-    at_work = [n for n in memory.workers if n not in memory.draining</span>
+<span class="d">-               and (n in live or n not in memory.registered)]</span>
+<span class="d">-    if len(at_work) &lt;= config.max_workers:</span>
+<span class="d">-        for n, s in live.items():</span>
+<span class="d">-            if s == &quot;busy&quot; and n in memory.workers and memory.workers[n][&quot;ref&quot;] == REF:</span>
+<span class="d">-                assert n not in d.drain</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@settings(max_examples=500)</span>
+<span class="d">-@given(states())</span>
+<span class="d">-def test_an_idle_worker_is_stopped_for_idleness_only_when_no_job_waits(state):</span>
+<span class="d">-    waiting, live, memory, config = state</span>
+<span class="d">-    d, _ = decide(NOW, waiting, live, memory, config, REF)</span>
+<span class="d">-    at_work = [n for n in memory.workers if n not in memory.draining</span>
+<span class="d">-               and (n in live or n not in memory.registered)]</span>
+<span class="d">-    if waiting &gt; 0 and len(at_work) &lt;= config.max_workers:</span>
+<span class="d">-        for n in d.drain:</span>
+<span class="d">-            assert live[n] == &quot;busy&quot; or memory.workers[n][&quot;ref&quot;] != REF</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-# --- scenarios -------------------------------------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-def test_a_backlog_adds_workers_up_to_the_cap():</span>
+<span class="d">-    d, after = decide(NOW, 5, {}, Memory(), Config(max_workers=3), REF)</span>
+<span class="d">-    assert len(d.add) == 3 and not d.remove and not d.drain</span>
+<span class="d">-    assert all(after.workers[n] == {&quot;created&quot;: NOW, &quot;ref&quot;: REF} for n in d.add)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_booting_and_idle_workers_count_as_capacity():</span>
+<span class="d">-    memory = Memory(workers={&quot;subplz-burst-a&quot;: worker(2 * MIN), &quot;subplz-burst-b&quot;: worker(15 * MIN)},</span>
+<span class="d">-                    registered={&quot;subplz-burst-b&quot;})</span>
+<span class="d">-    d, _ = decide(NOW, 2, {&quot;subplz-burst-b&quot;: &quot;idle&quot;}, memory, Config(max_workers=5), REF)</span>
+<span class="d">-    assert d.add == () and not d.drain and not d.remove</span>
+<span class="d">-    d, _ = decide(NOW, 3, {&quot;subplz-burst-b&quot;: &quot;idle&quot;}, memory, Config(max_workers=5), REF)</span>
+<span class="d">-    assert len(d.add) == 1</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_an_idle_worker_stops_after_the_grace_time_then_its_droplet_goes():</span>
+<span class="d">-    name = &quot;subplz-burst-a&quot;</span>
+<span class="d">-    memory = Memory(workers={name: worker(60 * MIN)}, registered={name},</span>
+<span class="d">-                    idle_since={name: NOW - 11 * MIN})</span>
+<span class="d">-    d, after = decide(NOW, 0, {name: &quot;idle&quot;}, memory, Config(max_workers=3), REF)</span>
+<span class="d">-    assert d.drain == {name} and not d.remove</span>
+<span class="d">-    # It stopped: rq no longer lists it, so the droplet is destroyed.</span>
+<span class="d">-    d, after = decide(NOW + MIN, 0, {}, after, Config(max_workers=3), REF)</span>
+<span class="d">-    assert d.remove == {name} and after.workers == {}</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_an_idle_worker_waits_for_new_jobs_during_the_grace_time():</span>
+<span class="d">-    name = &quot;subplz-burst-a&quot;</span>
+<span class="d">-    memory = Memory(workers={name: worker(60 * MIN)}, registered={name},</span>
+<span class="d">-                    idle_since={name: NOW - 5 * MIN})</span>
+<span class="d">-    d, _ = decide(NOW, 0, {name: &quot;idle&quot;}, memory, Config(max_workers=3), REF)</span>
+<span class="d">-    assert not d.drain and not d.remove</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_a_droplet_that_never_starts_its_worker_is_destroyed():</span>
+<span class="d">-    memory = Memory(workers={&quot;subplz-burst-a&quot;: worker(21 * MIN)})</span>
+<span class="d">-    d, _ = decide(NOW, 1, {}, memory, Config(max_workers=1), REF)</span>
+<span class="d">-    assert d.remove == {&quot;subplz-burst-a&quot;}</span>
+<span class="d">-    assert len(d.add) == 1  # and a new one takes its place</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_after_a_deploy_the_workers_of_the_old_commit_are_replaced():</span>
+<span class="d">-    memory = Memory(</span>
+<span class="d">-        workers={&quot;subplz-burst-idle&quot;: worker(60 * MIN, &quot;old&quot;),</span>
+<span class="d">-                 &quot;subplz-burst-busy&quot;: worker(60 * MIN, &quot;old&quot;),</span>
+<span class="d">-                 &quot;subplz-burst-boot&quot;: worker(2 * MIN, &quot;old&quot;)},</span>
+<span class="d">-        registered={&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;},</span>
+<span class="d">-    )</span>
+<span class="d">-    live = {&quot;subplz-burst-idle&quot;: &quot;idle&quot;, &quot;subplz-burst-busy&quot;: &quot;busy&quot;}</span>
+<span class="d">-    d, after = decide(NOW, 2, live, memory, Config(max_workers=3), REF)</span>
+<span class="d">-    assert d.drain == {&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;}  # the busy one finishes first</span>
+<span class="d">-    assert d.remove == {&quot;subplz-burst-boot&quot;}</span>
+<span class="d">-    assert len(d.add) == 2 and all(after.workers[n][&quot;ref&quot;] == REF for n in d.add)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_a_cap_of_zero_stops_every_worker_and_starts_none():</span>
+<span class="d">-    memory = Memory(</span>
+<span class="d">-        workers={&quot;subplz-burst-boot&quot;: worker(MIN), &quot;subplz-burst-idle&quot;: worker(60 * MIN),</span>
+<span class="d">-                 &quot;subplz-burst-busy&quot;: worker(60 * MIN)},</span>
+<span class="d">-        registered={&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;},</span>
+<span class="d">-    )</span>
+<span class="d">-    live = {&quot;subplz-burst-idle&quot;: &quot;idle&quot;, &quot;subplz-burst-busy&quot;: &quot;busy&quot;}</span>
+<span class="d">-    d, _ = decide(NOW, 4, live, memory, Config(max_workers=0), REF)</span>
+<span class="d">-    assert d.remove == {&quot;subplz-burst-boot&quot;}</span>
+<span class="d">-    assert d.drain == {&quot;subplz-burst-idle&quot;, &quot;subplz-burst-busy&quot;}</span>
+<span class="d">-    assert d.add == ()</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-# --- Redis side -----------------------------------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-def test_the_controller_counts_the_paid_queue_of_the_app():</span>
+<span class="d">-    from backend.queue import PAID_QUEUE</span>
+<span class="d">-    assert bc.QUEUE_NAME == PAID_QUEUE</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def register(conn, rq_name: str, host: str, state: str) -&gt; None:</span>
+<span class="d">-    w = Worker([Queue(bc.QUEUE_NAME, connection=conn)], connection=conn, name=rq_name)</span>
+<span class="d">-    w.hostname = host</span>
+<span class="d">-    w.register_birth()</span>
+<span class="d">-    w.set_state(state)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_read_queue_reports_burst_workers_only():</span>
+<span class="d">-    conn = fakeredis.FakeRedis()</span>
+<span class="d">-    register(conn, &quot;rq-1&quot;, &quot;subplz-burst-1-0&quot;, &quot;busy&quot;)</span>
+<span class="d">-    register(conn, &quot;rq-2&quot;, &quot;subplz-burst-1-1&quot;, &quot;idle&quot;)</span>
+<span class="d">-    register(conn, &quot;rq-web&quot;, &quot;racknerd-655a1e9&quot;, &quot;busy&quot;)  # the web server&#x27;s own worker</span>
+<span class="d">-    Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="d">-    waiting, live, rq_names = bc.read_queue(conn)</span>
+<span class="d">-    assert waiting == 1</span>
+<span class="d">-    assert live == {&quot;subplz-burst-1-0&quot;: &quot;busy&quot;, &quot;subplz-burst-1-1&quot;: &quot;idle&quot;}</span>
+<span class="d">-    assert rq_names == {&quot;subplz-burst-1-0&quot;: &quot;rq-1&quot;, &quot;subplz-burst-1-1&quot;: &quot;rq-2&quot;}</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_send_drain_sends_the_rq_shutdown_command(monkeypatch):</span>
+<span class="d">-    sent = []</span>
+<span class="d">-    monkeypatch.setattr(&quot;rq.command.send_shutdown_command&quot;, lambda conn, name: sent.append(name))</span>
+<span class="d">-    bc.send_drain(None, {&quot;subplz-burst-a&quot;: &quot;rq-a&quot;, &quot;subplz-burst-b&quot;: &quot;rq-b&quot;},</span>
+<span class="d">-                  frozenset({&quot;subplz-burst-a&quot;}))</span>
+<span class="d">-    assert sent == [&quot;rq-a&quot;]</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-# --- one run, with a fake Terraform -------------------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-@pytest.fixture</span>
+<span class="d">-def world(tmp_path, monkeypatch):</span>
+<span class="d">-    conn = fakeredis.FakeRedis()</span>
+<span class="d">-    monkeypatch.setattr(&quot;redis.Redis.from_url&quot;, lambda url: conn)</span>
+<span class="d">-    released = []</span>
+<span class="d">-    monkeypatch.setattr(bc, &quot;ensure_release&quot;, lambda app_dir, ref, bucket: released.append(ref))</span>
+<span class="d">-    calls = tmp_path / &quot;calls.txt&quot;</span>
+<span class="d">-    fake = tmp_path / &quot;fake_terraform.py&quot;</span>
+<span class="d">-    fake.write_text(</span>
+<span class="d">-        &quot;import sys, pathlib\n&quot;</span>
+<span class="d">-        f&quot;pathlib.Path({str(calls)!r}).open(&#x27;a&#x27;).write(&#x27; &#x27;.join(sys.argv[1:]) + &#x27;\\n&#x27;)\n&quot;</span>
+<span class="d">-        f&quot;sys.exit(int(pathlib.Path({str(tmp_path / &#x27;exit_code&#x27;)!r}).read_text() or 0))\n&quot;</span>
+<span class="d">-    )</span>
+<span class="d">-    (tmp_path / &quot;exit_code&quot;).write_text(&quot;0&quot;)</span>
+<span class="d">-</span>
+<span class="d">-    def run(extra=()):</span>
+<span class="d">-        argv = [&quot;--redis-url&quot;, &quot;redis://x&quot;, &quot;--bucket&quot;, &quot;b&quot;, &quot;--max-workers&quot;, &quot;2&quot;,</span>
+<span class="d">-                &quot;--app-dir&quot;, str(Path(__file__).resolve().parents[1]),</span>
+<span class="d">-                &quot;--module-dir&quot;, str(tmp_path / &quot;workers&quot;),</span>
+<span class="d">-                &quot;--state&quot;, str(tmp_path / &quot;state.json&quot;),</span>
+<span class="d">-                &quot;--var-file&quot;, str(tmp_path / &quot;vars.json&quot;),</span>
+<span class="d">-                &quot;--terraform&quot;, sys.executable, str(fake), *extra]</span>
+<span class="d">-        return bc.main(argv)</span>
+<span class="d">-</span>
+<span class="d">-    return conn, run, tmp_path, calls, released</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_a_run_writes_the_workers_and_applies(world):</span>
+<span class="d">-    conn, run, tmp, calls, released = world</span>
+<span class="d">-    for _ in range(3):</span>
+<span class="d">-        Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="d">-    assert run() == 0</span>
+<span class="d">-    workers = json.loads((tmp / &quot;vars.json&quot;).read_text())[&quot;workers&quot;]</span>
+<span class="d">-    assert len(workers) == 2  # the cap</span>
+<span class="d">-    assert &quot;apply -auto-approve&quot; in calls.read_text()</span>
+<span class="d">-    assert len(released) == 1  # the app went to the bucket for the new workers</span>
+<span class="d">-    state = json.loads((tmp / &quot;state.json&quot;).read_text())</span>
+<span class="d">-    assert set(state[&quot;workers&quot;]) == set(workers)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_a_failed_apply_keeps_the_old_state(world):</span>
+<span class="d">-    conn, run, tmp, calls, released = world</span>
+<span class="d">-    Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="d">-    (tmp / &quot;exit_code&quot;).write_text(&quot;1&quot;)</span>
+<span class="d">-    assert run() == 1</span>
+<span class="d">-    assert json.loads((tmp / &quot;vars.json&quot;).read_text()) == {&quot;workers&quot;: {}}</span>
+<span class="d">-    assert not (tmp / &quot;state.json&quot;).exists()</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def test_a_dry_run_changes_nothing(world):</span>
+<span class="d">-    conn, run, tmp, calls, released = world</span>
+<span class="d">-    Queue(bc.QUEUE_NAME, connection=conn).enqueue(&quot;os.getcwd&quot;)</span>
+<span class="d">-    assert run([&quot;--dry-run&quot;]) == 0</span>
+<span class="d">-    assert not calls.exists() and not (tmp / &quot;vars.json&quot;).exists() and not released</span>
+diff --git a/tools/burst/__init__.py b/tools/burst/__init__.py
+new file mode 100644
+index 0000000..904de78
+--- /dev/null
++++ b/tools/burst/__init__.py
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+&quot;&quot;&quot;The burst controller: see __main__.py and infra/burst/README.md.&quot;&quot;&quot;</span>
+diff --git a/tools/burst/__main__.py b/tools/burst/__main__.py
+new file mode 100644
+index 0000000..31757a1
+--- /dev/null
++++ b/tools/burst/__main__.py
+<span class="h">@@ -0,0 +1,303 @@</span>
+<span class="a">+&quot;&quot;&quot;Burst controller: add workers on the cheapest cloud when paid jobs wait.</span>
+<span class="a">+</span>
+<span class="a">+The web server runs `python -m tools.burst` once a minute (a systemd timer,</span>
+<span class="a">+see infra/burst/README.md). One run does this:</span>
+<span class="a">+</span>
+<span class="a">+1. Read the paid queue in Redis, and the state of each burst worker.</span>
+<span class="a">+2. Read the live offers of each cloud that has credentials (AWS spot prices,</span>
+<span class="a">+   Hetzner prices and stock), and the net revenue of the last 30 days.</span>
+<span class="a">+3. Decide (core.decide): new workers go to the offer with the lowest cost per</span>
+<span class="a">+   book, inside the spend cap. Idle workers get the rq shutdown command: rq</span>
+<span class="a">+   lets a worker finish its job first, so a scale-in never kills a paid job.</span>
+<span class="a">+4. For each cloud whose set of workers changed: write its Terraform variable</span>
+<span class="a">+   file and run `terraform apply` on infra/burst/workers/&lt;cloud&gt;. If the apply</span>
+<span class="a">+   fails, that cloud rests for 30 minutes, and the next run uses the next</span>
+<span class="a">+   cheapest offer.</span>
+<span class="a">+</span>
+<span class="a">+The host name of a worker is its machine name, and rq records the host name of</span>
+<span class="a">+each worker. That is how a machine and its rq worker are matched.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import argparse</span>
+<span class="a">+import json</span>
+<span class="a">+import logging</span>
+<span class="a">+import os</span>
+<span class="a">+import subprocess</span>
+<span class="a">+import sys</span>
+<span class="a">+import tempfile</span>
+<span class="a">+import time</span>
+<span class="a">+from datetime import datetime, timedelta, timezone</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+from .core import NAME_PREFIX, Config, Memory, Offer, decide, spend_30d, spend_cap_usd</span>
+<span class="a">+</span>
+<span class="a">+log = logging.getLogger(&quot;subplz.burst&quot;)</span>
+<span class="a">+</span>
+<span class="a">+QUEUE_NAME = &quot;subplz-jobs-paid&quot;  # backend.queue.PAID_QUEUE: burst workers take paid jobs only</span>
+<span class="a">+RELEASE_PREFIX = &quot;releases/&quot;</span>
+<span class="a">+PROVIDERS = (&quot;aws&quot;, &quot;hetzner&quot;)</span>
+<span class="a">+COOLDOWN_S = 30 * 60</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- Redis ---------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def read_queue(conn) -&gt; tuple[int, dict[str, str], dict[str, str]]:</span>
+<span class="a">+    &quot;&quot;&quot;Waiting paid jobs, the state of each burst worker, and its rq worker name.&quot;&quot;&quot;</span>
+<span class="a">+    from rq import Queue, Worker</span>
+<span class="a">+</span>
+<span class="a">+    waiting = Queue(QUEUE_NAME, connection=conn).count</span>
+<span class="a">+    live: dict[str, str] = {}</span>
+<span class="a">+    rq_names: dict[str, str] = {}</span>
+<span class="a">+    for worker in Worker.all(connection=conn):</span>
+<span class="a">+        host = worker.hostname or &quot;&quot;</span>
+<span class="a">+        if not host.startswith(NAME_PREFIX):</span>
+<span class="a">+            continue  # the web server&#x27;s own worker, or one that this code does not manage</span>
+<span class="a">+        live[host] = &quot;busy&quot; if worker.get_state() == &quot;busy&quot; else &quot;idle&quot;</span>
+<span class="a">+        rq_names[host] = worker.name</span>
+<span class="a">+    return waiting, live, rq_names</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def send_drain(conn, rq_names: dict[str, str], names: frozenset[str]) -&gt; None:</span>
+<span class="a">+    from rq.command import send_shutdown_command</span>
+<span class="a">+</span>
+<span class="a">+    for name in sorted(names):</span>
+<span class="a">+        if name in rq_names:</span>
+<span class="a">+            send_shutdown_command(conn, rq_names[name])</span>
+<span class="a">+            log.info(&quot;told %s to stop after its current job&quot;, name)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- files ---------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def load_memory(path: Path) -&gt; Memory:</span>
+<span class="a">+    if not path.exists():</span>
+<span class="a">+        return Memory()</span>
+<span class="a">+    return Memory.from_json(json.loads(path.read_text(encoding=&quot;utf-8&quot;)))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def save_json(path: Path, data: dict) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Write `data` so that a crash never leaves half a file.&quot;&quot;&quot;</span>
+<span class="a">+    path.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=&quot;.tmp&quot;)</span>
+<span class="a">+    with os.fdopen(fd, &quot;w&quot;, encoding=&quot;utf-8&quot;) as out:</span>
+<span class="a">+        json.dump(data, out, indent=2, sort_keys=True)</span>
+<span class="a">+    os.replace(tmp, path)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def provider_vars(memory: Memory, provider: str) -&gt; dict:</span>
+<span class="a">+    &quot;&quot;&quot;The Terraform variables of one cloud: its workers.&quot;&quot;&quot;</span>
+<span class="a">+    return {&quot;workers&quot;: {</span>
+<span class="a">+        name: {&quot;ref&quot;: w[&quot;ref&quot;], &quot;machine&quot;: w[&quot;machine&quot;], &quot;zone&quot;: w[&quot;zone&quot;]}</span>
+<span class="a">+        for name, w in sorted(memory.workers.items()) if w[&quot;provider&quot;] == provider</span>
+<span class="a">+    }}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- clouds --------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def env_float(name: str, default: float) -&gt; float:</span>
+<span class="a">+    return float(os.environ.get(name, default))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def env_list(name: str, default: str) -&gt; list[str]:</span>
+<span class="a">+    return [v.strip() for v in os.environ.get(name, default).split(&quot;,&quot;) if v.strip()]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def vcpus_in_use(memory: Memory, provider: str) -&gt; int:</span>
+<span class="a">+    from .offers import AWS_VCPUS</span>
+<span class="a">+</span>
+<span class="a">+    return sum(AWS_VCPUS.get(w[&quot;machine&quot;], 4) for w in memory.workers.values()</span>
+<span class="a">+               if w[&quot;provider&quot;] == provider)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def gather_offers(memory: Memory) -&gt; list[Offer]:</span>
+<span class="a">+    &quot;&quot;&quot;The live offers of each cloud that has credentials. A cloud whose API</span>
+<span class="a">+    fails gives no offers this run; the others still do.&quot;&quot;&quot;</span>
+<span class="a">+    from . import offers</span>
+<span class="a">+</span>
+<span class="a">+    found: list[Offer] = []</span>
+<span class="a">+    if os.environ.get(&quot;SUBPLZ_BURST_AWS_ACCESS_KEY_ID&quot;):</span>
+<span class="a">+        try:</span>
+<span class="a">+            import boto3</span>
+<span class="a">+</span>
+<span class="a">+            ec2 = boto3.client(</span>
+<span class="a">+                &quot;ec2&quot;, region_name=os.environ.get(&quot;SUBPLZ_BURST_AWS_REGION&quot;, &quot;us-west-2&quot;),</span>
+<span class="a">+                aws_access_key_id=os.environ[&quot;SUBPLZ_BURST_AWS_ACCESS_KEY_ID&quot;],</span>
+<span class="a">+                aws_secret_access_key=os.environ[&quot;SUBPLZ_BURST_AWS_SECRET_ACCESS_KEY&quot;],</span>
+<span class="a">+            )</span>
+<span class="a">+            machines = env_list(&quot;SUBPLZ_BURST_AWS_TYPES&quot;, &quot;c6a.xlarge,c7a.xlarge,m6a.xlarge&quot;)</span>
+<span class="a">+            since = datetime.now(timezone.utc) - timedelta(hours=1)</span>
+<span class="a">+            limit = int(os.environ.get(&quot;SUBPLZ_BURST_AWS_VCPU_LIMIT&quot;, &quot;5&quot;))</span>
+<span class="a">+            capacity = max(0, limit - vcpus_in_use(memory, &quot;aws&quot;)) // 4</span>
+<span class="a">+            found += offers.aws_offers(</span>
+<span class="a">+                offers.fetch_aws_spot_prices(ec2, machines, since),</span>
+<span class="a">+                max_price=env_float(&quot;SUBPLZ_BURST_AWS_MAX_PRICE&quot;, 0.0625),</span>
+<span class="a">+                # A public IPv4 address ($0.005/h) and a 20 GB disk ($0.0022/h).</span>
+<span class="a">+                extra_usd_per_hour=env_float(&quot;SUBPLZ_BURST_AWS_EXTRA_USD_PER_HOUR&quot;, 0.0072),</span>
+<span class="a">+                # AWS gives 100 GB of transfer out each month for free. Above it,</span>
+<span class="a">+                # each result that a worker sends to R2 costs $0.09/GB.</span>
+<span class="a">+                extra_usd_per_book=env_float(&quot;SUBPLZ_BURST_AWS_EGRESS_USD_PER_BOOK&quot;, 0.0),</span>
+<span class="a">+                capacity=capacity,</span>
+<span class="a">+            )</span>
+<span class="a">+        except Exception:  # noqa: BLE001 - one cloud failing must not stop the others</span>
+<span class="a">+            log.exception(&quot;AWS offers failed&quot;)</span>
+<span class="a">+    if os.environ.get(&quot;HCLOUD_TOKEN&quot;):</span>
+<span class="a">+        try:</span>
+<span class="a">+            import requests</span>
+<span class="a">+</span>
+<span class="a">+            def get_json(path: str) -&gt; dict:</span>
+<span class="a">+                r = requests.get(f&quot;https://api.hetzner.cloud/v1{path}&quot;, timeout=20,</span>
+<span class="a">+                                 headers={&quot;Authorization&quot;: f&quot;Bearer {os.environ[&#x27;HCLOUD_TOKEN&#x27;]}&quot;})</span>
+<span class="a">+                r.raise_for_status()</span>
+<span class="a">+                return r.json()</span>
+<span class="a">+</span>
+<span class="a">+            limit = int(os.environ.get(&quot;SUBPLZ_BURST_HETZNER_SERVER_LIMIT&quot;, &quot;5&quot;))</span>
+<span class="a">+            in_use = sum(1 for w in memory.workers.values() if w[&quot;provider&quot;] == &quot;hetzner&quot;)</span>
+<span class="a">+            found += offers.hetzner_offers(</span>
+<span class="a">+                get_json,</span>
+<span class="a">+                machines=set(env_list(&quot;SUBPLZ_BURST_HETZNER_TYPES&quot;, &quot;cx33,cx43,cpx31,cpx32,ccx13&quot;)),</span>
+<span class="a">+                usd_per_eur=env_float(&quot;SUBPLZ_BURST_USD_PER_EUR&quot;, 1.15),</span>
+<span class="a">+                # A primary IPv4 address: 0.50 EUR a month.</span>
+<span class="a">+                ipv4_eur_per_hour=env_float(&quot;SUBPLZ_BURST_HETZNER_IPV4_EUR_PER_HOUR&quot;, 0.0007),</span>
+<span class="a">+                capacity=max(0, limit - in_use),</span>
+<span class="a">+            )</span>
+<span class="a">+        except Exception:  # noqa: BLE001</span>
+<span class="a">+            log.exception(&quot;Hetzner offers failed&quot;)</span>
+<span class="a">+    return found</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def revenue_30d() -&gt; float:</span>
+<span class="a">+    from backend.db import SessionLocal</span>
+<span class="a">+</span>
+<span class="a">+    from .revenue import revenue_30d_usd</span>
+<span class="a">+</span>
+<span class="a">+    with SessionLocal() as session:</span>
+<span class="a">+        return revenue_30d_usd(session, datetime.now(timezone.utc))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def terraform_env(provider: str) -&gt; dict[str, str]:</span>
+<span class="a">+    &quot;&quot;&quot;The environment of one `terraform apply`. The storage keys of the app are</span>
+<span class="a">+    also AWS_* variables (R2 speaks the S3 protocol), so they must not reach the</span>
+<span class="a">+    AWS provider: it gets the burst keys instead.&quot;&quot;&quot;</span>
+<span class="a">+    env = {k: v for k, v in os.environ.items()</span>
+<span class="a">+           if not (k.startswith(&quot;AWS_&quot;) or k.startswith(&quot;SUBPLZ_WEB_&quot;))}</span>
+<span class="a">+    if provider == &quot;aws&quot;:</span>
+<span class="a">+        env[&quot;AWS_ACCESS_KEY_ID&quot;] = os.environ.get(&quot;SUBPLZ_BURST_AWS_ACCESS_KEY_ID&quot;, &quot;&quot;)</span>
+<span class="a">+        env[&quot;AWS_SECRET_ACCESS_KEY&quot;] = os.environ.get(&quot;SUBPLZ_BURST_AWS_SECRET_ACCESS_KEY&quot;, &quot;&quot;)</span>
+<span class="a">+        env[&quot;AWS_REGION&quot;] = os.environ.get(&quot;SUBPLZ_BURST_AWS_REGION&quot;, &quot;us-west-2&quot;)</span>
+<span class="a">+    return env</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def terraform_apply(terraform: list[str], module_dir: Path, var_file: Path, env: dict) -&gt; bool:</span>
+<span class="a">+    cmd = [*terraform, f&quot;-chdir={module_dir}&quot;, &quot;apply&quot;, &quot;-auto-approve&quot;,</span>
+<span class="a">+           &quot;-input=false&quot;, &quot;-no-color&quot;, f&quot;-var-file={var_file}&quot;]</span>
+<span class="a">+    result = subprocess.run(cmd, capture_output=True, text=True, env=env)</span>
+<span class="a">+    if result.returncode != 0:</span>
+<span class="a">+        log.error(&quot;terraform apply failed in %s (%s):\n%s&quot;, module_dir, result.returncode,</span>
+<span class="a">+                  result.stderr[-4000:])</span>
+<span class="a">+        return False</span>
+<span class="a">+    return True</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def ensure_release(app_dir: Path, ref: str, bucket: str) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Put the app at `ref` in the bucket, where new workers download it: the</span>
+<span class="a">+    repository is private, and a worker must run the web server&#x27;s commit.&quot;&quot;&quot;</span>
+<span class="a">+    import boto3</span>
+<span class="a">+    from botocore.exceptions import ClientError</span>
+<span class="a">+</span>
+<span class="a">+    s3 = boto3.client(&quot;s3&quot;)</span>
+<span class="a">+    key = f&quot;{RELEASE_PREFIX}{ref}.tar.gz&quot;</span>
+<span class="a">+    try:</span>
+<span class="a">+        s3.head_object(Bucket=bucket, Key=key)</span>
+<span class="a">+        return</span>
+<span class="a">+    except ClientError as exc:</span>
+<span class="a">+        if exc.response.get(&quot;Error&quot;, {}).get(&quot;Code&quot;) not in (&quot;404&quot;, &quot;NoSuchKey&quot;, &quot;NotFound&quot;):</span>
+<span class="a">+            raise</span>
+<span class="a">+    with tempfile.TemporaryDirectory() as tmp:</span>
+<span class="a">+        archive = Path(tmp) / &quot;app.tar.gz&quot;</span>
+<span class="a">+        subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(app_dir), &quot;archive&quot;, &quot;--format=tar.gz&quot;,</span>
+<span class="a">+                        &quot;-o&quot;, str(archive), ref], check=True)</span>
+<span class="a">+        s3.upload_file(str(archive), bucket, key)</span>
+<span class="a">+    log.info(&quot;uploaded %s&quot;, key)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def rollback(provider: str, old: Memory, new: Memory, now: float) -&gt; Memory:</span>
+<span class="a">+    &quot;&quot;&quot;Undo one cloud&#x27;s part of a decision after its apply failed, and rest it.&quot;&quot;&quot;</span>
+<span class="a">+    workers = {n: w for n, w in new.workers.items() if w[&quot;provider&quot;] != provider}</span>
+<span class="a">+    workers.update({n: w for n, w in old.workers.items() if w[&quot;provider&quot;] == provider})</span>
+<span class="a">+    new.workers = workers</span>
+<span class="a">+    new.ledger = [e for e in new.ledger</span>
+<span class="a">+                  if not (e.get(&quot;provider&quot;) == provider and e[&quot;end&quot;] == now)]</span>
+<span class="a">+    new.draining &amp;= set(workers)</span>
+<span class="a">+    new.cooldown = {**new.cooldown, provider: now + COOLDOWN_S}</span>
+<span class="a">+    return new</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- one run ---------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def run(args: argparse.Namespace) -&gt; int:</span>
+<span class="a">+    from redis import Redis</span>
+<span class="a">+</span>
+<span class="a">+    now = time.time()</span>
+<span class="a">+    config = Config(max_workers=args.max_workers)</span>
+<span class="a">+    ref = subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(args.app_dir), &quot;rev-parse&quot;, &quot;HEAD&quot;],</span>
+<span class="a">+                         check=True, capture_output=True, text=True).stdout.strip()</span>
+<span class="a">+    conn = Redis.from_url(args.redis_url)</span>
+<span class="a">+    waiting, live, rq_names = read_queue(conn)</span>
+<span class="a">+    state_file = args.state_dir / &quot;controller.json&quot;</span>
+<span class="a">+    memory = load_memory(state_file)</span>
+<span class="a">+    offers = gather_offers(memory) if waiting else []</span>
+<span class="a">+    cap = spend_cap_usd(revenue_30d(), k=args.cap_share, floor=args.cap_floor, ceiling=args.cap_ceiling)</span>
+<span class="a">+    decision, new_memory = decide(now, waiting, live, memory, config, ref, offers, cap)</span>
+<span class="a">+    log.info(&quot;waiting=%d live=%s spend30=$%.2f cap=$%.2f add=%s drain=%s remove=%s&quot;,</span>
+<span class="a">+             waiting, live, spend_30d(now, memory), cap,</span>
+<span class="a">+             [(n, o.provider, o.machine, o.zone, round(o.usd_per_book(config), 3))</span>
+<span class="a">+              for n, o in decision.add],</span>
+<span class="a">+             sorted(decision.drain), sorted(decision.remove))</span>
+<span class="a">+    if waiting and not decision.add and not live:</span>
+<span class="a">+        log.warning(&quot;paid jobs wait, and no burst worker can start (spend cap, or no offer)&quot;)</span>
+<span class="a">+    if args.dry_run:</span>
+<span class="a">+        return 0</span>
+<span class="a">+</span>
+<span class="a">+    send_drain(conn, rq_names, decision.drain)</span>
+<span class="a">+    if decision.add:</span>
+<span class="a">+        ensure_release(args.app_dir, ref, args.bucket)</span>
+<span class="a">+    status = 0</span>
+<span class="a">+    for provider in PROVIDERS:</span>
+<span class="a">+        if provider_vars(memory, provider) == provider_vars(new_memory, provider):</span>
+<span class="a">+            continue</span>
+<span class="a">+        var_file = args.state_dir / f&quot;workers-{provider}.tfvars.json&quot;</span>
+<span class="a">+        save_json(var_file, provider_vars(new_memory, provider))</span>
+<span class="a">+        if not terraform_apply(args.terraform, args.modules_dir / provider, var_file,</span>
+<span class="a">+                               terraform_env(provider)):</span>
+<span class="a">+            new_memory = rollback(provider, memory, new_memory, now)</span>
+<span class="a">+            save_json(var_file, provider_vars(new_memory, provider))</span>
+<span class="a">+            status = 1</span>
+<span class="a">+    save_json(state_file, new_memory.to_json())</span>
+<span class="a">+    return status</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main(argv: list[str] | None = None) -&gt; int:</span>
+<span class="a">+    logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)</span>
+<span class="a">+    p = argparse.ArgumentParser(prog=&quot;python -m tools.burst&quot;, description=__doc__.splitlines()[0])</span>
+<span class="a">+    p.add_argument(&quot;--max-workers&quot;, type=int,</span>
+<span class="a">+                   default=int(os.environ.get(&quot;SUBPLZ_BURST_MAX_WORKERS&quot;, &quot;1&quot;)))</span>
+<span class="a">+    p.add_argument(&quot;--cap-share&quot;, type=float, default=env_float(&quot;SUBPLZ_BURST_CAP_SHARE&quot;, 0.30),</span>
+<span class="a">+                   help=&quot;share of the net revenue of 30 days that burst workers may spend&quot;)</span>
+<span class="a">+    p.add_argument(&quot;--cap-floor&quot;, type=float, default=env_float(&quot;SUBPLZ_BURST_CAP_FLOOR_USD&quot;, 5.0))</span>
+<span class="a">+    p.add_argument(&quot;--cap-ceiling&quot;, type=float, default=env_float(&quot;SUBPLZ_BURST_CAP_CEILING_USD&quot;, 100.0))</span>
+<span class="a">+    p.add_argument(&quot;--redis-url&quot;, default=os.environ.get(&quot;SUBPLZ_WEB_REDIS_URL&quot;, &quot;&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--bucket&quot;, default=os.environ.get(&quot;SUBPLZ_WEB_S3_BUCKET&quot;, &quot;&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--app-dir&quot;, type=Path, default=Path(&quot;/opt/subplz-web&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--modules-dir&quot;, type=Path, default=Path(&quot;/opt/subplz-web/infra/burst/workers&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--state-dir&quot;, type=Path, default=Path(&quot;/var/lib/subplz-burst&quot;))</span>
+<span class="a">+    p.add_argument(&quot;--terraform&quot;, nargs=&quot;+&quot;, default=[&quot;terraform&quot;])</span>
+<span class="a">+    p.add_argument(&quot;--dry-run&quot;, action=&quot;store_true&quot;, help=&quot;decide and log, change nothing&quot;)</span>
+<span class="a">+    args = p.parse_args(argv)</span>
+<span class="a">+    if not args.redis_url or not args.bucket:</span>
+<span class="a">+        p.error(&quot;set SUBPLZ_WEB_REDIS_URL and SUBPLZ_WEB_S3_BUCKET (or --redis-url, --bucket)&quot;)</span>
+<span class="a">+    return run(args)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    sys.exit(main())</span>
+diff --git a/tools/burst/core.py b/tools/burst/core.py
+new file mode 100644
+index 0000000..cdd7949
+--- /dev/null
++++ b/tools/burst/core.py
+<span class="h">@@ -0,0 +1,252 @@</span>
+<span class="a">+&quot;&quot;&quot;The decisions of the burst controller. Pure: no I/O, no clock, no network.</span>
+<span class="a">+</span>
+<span class="a">+`decide` takes what rq reports about the queue and the workers, the live</span>
+<span class="a">+offers of the clouds, and the spend cap. It returns which workers to start (on</span>
+<span class="a">+the cheapest offer), which to stop, and which machines to destroy.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import math</span>
+<span class="a">+from dataclasses import dataclass, field</span>
+<span class="a">+</span>
+<span class="a">+NAME_PREFIX = &quot;subplz-burst-&quot;</span>
+<span class="a">+HOUR = 3600.0</span>
+<span class="a">+WINDOW = 30 * 86400.0  # the spend cap and the revenue both look back 30 days</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Config:</span>
+<span class="a">+    max_workers: int</span>
+<span class="a">+    # A new machine installs the speech stack before its worker starts.</span>
+<span class="a">+    boot_timeout_s: float = 20 * 60</span>
+<span class="a">+    # An idle worker waits this long for a new job before it stops.</span>
+<span class="a">+    idle_grace_s: float = 10 * 60</span>
+<span class="a">+    # A 10-hour book on 4 vCPU: the web server does it at about 5x real time.</span>
+<span class="a">+    book_hours_4vcpu: float = 2.0</span>
+<span class="a">+    boot_hours: float = 0.15</span>
+<span class="a">+    # The cap keeps this much work of each worker in reserve.</span>
+<span class="a">+    reserve_hours: float = 2.5</span>
+<span class="a">+    # A cloud that bills each started hour gets its worker stopped only late in</span>
+<span class="a">+    # the hour that is paid already.</span>
+<span class="a">+    hour_drain_after_s: float = 50 * 60</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Offer:</span>
+<span class="a">+    &quot;&quot;&quot;A machine that one cloud can start now, at its live price.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    provider: str  # &quot;aws&quot; or &quot;hetzner&quot;: the Terraform module infra/burst/workers/&lt;provider&gt;</span>
+<span class="a">+    machine: str  # instance type or server type</span>
+<span class="a">+    zone: str  # AWS availability zone or Hetzner location</span>
+<span class="a">+    vcpus: int</span>
+<span class="a">+    usd_per_hour: float  # all that the machine costs per hour: price, IPv4 address, disk</span>
+<span class="a">+    per_started_hour: bool = False  # Hetzner bills each started hour in full</span>
+<span class="a">+    extra_usd_per_book: float = 0.0  # for example the transfer fee of the results</span>
+<span class="a">+    capacity: int = 1000  # machines of this offer that the account can start now</span>
+<span class="a">+</span>
+<span class="a">+    def usd_per_book(self, config: Config) -&gt; float:</span>
+<span class="a">+        hours = config.book_hours_4vcpu * 4 / self.vcpus + config.boot_hours</span>
+<span class="a">+        return self.usd_per_hour * hours + self.extra_usd_per_book</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass</span>
+<span class="a">+class Memory:</span>
+<span class="a">+    &quot;&quot;&quot;What the controller keeps between runs, in a JSON file.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    # name -&gt; {&quot;created&quot;, &quot;ref&quot;, &quot;provider&quot;, &quot;machine&quot;, &quot;zone&quot;, &quot;usd_per_hour&quot;, &quot;per_started_hour&quot;}</span>
+<span class="a">+    workers: dict[str, dict] = field(default_factory=dict)</span>
+<span class="a">+    # Names that had an rq worker at least once.</span>
+<span class="a">+    registered: set[str] = field(default_factory=set)</span>
+<span class="a">+    # name -&gt; time from which the worker was idle without a break.</span>
+<span class="a">+    idle_since: dict[str, float] = field(default_factory=dict)</span>
+<span class="a">+    # Names that received the rq shutdown command.</span>
+<span class="a">+    draining: set[str] = field(default_factory=set)</span>
+<span class="a">+    # Machines that ended in the last 30 days:</span>
+<span class="a">+    # {&quot;name&quot;, &quot;provider&quot;, &quot;start&quot;, &quot;end&quot;, &quot;usd_per_hour&quot;, &quot;per_started_hour&quot;}.</span>
+<span class="a">+    ledger: list[dict] = field(default_factory=list)</span>
+<span class="a">+    # provider -&gt; time until which the controller does not use it (an apply failed).</span>
+<span class="a">+    cooldown: dict[str, float] = field(default_factory=dict)</span>
+<span class="a">+</span>
+<span class="a">+    def to_json(self) -&gt; dict:</span>
+<span class="a">+        return {</span>
+<span class="a">+            &quot;workers&quot;: self.workers,</span>
+<span class="a">+            &quot;registered&quot;: sorted(self.registered),</span>
+<span class="a">+            &quot;idle_since&quot;: self.idle_since,</span>
+<span class="a">+            &quot;draining&quot;: sorted(self.draining),</span>
+<span class="a">+            &quot;ledger&quot;: self.ledger,</span>
+<span class="a">+            &quot;cooldown&quot;: self.cooldown,</span>
+<span class="a">+        }</span>
+<span class="a">+</span>
+<span class="a">+    @classmethod</span>
+<span class="a">+    def from_json(cls, data: dict) -&gt; Memory:</span>
+<span class="a">+        return cls(</span>
+<span class="a">+            workers=dict(data.get(&quot;workers&quot;, {})),</span>
+<span class="a">+            registered=set(data.get(&quot;registered&quot;, [])),</span>
+<span class="a">+            idle_since=dict(data.get(&quot;idle_since&quot;, {})),</span>
+<span class="a">+            draining=set(data.get(&quot;draining&quot;, [])),</span>
+<span class="a">+            ledger=list(data.get(&quot;ledger&quot;, [])),</span>
+<span class="a">+            cooldown=dict(data.get(&quot;cooldown&quot;, {})),</span>
+<span class="a">+        )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@dataclass(frozen=True)</span>
+<span class="a">+class Decision:</span>
+<span class="a">+    add: tuple[tuple[str, Offer], ...]  # new machines: (name, offer)</span>
+<span class="a">+    drain: frozenset[str]  # send these workers the rq shutdown command</span>
+<span class="a">+    remove: frozenset[str]  # destroy these machines</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def machine_cost(start: float, end: float, usd_per_hour: float, per_started_hour: bool) -&gt; float:</span>
+<span class="a">+    hours = max(0.0, end - start) / HOUR</span>
+<span class="a">+    if per_started_hour:</span>
+<span class="a">+        hours = math.ceil(hours)</span>
+<span class="a">+    return hours * usd_per_hour</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def spend_30d(now: float, memory: Memory) -&gt; float:</span>
+<span class="a">+    &quot;&quot;&quot;What the machines of the last 30 days cost: the ended ones and the running ones.&quot;&quot;&quot;</span>
+<span class="a">+    total = 0.0</span>
+<span class="a">+    for entry in memory.ledger:</span>
+<span class="a">+        if entry[&quot;end&quot;] &gt;= now - WINDOW:</span>
+<span class="a">+            total += machine_cost(entry[&quot;start&quot;], entry[&quot;end&quot;], entry[&quot;usd_per_hour&quot;],</span>
+<span class="a">+                                  entry[&quot;per_started_hour&quot;])</span>
+<span class="a">+    for info in memory.workers.values():</span>
+<span class="a">+        total += machine_cost(info[&quot;created&quot;], now, info[&quot;usd_per_hour&quot;], info[&quot;per_started_hour&quot;])</span>
+<span class="a">+    return total</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def spend_cap_usd(revenue_30d_usd: float, k: float = 0.30, floor: float = 5.0,</span>
+<span class="a">+                  ceiling: float = 100.0) -&gt; float:</span>
+<span class="a">+    &quot;&quot;&quot;The burst budget of the last 30 days: a share of the net revenue, with a floor</span>
+<span class="a">+    so that the first buyer gets a burst worker, and a ceiling.&quot;&quot;&quot;</span>
+<span class="a">+    return min(ceiling, max(floor, k * revenue_30d_usd))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def decide(</span>
+<span class="a">+    now: float,</span>
+<span class="a">+    waiting: int,</span>
+<span class="a">+    live: dict[str, str],</span>
+<span class="a">+    memory: Memory,</span>
+<span class="a">+    config: Config,</span>
+<span class="a">+    ref: str,</span>
+<span class="a">+    offers: list[Offer] = (),</span>
+<span class="a">+    cap_usd: float = math.inf,</span>
+<span class="a">+) -&gt; tuple[Decision, Memory]:</span>
+<span class="a">+    &quot;&quot;&quot;The next set of burst workers.</span>
+<span class="a">+</span>
+<span class="a">+    `waiting` is the number of paid jobs that no worker has taken. `live` maps</span>
+<span class="a">+    the host name of each burst worker that rq knows to &quot;busy&quot; or &quot;idle&quot;. `ref`</span>
+<span class="a">+    is the app commit for new workers. `offers` are the machines that the clouds</span>
+<span class="a">+    can start now. `cap_usd` is the spend cap of the last 30 days.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    keep: set[str] = set()</span>
+<span class="a">+    remove: set[str] = set()</span>
+<span class="a">+    drain: set[str] = set()</span>
+<span class="a">+    registered = set(memory.registered)</span>
+<span class="a">+    idle_since = dict(memory.idle_since)</span>
+<span class="a">+    draining = set(memory.draining)</span>
+<span class="a">+    booting: list[str] = []</span>
+<span class="a">+    idle_ready: list[str] = []</span>
+<span class="a">+    busy: list[str] = []</span>
+<span class="a">+</span>
+<span class="a">+    for name, info in memory.workers.items():</span>
+<span class="a">+        state = live.get(name)</span>
+<span class="a">+        stale = info.get(&quot;ref&quot;) != ref</span>
+<span class="a">+        if state is None:</span>
+<span class="a">+            if name in registered or stale:</span>
+<span class="a">+                remove.add(name)  # it stopped, or it would run an old commit</span>
+<span class="a">+            elif now - info[&quot;created&quot;] &gt;= config.boot_timeout_s:</span>
+<span class="a">+                remove.add(name)  # it never started</span>
+<span class="a">+            else:</span>
+<span class="a">+                keep.add(name)</span>
+<span class="a">+                booting.append(name)</span>
+<span class="a">+            continue</span>
+<span class="a">+</span>
+<span class="a">+        keep.add(name)</span>
+<span class="a">+        registered.add(name)</span>
+<span class="a">+        if state == &quot;busy&quot;:</span>
+<span class="a">+            idle_since.pop(name, None)</span>
+<span class="a">+            if stale and name not in draining:</span>
+<span class="a">+                drain.add(name)  # it finishes the job, then stops</span>
+<span class="a">+            elif name not in draining:</span>
+<span class="a">+                busy.append(name)</span>
+<span class="a">+            continue</span>
+<span class="a">+</span>
+<span class="a">+        idle_since.setdefault(name, now)</span>
+<span class="a">+        if name in draining:</span>
+<span class="a">+            continue  # it stops soon</span>
+<span class="a">+        late_in_paid_hour = (not info.get(&quot;per_started_hour&quot;)</span>
+<span class="a">+                             or (now - info[&quot;created&quot;]) % HOUR &gt;= config.hour_drain_after_s)</span>
+<span class="a">+        if stale or (waiting == 0 and now - idle_since[name] &gt;= config.idle_grace_s</span>
+<span class="a">+                     and late_in_paid_hour):</span>
+<span class="a">+            drain.add(name)</span>
+<span class="a">+        else:</span>
+<span class="a">+            idle_ready.append(name)</span>
+<span class="a">+</span>
+<span class="a">+    # Above the cap on workers (the operator lowered it): stop the cheapest first.</span>
+<span class="a">+    active = len(booting) + len(idle_ready) + len(busy)</span>
+<span class="a">+    excess = active - config.max_workers</span>
+<span class="a">+    while excess &gt; 0 and booting:</span>
+<span class="a">+        name = booting.pop()</span>
+<span class="a">+        keep.discard(name)</span>
+<span class="a">+        remove.add(name)</span>
+<span class="a">+        excess -= 1</span>
+<span class="a">+    for group in (idle_ready, busy):</span>
+<span class="a">+        while excess &gt; 0 and group:</span>
+<span class="a">+            drain.add(group.pop())</span>
+<span class="a">+            excess -= 1</span>
+<span class="a">+</span>
+<span class="a">+    # The machines that end now go to the ledger of the spend cap.</span>
+<span class="a">+    ledger = [e for e in memory.ledger if e[&quot;end&quot;] &gt;= now - WINDOW]</span>
+<span class="a">+    for name in remove:</span>
+<span class="a">+        info = memory.workers[name]</span>
+<span class="a">+        ledger.append({&quot;name&quot;: name, &quot;provider&quot;: info[&quot;provider&quot;], &quot;start&quot;: info[&quot;created&quot;],</span>
+<span class="a">+                       &quot;end&quot;: now, &quot;usd_per_hour&quot;: info[&quot;usd_per_hour&quot;],</span>
+<span class="a">+                       &quot;per_started_hour&quot;: info[&quot;per_started_hour&quot;]})</span>
+<span class="a">+</span>
+<span class="a">+    kept = {n: memory.workers[n] for n in keep}</span>
+<span class="a">+    budget = cap_usd - spend_30d(now, Memory(workers=kept, ledger=ledger))</span>
+<span class="a">+    reserved = sum(config.reserve_hours * info[&quot;usd_per_hour&quot;]</span>
+<span class="a">+                   for n, info in kept.items() if n not in draining | drain)</span>
+<span class="a">+</span>
+<span class="a">+    active = len(booting) + len(idle_ready) + len(busy)</span>
+<span class="a">+    need = waiting - len(idle_ready) - len(booting)</span>
+<span class="a">+    room = config.max_workers - active</span>
+<span class="a">+    usable = sorted(</span>
+<span class="a">+        (o for o in offers if memory.cooldown.get(o.provider, 0.0) &lt;= now and o.capacity &gt; 0),</span>
+<span class="a">+        key=lambda o: (o.usd_per_book(config), o.provider, o.machine, o.zone),</span>
+<span class="a">+    )</span>
+<span class="a">+    left = {o: o.capacity for o in usable}</span>
+<span class="a">+    taken = set(memory.workers) | set(live)</span>
+<span class="a">+    add: list[tuple[str, Offer]] = []</span>
+<span class="a">+    i = 0</span>
+<span class="a">+    while len(add) &lt; min(need, room):</span>
+<span class="a">+        offer = next((o for o in usable if left[o] &gt; 0</span>
+<span class="a">+                      and reserved + config.reserve_hours * o.usd_per_hour &lt;= budget), None)</span>
+<span class="a">+        if offer is None:</span>
+<span class="a">+            break  # no cloud can start one, or the spend cap is reached</span>
+<span class="a">+        name = f&quot;{NAME_PREFIX}{int(now)}-{i}&quot;</span>
+<span class="a">+        i += 1</span>
+<span class="a">+        if name in taken:</span>
+<span class="a">+            continue</span>
+<span class="a">+        left[offer] -= 1</span>
+<span class="a">+        reserved += config.reserve_hours * offer.usd_per_hour</span>
+<span class="a">+        add.append((name, offer))</span>
+<span class="a">+</span>
+<span class="a">+    workers = dict(kept)</span>
+<span class="a">+    for name, offer in add:</span>
+<span class="a">+        workers[name] = {</span>
+<span class="a">+            &quot;created&quot;: now, &quot;ref&quot;: ref, &quot;provider&quot;: offer.provider, &quot;machine&quot;: offer.machine,</span>
+<span class="a">+            &quot;zone&quot;: offer.zone, &quot;usd_per_hour&quot;: offer.usd_per_hour,</span>
+<span class="a">+            &quot;per_started_hour&quot;: offer.per_started_hour,</span>
+<span class="a">+        }</span>
+<span class="a">+    new_memory = Memory(</span>
+<span class="a">+        workers=workers,</span>
+<span class="a">+        registered=registered &amp; keep,</span>
+<span class="a">+        idle_since={n: t for n, t in idle_since.items() if n in keep and live.get(n) == &quot;idle&quot;},</span>
+<span class="a">+        draining=(draining | drain) &amp; keep,</span>
+<span class="a">+        ledger=ledger,</span>
+<span class="a">+        cooldown={p: t for p, t in memory.cooldown.items() if t &gt; now},</span>
+<span class="a">+    )</span>
+<span class="a">+    return Decision(add=tuple(add), drain=frozenset(drain), remove=frozenset(remove)), new_memory</span>
+diff --git a/tools/burst/offers.py b/tools/burst/offers.py
+new file mode 100644
+index 0000000..ba75655
+--- /dev/null
++++ b/tools/burst/offers.py
+<span class="h">@@ -0,0 +1,95 @@</span>
+<span class="a">+&quot;&quot;&quot;Live offers of the clouds: which machines each one can start now, and at what price.</span>
+<span class="a">+</span>
+<span class="a">+Each function reads one provider&#x27;s API and returns `core.Offer` objects. The</span>
+<span class="a">+controller asks again each time it wants a new worker, so a price drop or new</span>
+<span class="a">+stock at one cloud moves the next worker there.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+from collections.abc import Callable, Iterable</span>
+<span class="a">+</span>
+<span class="a">+from .core import Offer</span>
+<span class="a">+</span>
+<span class="a">+# Instance types that can run a worker (4 vCPU, 8 GB), and their vCPUs. Arm</span>
+<span class="a">+# types (c7g, c6g) need an arm64 install that nobody has measured yet: turn</span>
+<span class="a">+# them on with SUBPLZ_BURST_AWS_TYPES after one test book.</span>
+<span class="a">+AWS_VCPUS = {</span>
+<span class="a">+    &quot;c6a.xlarge&quot;: 4, &quot;c7a.xlarge&quot;: 4, &quot;m6a.xlarge&quot;: 4, &quot;c6i.xlarge&quot;: 4, &quot;c7i.xlarge&quot;: 4,</span>
+<span class="a">+    &quot;c7g.xlarge&quot;: 4, &quot;c6g.xlarge&quot;: 4, &quot;m7g.xlarge&quot;: 4,</span>
+<span class="a">+}</span>
+<span class="a">+AWS_ARM = {&quot;c7g.xlarge&quot;, &quot;c6g.xlarge&quot;, &quot;m7g.xlarge&quot;}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def aws_offers(</span>
+<span class="a">+    spot_prices: Iterable[dict],</span>
+<span class="a">+    *,</span>
+<span class="a">+    max_price: float,</span>
+<span class="a">+    extra_usd_per_hour: float,</span>
+<span class="a">+    extra_usd_per_book: float,</span>
+<span class="a">+    capacity: int,</span>
+<span class="a">+) -&gt; list[Offer]:</span>
+<span class="a">+    &quot;&quot;&quot;Offers from AWS spot price history (DescribeSpotPriceHistory items).</span>
+<span class="a">+</span>
+<span class="a">+    The newest price of each instance type in each availability zone counts.</span>
+<span class="a">+    A price above `max_price` is left out: the spot request would not start.</span>
+<span class="a">+    `extra_usd_per_hour` is the public IPv4 address and the disk.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    newest: dict[tuple[str, str], tuple[str, float]] = {}</span>
+<span class="a">+    for item in spot_prices:</span>
+<span class="a">+        key = (item[&quot;InstanceType&quot;], item[&quot;AvailabilityZone&quot;])</span>
+<span class="a">+        stamp = str(item[&quot;Timestamp&quot;])</span>
+<span class="a">+        if key not in newest or stamp &gt; newest[key][0]:</span>
+<span class="a">+            newest[key] = (stamp, float(item[&quot;SpotPrice&quot;]))</span>
+<span class="a">+    return [</span>
+<span class="a">+        Offer(</span>
+<span class="a">+            provider=&quot;aws&quot;, machine=machine, zone=zone, vcpus=AWS_VCPUS[machine],</span>
+<span class="a">+            usd_per_hour=price + extra_usd_per_hour, per_started_hour=False,</span>
+<span class="a">+            extra_usd_per_book=extra_usd_per_book, capacity=capacity,</span>
+<span class="a">+        )</span>
+<span class="a">+        for (machine, zone), (_, price) in sorted(newest.items())</span>
+<span class="a">+        if machine in AWS_VCPUS and price &lt;= max_price</span>
+<span class="a">+    ]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def fetch_aws_spot_prices(ec2, machines: list[str], since) -&gt; list[dict]:</span>
+<span class="a">+    &quot;&quot;&quot;DescribeSpotPriceHistory for Linux, all pages.&quot;&quot;&quot;</span>
+<span class="a">+    items: list[dict] = []</span>
+<span class="a">+    pages = ec2.get_paginator(&quot;describe_spot_price_history&quot;).paginate(</span>
+<span class="a">+        InstanceTypes=machines, ProductDescriptions=[&quot;Linux/UNIX&quot;], StartTime=since,</span>
+<span class="a">+    )</span>
+<span class="a">+    for page in pages:</span>
+<span class="a">+        items.extend(page[&quot;SpotPriceHistory&quot;])</span>
+<span class="a">+    return items</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def hetzner_offers(</span>
+<span class="a">+    get_json: Callable[[str], dict],</span>
+<span class="a">+    *,</span>
+<span class="a">+    machines: set[str],</span>
+<span class="a">+    usd_per_eur: float,</span>
+<span class="a">+    ipv4_eur_per_hour: float,</span>
+<span class="a">+    capacity: int,</span>
+<span class="a">+) -&gt; list[Offer]:</span>
+<span class="a">+    &quot;&quot;&quot;Offers from the Hetzner Cloud API: the server types for sale in each</span>
+<span class="a">+    location, at the hourly net price, where a datacenter has them in stock.&quot;&quot;&quot;</span>
+<span class="a">+    server_types = get_json(&quot;/server_types?per_page=50&quot;)[&quot;server_types&quot;]</span>
+<span class="a">+    in_stock = {</span>
+<span class="a">+        (dc[&quot;location&quot;][&quot;name&quot;], type_id)</span>
+<span class="a">+        for dc in get_json(&quot;/datacenters?per_page=50&quot;)[&quot;datacenters&quot;]</span>
+<span class="a">+        for type_id in dc[&quot;server_types&quot;][&quot;available&quot;]</span>
+<span class="a">+    }</span>
+<span class="a">+    offers = []</span>
+<span class="a">+    for st in server_types:</span>
+<span class="a">+        if st[&quot;name&quot;] not in machines or st.get(&quot;architecture&quot;) != &quot;x86&quot; or st.get(&quot;deprecation&quot;):</span>
+<span class="a">+            continue</span>
+<span class="a">+        for price in st[&quot;prices&quot;]:</span>
+<span class="a">+            if (price[&quot;location&quot;], st[&quot;id&quot;]) not in in_stock:</span>
+<span class="a">+                continue</span>
+<span class="a">+            eur = float(price[&quot;price_hourly&quot;][&quot;net&quot;]) + ipv4_eur_per_hour</span>
+<span class="a">+            offers.append(Offer(</span>
+<span class="a">+                provider=&quot;hetzner&quot;, machine=st[&quot;name&quot;], zone=price[&quot;location&quot;],</span>
+<span class="a">+                vcpus=int(st[&quot;cores&quot;]), usd_per_hour=eur * usd_per_eur,</span>
+<span class="a">+                per_started_hour=True, capacity=capacity,</span>
+<span class="a">+            ))</span>
+<span class="a">+    return sorted(offers, key=lambda o: (o.machine, o.zone))</span>
+diff --git a/tools/burst/revenue.py b/tools/burst/revenue.py
+new file mode 100644
+index 0000000..284e007
+--- /dev/null
++++ b/tools/burst/revenue.py
+<span class="h">@@ -0,0 +1,55 @@</span>
+<span class="a">+&quot;&quot;&quot;The net server revenue of the last 30 days: the base of the burst spend cap.</span>
+<span class="a">+</span>
+<span class="a">+Packs count for 30 days after the purchase. A subscription counts while it is</span>
+<span class="a">+active and paid for the current period. Free credits count for nothing. Stripe</span>
+<span class="a">+takes 2.9% + 30 cents of each payment, and 0.7% more of a subscription payment</span>
+<span class="a">+(Stripe Billing).</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import math</span>
+<span class="a">+from datetime import datetime, timedelta</span>
+<span class="a">+</span>
+<span class="a">+from sqlalchemy import select</span>
+<span class="a">+from sqlalchemy.orm import Session</span>
+<span class="a">+</span>
+<span class="a">+from backend import pricing</span>
+<span class="a">+from backend.db import Account, Purchase</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def net_pack_cents(amount_cents: int) -&gt; int:</span>
+<span class="a">+    return amount_cents - math.ceil(0.029 * amount_cents) - 30</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def net_subscription_cents(amount_cents: int) -&gt; int:</span>
+<span class="a">+    return amount_cents - math.ceil(0.036 * amount_cents) - 30</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _aware(when: datetime | None) -&gt; datetime | None:</span>
+<span class="a">+    &quot;&quot;&quot;SQLite gives back naive times. The app writes UTC.&quot;&quot;&quot;</span>
+<span class="a">+    if when is None or when.tzinfo is not None:</span>
+<span class="a">+        return when</span>
+<span class="a">+    from datetime import timezone</span>
+<span class="a">+    return when.replace(tzinfo=timezone.utc)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def revenue_30d_usd(session: Session, now: datetime) -&gt; float:</span>
+<span class="a">+    since = now - timedelta(days=30)</span>
+<span class="a">+    total = 0</span>
+<span class="a">+    for plan_id, amount, created in session.execute(</span>
+<span class="a">+        select(Purchase.plan_id, Purchase.amount_cents, Purchase.created_at)</span>
+<span class="a">+    ):</span>
+<span class="a">+        plan = pricing.get(plan_id, retired=True)</span>
+<span class="a">+        if plan is None or plan.recurring or _aware(created) &lt; since:</span>
+<span class="a">+            continue</span>
+<span class="a">+        total += net_pack_cents(amount)</span>
+<span class="a">+    for plan_id, ends in session.execute(</span>
+<span class="a">+        select(Account.subscription_plan_id, Account.subscription_period_end)</span>
+<span class="a">+        .where(Account.subscription_status == &quot;active&quot;)</span>
+<span class="a">+    ):</span>
+<span class="a">+        plan = pricing.get(plan_id or &quot;&quot;, retired=True)</span>
+<span class="a">+        if plan is None or not plan.recurring or ends is None or _aware(ends) &lt;= now:</span>
+<span class="a">+            continue</span>
+<span class="a">+        total += net_subscription_cents(plan.price_cents)</span>
+<span class="a">+    return total / 100</span>
+diff --git a/tools/burst_controller.py b/tools/burst_controller.py
+deleted file mode 100644
+index 84e453b..0000000
+--- a/tools/burst_controller.py
++++ /dev/null
+<span class="h">@@ -1,313 +0,0 @@</span>
+<span class="d">-&quot;&quot;&quot;Burst workers: add them when jobs wait, remove them when they are idle.</span>
+<span class="d">-</span>
+<span class="d">-The web server runs this once a minute (a systemd timer, see</span>
+<span class="d">-infra/burst/README.md). One run does this:</span>
+<span class="d">-</span>
+<span class="d">-1. Read the Redis queue: how many jobs wait, and which burst workers are busy</span>
+<span class="d">-   or idle.</span>
+<span class="d">-2. Decide the set of burst workers (`decide`).</span>
+<span class="d">-3. Send the rq shutdown command to each worker that is no longer needed. rq</span>
+<span class="d">-   lets a worker finish its job before it stops, so a scale-in never kills a</span>
+<span class="d">-   paid job.</span>
+<span class="d">-4. Write the set to the Terraform variables of infra/burst/workers and run</span>
+<span class="d">-   `terraform apply` when the set changed. Terraform makes the new droplets,</span>
+<span class="d">-   and destroys each droplet whose worker has stopped.</span>
+<span class="d">-</span>
+<span class="d">-The host name of a burst worker is its droplet name, and rq records the host</span>
+<span class="d">-name of each worker. That is how a droplet and its rq worker are matched.</span>
+<span class="d">-Workers run the app at the git commit of this server (`ref`). After a deploy,</span>
+<span class="d">-the workers of the old commit stop and new ones take their place.</span>
+<span class="d">-&quot;&quot;&quot;</span>
+<span class="d">-</span>
+<span class="d">-from __future__ import annotations</span>
+<span class="d">-</span>
+<span class="d">-import argparse</span>
+<span class="d">-import json</span>
+<span class="d">-import logging</span>
+<span class="d">-import os</span>
+<span class="d">-import subprocess</span>
+<span class="d">-import sys</span>
+<span class="d">-import tempfile</span>
+<span class="d">-import time</span>
+<span class="d">-from dataclasses import dataclass, field</span>
+<span class="d">-from pathlib import Path</span>
+<span class="d">-</span>
+<span class="d">-log = logging.getLogger(&quot;subplz.burst&quot;)</span>
+<span class="d">-</span>
+<span class="d">-NAME_PREFIX = &quot;subplz-burst-&quot;</span>
+<span class="d">-QUEUE_NAME = &quot;subplz-jobs-paid&quot;  # backend.queue.PAID_QUEUE: burst workers take paid jobs only</span>
+<span class="d">-RELEASE_PREFIX = &quot;releases/&quot;</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@dataclass(frozen=True)</span>
+<span class="d">-class Config:</span>
+<span class="d">-    max_workers: int</span>
+<span class="d">-    # A new droplet installs the speech stack before its worker starts.</span>
+<span class="d">-    boot_timeout_s: float = 20 * 60</span>
+<span class="d">-    # An idle worker waits this long for a new job before it stops.</span>
+<span class="d">-    idle_grace_s: float = 10 * 60</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@dataclass</span>
+<span class="d">-class Memory:</span>
+<span class="d">-    &quot;&quot;&quot;What the controller keeps between runs, in a JSON file.&quot;&quot;&quot;</span>
+<span class="d">-</span>
+<span class="d">-    # name -&gt; {&quot;created&quot;: unix time, &quot;ref&quot;: git commit of the app}</span>
+<span class="d">-    workers: dict[str, dict] = field(default_factory=dict)</span>
+<span class="d">-    # Names that had an rq worker at least once.</span>
+<span class="d">-    registered: set[str] = field(default_factory=set)</span>
+<span class="d">-    # name -&gt; unix time from which the worker was idle without a break.</span>
+<span class="d">-    idle_since: dict[str, float] = field(default_factory=dict)</span>
+<span class="d">-    # Names that received the rq shutdown command.</span>
+<span class="d">-    draining: set[str] = field(default_factory=set)</span>
+<span class="d">-</span>
+<span class="d">-    def to_json(self) -&gt; dict:</span>
+<span class="d">-        return {</span>
+<span class="d">-            &quot;workers&quot;: self.workers,</span>
+<span class="d">-            &quot;registered&quot;: sorted(self.registered),</span>
+<span class="d">-            &quot;idle_since&quot;: self.idle_since,</span>
+<span class="d">-            &quot;draining&quot;: sorted(self.draining),</span>
+<span class="d">-        }</span>
+<span class="d">-</span>
+<span class="d">-    @classmethod</span>
+<span class="d">-    def from_json(cls, data: dict) -&gt; Memory:</span>
+<span class="d">-        return cls(</span>
+<span class="d">-            workers=dict(data.get(&quot;workers&quot;, {})),</span>
+<span class="d">-            registered=set(data.get(&quot;registered&quot;, [])),</span>
+<span class="d">-            idle_since=dict(data.get(&quot;idle_since&quot;, {})),</span>
+<span class="d">-            draining=set(data.get(&quot;draining&quot;, [])),</span>
+<span class="d">-        )</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-@dataclass(frozen=True)</span>
+<span class="d">-class Decision:</span>
+<span class="d">-    add: tuple[str, ...]  # new droplets</span>
+<span class="d">-    drain: frozenset[str]  # send these workers the rq shutdown command</span>
+<span class="d">-    remove: frozenset[str]  # destroy these droplets</span>
+<span class="d">-</span>
+<span class="d">-    @property</span>
+<span class="d">-    def changes_droplets(self) -&gt; bool:</span>
+<span class="d">-        return bool(self.add or self.remove)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def decide(</span>
+<span class="d">-    now: float,</span>
+<span class="d">-    waiting: int,</span>
+<span class="d">-    live: dict[str, str],</span>
+<span class="d">-    memory: Memory,</span>
+<span class="d">-    config: Config,</span>
+<span class="d">-    ref: str,</span>
+<span class="d">-) -&gt; tuple[Decision, Memory]:</span>
+<span class="d">-    &quot;&quot;&quot;The next set of burst workers. Pure: no I/O.</span>
+<span class="d">-</span>
+<span class="d">-    `waiting` is the number of queued jobs that no worker has taken. `live`</span>
+<span class="d">-    maps the host name of each burst worker that rq knows to &quot;busy&quot; or &quot;idle&quot;.</span>
+<span class="d">-    `ref` is the app commit for new workers.</span>
+<span class="d">-    &quot;&quot;&quot;</span>
+<span class="d">-    keep: set[str] = set()</span>
+<span class="d">-    remove: set[str] = set()</span>
+<span class="d">-    drain: set[str] = set()</span>
+<span class="d">-    registered = set(memory.registered)</span>
+<span class="d">-    idle_since = dict(memory.idle_since)</span>
+<span class="d">-    draining = set(memory.draining)</span>
+<span class="d">-    booting: list[str] = []</span>
+<span class="d">-    idle_ready: list[str] = []</span>
+<span class="d">-    busy: list[str] = []</span>
+<span class="d">-</span>
+<span class="d">-    for name, info in memory.workers.items():</span>
+<span class="d">-        state = live.get(name)</span>
+<span class="d">-        stale = info.get(&quot;ref&quot;) != ref</span>
+<span class="d">-        if state is None:</span>
+<span class="d">-            if name in registered or stale:</span>
+<span class="d">-                remove.add(name)  # it stopped, or it would run an old commit</span>
+<span class="d">-            elif now - info[&quot;created&quot;] &gt;= config.boot_timeout_s:</span>
+<span class="d">-                remove.add(name)  # it never started</span>
+<span class="d">-            else:</span>
+<span class="d">-                keep.add(name)</span>
+<span class="d">-                booting.append(name)</span>
+<span class="d">-            continue</span>
+<span class="d">-</span>
+<span class="d">-        keep.add(name)</span>
+<span class="d">-        registered.add(name)</span>
+<span class="d">-        if state == &quot;busy&quot;:</span>
+<span class="d">-            idle_since.pop(name, None)</span>
+<span class="d">-            if stale and name not in draining:</span>
+<span class="d">-                drain.add(name)  # it finishes the job, then stops</span>
+<span class="d">-            elif name not in draining:</span>
+<span class="d">-                busy.append(name)</span>
+<span class="d">-            continue</span>
+<span class="d">-</span>
+<span class="d">-        idle_since.setdefault(name, now)</span>
+<span class="d">-        if name in draining:</span>
+<span class="d">-            continue  # it stops soon</span>
+<span class="d">-        if stale or (waiting == 0 and now - idle_since[name] &gt;= config.idle_grace_s):</span>
+<span class="d">-            drain.add(name)</span>
+<span class="d">-        else:</span>
+<span class="d">-            idle_ready.append(name)</span>
+<span class="d">-</span>
+<span class="d">-    # Above the cap (the operator lowered it): stop the cheapest workers first.</span>
+<span class="d">-    active = len(booting) + len(idle_ready) + len(busy)</span>
+<span class="d">-    excess = active - config.max_workers</span>
+<span class="d">-    while excess &gt; 0 and booting:</span>
+<span class="d">-        name = booting.pop()</span>
+<span class="d">-        keep.discard(name)</span>
+<span class="d">-        remove.add(name)</span>
+<span class="d">-        excess -= 1</span>
+<span class="d">-    for group in (idle_ready, busy):</span>
+<span class="d">-        while excess &gt; 0 and group:</span>
+<span class="d">-            drain.add(group.pop())</span>
+<span class="d">-            excess -= 1</span>
+<span class="d">-</span>
+<span class="d">-    active = len(booting) + len(idle_ready) + len(busy)</span>
+<span class="d">-    need = waiting - len(idle_ready) - len(booting)</span>
+<span class="d">-    room = config.max_workers - active</span>
+<span class="d">-    count = max(0, min(need, room))</span>
+<span class="d">-    taken = set(memory.workers) | set(live)</span>
+<span class="d">-    new_names: list[str] = []</span>
+<span class="d">-    i = 0</span>
+<span class="d">-    while len(new_names) &lt; count:</span>
+<span class="d">-        name = f&quot;{NAME_PREFIX}{int(now)}-{i}&quot;</span>
+<span class="d">-        i += 1</span>
+<span class="d">-        if name not in taken:</span>
+<span class="d">-            new_names.append(name)</span>
+<span class="d">-    add = tuple(new_names)</span>
+<span class="d">-</span>
+<span class="d">-    workers = {n: memory.workers[n] for n in keep}</span>
+<span class="d">-    workers.update({n: {&quot;created&quot;: now, &quot;ref&quot;: ref} for n in add})</span>
+<span class="d">-    draining = (draining | drain) &amp; keep</span>
+<span class="d">-    new_memory = Memory(</span>
+<span class="d">-        workers=workers,</span>
+<span class="d">-        registered=registered &amp; keep,</span>
+<span class="d">-        idle_since={n: t for n, t in idle_since.items() if n in keep and live.get(n) == &quot;idle&quot;},</span>
+<span class="d">-        draining=draining,</span>
+<span class="d">-    )</span>
+<span class="d">-    return Decision(add=add, drain=frozenset(drain), remove=frozenset(remove)), new_memory</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-# --- I/O ---------------------------------------------------------------------</span>
+<span class="d">-</span>
+<span class="d">-def read_queue(conn) -&gt; tuple[int, dict[str, str], dict[str, str]]:</span>
+<span class="d">-    &quot;&quot;&quot;Queued jobs, the state of each burst worker, and its rq worker name.&quot;&quot;&quot;</span>
+<span class="d">-    from rq import Queue, Worker</span>
+<span class="d">-</span>
+<span class="d">-    waiting = Queue(QUEUE_NAME, connection=conn).count</span>
+<span class="d">-    live: dict[str, str] = {}</span>
+<span class="d">-    rq_names: dict[str, str] = {}</span>
+<span class="d">-    for worker in Worker.all(connection=conn):</span>
+<span class="d">-        host = worker.hostname or &quot;&quot;</span>
+<span class="d">-        if not host.startswith(NAME_PREFIX):</span>
+<span class="d">-            continue  # the web server&#x27;s own worker, or one this code does not manage</span>
+<span class="d">-        live[host] = &quot;busy&quot; if worker.get_state() == &quot;busy&quot; else &quot;idle&quot;</span>
+<span class="d">-        rq_names[host] = worker.name</span>
+<span class="d">-    return waiting, live, rq_names</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def send_drain(conn, rq_names: dict[str, str], names: frozenset[str]) -&gt; None:</span>
+<span class="d">-    from rq.command import send_shutdown_command</span>
+<span class="d">-</span>
+<span class="d">-    for name in sorted(names):</span>
+<span class="d">-        if name in rq_names:</span>
+<span class="d">-            send_shutdown_command(conn, rq_names[name])</span>
+<span class="d">-            log.info(&quot;told %s to stop after its current job&quot;, name)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def load_memory(path: Path) -&gt; Memory:</span>
+<span class="d">-    if not path.exists():</span>
+<span class="d">-        return Memory()</span>
+<span class="d">-    return Memory.from_json(json.loads(path.read_text(encoding=&quot;utf-8&quot;)))</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def save_json(path: Path, data: dict) -&gt; None:</span>
+<span class="d">-    &quot;&quot;&quot;Write `data` so that a crash never leaves half a file.&quot;&quot;&quot;</span>
+<span class="d">-    path.parent.mkdir(parents=True, exist_ok=True)</span>
+<span class="d">-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=&quot;.tmp&quot;)</span>
+<span class="d">-    with os.fdopen(fd, &quot;w&quot;, encoding=&quot;utf-8&quot;) as out:</span>
+<span class="d">-        json.dump(data, out, indent=2, sort_keys=True)</span>
+<span class="d">-    os.replace(tmp, path)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def terraform_vars(memory: Memory) -&gt; dict:</span>
+<span class="d">-    return {&quot;workers&quot;: {n: {&quot;ref&quot;: info[&quot;ref&quot;]} for n, info in sorted(memory.workers.items())}}</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def terraform_apply(terraform: list[str], module_dir: Path, var_file: Path) -&gt; bool:</span>
+<span class="d">-    cmd = [*terraform, f&quot;-chdir={module_dir}&quot;, &quot;apply&quot;, &quot;-auto-approve&quot;,</span>
+<span class="d">-           &quot;-input=false&quot;, &quot;-no-color&quot;, f&quot;-var-file={var_file}&quot;]</span>
+<span class="d">-    result = subprocess.run(cmd, capture_output=True, text=True)</span>
+<span class="d">-    if result.returncode != 0:</span>
+<span class="d">-        log.error(&quot;terraform apply failed (%s):\n%s&quot;, result.returncode, result.stderr[-4000:])</span>
+<span class="d">-        return False</span>
+<span class="d">-    return True</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def ensure_release(app_dir: Path, ref: str, bucket: str) -&gt; None:</span>
+<span class="d">-    &quot;&quot;&quot;Put the app at `ref` in the bucket, where new workers download it.&quot;&quot;&quot;</span>
+<span class="d">-    import boto3</span>
+<span class="d">-    from botocore.exceptions import ClientError</span>
+<span class="d">-</span>
+<span class="d">-    s3 = boto3.client(&quot;s3&quot;)</span>
+<span class="d">-    key = f&quot;{RELEASE_PREFIX}{ref}.tar.gz&quot;</span>
+<span class="d">-    try:</span>
+<span class="d">-        s3.head_object(Bucket=bucket, Key=key)</span>
+<span class="d">-        return</span>
+<span class="d">-    except ClientError as exc:</span>
+<span class="d">-        if exc.response.get(&quot;Error&quot;, {}).get(&quot;Code&quot;) not in (&quot;404&quot;, &quot;NoSuchKey&quot;, &quot;NotFound&quot;):</span>
+<span class="d">-            raise</span>
+<span class="d">-    with tempfile.TemporaryDirectory() as tmp:</span>
+<span class="d">-        archive = Path(tmp) / &quot;app.tar.gz&quot;</span>
+<span class="d">-        subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(app_dir), &quot;archive&quot;, &quot;--format=tar.gz&quot;,</span>
+<span class="d">-                        &quot;-o&quot;, str(archive), ref], check=True)</span>
+<span class="d">-        s3.upload_file(str(archive), bucket, key)</span>
+<span class="d">-    log.info(&quot;uploaded %s&quot;, key)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def run(args: argparse.Namespace) -&gt; int:</span>
+<span class="d">-    from redis import Redis</span>
+<span class="d">-</span>
+<span class="d">-    config = Config(max_workers=args.max_workers)</span>
+<span class="d">-    ref = subprocess.run([&quot;git&quot;, &quot;-C&quot;, str(args.app_dir), &quot;rev-parse&quot;, &quot;HEAD&quot;],</span>
+<span class="d">-                         check=True, capture_output=True, text=True).stdout.strip()</span>
+<span class="d">-    conn = Redis.from_url(args.redis_url)</span>
+<span class="d">-    waiting, live, rq_names = read_queue(conn)</span>
+<span class="d">-    memory = load_memory(args.state)</span>
+<span class="d">-    decision, new_memory = decide(time.time(), waiting, live, memory, config, ref)</span>
+<span class="d">-    log.info(&quot;waiting=%d live=%s add=%s drain=%s remove=%s&quot;, waiting, live,</span>
+<span class="d">-             list(decision.add), sorted(decision.drain), sorted(decision.remove))</span>
+<span class="d">-    if args.dry_run:</span>
+<span class="d">-        return 0</span>
+<span class="d">-</span>
+<span class="d">-    send_drain(conn, rq_names, decision.drain)</span>
+<span class="d">-    if decision.changes_droplets:</span>
+<span class="d">-        if decision.add:</span>
+<span class="d">-            ensure_release(args.app_dir, ref, args.bucket)</span>
+<span class="d">-        save_json(args.var_file, terraform_vars(new_memory))</span>
+<span class="d">-        if not terraform_apply(args.terraform, args.module_dir, args.var_file):</span>
+<span class="d">-            # Keep the old memory: the next run decides again from the facts.</span>
+<span class="d">-            save_json(args.var_file, terraform_vars(memory))</span>
+<span class="d">-            return 1</span>
+<span class="d">-    save_json(args.state, new_memory.to_json())</span>
+<span class="d">-    return 0</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-def main(argv: list[str] | None = None) -&gt; int:</span>
+<span class="d">-    logging.basicConfig(level=logging.INFO, format=&quot;%(asctime)s %(levelname)s %(message)s&quot;)</span>
+<span class="d">-    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])</span>
+<span class="d">-    p.add_argument(&quot;--max-workers&quot;, type=int,</span>
+<span class="d">-                   default=int(os.environ.get(&quot;SUBPLZ_BURST_MAX_WORKERS&quot;, &quot;3&quot;)))</span>
+<span class="d">-    p.add_argument(&quot;--redis-url&quot;, default=os.environ.get(&quot;SUBPLZ_WEB_REDIS_URL&quot;, &quot;&quot;))</span>
+<span class="d">-    p.add_argument(&quot;--bucket&quot;, default=os.environ.get(&quot;SUBPLZ_WEB_S3_BUCKET&quot;, &quot;&quot;))</span>
+<span class="d">-    p.add_argument(&quot;--app-dir&quot;, type=Path, default=Path(&quot;/opt/subplz-web&quot;))</span>
+<span class="d">-    p.add_argument(&quot;--module-dir&quot;, type=Path,</span>
+<span class="d">-                   default=Path(&quot;/opt/subplz-web/infra/burst/workers&quot;))</span>
+<span class="d">-    p.add_argument(&quot;--state&quot;, type=Path, default=Path(&quot;/var/lib/subplz-burst/controller.json&quot;))</span>
+<span class="d">-    p.add_argument(&quot;--var-file&quot;, type=Path, default=Path(&quot;/var/lib/subplz-burst/workers.tfvars.json&quot;))</span>
+<span class="d">-    p.add_argument(&quot;--terraform&quot;, nargs=&quot;+&quot;, default=[&quot;terraform&quot;])</span>
+<span class="d">-    p.add_argument(&quot;--dry-run&quot;, action=&quot;store_true&quot;, help=&quot;decide and log, change nothing&quot;)</span>
+<span class="d">-    args = p.parse_args(argv)</span>
+<span class="d">-    if not args.redis_url or not args.bucket:</span>
+<span class="d">-        p.error(&quot;set SUBPLZ_WEB_REDIS_URL and SUBPLZ_WEB_S3_BUCKET (or --redis-url, --bucket)&quot;)</span>
+<span class="d">-    return run(args)</span>
+<span class="d">-</span>
+<span class="d">-</span>
+<span class="d">-if __name__ == &quot;__main__&quot;:</span>
+<span class="d">-    sys.exit(main())</span></pre>
+</div></body></html>

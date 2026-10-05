@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web f61e9113 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit f61e9113ae1f49bfba30fa6804e19410c4adbde5
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:45:22 -0700
+
+Add a tool that copies the app database to another database
+
+Burst workers share one Postgres database with the web server, and the
+web server keeps its data in SQLite today. tools/copy_database.py copies
+every row of every app table from one database URL to another: SQLite to
+Postgres when burst mode goes on, and back when it goes off. It makes the
+tables from the app models, marks the naive SQLite times as UTC, and
+refuses a target that has rows already.
+
+The test copies random databases and compares every row.
+
+</pre><pre> tests/test_copy_database.py | 83 +++++++++++++++++++++++++++++++++++++++++++++
+ tools/copy_database.py      | 68 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 151 insertions(+)
+</pre><pre>diff --git a/tests/test_copy_database.py b/tests/test_copy_database.py
+new file mode 100644
+index 0000000..bb70a67
+--- /dev/null
++++ b/tests/test_copy_database.py
+<span class="h">@@ -0,0 +1,83 @@</span>
+<span class="a">+&quot;&quot;&quot;tools/copy_database.py: a copy has every row of every table, unchanged.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+from datetime import date, datetime, timedelta, timezone</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+from hypothesis import HealthCheck, given, settings</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+from sqlalchemy import create_engine, select</span>
+<span class="a">+from sqlalchemy.orm import Session</span>
+<span class="a">+</span>
+<span class="a">+from backend.db import Account, Artifact, Base, Job, JobStatus, Purchase</span>
+<span class="a">+from tools.copy_database import copy_database</span>
+<span class="a">+</span>
+<span class="a">+T0 = datetime(2026, 9, 22, tzinfo=timezone.utc)</span>
+<span class="a">+text = st.text(st.characters(codec=&quot;utf-8&quot;, exclude_categories=(&quot;Cs&quot;, &quot;Cc&quot;)), max_size=20)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@st.composite</span>
+<span class="a">+def databases(draw):</span>
+<span class="a">+    accounts = []</span>
+<span class="a">+    for a in range(draw(st.integers(1, 4))):</span>
+<span class="a">+        account = Account(</span>
+<span class="a">+            id=f&quot;acct_{a}&quot;, device_token=f&quot;dev_{a}&quot;,</span>
+<span class="a">+            email=draw(st.none() | st.just(f&quot;reader{a}@example.com&quot;)),</span>
+<span class="a">+            purchased_credits=draw(st.integers(0, 500)),</span>
+<span class="a">+            daily_credit_on=draw(st.none() | st.dates(date(2026, 1, 1), date(2027, 1, 1))),</span>
+<span class="a">+            created_at=T0 + timedelta(seconds=draw(st.integers(0, 10**6))),</span>
+<span class="a">+        )</span>
+<span class="a">+        accounts.append(account)</span>
+<span class="a">+        for j in range(draw(st.integers(0, 3))):</span>
+<span class="a">+            job_id = f&quot;job_{a}_{j}&quot;</span>
+<span class="a">+            accounts.append(Job(</span>
+<span class="a">+                id=job_id, account_id=account.id, status=draw(st.sampled_from(list(JobStatus))),</span>
+<span class="a">+                language=&quot;ja&quot;, splitter=&quot;pysbd&quot;, model=&quot;tiny&quot;,</span>
+<span class="a">+                audio_filename=draw(text), text_filename=draw(text),</span>
+<span class="a">+                audio_duration_seconds=draw(st.none() | st.floats(0, 1e5)),</span>
+<span class="a">+                progress=draw(st.floats(0, 1)), error=draw(st.none() | text),</span>
+<span class="a">+            ))</span>
+<span class="a">+            accounts.append(Artifact(id=f&quot;art_{a}_{j}&quot;, job_id=job_id, kind=&quot;srt&quot;,</span>
+<span class="a">+                                     filename=draw(text), storage_key=f&quot;{job_id}/out.srt&quot;))</span>
+<span class="a">+        if draw(st.booleans()):</span>
+<span class="a">+            accounts.append(Purchase(id=f&quot;buy_{a}&quot;, account_id=account.id, plan_id=&quot;pack10&quot;,</span>
+<span class="a">+                                     credits=10, amount_cents=499, stripe_session_id=f&quot;cs_{a}&quot;))</span>
+<span class="a">+    return accounts</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def rows(url: str) -&gt; dict[str, list[dict]]:</span>
+<span class="a">+    engine = create_engine(url)</span>
+<span class="a">+    with engine.connect() as c:</span>
+<span class="a">+        return {t.name: sorted((dict(r._mapping) for r in c.execute(select(t))), key=repr)</span>
+<span class="a">+                for t in Base.metadata.sorted_tables}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@settings(max_examples=40, deadline=None,</span>
+<span class="a">+          suppress_health_check=[HealthCheck.function_scoped_fixture])</span>
+<span class="a">+@given(objects=databases())</span>
+<span class="a">+def test_the_copy_has_every_row_unchanged(tmp_path_factory, objects):</span>
+<span class="a">+    tmp = tmp_path_factory.mktemp(&quot;copy&quot;)</span>
+<span class="a">+    source, target = f&quot;sqlite:///{tmp / &#x27;source.db&#x27;}&quot;, f&quot;sqlite:///{tmp / &#x27;target.db&#x27;}&quot;</span>
+<span class="a">+    engine = create_engine(source)</span>
+<span class="a">+    Base.metadata.create_all(engine)</span>
+<span class="a">+    with Session(engine) as s:</span>
+<span class="a">+        s.add_all(objects)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+</span>
+<span class="a">+    counts = copy_database(source, target)</span>
+<span class="a">+</span>
+<span class="a">+    assert rows(target) == rows(source)</span>
+<span class="a">+    assert counts[&quot;accounts&quot;] == len([o for o in objects if isinstance(o, Account)])</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_copy_refuses_a_target_with_rows(tmp_path):</span>
+<span class="a">+    source, target = f&quot;sqlite:///{tmp_path / &#x27;s.db&#x27;}&quot;, f&quot;sqlite:///{tmp_path / &#x27;t.db&#x27;}&quot;</span>
+<span class="a">+    for url in (source, target):</span>
+<span class="a">+        engine = create_engine(url)</span>
+<span class="a">+        Base.metadata.create_all(engine)</span>
+<span class="a">+        with Session(engine) as s:</span>
+<span class="a">+            s.add(Account(id=&quot;acct_x&quot;, device_token=&quot;dev_x&quot;))</span>
+<span class="a">+            s.commit()</span>
+<span class="a">+    with pytest.raises(RuntimeError, match=&quot;accounts&quot;):</span>
+<span class="a">+        copy_database(source, target)</span>
+diff --git a/tools/copy_database.py b/tools/copy_database.py
+new file mode 100644
+index 0000000..b59be97
+--- /dev/null
++++ b/tools/copy_database.py
+<span class="h">@@ -0,0 +1,68 @@</span>
+<span class="a">+&quot;&quot;&quot;Copy every row of the app database to another database.</span>
+<span class="a">+</span>
+<span class="a">+The web server needs this once, when it turns on burst workers: the workers</span>
+<span class="a">+share a Postgres database with it, and until then the data is in SQLite (see</span>
+<span class="a">+infra/burst/README.md).</span>
+<span class="a">+</span>
+<span class="a">+    python -m tools.copy_database sqlite:////opt/subplz-web/data/subplz.db \\</span>
+<span class="a">+        &quot;postgresql+psycopg://user:password@host:port/db?sslmode=require&quot;</span>
+<span class="a">+</span>
+<span class="a">+The target gets the tables of the app models first. The copy refuses a target</span>
+<span class="a">+that has rows already, so it never mixes two databases.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import sys</span>
+<span class="a">+from datetime import datetime, timezone</span>
+<span class="a">+</span>
+<span class="a">+from sqlalchemy import DateTime, create_engine, func, insert, select</span>
+<span class="a">+</span>
+<span class="a">+from backend.db import Base</span>
+<span class="a">+</span>
+<span class="a">+BATCH = 1000</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _as_utc(table, row: dict) -&gt; dict:</span>
+<span class="a">+    &quot;&quot;&quot;SQLite keeps no time zone. The app writes UTC, so say so for Postgres.&quot;&quot;&quot;</span>
+<span class="a">+    for column in table.columns:</span>
+<span class="a">+        value = row.get(column.name)</span>
+<span class="a">+        if (isinstance(column.type, DateTime) and column.type.timezone</span>
+<span class="a">+                and isinstance(value, datetime) and value.tzinfo is None):</span>
+<span class="a">+            row[column.name] = value.replace(tzinfo=timezone.utc)</span>
+<span class="a">+    return row</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def copy_database(source_url: str, target_url: str) -&gt; dict[str, int]:</span>
+<span class="a">+    &quot;&quot;&quot;Copy each table of the app from `source_url` to `target_url`.</span>
+<span class="a">+</span>
+<span class="a">+    Returns the number of rows copied for each table.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    source = create_engine(source_url)</span>
+<span class="a">+    target = create_engine(target_url)</span>
+<span class="a">+    Base.metadata.create_all(target)</span>
+<span class="a">+    counts: dict[str, int] = {}</span>
+<span class="a">+    with source.connect() as src, target.begin() as dst:</span>
+<span class="a">+        for table in Base.metadata.sorted_tables:</span>
+<span class="a">+            if dst.execute(select(func.count()).select_from(table)).scalar():</span>
+<span class="a">+                raise RuntimeError(f&quot;table {table.name} has rows in the target already&quot;)</span>
+<span class="a">+        # sorted_tables puts each table after the tables that it refers to.</span>
+<span class="a">+        for table in Base.metadata.sorted_tables:</span>
+<span class="a">+            rows = [_as_utc(table, dict(r._mapping)) for r in src.execute(select(table))]</span>
+<span class="a">+            for start in range(0, len(rows), BATCH):</span>
+<span class="a">+                dst.execute(insert(table), rows[start:start + BATCH])</span>
+<span class="a">+            counts[table.name] = len(rows)</span>
+<span class="a">+    return counts</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def main(argv: list[str]) -&gt; int:</span>
+<span class="a">+    if len(argv) != 2:</span>
+<span class="a">+        print(__doc__, file=sys.stderr)</span>
+<span class="a">+        return 2</span>
+<span class="a">+    for table, count in copy_database(argv[0], argv[1]).items():</span>
+<span class="a">+        print(f&quot;{table}: {count}&quot;)</span>
+<span class="a">+    return 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    sys.exit(main(sys.argv[1:]))</span></pre>
+</div></body></html>

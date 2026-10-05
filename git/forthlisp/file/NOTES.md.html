@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>forthlisp/NOTES.md - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>forthlisp</h1><span class="desc">Scheme on a from-scratch Forth on from-scratch machine code: core (host Lisp, Scheme in Forth, R7RS harness)</span><p class="url">git clone https://github.com/equwal/forthlisp</p><p><a href="../../forthlisp/index.html">Log</a> | <a href="../../forthlisp/files.html">Files</a> | <a href="../../forthlisp/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>NOTES.md (17563 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> # Assembly -&gt; SBCL breadboard -&gt; Forth -&gt; Lisp on the STM32F446
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> One emulated STM32F446 (Cortex-M4F, 128 KiB RAM, 512 KiB flash). Every layer is built here,
+<a id="l4" href="#l4">4</a> from Thumb-2 machine code up; no third-party Forth (Mecrisp-Stellaris, used before
+<a id="l5" href="#l5">5</a> 2026-10-04, is gone, and with it the GPLv3 question). All published numbers are measured
+<a id="l6" href="#l6">6</a> on this stack: `asm-tests.txt`, `kernel-tests.txt`, `conformance.txt`.
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> ```
+<a id="l9" href="#l9">9</a>  4  LISP     R7RS-small subset Scheme, written in Forth words (lisp.fs), loaded through
+<a id="l10" href="#l10">10</a>              the Forth console; prims.lisp + prelude.scm on top.         tests: r7rs-tests.scm
+<a id="l11" href="#l11">11</a>              ------------------------------------------------------------------------
+<a id="l12" href="#l12">12</a>  3  FORTH    our own indirect-threaded Forth kernel on the chip: primitives in Thumb-2,
+<a id="l13" href="#l13">13</a>              outer interpreter in Forth (kernel.fs), dictionary, serial console.
+<a id="l14" href="#l14">14</a>                                                                          tests: forth-tests.txt
+<a id="l15" href="#l15">15</a>              ------------------------------------------------------------------------
+<a id="l16" href="#l16">16</a>  2  SBCL     breadboard on the host: a Thumb-2 assembler on SBCL&#x27;s sb-assem segments,
+<a id="l17" href="#l17">17</a>              VOP-style primitive templates, a metacompiler for kernel.fs, image writer.
+<a id="l18" href="#l18">18</a>                                                                          tests: asm-tests (vs GNU as)
+<a id="l19" href="#l19">19</a>              ------------------------------------------------------------------------
+<a id="l20" href="#l20">20</a>  1  ASM      Thumb-2 / ARMv7-M instructions (and FPv4-SP for floats)     tests: byte-exact encodings
+<a id="l21" href="#l21">21</a> ```
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> Each layer has its own tests, run in this order: assembler encodings (byte-identical to
+<a id="l24" href="#l24">24</a> `arm-none-eabi-as`), kernel words over the serial console, then the Scheme conformance suite.
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> ## Plan
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> ### Layer 2: the SBCL breadboard
+<a id="l29" href="#l29">29</a> 
+<a id="l30" href="#l30">30</a> Paul Khuong, &quot;SBCL: the ultimate assembly code breadboard&quot;
+<a id="l31" href="#l31">31</a> (https://pvk.ca/Blog/2014/03/15/sbcl-the-ultimate-assembly-code-breadboard/), writes machine
+<a id="l32" href="#l32">32</a> code from the SBCL REPL with SBCL&#x27;s own assembler (`sb-assem` segments, `inst`, `define-vop`)
+<a id="l33" href="#l33">33</a> and inspects it with `sb-disassem`. SBCL&#x27;s backend targets the host (x86-64), so
+<a id="l34" href="#l34">34</a> its instruction definitions and `define-vop` cannot emit Thumb-2, and a VOP cannot run on the
+<a id="l35" href="#l35">35</a> host. The decision:
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a> - **Reuse `sb-assem` for what is ISA-neutral**: segments (`make-segment`, `emit-byte`),
+<a id="l38" href="#l38">38</a>   labels (`gen-label`, `emit-label`, `label-position`), and back-patches (`emit-back-patch`)
+<a id="l39" href="#l39">39</a>   for forward references, branch offsets and absolute cells. Checked on SBCL 2.6.9.
+<a id="l40" href="#l40">40</a> - **Write the Thumb-2 encoders as plain Lisp functions** over those segments, one per
+<a id="l41" href="#l41">41</a>   instruction form, and test each form against `arm-none-eabi-as` byte for byte.
+<a id="l42" href="#l42">42</a> - **VOP-style templates for primitives**: `defcode` takes a Forth name and a body of
+<a id="l43" href="#l43">43</a>   instructions, lays down the dictionary header, and appends `NEXT`, the way a VOP pairs
+<a id="l44" href="#l44">44</a>   a name with a code template.
+<a id="l45" href="#l45">45</a> - The host also metacompiles the high-level kernel (`kernel.fs`) into threaded code, links
+<a id="l46" href="#l46">46</a>   every reference with labels, and writes the flash image.
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> ### Layer 3: the kernel
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a> - **Threading: indirect-threaded code (ITC).** A colon definition is a list of execution
+<a id="l51" href="#l51">51</a>   tokens (cell addresses), so the on-chip compiler only appends cells and never encodes
+<a id="l52" href="#l52">52</a>   instructions. The cost is one extra load per word, which is acceptable for an interpreter host.
+<a id="l53" href="#l53">53</a> - **Registers:** r4 = IP, r5 = data stack pointer (full descending; holds the second item),
+<a id="l54" href="#l54">54</a>   r6 = TOS, r7 = W (current xt), sp = return stack, r0-r3 and r12 scratch.
+<a id="l55" href="#l55">55</a> - **NEXT:** `ldr r7,[r4],#4 ; ldr r0,[r7] ; bx r0`.
+<a id="l56" href="#l56">56</a> - **Header:** link (4 bytes), flags (bit 7 immediate, bit 6 hidden), name length, name,
+<a id="l57" href="#l57">57</a>   pad to 4, then the code field (CFA), then the body. An xt is a CFA address.
+<a id="l58" href="#l58">58</a> - **Memory map:**
+<a id="l59" href="#l59">59</a>   - Flash `0x08000000`: vector table, primitives, kernel headers and threads (read-only).
+<a id="l60" href="#l60">60</a>   - RAM `0x20000000`: system variables and the 512-byte input buffer, then the user dictionary.
+<a id="l61" href="#l61">61</a>   - Data stack: 4 KiB below `0x2001EFE0`.
+<a id="l62" href="#l62">62</a>   - Return stack: 4 KiB below `0x2001FFE0`. QEMU&#x27;s netduinoplus2 breaks on writes to the last
+<a id="l63" href="#l63">63</a>     32 bytes of RAM, so the stacks stop short of them.
+<a id="l64" href="#l64">64</a> - **Console:** USART2, polled, 115200 baud from the 16 MHz HSI. It is QEMU&#x27;s second
+<a id="l65" href="#l65">65</a>   `-serial`. `accept` treats Backspace and Delete alike.
+<a id="l66" href="#l66">66</a> - **Compatibility:** the console protocol (` ok.`, `not found.`) and the word set that
+<a id="l67" href="#l67">67</a>   `lisp.fs` uses (`variable` with an initial value, `buffer:`, `token`, `h@`, `cbis!`, ...)
+<a id="l68" href="#l68">68</a>   follow Mecrisp, so layer 4 loads unchanged.
+<a id="l69" href="#l69">69</a> - **Flash writing:** the image is written by the host. A runtime `flash!` follows RM0390
+<a id="l70" href="#l70">70</a>   (unlock keys, PG, PSIZE). QEMU does not model the F4 flash controller, so `flash!` is
+<a id="l71" href="#l71">71</a>   untested in emulation.
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a> ## Influences: remote patching of running systems
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a> - **gll-mag-patch** (Ron Garret, JPL 1993; https://github.com/rongarret/gll-mag-patch).
+<a id="l76" href="#l76">76</a>   Galileo&#x27;s magnetometer ran Forth on an RCA 1802. A RAM byte had failed, and the original
+<a id="l77" href="#l77">77</a>   development system no longer worked (README). Garret rebuilt the toolchain in Macintosh
+<a id="l78" href="#l78">78</a>   Common Lisp:
+<a id="l79" href="#l79">79</a>   - `forthcomp.lisp` rebuilds the flight dictionary from the ROM and RAM images and their
+<a id="l80" href="#l80">80</a>     word index (`build-gll-dictionary`).
+<a id="l81" href="#l81">81</a>   - `compiler-test` recompiles every recovered RAM word from `ram source.lisp` and diffs it
+<a id="l82" href="#l82">82</a>     byte for byte against the flight RAM image. This proves the new compiler reproduces the
+<a id="l83" href="#l83">83</a>     old one.
+<a id="l84" href="#l84">84</a>   - `compile-patch` compiles a replacement word at the **old word&#x27;s address**. It warns when
+<a id="l85" href="#l85">85</a>     the patch overflows the old slot and prints only the bytes that differ. `Patches/delivered`
+<a id="l86" href="#l86">86</a>     holds those address-plus-hex deltas, which are what was uplinked.
+<a id="l87" href="#l87">87</a>   - `Patches/development` frees space by merging the slots of retired words (DSP12 and DSP3)
+<a id="l88" href="#l88">88</a>     into one larger slot for the new word.
+<a id="l89" href="#l89">89</a>   - `sim1802` simulates the 1802; `asm1802` is its assembler; `lisp-&gt;forth` and macros such
+<a id="l90" href="#l90">90</a>     as `main-event-loop` generate Forth from Lisp.
+<a id="l91" href="#l91">91</a>   - `Patches/test results` records the instrument team&#x27;s independent review. They confirmed
+<a id="l92" href="#l92">92</a>     the compiled bytes matched the source, then ran the logic on their own test setup and
+<a id="l93" href="#l93">93</a>     found it still wrong (extra vectors at rim 0 and 90). Review caught the bug before uplink.
+<a id="l94" href="#l94">94</a>   - The flight `MAIN` computes ROM and RAM checksums (`ram source.lisp`).
+<a id="l95" href="#l95">95</a> - **&quot;Lisping at JPL&quot;** (Ron Garret; https://flownet.com/gat/jpl-lisp.html).
+<a id="l96" href="#l96">96</a>   - The magnetometer team had judged the patch too costly to attempt. A Lisp-built Forth
+<a id="l97" href="#l97">97</a>     environment with a hardware simulator delivered it in under three months of part-time work.
+<a id="l98" href="#l98">98</a>   - On Deep Space 1, a Lisp REPL running on the spacecraft let the team find and fix a race
+<a id="l99" href="#l99">99</a>     condition that ground testing had missed, about 100 million miles away.
+<a id="l100" href="#l100">100</a>   - Earlier robots used Lisp-hosted compilers for small targets, for example a 68HC11
+<a id="l101" href="#l101">101</a>     with 256 bytes of RAM.
+<a id="l102" href="#l102">102</a> 
+<a id="l103" href="#l103">103</a> What this design takes from them:
+<a id="l104" href="#l104">104</a> - The host holds the full development system: assembler, metacompiler, simulator-like tests.
+<a id="l105" href="#l105">105</a> - The target keeps a live interpreter, so code can be redefined over the serial link.
+<a id="l106" href="#l106">106</a> - The compiler is proven by reproducing known-good bytes, as `compiler-test` did.
+<a id="l107" href="#l107">107</a> - Patches are small, addressed, size-checked deltas. Each one is reviewed and tested off the
+<a id="l108" href="#l108">108</a>   target before it is sent.
+<a id="l109" href="#l109">109</a> 
+<a id="l110" href="#l110">110</a> ## Status
+<a id="l111" href="#l111">111</a> 
+<a id="l112" href="#l112">112</a> | Layer | Test | Result |
+<a id="l113" href="#l113">113</a> |---|---|---|
+<a id="l114" href="#l114">114</a> | 1-2 assembler | `asm-test.lisp`: every encoder form vs `arm-none-eabi-as` (incl. FPv4-SP), plus repeated label references | 105/105 |
+<a id="l115" href="#l115">115</a> | 3 kernel | `forth-tests.txt` via `host.lisp ktest`, fresh boot | 71/71 |
+<a id="l116" href="#l116">116</a> | 4 Scheme | chibi-scheme&#x27;s R7RS suite, `tests/r7rs/`, via `host.lisp suite` | see `tests/r7rs/results.txt` |
+<a id="l117" href="#l117">117</a> | 4 Scheme | our own regression suite `r7rs-tests.scm` via `host.lisp test` | 390/390 |
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a> - Kernel image: about 10.4 KiB of flash, 197 words (FPU words `f+ f- f* f/ s&gt;f f&gt;s fsqrt f&lt; f=`).
+<a id="l120" href="#l120">120</a> - RAM after `lisp.fs`, `prims.lisp` and `prelude.scm` load:
+<a id="l121" href="#l121">121</a>   - cons heap 60 KiB (7679 cells);
+<a id="l122" href="#l122">122</a>   - blob heap 12 KiB;
+<a id="l123" href="#l123">123</a>   - symbol names 10 KiB;
+<a id="l124" href="#l124">124</a>   - 5.9 KiB of dictionary free (`unused` = 5928).
+<a id="l125" href="#l125">125</a>   The prelude grew with item 4. At 48 KiB of heap, the 20000-iteration tail-call test spent
+<a id="l126" href="#l126">126</a>   most of its time in GC.
+<a id="l127" href="#l127">127</a> - The kernel prints `Redefine NAME.` when a definition shadows an existing word, and `host.lisp`
+<a id="l128" href="#l128">128</a>   stops the load on it. A list-length word named `llen` once silently captured the reader&#x27;s
+<a id="l129" href="#l129">129</a>   `llen` variable in every later word.
+<a id="l130" href="#l130">130</a> - `lisp.fs` loaded unchanged: the kernel follows Mecrisp&#x27;s console protocol and word set.
+<a id="l131" href="#l131">131</a> - Gotcha: sb-assem&#x27;s `emit-back-patch` (SBCL 2.6.9) resolved only the first of several adjacent
+<a id="l132" href="#l132">132</a>   references to one label, which left zero cells in the vector table and `li` loads.
+<a id="l133" href="#l133">133</a>   `asm.lisp` now keeps its own fixup list; `asm-test.lisp` has a regression case for it.
+<a id="l134" href="#l134">134</a> - A Z80 machine built the same way (own Z80 kernel, SBCL Z80 assembler, z80pack cpmsim)
+<a id="l135" href="#l135">135</a>   lives in `z80/`; see `z80/NOTES.md`.
+<a id="l136" href="#l136">136</a> ## Conformance
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a> **Target: the full R7RS-small suite of chibi-scheme** (Alex Shinn; `tests/r7rs-tests.scm`,
+<a id="l139" href="#l139">139</a> 1132 test calls; BSD licence, kept in `tests/r7rs/LICENSE`), vendored unmodified in `tests/r7rs/`.
+<a id="l140" href="#l140">140</a> - `host.lisp suite` splits the file into top-level forms and sends each one to the chip as one
+<a id="l141" href="#l141">141</a>   line (the longest is 454 bytes; the line buffer is 512).
+<a id="l142" href="#l142">142</a> - `shim.scm` defines `test`, `test-assert`, `test-begin` and `test-end` as chip procedures that
+<a id="l143" href="#l143">143</a>   print a pass or fail marker.
+<a id="l144" href="#l144">144</a> - `skip.scm` lists what cannot run yet, by section, test head, text or number-literal kind,
+<a id="l145" href="#l145">145</a>   each with a reason. A test that uses a name whose definition was skipped is skipped with
+<a id="l146" href="#l146">146</a>   that reason too. `results.txt` counts the skips per reason; no test is deleted.
+<a id="l147" href="#l147">147</a> - A form that errors counts all of its unreported tests as failed. If the chip stops
+<a id="l148" href="#l148">148</a>   answering, every later test counts as failed.
+<a id="l149" href="#l149">149</a> - First run on the own stack: 244 passed, 78 failed, 810 skipped, 1132 total. After item 1 (numbers): 302 passed, 119 failed, 711 skipped. After item 2 (characters,
+<a id="l150" href="#l150">150</a>   strings, vectors, bytevectors): 486 passed, 123 failed, 523 skipped. After item 3 (sqrt,
+<a id="l151" href="#l151">151</a>   rounding): 500 passed, 109 failed, 523 skipped. After items 4 and 5 (macros, call/cc,
+<a id="l152" href="#l152">152</a>   dynamic-wind, exceptions, raisable primitive errors, values, promises, parameters, records):
+<a id="l153" href="#l153">153</a>   603 passed, 140 failed, 389 skipped. It found two
+<a id="l154" href="#l154">154</a>   bugs, now fixed and covered by local regression tests: `list?` looped on a circular list,
+<a id="l155" href="#l155">155</a>   and `case` lacked `=&gt;`.
+<a id="l156" href="#l156">156</a> 
+<a id="l157" href="#l157">157</a> Our own suite below stays local: a reported sieve program, string cases and those regressions.
+<a id="l158" href="#l158">158</a> 
+<a id="l159" href="#l159">159</a> `r7rs-tests.scm` holds 205 cases, most of them the examples of R7RS-small sections 4.1, 4.2, 5.3, 6.1-6.5, 6.7, 6.8 and 6.10, a 20000-iteration tail-call loop, and a regression case: a multi-line Sieve of Eratosthenes with a docstring, vectors, `do`, `when` and named let. `host.lisp test` sends each to the emulated chip and compares the printed result. Last run: see `conformance.txt` (205 passed, 0 failed).
+<a id="l160" href="#l160">160</a> 
+<a id="l161" href="#l161">161</a> ### Supported
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a> - Special forms: `quote` `&#x27;x` `if` `define` (variables, procedures, internal defines) `set!` `lambda` (fixed, dotted and rest parameters) `begin` `let` (and named let) `let*` `letrec` `letrec*` `cond` (with `else` and `=&gt;`) `case` `and` `or` `when` `unless` `do`.
+<a id="l164" href="#l164">164</a> - Data: exact integers, strings (escapes `\&quot;` `\\` `\n` `\t`; may span lines), vectors (`#(...)`), symbols, pairs and lists, `#t` `#f` (also `#true` `#false`), `&#x27;()` distinct from `#f`, procedures.
+<a id="l165" href="#l165">165</a> - Procedures: `+ - * quotient remainder modulo = &lt; &gt; &lt;= &gt;= eq? eqv? equal? car cdr cons set-car! set-cdr! null? pair? list? symbol? number? integer? exact? exact-integer? inexact? boolean? procedure? apply display write newline string? vector? list-&gt;string list-&gt;vector make-vector vector-ref vector-set!` and, from `prelude.scm`, `not caar cadr cdar cddr caddr list length reverse append list-tail list-ref list-copy make-list map for-each memq memv member assq assv assoc zero? positive? negative? odd? even? abs max min gcd lcm square boolean=? symbol=? string-&gt;list string-length string=? string-append vector vector-&gt;list vector-length floor ceiling round truncate exact inexact sqrt exact-integer-sqrt`.
+<a id="l166" href="#l166">166</a> - Proper tail calls in `if`, `cond`, `case`, `and`, `or`, `when`, `unless`, `let` forms, `begin`, `do` and procedure bodies.
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a> ### Deviations from R7RS-small
+<a id="l169" href="#l169">169</a> 
+<a id="l170" href="#l170">170</a> - Numbers: exact integers are 31-bit fixnums; a result outside -2^30..2^30-1 raises `overflow`
+<a id="l171" href="#l171">171</a>   (no bignums; 64-bit products are checked with `m*`). Exact rationals are normalized fixnum
+<a id="l172" href="#l172">172</a>   pairs. Inexact reals are IEEE **single** precision on the M4F FPU (R7RS expects double):
+<a id="l173" href="#l173">173</a>   about 7 significant digits. Printing uses 7 digits and the last one can be off by one, so
+<a id="l174" href="#l174">174</a>   output need not read back to the same float. No complex numbers, no `exp`/`log`/trig yet.
+<a id="l175" href="#l175">175</a> - Characters are bytes (Latin-1): no Unicode, since the serial console and the string storage
+<a id="l176" href="#l176">176</a>   are 8-bit. Strings, vectors and bytevectors live in a 16 KiB blob heap, with O(1) access.
+<a id="l177" href="#l177">177</a>   The GC compacts live blobs. Missing from the string library: `string-fill!`, `string-copy!`,
+<a id="l178" href="#l178">178</a>   case conversion of whole strings, and `-ci` string comparisons.
+<a id="l179" href="#l179">179</a> - `sqrt` is exact for exact squares (`(sqrt 1/4)` is `1/2`) and inexact otherwise. A negative argument gives `+nan.0`, because there are no complex numbers. `exact-integer-sqrt` returns a list `(s r)` until multiple values exist. `floor`, `ceiling`, `truncate` and `round` (half to even) handle rationals and floats. No `exp`, `log` or trigonometry yet.
+<a id="l180" href="#l180">180</a> - Macros: `define-syntax`, `let-syntax`, `letrec-syntax` and `syntax-rules` (with literals, `_`,
+<a id="l181" href="#l181">181</a>   nested ellipses, custom ellipsis, `(... ...)`) are **not hygienic**. A template symbol means
+<a id="l182" href="#l182">182</a>   whatever it means where the expansion lands. `quasiquote`, `delay`, `delay-force`, `guard`,
+<a id="l183" href="#l183">183</a>   `parameterize`, `define-record-type`, `case-lambda`, `let-values` and `define-values` are
+<a id="l184" href="#l184">184</a>   procedural macros in `prelude.scm`. `let-values` binds left to right, like `let*-values`.
+<a id="l185" href="#l185">185</a> - `call/cc` is **escape-only**. A continuation works while its `call/cc` is still active.
+<a id="l186" href="#l186">186</a>   Calling it later is an error. There is no re-entry and no generators. `dynamic-wind` runs the
+<a id="l187" href="#l187">187</a>   *after* thunks when an escape leaves its extent.
+<a id="l188" href="#l188">188</a> - Exceptions: `raise`, `raise-continuable`, `with-exception-handler`, `guard`, `error` and
+<a id="l189" href="#l189">189</a>   error objects. Errors from primitives (`car` of a non-pair, a vector index out of range, an
+<a id="l190" href="#l190">190</a>   unbound variable, ...) raise error objects when a handler is installed. Uncaught errors print
+<a id="l191" href="#l191">191</a>   their message and irritants and return to the prompt. A `guard` with no matching clause
+<a id="l192" href="#l192">192</a>   re-raises in the dynamic environment of the `guard`, not of the original `raise`. `too deep`
+<a id="l193" href="#l193">193</a>   and `out of memory` are never raisable, because recovering needs the stack or heap they
+<a id="l194" href="#l194">194</a>   report as exhausted.
+<a id="l195" href="#l195">195</a> - Symbols are never garbage collected. Their names share a 10 KiB buffer.
+<a id="l196" href="#l196">196</a> - No libraries (`import`) and no ports beyond the console yet.
+<a id="l197" href="#l197">197</a> - Primitives check their argument count (a table in `prelude.scm`); a wrong count raises
+<a id="l198" href="#l198">198</a>   `wrong number of arguments`. Closures check theirs (`too few arguments`, `too many arguments`).
+<a id="l199" href="#l199">199</a> - Recursion depth is bounded by the 4 KiB stacks: non-tail recursion raises `too deep` between 150 and 200 levels (measured with `(d 150)` and `(d 200)`).
+<a id="l200" href="#l200">200</a> - `define` returns an unspecified value. The REPL echoes the name of a top-level `define` or
+<a id="l201" href="#l201">201</a>   `define-syntax` as a convenience; the name is not the value.
+<a id="l202" href="#l202">202</a> 
+<a id="l203" href="#l203">203</a> ## Implementation
+<a id="l204" href="#l204">204</a> 
+<a id="l205" href="#l205">205</a> - Values are 32-bit. Low bits: `xx1` fixnum, `000` pair (0 is `&#x27;()`), `010` symbol, `100` immediate (`#f` `#t`, unspecified, unbound, special-form markers), `110` procedure. Cells are 8 bytes (car, cdr) in a 64 KiB heap (8191 cells).
+<a id="l206" href="#l206">206</a> - A symbol&#x27;s cdr is its global value. A special form name is bound to a marker value, so a local variable of the same name shadows it.
+<a id="l207" href="#l207">207</a> - An environment is an alist in front of the globals. Each procedure call and `let` adds a dummy binding first, so an internal `define` can splice its binding in after the head without touching the enclosing scope.
+<a id="l208" href="#l208">208</a> - `eval` is a loop: special-form handlers return either a value or a new (expression, environment) pair, which is how tail calls run in constant stack.
+<a id="l209" href="#l209">209</a> - GC: mark-sweep, run when `cons` finds the free list empty. Roots are the symbol list and every word on the data and return stacks that looks like a heap reference (conservative scan), so a GC inside a running expression is safe.
+<a id="l210" href="#l210">210</a> - Reader: lines come from Mecrisp&#x27;s `accept`, which handles Backspace (0x08) and Delete (0x7f) and echoes the erase; the reader then parses from that line buffer (512 bytes). An expression may span lines.
+<a id="l211" href="#l211">211</a> 
+<a id="l212" href="#l212">212</a> ## Serial driving
+<a id="l213" href="#l213">213</a> 
+<a id="l214" href="#l214">214</a> The host sends one character at a time and waits for the echo, then waits for ` ok.` (Forth) or `&gt; ` (Scheme). The emulated USART has a one-byte receive register.
+<a id="l215" href="#l215">215</a> 
+<a id="l216" href="#l216">216</a> ## Files
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a> - `host.lisp` -- compiler and serial driver: `compile FILE | load | demo | test [FILE] | eval EXPR... | forth LINE...`.
+<a id="l219" href="#l219">219</a> - `lisp.fs` -- the chip Scheme: values, GC, symbols, reader, printer, eval, special forms, Forth-side primitives, REPL.
+<a id="l220" href="#l220">220</a> - `prims.lisp` -- arithmetic, comparison and type primitives in the host dialect.
+<a id="l221" href="#l221">221</a> - `prelude.scm` -- library procedures in Scheme, one form per line.
+<a id="l222" href="#l222">222</a> - `r7rs-tests.scm`, `conformance.txt` -- the conformance subset and its last result.
+<a id="l223" href="#l223">223</a> - `demo.lisp`, `demo.sh`, `transcript.txt` -- scripted proof of all three layers.
+<a id="l224" href="#l224">224</a> - `build-firmware.sh` -- the F446 Mecrisp build. The image is not committed; the launchers build it when missing.
+<a id="l225" href="#l225">225</a> - `stm32-lisp`, `stm32-forth` -- launchers (QEMU netduinoplus2).
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a> ## Sources used
+<a id="l228" href="#l228">228</a> 
+<a id="l229" href="#l229">229</a> - Ron Garret, gll-mag-patch (`forthcomp.lisp`, README) and &quot;Lisp at JPL&quot; (flownet.com/gat/jpl-lisp.html).
+<a id="l230" href="#l230">230</a> - R7RS-small report (r7rs.org) for the forms, procedures and test examples.
+<a id="l231" href="#l231">231</a> - Mecrisp-Stellaris 2.6.5 source (`common/forth-core.s` stack sizes, `common/query.s` accept, `stm32f407/` port).</pre>
+</div></body></html>

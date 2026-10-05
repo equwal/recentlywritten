@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sshp-ai/sshp_mcp.py - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sshp-ai</h1><span class="desc">Agent skill + read-only MCP server for parallel SSH fleet checks with bahamas10/sshp</span><p class="url">git clone https://github.com/equwal/sshp-ai</p><p><a href="../../sshp-ai/index.html">Log</a> | <a href="../../sshp-ai/files.html">Files</a> | <a href="../../sshp-ai/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>sshp_mcp.py (9716 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> #!/usr/bin/env python3
+<a id="l2" href="#l2">2</a> &quot;&quot;&quot;Stdio MCP server that runs commands on many hosts through sshp.
+<a id="l3" href="#l3">3</a> 
+<a id="l4" href="#l4">4</a> Safety comes from the server config, never from the model:
+<a id="l5" href="#l5">5</a> - Only hosts listed in the hosts file can be targeted.
+<a id="l6" href="#l6">6</a> - Out of the box only read-only commands run; set &quot;allow_write&quot;: true for a
+<a id="l7" href="#l7">7</a>   general-purpose runner. A command must start with an allowed verb
+<a id="l8" href="#l8">8</a>   and must not contain shell metacharacters, unless the config sets
+<a id="l9" href="#l9">9</a>   &quot;allow_write&quot;: true.
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> Config: $SSHP_AI_CONFIG, else ~/.config/sshp-ai/config.json. Keys:
+<a id="l12" href="#l12">12</a>   hosts_file    path to a newline-separated hosts file (default ~/.config/sshp-ai/hosts)
+<a id="l13" href="#l13">13</a>   allow_write   bool, default false
+<a id="l14" href="#l14">14</a>   read_only_verbs  list of first words allowed in read-only mode (optional override)
+<a id="l15" href="#l15">15</a>   sshp          sshp binary (default &quot;sshp&quot;)
+<a id="l16" href="#l16">16</a>   ssh_options   list of &quot;key=value&quot; ssh options (default BatchMode=yes, ConnectTimeout=10)
+<a id="l17" href="#l17">17</a> &quot;&quot;&quot;
+<a id="l18" href="#l18">18</a> import json
+<a id="l19" href="#l19">19</a> import os
+<a id="l20" href="#l20">20</a> import re
+<a id="l21" href="#l21">21</a> import shlex
+<a id="l22" href="#l22">22</a> import subprocess
+<a id="l23" href="#l23">23</a> import sys
+<a id="l24" href="#l24">24</a> import tempfile
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> VERSION = &quot;0.1.0&quot;
+<a id="l27" href="#l27">27</a> CONFIG_DIR = os.path.expanduser(&quot;~/.config/sshp-ai&quot;)
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> READ_ONLY_VERBS = [
+<a id="l30" href="#l30">30</a>     &quot;uptime&quot;, &quot;uname&quot;, &quot;hostname&quot;, &quot;whoami&quot;, &quot;id&quot;, &quot;date&quot;, &quot;df&quot;, &quot;du&quot;, &quot;free&quot;,
+<a id="l31" href="#l31">31</a>     &quot;cat&quot;, &quot;head&quot;, &quot;tail&quot;, &quot;ls&quot;, &quot;stat&quot;, &quot;wc&quot;, &quot;grep&quot;, &quot;ps&quot;, &quot;pgrep&quot;, &quot;who&quot;,
+<a id="l32" href="#l32">32</a>     &quot;w&quot;, &quot;last&quot;, &quot;lsblk&quot;, &quot;ip&quot;, &quot;ss&quot;, &quot;netstat&quot;, &quot;systemctl&quot;, &quot;journalctl&quot;,
+<a id="l33" href="#l33">33</a>     &quot;docker&quot;, &quot;nproc&quot;, &quot;lscpu&quot;, &quot;env&quot;, &quot;printenv&quot;, &quot;which&quot;, &quot;test&quot;, &quot;echo&quot;,
+<a id="l34" href="#l34">34</a>     &quot;sha256sum&quot;, &quot;md5sum&quot;, &quot;find&quot;, &quot;dmesg&quot;, &quot;uptime&quot;, &quot;mount&quot;,
+<a id="l35" href="#l35">35</a> ]
+<a id="l36" href="#l36">36</a> # Subcommands of multi-purpose verbs that are safe to read.
+<a id="l37" href="#l37">37</a> READ_ONLY_SUBCOMMANDS = {
+<a id="l38" href="#l38">38</a>     &quot;systemctl&quot;: {&quot;status&quot;, &quot;is-active&quot;, &quot;is-enabled&quot;, &quot;is-failed&quot;, &quot;list-units&quot;,
+<a id="l39" href="#l39">39</a>                   &quot;list-timers&quot;, &quot;show&quot;, &quot;cat&quot;, &quot;--failed&quot;},
+<a id="l40" href="#l40">40</a>     &quot;docker&quot;: {&quot;ps&quot;, &quot;images&quot;, &quot;inspect&quot;, &quot;logs&quot;, &quot;stats&quot;, &quot;version&quot;, &quot;info&quot;},
+<a id="l41" href="#l41">41</a>     &quot;ip&quot;: {&quot;a&quot;, &quot;addr&quot;, &quot;address&quot;, &quot;r&quot;, &quot;route&quot;, &quot;link&quot;, &quot;-br&quot;, &quot;-4&quot;, &quot;-6&quot;},
+<a id="l42" href="#l42">42</a> }
+<a id="l43" href="#l43">43</a> FORBIDDEN = re.compile(r&quot;[;&amp;|&lt;&gt;`$\n\\]|\(|\)&quot;)
+<a id="l44" href="#l44">44</a> FIND_WRITE = {&quot;-delete&quot;, &quot;-exec&quot;, &quot;-execdir&quot;, &quot;-ok&quot;, &quot;-okdir&quot;, &quot;-fprint&quot;, &quot;-fprintf&quot;, &quot;-fls&quot;}
+<a id="l45" href="#l45">45</a> EXIT_RE = re.compile(r&quot;^\[(?P&lt;host&gt;[^\]]+)\] exited: (?P&lt;code&gt;-?\d+)&quot;)
+<a id="l46" href="#l46">46</a> LINE_RE = re.compile(r&quot;^\[(?P&lt;host&gt;[^\]]+)\] ?(?P&lt;text&gt;.*)$&quot;)
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a> def load_config():
+<a id="l50" href="#l50">50</a>     path = os.environ.get(&quot;SSHP_AI_CONFIG&quot;, os.path.join(CONFIG_DIR, &quot;config.json&quot;))
+<a id="l51" href="#l51">51</a>     cfg = {}
+<a id="l52" href="#l52">52</a>     if os.path.exists(path):
+<a id="l53" href="#l53">53</a>         with open(path, encoding=&quot;utf-8&quot;) as f:
+<a id="l54" href="#l54">54</a>             cfg = json.load(f)
+<a id="l55" href="#l55">55</a>     cfg.setdefault(&quot;hosts_file&quot;, os.path.join(CONFIG_DIR, &quot;hosts&quot;))
+<a id="l56" href="#l56">56</a>     cfg[&quot;hosts_file&quot;] = os.path.expanduser(cfg[&quot;hosts_file&quot;])
+<a id="l57" href="#l57">57</a>     cfg.setdefault(&quot;allow_write&quot;, False)
+<a id="l58" href="#l58">58</a>     cfg.setdefault(&quot;read_only_verbs&quot;, READ_ONLY_VERBS)
+<a id="l59" href="#l59">59</a>     cfg.setdefault(&quot;sshp&quot;, &quot;sshp&quot;)
+<a id="l60" href="#l60">60</a>     cfg.setdefault(&quot;ssh_options&quot;, [&quot;BatchMode=yes&quot;, &quot;ConnectTimeout=10&quot;])
+<a id="l61" href="#l61">61</a>     return cfg
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> def read_hosts(path):
+<a id="l65" href="#l65">65</a>     if not os.path.exists(path):
+<a id="l66" href="#l66">66</a>         return []
+<a id="l67" href="#l67">67</a>     with open(path, encoding=&quot;utf-8&quot;) as f:
+<a id="l68" href="#l68">68</a>         return [l.strip() for l in f if l.strip() and not l.lstrip().startswith(&quot;#&quot;)]
+<a id="l69" href="#l69">69</a> 
+<a id="l70" href="#l70">70</a> 
+<a id="l71" href="#l71">71</a> def check_command(command, cfg):
+<a id="l72" href="#l72">72</a>     &quot;&quot;&quot;Return an error string, or None if the command is allowed.&quot;&quot;&quot;
+<a id="l73" href="#l73">73</a>     if not command.strip():
+<a id="l74" href="#l74">74</a>         return &quot;empty command&quot;
+<a id="l75" href="#l75">75</a>     if cfg[&quot;allow_write&quot;]:
+<a id="l76" href="#l76">76</a>         return None
+<a id="l77" href="#l77">77</a>     if FORBIDDEN.search(command):
+<a id="l78" href="#l78">78</a>         return &quot;read-only mode: shell metacharacters are not allowed&quot;
+<a id="l79" href="#l79">79</a>     try:
+<a id="l80" href="#l80">80</a>         words = shlex.split(command)
+<a id="l81" href="#l81">81</a>     except ValueError as e:
+<a id="l82" href="#l82">82</a>         return f&quot;cannot parse command: {e}&quot;
+<a id="l83" href="#l83">83</a>     verb = words[0]
+<a id="l84" href="#l84">84</a>     if verb not in cfg[&quot;read_only_verbs&quot;]:
+<a id="l85" href="#l85">85</a>         return f&quot;read-only mode: &#x27;{verb}&#x27; is not an allowed verb&quot;
+<a id="l86" href="#l86">86</a>     subs = READ_ONLY_SUBCOMMANDS.get(verb)
+<a id="l87" href="#l87">87</a>     if subs is not None and len(words) &gt; 1 and words[1] not in subs:
+<a id="l88" href="#l88">88</a>         return f&quot;read-only mode: &#x27;{verb} {words[1]}&#x27; is not allowed&quot;
+<a id="l89" href="#l89">89</a>     if verb == &quot;find&quot; and FIND_WRITE.intersection(words):
+<a id="l90" href="#l90">90</a>         return &quot;read-only mode: find actions that write or execute are not allowed&quot;
+<a id="l91" href="#l91">91</a>     if verb == &quot;dmesg&quot; and any(w.startswith(&quot;-C&quot;) or w in (&quot;-c&quot;, &quot;--clear&quot;, &quot;--read-clear&quot;) for w in words):
+<a id="l92" href="#l92">92</a>         return &quot;read-only mode: dmesg clear is not allowed&quot;
+<a id="l93" href="#l93">93</a>     if verb == &quot;date&quot; and any(w.startswith(&quot;-s&quot;) or w == &quot;--set&quot; for w in words):
+<a id="l94" href="#l94">94</a>         return &quot;read-only mode: date --set is not allowed&quot;
+<a id="l95" href="#l95">95</a>     if verb == &quot;hostname&quot; and len(words) &gt; 1 and not words[1].startswith(&quot;-&quot;):
+<a id="l96" href="#l96">96</a>         return &quot;read-only mode: setting the hostname is not allowed&quot;
+<a id="l97" href="#l97">97</a>     return None
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> def sshp_run(args, cfg):
+<a id="l101" href="#l101">101</a>     command = args.get(&quot;command&quot;, &quot;&quot;)
+<a id="l102" href="#l102">102</a>     allowed = read_hosts(cfg[&quot;hosts_file&quot;])
+<a id="l103" href="#l103">103</a>     hosts = args.get(&quot;hosts&quot;) or allowed
+<a id="l104" href="#l104">104</a>     bad = [h for h in hosts if h not in allowed]
+<a id="l105" href="#l105">105</a>     if bad:
+<a id="l106" href="#l106">106</a>         return {&quot;error&quot;: f&quot;hosts not in allowlist {cfg[&#x27;hosts_file&#x27;]}: {bad}&quot;}
+<a id="l107" href="#l107">107</a>     if not hosts:
+<a id="l108" href="#l108">108</a>         return {&quot;error&quot;: f&quot;no hosts: add them to {cfg[&#x27;hosts_file&#x27;]}&quot;}
+<a id="l109" href="#l109">109</a>     err = check_command(command, cfg)
+<a id="l110" href="#l110">110</a>     if err:
+<a id="l111" href="#l111">111</a>         return {&quot;error&quot;: err}
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a>     max_jobs = max(1, min(int(args.get(&quot;max_jobs&quot;, 10)), 50))
+<a id="l114" href="#l114">114</a>     timeout = max(1, min(int(args.get(&quot;timeout&quot;, 60)), 600))
+<a id="l115" href="#l115">115</a>     argv = [cfg[&quot;sshp&quot;], &quot;-e&quot;, &quot;-c&quot;, &quot;off&quot;, &quot;-m&quot;, str(max_jobs)]
+<a id="l116" href="#l116">116</a>     if args.get(&quot;dry_run&quot;):
+<a id="l117" href="#l117">117</a>         argv.append(&quot;-n&quot;)
+<a id="l118" href="#l118">118</a>     user = args.get(&quot;user&quot;)
+<a id="l119" href="#l119">119</a>     if user:
+<a id="l120" href="#l120">120</a>         if not re.fullmatch(r&quot;[A-Za-z0-9._-]+&quot;, user):
+<a id="l121" href="#l121">121</a>             return {&quot;error&quot;: &quot;invalid user&quot;}
+<a id="l122" href="#l122">122</a>         argv += [&quot;-l&quot;, user]
+<a id="l123" href="#l123">123</a>     for opt in cfg[&quot;ssh_options&quot;]:
+<a id="l124" href="#l124">124</a>         argv += [&quot;-o&quot;, opt]
+<a id="l125" href="#l125">125</a> 
+<a id="l126" href="#l126">126</a>     # newline=&quot;\n&quot;: sshp keeps a CR from a Windows CRLF line as part of the host name.
+<a id="l127" href="#l127">127</a>     with tempfile.NamedTemporaryFile(&quot;w&quot;, suffix=&quot;.hosts&quot;, delete=False, newline=&quot;\n&quot;) as f:
+<a id="l128" href="#l128">128</a>         f.write(&quot;\n&quot;.join(hosts) + &quot;\n&quot;)
+<a id="l129" href="#l129">129</a>         hosts_path = f.name
+<a id="l130" href="#l130">130</a>     try:
+<a id="l131" href="#l131">131</a>         argv += [&quot;-f&quot;, hosts_path, &quot;--&quot;, command]
+<a id="l132" href="#l132">132</a>         try:
+<a id="l133" href="#l133">133</a>             p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+<a id="l134" href="#l134">134</a>         except subprocess.TimeoutExpired:
+<a id="l135" href="#l135">135</a>             return {&quot;error&quot;: f&quot;sshp did not finish within {timeout}s&quot;}
+<a id="l136" href="#l136">136</a>         except FileNotFoundError:
+<a id="l137" href="#l137">137</a>             return {&quot;error&quot;: f&quot;sshp binary not found: {cfg[&#x27;sshp&#x27;]}&quot;}
+<a id="l138" href="#l138">138</a>     finally:
+<a id="l139" href="#l139">139</a>         os.unlink(hosts_path)
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a>     results = {h: {&quot;output&quot;: [], &quot;exit_code&quot;: None} for h in hosts}
+<a id="l142" href="#l142">142</a>     for line in p.stdout.splitlines():
+<a id="l143" href="#l143">143</a>         m = EXIT_RE.match(line)
+<a id="l144" href="#l144">144</a>         if m and m[&quot;host&quot;] in results:
+<a id="l145" href="#l145">145</a>             results[m[&quot;host&quot;]][&quot;exit_code&quot;] = int(m[&quot;code&quot;])
+<a id="l146" href="#l146">146</a>             continue
+<a id="l147" href="#l147">147</a>         m = LINE_RE.match(line)
+<a id="l148" href="#l148">148</a>         if m and m[&quot;host&quot;] in results:
+<a id="l149" href="#l149">149</a>             results[m[&quot;host&quot;]][&quot;output&quot;].append(m[&quot;text&quot;])
+<a id="l150" href="#l150">150</a>     return {
+<a id="l151" href="#l151">151</a>         &quot;sshp_exit_code&quot;: p.returncode,
+<a id="l152" href="#l152">152</a>         &quot;dry_run&quot;: bool(args.get(&quot;dry_run&quot;)),
+<a id="l153" href="#l153">153</a>         &quot;hosts&quot;: {h: {&quot;output&quot;: &quot;\n&quot;.join(r[&quot;output&quot;]), &quot;exit_code&quot;: r[&quot;exit_code&quot;]}
+<a id="l154" href="#l154">154</a>                   for h, r in results.items()},
+<a id="l155" href="#l155">155</a>         &quot;sshp_stderr&quot;: p.stderr.strip(),
+<a id="l156" href="#l156">156</a>     }
+<a id="l157" href="#l157">157</a> 
+<a id="l158" href="#l158">158</a> 
+<a id="l159" href="#l159">159</a> TOOLS = [
+<a id="l160" href="#l160">160</a>     {
+<a id="l161" href="#l161">161</a>         &quot;name&quot;: &quot;sshp_run&quot;,
+<a id="l162" href="#l162">162</a>         &quot;description&quot;: &quot;Run one command on many SSH hosts in parallel with sshp. &quot;
+<a id="l163" href="#l163">163</a>                        &quot;Returns per-host output (stdout+stderr merged) and exit code. &quot;
+<a id="l164" href="#l164">164</a>                        &quot;Hosts must be in the server allowlist. Without allow_write in the &quot;
+<a id="l165" href="#l165">165</a>                        &quot;server config, only read-only commands are accepted.&quot;,
+<a id="l166" href="#l166">166</a>         &quot;inputSchema&quot;: {
+<a id="l167" href="#l167">167</a>             &quot;type&quot;: &quot;object&quot;,
+<a id="l168" href="#l168">168</a>             &quot;properties&quot;: {
+<a id="l169" href="#l169">169</a>                 &quot;command&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Remote command, e.g. &#x27;uptime&#x27; or &#x27;df -h /&#x27;.&quot;},
+<a id="l170" href="#l170">170</a>                 &quot;hosts&quot;: {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;},
+<a id="l171" href="#l171">171</a>                           &quot;description&quot;: &quot;Subset of allowlisted hosts. Default: all.&quot;},
+<a id="l172" href="#l172">172</a>                 &quot;max_jobs&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 1, &quot;maximum&quot;: 50, &quot;default&quot;: 10},
+<a id="l173" href="#l173">173</a>                 &quot;timeout&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 1, &quot;maximum&quot;: 600, &quot;default&quot;: 60,
+<a id="l174" href="#l174">174</a>                             &quot;description&quot;: &quot;Seconds for the whole run.&quot;},
+<a id="l175" href="#l175">175</a>                 &quot;user&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;SSH login name (-l).&quot;},
+<a id="l176" href="#l176">176</a>                 &quot;dry_run&quot;: {&quot;type&quot;: &quot;boolean&quot;, &quot;default&quot;: False,
+<a id="l177" href="#l177">177</a>                             &quot;description&quot;: &quot;Pass -n: show what would run, start nothing.&quot;},
+<a id="l178" href="#l178">178</a>             },
+<a id="l179" href="#l179">179</a>             &quot;required&quot;: [&quot;command&quot;],
+<a id="l180" href="#l180">180</a>         },
+<a id="l181" href="#l181">181</a>     },
+<a id="l182" href="#l182">182</a>     {
+<a id="l183" href="#l183">183</a>         &quot;name&quot;: &quot;sshp_hosts&quot;,
+<a id="l184" href="#l184">184</a>         &quot;description&quot;: &quot;List allowlisted hosts and whether writes are enabled.&quot;,
+<a id="l185" href="#l185">185</a>         &quot;inputSchema&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {}},
+<a id="l186" href="#l186">186</a>     },
+<a id="l187" href="#l187">187</a> ]
+<a id="l188" href="#l188">188</a> 
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a> def handle(req):
+<a id="l191" href="#l191">191</a>     method, rid = req.get(&quot;method&quot;), req.get(&quot;id&quot;)
+<a id="l192" href="#l192">192</a>     if rid is None:
+<a id="l193" href="#l193">193</a>         return None  # notification
+<a id="l194" href="#l194">194</a>     if method == &quot;initialize&quot;:
+<a id="l195" href="#l195">195</a>         result = {&quot;protocolVersion&quot;: req.get(&quot;params&quot;, {}).get(&quot;protocolVersion&quot;, &quot;2025-06-18&quot;),
+<a id="l196" href="#l196">196</a>                   &quot;capabilities&quot;: {&quot;tools&quot;: {}},
+<a id="l197" href="#l197">197</a>                   &quot;serverInfo&quot;: {&quot;name&quot;: &quot;sshp-ai&quot;, &quot;version&quot;: VERSION}}
+<a id="l198" href="#l198">198</a>     elif method == &quot;ping&quot;:
+<a id="l199" href="#l199">199</a>         result = {}
+<a id="l200" href="#l200">200</a>     elif method == &quot;tools/list&quot;:
+<a id="l201" href="#l201">201</a>         result = {&quot;tools&quot;: TOOLS}
+<a id="l202" href="#l202">202</a>     elif method == &quot;tools/call&quot;:
+<a id="l203" href="#l203">203</a>         params = req.get(&quot;params&quot;, {})
+<a id="l204" href="#l204">204</a>         cfg = load_config()
+<a id="l205" href="#l205">205</a>         if params.get(&quot;name&quot;) == &quot;sshp_run&quot;:
+<a id="l206" href="#l206">206</a>             out = sshp_run(params.get(&quot;arguments&quot;, {}), cfg)
+<a id="l207" href="#l207">207</a>         elif params.get(&quot;name&quot;) == &quot;sshp_hosts&quot;:
+<a id="l208" href="#l208">208</a>             out = {&quot;hosts&quot;: read_hosts(cfg[&quot;hosts_file&quot;]), &quot;allow_write&quot;: cfg[&quot;allow_write&quot;]}
+<a id="l209" href="#l209">209</a>         else:
+<a id="l210" href="#l210">210</a>             return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: rid, &quot;error&quot;: {&quot;code&quot;: -32602, &quot;message&quot;: &quot;unknown tool&quot;}}
+<a id="l211" href="#l211">211</a>         result = {&quot;content&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: json.dumps(out, indent=1)}],
+<a id="l212" href="#l212">212</a>                   &quot;isError&quot;: &quot;error&quot; in out}
+<a id="l213" href="#l213">213</a>     else:
+<a id="l214" href="#l214">214</a>         return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: rid, &quot;error&quot;: {&quot;code&quot;: -32601, &quot;message&quot;: f&quot;unknown method {method}&quot;}}
+<a id="l215" href="#l215">215</a>     return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: rid, &quot;result&quot;: result}
+<a id="l216" href="#l216">216</a> 
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a> def main():
+<a id="l219" href="#l219">219</a>     for line in sys.stdin:
+<a id="l220" href="#l220">220</a>         if not line.strip():
+<a id="l221" href="#l221">221</a>             continue
+<a id="l222" href="#l222">222</a>         try:
+<a id="l223" href="#l223">223</a>             resp = handle(json.loads(line))
+<a id="l224" href="#l224">224</a>         except Exception as e:  # keep the server alive on bad input
+<a id="l225" href="#l225">225</a>             resp = {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: None, &quot;error&quot;: {&quot;code&quot;: -32700, &quot;message&quot;: str(e)}}
+<a id="l226" href="#l226">226</a>         if resp is not None:
+<a id="l227" href="#l227">227</a>             sys.stdout.write(json.dumps(resp) + &quot;\n&quot;)
+<a id="l228" href="#l228">228</a>             sys.stdout.flush()
+<a id="l229" href="#l229">229</a> 
+<a id="l230" href="#l230">230</a> 
+<a id="l231" href="#l231">231</a> if __name__ == &quot;__main__&quot;:
+<a id="l232" href="#l232">232</a>     main()</pre>
+</div></body></html>

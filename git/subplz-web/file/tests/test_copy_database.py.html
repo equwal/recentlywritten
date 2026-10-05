@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/tests/test_copy_database.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tests/test_copy_database.py (5170 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;tools/copy_database.py: a copy has every row of every table, unchanged.&quot;&quot;&quot;
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> from __future__ import annotations
+<a id="l4" href="#l4">4</a> 
+<a id="l5" href="#l5">5</a> import os
+<a id="l6" href="#l6">6</a> import subprocess
+<a id="l7" href="#l7">7</a> import sys
+<a id="l8" href="#l8">8</a> from datetime import date, datetime, timedelta, timezone
+<a id="l9" href="#l9">9</a> from pathlib import Path
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> import pytest
+<a id="l12" href="#l12">12</a> from hypothesis import HealthCheck, given, settings
+<a id="l13" href="#l13">13</a> from hypothesis import strategies as st
+<a id="l14" href="#l14">14</a> from sqlalchemy import create_engine, inspect, select
+<a id="l15" href="#l15">15</a> from sqlalchemy.orm import Session
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> from backend.captions import CaptionBalance
+<a id="l18" href="#l18">18</a> from backend.db import Account, Artifact, Base, Job, JobStatus, Purchase
+<a id="l19" href="#l19">19</a> from backend.subrep import SubrepLicence, WaitlistEntry
+<a id="l20" href="#l20">20</a> from tools.copy_database import copy_database
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> T0 = datetime(2026, 9, 22, tzinfo=timezone.utc)
+<a id="l23" href="#l23">23</a> text = st.text(st.characters(codec=&quot;utf-8&quot;, exclude_categories=(&quot;Cs&quot;, &quot;Cc&quot;)), max_size=20)
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> @st.composite
+<a id="l27" href="#l27">27</a> def databases(draw):
+<a id="l28" href="#l28">28</a>     accounts = []
+<a id="l29" href="#l29">29</a>     for a in range(draw(st.integers(1, 4))):
+<a id="l30" href="#l30">30</a>         account = Account(
+<a id="l31" href="#l31">31</a>             id=f&quot;acct_{a}&quot;, device_token=f&quot;dev_{a}&quot;,
+<a id="l32" href="#l32">32</a>             email=draw(st.none() | st.just(f&quot;reader{a}@example.com&quot;)),
+<a id="l33" href="#l33">33</a>             purchased_credits=draw(st.integers(0, 500)),
+<a id="l34" href="#l34">34</a>             daily_credit_on=draw(st.none() | st.dates(date(2026, 1, 1), date(2027, 1, 1))),
+<a id="l35" href="#l35">35</a>             created_at=T0 + timedelta(seconds=draw(st.integers(0, 10**6))),
+<a id="l36" href="#l36">36</a>         )
+<a id="l37" href="#l37">37</a>         accounts.append(account)
+<a id="l38" href="#l38">38</a>         for j in range(draw(st.integers(0, 3))):
+<a id="l39" href="#l39">39</a>             job_id = f&quot;job_{a}_{j}&quot;
+<a id="l40" href="#l40">40</a>             accounts.append(Job(
+<a id="l41" href="#l41">41</a>                 id=job_id, account_id=account.id, status=draw(st.sampled_from(list(JobStatus))),
+<a id="l42" href="#l42">42</a>                 language=&quot;ja&quot;, splitter=&quot;pysbd&quot;, model=&quot;tiny&quot;,
+<a id="l43" href="#l43">43</a>                 audio_filename=draw(text), text_filename=draw(text),
+<a id="l44" href="#l44">44</a>                 audio_duration_seconds=draw(st.none() | st.floats(0, 1e5)),
+<a id="l45" href="#l45">45</a>                 progress=draw(st.floats(0, 1)), error=draw(st.none() | text),
+<a id="l46" href="#l46">46</a>             ))
+<a id="l47" href="#l47">47</a>             accounts.append(Artifact(id=f&quot;art_{a}_{j}&quot;, job_id=job_id, kind=&quot;srt&quot;,
+<a id="l48" href="#l48">48</a>                                      filename=draw(text), storage_key=f&quot;{job_id}/out.srt&quot;))
+<a id="l49" href="#l49">49</a>         if draw(st.booleans()):
+<a id="l50" href="#l50">50</a>             accounts.append(Purchase(id=f&quot;buy_{a}&quot;, account_id=account.id, plan_id=&quot;pack10&quot;,
+<a id="l51" href="#l51">51</a>                                      credits=10, amount_cents=499, stripe_session_id=f&quot;cs_{a}&quot;))
+<a id="l52" href="#l52">52</a>     return accounts
+<a id="l53" href="#l53">53</a> 
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> def rows(url: str) -&gt; dict[str, list[dict]]:
+<a id="l56" href="#l56">56</a>     engine = create_engine(url)
+<a id="l57" href="#l57">57</a>     with engine.connect() as c:
+<a id="l58" href="#l58">58</a>         return {t.name: sorted((dict(r._mapping) for r in c.execute(select(t))), key=repr)
+<a id="l59" href="#l59">59</a>                 for t in Base.metadata.sorted_tables}
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> @settings(max_examples=40, deadline=None,
+<a id="l63" href="#l63">63</a>           suppress_health_check=[HealthCheck.function_scoped_fixture])
+<a id="l64" href="#l64">64</a> @given(objects=databases())
+<a id="l65" href="#l65">65</a> def test_the_copy_has_every_row_unchanged(tmp_path_factory, objects):
+<a id="l66" href="#l66">66</a>     tmp = tmp_path_factory.mktemp(&quot;copy&quot;)
+<a id="l67" href="#l67">67</a>     source, target = f&quot;sqlite:///{tmp / &#x27;source.db&#x27;}&quot;, f&quot;sqlite:///{tmp / &#x27;target.db&#x27;}&quot;
+<a id="l68" href="#l68">68</a>     engine = create_engine(source)
+<a id="l69" href="#l69">69</a>     Base.metadata.create_all(engine)
+<a id="l70" href="#l70">70</a>     with Session(engine) as s:
+<a id="l71" href="#l71">71</a>         s.add_all(objects)
+<a id="l72" href="#l72">72</a>         s.commit()
+<a id="l73" href="#l73">73</a> 
+<a id="l74" href="#l74">74</a>     counts = copy_database(source, target)
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a>     assert rows(target) == rows(source)
+<a id="l77" href="#l77">77</a>     assert counts[&quot;accounts&quot;] == len([o for o in objects if isinstance(o, Account)])
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> def test_the_copy_refuses_a_target_with_rows(tmp_path):
+<a id="l81" href="#l81">81</a>     source, target = f&quot;sqlite:///{tmp_path / &#x27;s.db&#x27;}&quot;, f&quot;sqlite:///{tmp_path / &#x27;t.db&#x27;}&quot;
+<a id="l82" href="#l82">82</a>     for url in (source, target):
+<a id="l83" href="#l83">83</a>         engine = create_engine(url)
+<a id="l84" href="#l84">84</a>         Base.metadata.create_all(engine)
+<a id="l85" href="#l85">85</a>         with Session(engine) as s:
+<a id="l86" href="#l86">86</a>             s.add(Account(id=&quot;acct_x&quot;, device_token=&quot;dev_x&quot;))
+<a id="l87" href="#l87">87</a>             s.commit()
+<a id="l88" href="#l88">88</a>     with pytest.raises(RuntimeError, match=&quot;accounts&quot;):
+<a id="l89" href="#l89">89</a>         copy_database(source, target)
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a> 
+<a id="l92" href="#l92">92</a> def test_the_command_copies_the_tables_of_every_model_module(tmp_path):
+<a id="l93" href="#l93">93</a>     &quot;&quot;&quot;The burst runbook runs the tool in a new interpreter. There, only the
+<a id="l94" href="#l94">94</a>     modules that the tool imports put their tables in Base.metadata. This test
+<a id="l95" href="#l95">95</a>     process imported backend.main already (conftest), so only a subprocess
+<a id="l96" href="#l96">96</a>     shows a model module that the tool does not import.&quot;&quot;&quot;
+<a id="l97" href="#l97">97</a>     source, target = f&quot;sqlite:///{tmp_path / &#x27;source.db&#x27;}&quot;, f&quot;sqlite:///{tmp_path / &#x27;target.db&#x27;}&quot;
+<a id="l98" href="#l98">98</a>     engine = create_engine(source)
+<a id="l99" href="#l99">99</a>     Base.metadata.create_all(engine)
+<a id="l100" href="#l100">100</a>     with Session(engine) as s:
+<a id="l101" href="#l101">101</a>         s.add(Account(id=&quot;acct_1&quot;, device_token=&quot;dev_1&quot;, email=&quot;reader@example.com&quot;))
+<a id="l102" href="#l102">102</a>         s.add(CaptionBalance(account_id=&quot;acct_1&quot;, seconds_left=20 * 3600, seconds_used=60))
+<a id="l103" href="#l103">103</a>         s.add(SubrepLicence(account_id=&quot;acct_1&quot;, refresh_key=&quot;key_1&quot;, subscription_id=&quot;sub_1&quot;,
+<a id="l104" href="#l104">104</a>                             status=&quot;active&quot;, plan_id=&quot;subrep_year&quot;, period_end=T0))
+<a id="l105" href="#l105">105</a>         s.add(WaitlistEntry(kind=&quot;ios&quot;, email=&quot;reader@example.com&quot;, account_id=&quot;acct_1&quot;))
+<a id="l106" href="#l106">106</a>         s.commit()
+<a id="l107" href="#l107">107</a> 
+<a id="l108" href="#l108">108</a>     env = {**os.environ, &quot;SUBPLZ_WEB_DATA_DIR&quot;: str(tmp_path)}
+<a id="l109" href="#l109">109</a>     root = Path(__file__).resolve().parent.parent
+<a id="l110" href="#l110">110</a>     out = subprocess.run([sys.executable, &quot;-m&quot;, &quot;tools.copy_database&quot;, source, target],
+<a id="l111" href="#l111">111</a>                          cwd=root, env=env, capture_output=True, text=True, timeout=120,
+<a id="l112" href="#l112">112</a>                          check=False)
+<a id="l113" href="#l113">113</a>     assert out.returncode == 0, out.stderr
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a>     assert set(Base.metadata.tables) &lt;= set(inspect(create_engine(target)).get_table_names())
+<a id="l116" href="#l116">116</a>     assert rows(target) == rows(source)</pre>
+</div></body></html>

@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>forthlisp-stm32/kernel.lisp - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>forthlisp-stm32</h1><span class="desc">STM32F446 target for forthlisp: Thumb-2 Forth kernel built by an SBCL assembler, QEMU netduinoplus2</span><p class="url">git clone https://github.com/equwal/forthlisp-stm32</p><p><a href="../../forthlisp-stm32/index.html">Log</a> | <a href="../../forthlisp-stm32/files.html">Files</a> | <a href="../../forthlisp-stm32/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>kernel.lisp (19013 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> ;;;; kernel.lisp -- layer 2 builds layer 3: the Forth kernel image for the STM32F446.
+<a id="l2" href="#l2">2</a> ;;;;
+<a id="l3" href="#l3">3</a> ;;;; Indirect-threaded. r4 = IP, r5 = data stack pointer (full descending, holds the second
+<a id="l4" href="#l4">4</a> ;;;; item), r6 = TOS, r7 = W (current xt), sp = return stack. NEXT: ldr r7,[r4],#4;
+<a id="l5" href="#l5">5</a> ;;;; ldr r0,[r7]; bx r0. Header: link, flags (80 immediate, 40 hidden), length, name,
+<a id="l6" href="#l6">6</a> ;;;; pad to 4, code field, body. Primitives are `defcode` templates (a name plus a Thumb-2
+<a id="l7" href="#l7">7</a> ;;;; body, NEXT appended); the high-level kernel is metacompiled from kernel.fs.
+<a id="l8" href="#l8">8</a> ;;;; Usage: sbcl --script kernel.lisp OUT.bin
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> (load (merge-pathnames &quot;asm.lisp&quot; *load-truename*))
+<a id="l11" href="#l11">11</a> (in-package :thumb)
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> ;;; ---------- memory map ----------
+<a id="l14" href="#l14">14</a> (defconstant +sysvars+ #x20000000)        ; state base latest dp &gt;in #tib hld nneg
+<a id="l15" href="#l15">15</a> (defconstant +tib+ #x20000040)            ; 512-byte input buffer
+<a id="l16" href="#l16">16</a> (defconstant +padend+ #x200002C0)         ; pictured numeric output grows down from here
+<a id="l17" href="#l17">17</a> (defconstant +ram-dict+ #x20000300)       ; first free RAM for the user dictionary
+<a id="l18" href="#l18">18</a> (defconstant +dstop+ #x2001EFE0)          ; data stack: 4 KiB below this
+<a id="l19" href="#l19">19</a> (defconstant +rstop+ #x2001FFE0)          ; return stack: 4 KiB below this (QEMU: keep off the last 32 bytes)
+<a id="l20" href="#l20">20</a> (defconstant +dict-limit+ #x2001DEE0)     ; dictionary stops 256 bytes above the data stack
+<a id="l21" href="#l21">21</a> (defconstant +usart2+ #x40004400)
+<a id="l22" href="#l22">22</a> (defparameter *sysvars* &#x27;(&quot;state&quot; &quot;base&quot; &quot;latest&quot; &quot;dp&quot; &quot;&gt;in&quot; &quot;#tib&quot; &quot;hld&quot; &quot;nneg&quot; &quot;emit-hook&quot;))
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> ;;; ---------- dictionary ----------
+<a id="l25" href="#l25">25</a> (defvar *xts* (make-hash-table :test &#x27;equal))
+<a id="l26" href="#l26">26</a> (defvar *defined* (make-hash-table :test &#x27;equal))
+<a id="l27" href="#l27">27</a> (defvar *last-link* nil)
+<a id="l28" href="#l28">28</a> (defun xt (name) (or (gethash name *xts*) (setf (gethash name *xts*) (label))))
+<a id="l29" href="#l29">29</a> (defun byte8 (b) (sb-assem:emit-byte *seg* (ldb (byte 8 0) b)))
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> (defun header (name &amp;optional (flags 0))
+<a id="l32" href="#l32">32</a>   &quot;Lay down a header; return NAME&#x27;s xt label, marked at the code field.&quot;
+<a id="l33" href="#l33">33</a>   (when (gethash name *defined*) (error &quot;~a defined twice&quot; name))
+<a id="l34" href="#l34">34</a>   (align4)
+<a id="l35" href="#l35">35</a>   (let ((link (mark (label))))
+<a id="l36" href="#l36">36</a>     (if *last-link* (abs32 *last-link*) (w32 0))
+<a id="l37" href="#l37">37</a>     (setf *last-link* link)
+<a id="l38" href="#l38">38</a>     (byte8 flags) (byte8 (length name))
+<a id="l39" href="#l39">39</a>     (loop for c across name do (byte8 (char-code c)))
+<a id="l40" href="#l40">40</a>     (align4)
+<a id="l41" href="#l41">41</a>     (setf (gethash name *defined*) t)
+<a id="l42" href="#l42">42</a>     (mark (xt name))))
+<a id="l43" href="#l43">43</a> 
+<a id="l44" href="#l44">44</a> (defvar *docol* (label)) (defvar *dovar* (label)) (defvar *docon* (label))
+<a id="l45" href="#l45">45</a> (defun next () (ldr :w :ip 4 :post) (ldr :r0 :w) (bx :r0))
+<a id="l46" href="#l46">46</a> (defun dpush (r) (str :tos :psp -4 :pre) (unless (eql r :tos) (mov :tos r)))
+<a id="l47" href="#l47">47</a> (defun dpop (r) (ldr r :psp 4 :post))
+<a id="l48" href="#l48">48</a> 
+<a id="l49" href="#l49">49</a> (defmacro defcode (name (&amp;key (next t) (flags 0)) &amp;body body)
+<a id="l50" href="#l50">50</a>   `(let ((code (label)))
+<a id="l51" href="#l51">51</a>      (header ,name ,flags)
+<a id="l52" href="#l52">52</a>      (abs32 code 1)
+<a id="l53" href="#l53">53</a>      (mark code)
+<a id="l54" href="#l54">54</a>      ,@body
+<a id="l55" href="#l55">55</a>      ,@(when next &#x27;((next)))))
+<a id="l56" href="#l56">56</a> (defun defconst (name value &amp;optional (addend 0))
+<a id="l57" href="#l57">57</a>   &quot;A constant: an integer, or a label&#x27;s address plus ADDEND.&quot;
+<a id="l58" href="#l58">58</a>   (header name) (abs32 *docon* 1)
+<a id="l59" href="#l59">59</a>   (if (integerp value) (w32 value) (abs32 value addend)))
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> ;;; ---------- primitives ----------
+<a id="l62" href="#l62">62</a> (defun binop (fn) (dpop :r0) (funcall fn :tos :r0 :tos))
+<a id="l63" href="#l63">63</a> (defun flag (c) &quot;TOS = -1 if condition C, else 0 (flags already set).&quot; (movw :tos 0) (it c) (mvn-0 :tos))
+<a id="l64" href="#l64">64</a> (defun cmp2 (c) (dpop :r0) (cmp-reg :r0 :tos) (flag c))
+<a id="l65" href="#l65">65</a> (defun cmp0 (c) (cmp-imm8 :tos 0) (flag c))
+<a id="l66" href="#l66">66</a> (defun store-or (addr value) (li :r1 addr) (ldr :r0 :r1) (li :r2 value) (orr-reg :r0 :r0 :r2) (str :r0 :r1))
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> (defun primitives ()
+<a id="l69" href="#l69">69</a>   (defcode &quot;exit&quot; () (pop1 :ip))
+<a id="l70" href="#l70">70</a>   (defcode &quot;lit&quot; () (dpush :tos) (ldr :tos :ip 4 :post))
+<a id="l71" href="#l71">71</a>   (defcode &quot;branch&quot; () (ldr :ip :ip))
+<a id="l72" href="#l72">72</a>   (defcode &quot;0branch&quot; () (mov :r0 :tos) (dpop :tos) (ldr :r1 :ip 4 :post) (cmp-imm8 :r0 0) (it :eq) (mov :ip :r1))
+<a id="l73" href="#l73">73</a>   (defcode &quot;execute&quot; (:next nil) (mov :w :tos) (dpop :tos) (ldr :r0 :w) (bx :r0))
+<a id="l74" href="#l74">74</a>   (defcode &quot;(do)&quot; () (ldr :r0 :ip 4 :post) (push1 :r0) (dpop :r1) (push1 :r1) (push1 :tos) (dpop :tos))
+<a id="l75" href="#l75">75</a>   (defcode &quot;(?do)&quot; ()
+<a id="l76" href="#l76">76</a>     (let ((go (label)) (done (label)))
+<a id="l77" href="#l77">77</a>       (ldr :r0 :ip 4 :post) (dpop :r1) (cmp-reg :r1 :tos) (bcc :ne go)
+<a id="l78" href="#l78">78</a>       (mov :ip :r0) (dpop :tos) (b done)
+<a id="l79" href="#l79">79</a>       (mark go) (push1 :r0) (push1 :r1) (push1 :tos) (dpop :tos)
+<a id="l80" href="#l80">80</a>       (mark done)))
+<a id="l81" href="#l81">81</a>   (defcode &quot;(loop)&quot; ()
+<a id="l82" href="#l82">82</a>     (let ((out (label)) (done (label)))
+<a id="l83" href="#l83">83</a>       (ldr :r0 :sp) (addw :r0 :r0 1) (ldr :r1 :sp 4) (cmp-reg :r0 :r1) (bcc :eq out)
+<a id="l84" href="#l84">84</a>       (str :r0 :sp) (ldr :ip :ip) (b done)
+<a id="l85" href="#l85">85</a>       (mark out) (addw :sp :sp 12) (addw :ip :ip 4)
+<a id="l86" href="#l86">86</a>       (mark done)))
+<a id="l87" href="#l87">87</a>   (defcode &quot;(+loop)&quot; ()
+<a id="l88" href="#l88">88</a>     (let ((out (label)) (done (label)))
+<a id="l89" href="#l89">89</a>       (ldr :r2 :sp) (ldr :r1 :sp 4) (sub-reg :r0 :r2 :r1) (add-reg :r3 :r0 :tos) (add-reg :r2 :r2 :tos)
+<a id="l90" href="#l90">90</a>       (dpop :tos) (eor-reg :r0 :r0 :r3) (cmp-imm8 :r0 0) (bcc :lt out)
+<a id="l91" href="#l91">91</a>       (str :r2 :sp) (ldr :ip :ip) (b done)
+<a id="l92" href="#l92">92</a>       (mark out) (addw :sp :sp 12) (addw :ip :ip 4)
+<a id="l93" href="#l93">93</a>       (mark done)))
+<a id="l94" href="#l94">94</a>   (defcode &quot;i&quot; () (dpush :tos) (ldr :tos :sp))
+<a id="l95" href="#l95">95</a>   (defcode &quot;j&quot; () (dpush :tos) (ldr :tos :sp 12))
+<a id="l96" href="#l96">96</a>   (defcode &quot;unloop&quot; () (addw :sp :sp 12))
+<a id="l97" href="#l97">97</a>   (defcode &quot;leave&quot; () (ldr :ip :sp 8) (addw :sp :sp 12))
+<a id="l98" href="#l98">98</a>   (defcode &quot;(s\&quot;)&quot; ()
+<a id="l99" href="#l99">99</a>     (ldrb :r0 :ip) (addw :r1 :ip 1) (str :tos :psp -4 :pre) (str :r1 :psp -4 :pre) (mov :tos :r0)
+<a id="l100" href="#l100">100</a>     (add-reg :ip :r1 :r0) (addw :ip :ip 3) (movw :r2 3) (bic-reg :ip :ip :r2))
+<a id="l101" href="#l101">101</a>   ;; stack
+<a id="l102" href="#l102">102</a>   (defcode &quot;dup&quot; () (dpush :tos))
+<a id="l103" href="#l103">103</a>   (defcode &quot;drop&quot; () (dpop :tos))
+<a id="l104" href="#l104">104</a>   (defcode &quot;swap&quot; () (ldr :r0 :psp) (str :tos :psp) (mov :tos :r0))
+<a id="l105" href="#l105">105</a>   (defcode &quot;over&quot; () (ldr :r0 :psp) (dpush :r0))
+<a id="l106" href="#l106">106</a>   (defcode &quot;rot&quot; () (ldr :r0 :psp) (ldr :r1 :psp 4) (str :r0 :psp 4) (str :tos :psp) (mov :tos :r1))
+<a id="l107" href="#l107">107</a>   (defcode &quot;-rot&quot; () (ldr :r0 :psp) (ldr :r1 :psp 4) (str :tos :psp 4) (str :r1 :psp) (mov :tos :r0))
+<a id="l108" href="#l108">108</a>   (defcode &quot;nip&quot; () (addw :psp :psp 4))
+<a id="l109" href="#l109">109</a>   (defcode &quot;tuck&quot; () (ldr :r0 :psp) (str :tos :psp) (str :r0 :psp -4 :pre))
+<a id="l110" href="#l110">110</a>   (defcode &quot;pick&quot; () (add-reg :r0 :psp :tos :lsl 2) (ldr :tos :r0))
+<a id="l111" href="#l111">111</a>   (defcode &quot;?dup&quot; () (cmp-imm8 :tos 0) (it :ne) (str :tos :psp -4 :pre))
+<a id="l112" href="#l112">112</a>   (defcode &quot;2dup&quot; () (ldr :r0 :psp) (str :tos :psp -4 :pre) (str :r0 :psp -4 :pre))
+<a id="l113" href="#l113">113</a>   (defcode &quot;2drop&quot; () (addw :psp :psp 4) (dpop :tos))
+<a id="l114" href="#l114">114</a>   (defcode &quot;&gt;r&quot; () (push1 :tos) (dpop :tos))
+<a id="l115" href="#l115">115</a>   (defcode &quot;r&gt;&quot; () (dpush :tos) (pop1 :tos))
+<a id="l116" href="#l116">116</a>   (defcode &quot;r@&quot; () (dpush :tos) (ldr :tos :sp))
+<a id="l117" href="#l117">117</a>   (defcode &quot;rdrop&quot; () (addw :sp :sp 4))
+<a id="l118" href="#l118">118</a>   (defcode &quot;depth&quot; () (li :r0 +dstop+) (sub-reg :r0 :r0 :psp) (mov-shift :r0 :r0 :asr 2) (dpush :r0))
+<a id="l119" href="#l119">119</a>   (defcode &quot;sp@&quot; () (dpush :tos) (mov :tos :psp))
+<a id="l120" href="#l120">120</a>   (defcode &quot;sp!&quot; () (addw :psp :tos 4) (ldr :tos :tos))
+<a id="l121" href="#l121">121</a>   (defcode &quot;rp@&quot; () (dpush :tos) (mov :tos :sp))
+<a id="l122" href="#l122">122</a>   (defcode &quot;rp!&quot; () (mov :sp :tos) (dpop :tos))
+<a id="l123" href="#l123">123</a>   ;; arithmetic and logic
+<a id="l124" href="#l124">124</a>   (defcode &quot;+&quot; () (binop #&#x27;add-reg))
+<a id="l125" href="#l125">125</a>   (defcode &quot;-&quot; () (binop #&#x27;sub-reg))
+<a id="l126" href="#l126">126</a>   (defcode &quot;*&quot; () (binop #&#x27;mul))
+<a id="l127" href="#l127">127</a>   (defcode &quot;/&quot; () (binop #&#x27;sdiv))
+<a id="l128" href="#l128">128</a>   (defcode &quot;mod&quot; () (dpop :r0) (sdiv :r1 :r0 :tos) (mls :tos :r1 :tos :r0))
+<a id="l129" href="#l129">129</a>   (defcode &quot;/mod&quot; () (ldr :r0 :psp) (sdiv :r1 :r0 :tos) (mls :r2 :r1 :tos :r0) (str :r2 :psp) (mov :tos :r1))
+<a id="l130" href="#l130">130</a>   (defcode &quot;u/mod&quot; () (ldr :r0 :psp) (udiv :r1 :r0 :tos) (mls :r2 :r1 :tos :r0) (str :r2 :psp) (mov :tos :r1))
+<a id="l131" href="#l131">131</a>   (defcode &quot;m*&quot; () (ldr :r0 :psp) (smull :r1 :r2 :r0 :tos) (str :r1 :psp) (mov :tos :r2))
+<a id="l132" href="#l132">132</a>   (defcode &quot;um*&quot; () (ldr :r0 :psp) (umull :r1 :r2 :r0 :tos) (str :r1 :psp) (mov :tos :r2))
+<a id="l133" href="#l133">133</a>   (defcode &quot;negate&quot; () (movw :r0 0) (sub-reg :tos :r0 :tos))
+<a id="l134" href="#l134">134</a>   (defcode &quot;abs&quot; () (mov-shift :r0 :tos :asr 31) (eor-reg :tos :tos :r0) (sub-reg :tos :tos :r0))
+<a id="l135" href="#l135">135</a>   (defcode &quot;and&quot; () (binop #&#x27;and-reg))
+<a id="l136" href="#l136">136</a>   (defcode &quot;or&quot; () (binop #&#x27;orr-reg))
+<a id="l137" href="#l137">137</a>   (defcode &quot;xor&quot; () (binop #&#x27;eor-reg))
+<a id="l138" href="#l138">138</a>   (defcode &quot;bic&quot; () (dpop :r0) (bic-reg :tos :r0 :tos))
+<a id="l139" href="#l139">139</a>   (defcode &quot;invert&quot; () (mvn-reg :tos :tos))
+<a id="l140" href="#l140">140</a>   (defcode &quot;lshift&quot; () (dpop :r0) (lsl-reg :tos :r0 :tos))
+<a id="l141" href="#l141">141</a>   (defcode &quot;rshift&quot; () (dpop :r0) (lsr-reg :tos :r0 :tos))
+<a id="l142" href="#l142">142</a>   (defcode &quot;arshift&quot; () (dpop :r0) (asr-reg :tos :r0 :tos))
+<a id="l143" href="#l143">143</a>   (defcode &quot;1+&quot; () (addw :tos :tos 1))
+<a id="l144" href="#l144">144</a>   (defcode &quot;1-&quot; () (subw :tos :tos 1))
+<a id="l145" href="#l145">145</a>   (defcode &quot;2+&quot; () (addw :tos :tos 2))
+<a id="l146" href="#l146">146</a>   (defcode &quot;2-&quot; () (subw :tos :tos 2))
+<a id="l147" href="#l147">147</a>   (defcode &quot;2*&quot; () (mov-shift :tos :tos :lsl 1))
+<a id="l148" href="#l148">148</a>   (defcode &quot;2/&quot; () (mov-shift :tos :tos :asr 1))
+<a id="l149" href="#l149">149</a>   (defcode &quot;cells&quot; () (mov-shift :tos :tos :lsl 2))
+<a id="l150" href="#l150">150</a>   (defcode &quot;cell+&quot; () (addw :tos :tos 4))
+<a id="l151" href="#l151">151</a>   (defcode &quot;min&quot; () (dpop :r0) (cmp-reg :r0 :tos) (it :lt) (mov :tos :r0))
+<a id="l152" href="#l152">152</a>   (defcode &quot;max&quot; () (dpop :r0) (cmp-reg :r0 :tos) (it :gt) (mov :tos :r0))
+<a id="l153" href="#l153">153</a>   (defcode &quot;=&quot; () (cmp2 :eq)) (defcode &quot;&lt;&gt;&quot; () (cmp2 :ne))
+<a id="l154" href="#l154">154</a>   (defcode &quot;&lt;&quot; () (cmp2 :lt)) (defcode &quot;&gt;&quot; () (cmp2 :gt))
+<a id="l155" href="#l155">155</a>   (defcode &quot;&lt;=&quot; () (cmp2 :le)) (defcode &quot;&gt;=&quot; () (cmp2 :ge))
+<a id="l156" href="#l156">156</a>   (defcode &quot;u&lt;&quot; () (cmp2 :lo)) (defcode &quot;u&gt;&quot; () (cmp2 :hi))
+<a id="l157" href="#l157">157</a>   (defcode &quot;0=&quot; () (cmp0 :eq)) (defcode &quot;0&lt;&gt;&quot; () (cmp0 :ne))
+<a id="l158" href="#l158">158</a>   (defcode &quot;0&lt;&quot; () (cmp0 :lt)) (defcode &quot;0&gt;&quot; () (cmp0 :gt))
+<a id="l159" href="#l159">159</a>   ;; memory
+<a id="l160" href="#l160">160</a>   (defcode &quot;@&quot; () (ldr :tos :tos))
+<a id="l161" href="#l161">161</a>   (defcode &quot;!&quot; () (dpop :r0) (str :r0 :tos) (dpop :tos))
+<a id="l162" href="#l162">162</a>   (defcode &quot;c@&quot; () (ldrb :tos :tos))
+<a id="l163" href="#l163">163</a>   (defcode &quot;c!&quot; () (dpop :r0) (strb :r0 :tos) (dpop :tos))
+<a id="l164" href="#l164">164</a>   (defcode &quot;h@&quot; () (ldrh :tos :tos))
+<a id="l165" href="#l165">165</a>   (defcode &quot;h!&quot; () (dpop :r0) (strh :r0 :tos) (dpop :tos))
+<a id="l166" href="#l166">166</a>   (defcode &quot;+!&quot; () (dpop :r0) (ldr :r1 :tos) (add-reg :r1 :r1 :r0) (str :r1 :tos) (dpop :tos))
+<a id="l167" href="#l167">167</a>   (defcode &quot;bis!&quot; () (dpop :r0) (ldr :r1 :tos) (orr-reg :r1 :r1 :r0) (str :r1 :tos) (dpop :tos))
+<a id="l168" href="#l168">168</a>   (defcode &quot;bic!&quot; () (dpop :r0) (ldr :r1 :tos) (bic-reg :r1 :r1 :r0) (str :r1 :tos) (dpop :tos))
+<a id="l169" href="#l169">169</a>   (defcode &quot;cbis!&quot; () (dpop :r0) (ldrb :r1 :tos) (orr-reg :r1 :r1 :r0) (strb :r1 :tos) (dpop :tos))
+<a id="l170" href="#l170">170</a>   (defcode &quot;cbic!&quot; () (dpop :r0) (ldrb :r1 :tos) (bic-reg :r1 :r1 :r0) (strb :r1 :tos) (dpop :tos))
+<a id="l171" href="#l171">171</a>   (defcode &quot;move&quot; ()                     ; ( src dst n ) overlap-safe
+<a id="l172" href="#l172">172</a>     (let ((back (label)) (fl (label)) (bl2 (label)) (done (label)))
+<a id="l173" href="#l173">173</a>       (mov :r2 :tos) (dpop :r1) (dpop :r0) (dpop :tos)
+<a id="l174" href="#l174">174</a>       (cmp-reg :r0 :r1) (bcc :lo back)
+<a id="l175" href="#l175">175</a>       (mark fl) (cmp-imm8 :r2 0) (bcc :eq done)
+<a id="l176" href="#l176">176</a>       (ldrb :r3 :r0 1 :post) (strb :r3 :r1 1 :post) (subw :r2 :r2 1) (b fl)
+<a id="l177" href="#l177">177</a>       (mark back) (add-reg :r0 :r0 :r2) (add-reg :r1 :r1 :r2)
+<a id="l178" href="#l178">178</a>       (mark bl2) (cmp-imm8 :r2 0) (bcc :eq done)
+<a id="l179" href="#l179">179</a>       (ldrb :r3 :r0 -1 :pre) (strb :r3 :r1 -1 :pre) (subw :r2 :r2 1) (b bl2)
+<a id="l180" href="#l180">180</a>       (mark done)))
+<a id="l181" href="#l181">181</a>   (defcode &quot;fill&quot; ()                     ; ( addr n c )
+<a id="l182" href="#l182">182</a>     (let ((lp (label)) (done (label)))
+<a id="l183" href="#l183">183</a>       (mov :r1 :tos) (dpop :r2) (dpop :r0) (dpop :tos)
+<a id="l184" href="#l184">184</a>       (mark lp) (cmp-imm8 :r2 0) (bcc :eq done)
+<a id="l185" href="#l185">185</a>       (strb :r1 :r0 1 :post) (subw :r2 :r2 1) (b lp)
+<a id="l186" href="#l186">186</a>       (mark done)))
+<a id="l187" href="#l187">187</a>   (defcode &quot;compare&quot; ()                  ; ( a1 n1 a2 n2 -- flag ) true if equal bytes
+<a id="l188" href="#l188">188</a>     (let ((lp (label)) (no (label)) (done (label)))
+<a id="l189" href="#l189">189</a>       (mov :r3 :tos) (dpop :r2) (dpop :r1) (dpop :r0) (movw :tos 0)
+<a id="l190" href="#l190">190</a>       (cmp-reg :r1 :r3) (bcc :ne done)
+<a id="l191" href="#l191">191</a>       (mark lp) (cmp-imm8 :r1 0) (bcc :eq no)
+<a id="l192" href="#l192">192</a>       (ldrb :r3 :r0 1 :post) (ldrb :r12 :r2 1 :post) (cmp-reg :r3 :r12) (bcc :ne done)
+<a id="l193" href="#l193">193</a>       (subw :r1 :r1 1) (b lp)
+<a id="l194" href="#l194">194</a>       (mark no) (mvn-0 :tos)
+<a id="l195" href="#l195">195</a>       (mark done)))
+<a id="l196" href="#l196">196</a>   (defcode &quot;count&quot; () (ldrb :r0 :tos 1 :post) (dpush :r0))
+<a id="l197" href="#l197">197</a>   ;; single-precision floats on the M4F FPU; a float is its IEEE-754 bit pattern in one cell
+<a id="l198" href="#l198">198</a>   (flet ((fbin (op) (dpop :r0) (vmov-s-r :s0 :r0) (vmov-s-r :s1 :tos) (funcall op :s0 :s0 :s1) (vmov-r-s :tos :s0))
+<a id="l199" href="#l199">199</a>          (fun (op) (vmov-s-r :s0 :tos) (funcall op :s0 :s0) (vmov-r-s :tos :s0))
+<a id="l200" href="#l200">200</a>          (fcmp (c) (dpop :r0) (vmov-s-r :s0 :r0) (vmov-s-r :s1 :tos) (vcmp :s0 :s1) (vmrs-apsr) (flag c)))
+<a id="l201" href="#l201">201</a>     (defcode &quot;f+&quot; () (fbin #&#x27;vadd))
+<a id="l202" href="#l202">202</a>     (defcode &quot;f-&quot; () (fbin #&#x27;vsub))
+<a id="l203" href="#l203">203</a>     (defcode &quot;f*&quot; () (fbin #&#x27;vmul))
+<a id="l204" href="#l204">204</a>     (defcode &quot;f/&quot; () (fbin #&#x27;vdiv))
+<a id="l205" href="#l205">205</a>     (defcode &quot;s&gt;f&quot; () (fun #&#x27;vcvt-f32-s32))
+<a id="l206" href="#l206">206</a>     (defcode &quot;f&gt;s&quot; () (fun #&#x27;vcvt-s32-f32))
+<a id="l207" href="#l207">207</a>     (defcode &quot;fsqrt&quot; () (fun #&#x27;vsqrt))
+<a id="l208" href="#l208">208</a>     (defcode &quot;f&lt;&quot; () (fcmp :mi))
+<a id="l209" href="#l209">209</a>     (defcode &quot;f=&quot; () (fcmp :eq)))
+<a id="l210" href="#l210">210</a>   ;; console: USART2, polled
+<a id="l211" href="#l211">211</a>   (defcode &quot;emit&quot; ()                     ; emit-hook = 0: USART2; else execute the hook with c on the stack
+<a id="l212" href="#l212">212</a>     (let ((wait (label)) (hook (label)) (done (label)))
+<a id="l213" href="#l213">213</a>       (li :r1 (+ +sysvars+ 32)) (ldr :r1 :r1) (cmp-imm8 :r1 0) (bcc :ne hook)
+<a id="l214" href="#l214">214</a>       (li :r1 +usart2+) (movw :r2 #x80)
+<a id="l215" href="#l215">215</a>       (mark wait) (ldr :r0 :r1) (tst-reg :r0 :r2) (bcc :eq wait)
+<a id="l216" href="#l216">216</a>       (str :tos :r1 4) (dpop :tos) (b done)
+<a id="l217" href="#l217">217</a>       (mark hook) (mov :w :r1) (ldr :r0 :w) (bx :r0)
+<a id="l218" href="#l218">218</a>       (mark done)))
+<a id="l219" href="#l219">219</a>   (defcode &quot;key&quot; ()
+<a id="l220" href="#l220">220</a>     (let ((wait (label)))
+<a id="l221" href="#l221">221</a>       (li :r1 +usart2+) (movw :r2 #x20)
+<a id="l222" href="#l222">222</a>       (mark wait) (ldr :r0 :r1) (tst-reg :r0 :r2) (bcc :eq wait)
+<a id="l223" href="#l223">223</a>       (dpush :tos) (ldr :tos :r1 4) (movw :r2 255) (and-reg :tos :tos :r2)))
+<a id="l224" href="#l224">224</a>   (defcode &quot;key?&quot; () (li :r1 +usart2+) (ldr :r0 :r1) (movw :r2 #x20) (dpush :tos) (tst-reg :r0 :r2) (flag :ne)))
+<a id="l225" href="#l225">225</a> 
+<a id="l226" href="#l226">226</a> (defun runtime-code ()
+<a id="l227" href="#l227">227</a>   &quot;Code fields shared by all colon words, variables and constants.&quot;
+<a id="l228" href="#l228">228</a>   (mark *docol*) (push1 :ip) (addw :ip :w 4) (next)
+<a id="l229" href="#l229">229</a>   (mark *dovar*) (dpush :tos) (addw :tos :w 4) (next)
+<a id="l230" href="#l230">230</a>   (mark *docon*) (dpush :tos) (ldr :tos :w 4) (next))
+<a id="l231" href="#l231">231</a> 
+<a id="l232" href="#l232">232</a> (defun reset-code (reset fault cold-thread)
+<a id="l233" href="#l233">233</a>   (mark reset)
+<a id="l234" href="#l234">234</a>   (store-or #xE000ED88 #x00F00000)         ; CPACR: enable the FPU (CP10, CP11)
+<a id="l235" href="#l235">235</a>   (store-or #x40023830 1)                  ; RCC AHB1ENR: GPIOA
+<a id="l236" href="#l236">236</a>   (store-or #x40023840 (ash 1 17))         ; RCC APB1ENR: USART2
+<a id="l237" href="#l237">237</a>   (store-or #x40020000 #xA0)               ; GPIOA MODER: PA2, PA3 alternate function
+<a id="l238" href="#l238">238</a>   (store-or #x40020020 #x7700)             ; GPIOA AFRL: AF7 = USART2
+<a id="l239" href="#l239">239</a>   (li :r1 (+ +usart2+ 8)) (movw :r0 #x8B) (str :r0 :r1)          ; BRR: 115200 baud at 16 MHz HSI
+<a id="l240" href="#l240">240</a>   (li :r1 (+ +usart2+ 12)) (movw :r0 #x200C) (str :r0 :r1)       ; CR1: UE TE RE
+<a id="l241" href="#l241">241</a>   (li :r1 +sysvars+) (movw :r0 0) (str :r0 :r1 0)                ; state
+<a id="l242" href="#l242">242</a>   (movw :r0 10) (str :r0 :r1 4)                                  ; base
+<a id="l243" href="#l243">243</a>   (li :r0 *last-link*) (str :r0 :r1 8)                           ; latest
+<a id="l244" href="#l244">244</a>   (li :r0 +ram-dict+) (str :r0 :r1 12)                           ; dp
+<a id="l245" href="#l245">245</a>   (movw :r0 0) (str :r0 :r1 32)                                  ; emit-hook: console
+<a id="l246" href="#l246">246</a>   (li :psp +dstop+) (movw :tos 0)
+<a id="l247" href="#l247">247</a>   (li :ip cold-thread) (next)
+<a id="l248" href="#l248">248</a>   (mark fault)                                                    ; print FAULT, then system reset
+<a id="l249" href="#l249">249</a>   (let ((msg (label)) (lp (label)) (wait (label)) (done (label)))
+<a id="l250" href="#l250">250</a>     (li :r3 msg) (li :r1 +usart2+) (movw :r2 #x80)
+<a id="l251" href="#l251">251</a>     (mark lp) (ldrb :r0 :r3 1 :post) (cmp-imm8 :r0 0) (bcc :eq done)
+<a id="l252" href="#l252">252</a>     (mark wait) (ldr :r12 :r1) (tst-reg :r12 :r2) (bcc :eq wait) (str :r0 :r1 4) (b lp)
+<a id="l253" href="#l253">253</a>     (mark done) (li :r0 #xE000ED0C) (li :r1 #x05FA0004) (str :r1 :r0) (b done)
+<a id="l254" href="#l254">254</a>     (mark msg) (loop for c across (format nil &quot;~c~%FAULT: reset~%&quot; #\Return) do (byte8 (char-code c))) (byte8 0)
+<a id="l255" href="#l255">255</a>     (align4)))
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a> ;;; ---------- metacompiler for kernel.fs ----------
+<a id="l258" href="#l258">258</a> (defun tokenize (text)
+<a id="l259" href="#l259">259</a>   &quot;Whitespace tokens; \\ and ( ) comments dropped; the text after .\&quot; s\&quot; .( becomes (:string ...).&quot;
+<a id="l260" href="#l260">260</a>   (let ((toks &#x27;()) (i 0) (n (length text)))
+<a id="l261" href="#l261">261</a>     (flet ((ws (c) (member c &#x27;(#\Space #\Tab #\Newline #\Return)))
+<a id="l262" href="#l262">262</a>            (upto (ch) (let ((e (or (position ch text :start i) n))) (prog1 (subseq text i e) (setf i (min n (1+ e)))))))
+<a id="l263" href="#l263">263</a>       (loop
+<a id="l264" href="#l264">264</a>         (loop while (and (&lt; i n) (ws (char text i))) do (incf i))
+<a id="l265" href="#l265">265</a>         (when (&gt;= i n) (return))
+<a id="l266" href="#l266">266</a>         (let* ((e (or (position-if #&#x27;ws text :start i) n)) (tok (subseq text i e)))
+<a id="l267" href="#l267">267</a>           (setf i e)
+<a id="l268" href="#l268">268</a>           (cond ((equal (first toks) &quot;:&quot;) (push tok toks))     ; a name, even if it looks special
+<a id="l269" href="#l269">269</a>                 ((string= tok &quot;\\&quot;) (upto #\Newline))
+<a id="l270" href="#l270">270</a>                 ((string= tok &quot;(&quot;) (upto #\)))
+<a id="l271" href="#l271">271</a>                 ((member tok &#x27;(&quot;.\&quot;&quot; &quot;s\&quot;&quot;) :test #&#x27;string=)
+<a id="l272" href="#l272">272</a>                  (incf i) (push tok toks) (push (list :string (upto #\&quot;)) toks))
+<a id="l273" href="#l273">273</a>                 (t (push tok toks)))))
+<a id="l274" href="#l274">274</a>       (nreverse toks))))
+<a id="l275" href="#l275">275</a> 
+<a id="l276" href="#l276">276</a> (defun parse-num (tok)
+<a id="l277" href="#l277">277</a>   (let* ((neg (and (&gt; (length tok) 1) (char= (char tok 0) #\-))) (s (if neg (subseq tok 1) tok))
+<a id="l278" href="#l278">278</a>          (base 10))
+<a id="l279" href="#l279">279</a>     (when (and (&gt; (length s) 1) (char= (char s 0) #\$)) (setf base 16 s (subseq s 1)))
+<a id="l280" href="#l280">280</a>     (let ((v (ignore-errors (parse-integer s :radix base))))
+<a id="l281" href="#l281">281</a>       (and v (if neg (- v) v)))))
+<a id="l282" href="#l282">282</a> 
+<a id="l283" href="#l283">283</a> (defun cell (name) (abs32 (xt name)))
+<a id="l284" href="#l284">284</a> (defun lit (v) (cell &quot;lit&quot;) (if (integerp v) (w32 v) (abs32 v)))
+<a id="l285" href="#l285">285</a> 
+<a id="l286" href="#l286">286</a> (defun compile-def (name body)
+<a id="l287" href="#l287">287</a>   &quot;BODY: tokens between the name and ;. Control structures resolve to labels here.&quot;
+<a id="l288" href="#l288">288</a>   (let ((cs &#x27;()))
+<a id="l289" href="#l289">289</a>     (loop while body do
+<a id="l290" href="#l290">290</a>       (let ((tok (pop body)))
+<a id="l291" href="#l291">291</a>         (cond
+<a id="l292" href="#l292">292</a>           ((consp tok) (error &quot;stray string in ~a&quot; name))
+<a id="l293" href="#l293">293</a>           ((string= tok &quot;if&quot;) (cell &quot;0branch&quot;) (let ((l (label))) (abs32 l) (push l cs)))
+<a id="l294" href="#l294">294</a>           ((string= tok &quot;else&quot;) (cell &quot;branch&quot;) (let ((l (label))) (abs32 l) (mark (pop cs)) (push l cs)))
+<a id="l295" href="#l295">295</a>           ((string= tok &quot;then&quot;) (mark (pop cs)))
+<a id="l296" href="#l296">296</a>           ((string= tok &quot;begin&quot;) (push (mark (label)) cs))
+<a id="l297" href="#l297">297</a>           ((string= tok &quot;until&quot;) (cell &quot;0branch&quot;) (abs32 (pop cs)))
+<a id="l298" href="#l298">298</a>           ((string= tok &quot;again&quot;) (cell &quot;branch&quot;) (abs32 (pop cs)))
+<a id="l299" href="#l299">299</a>           ((string= tok &quot;while&quot;) (cell &quot;0branch&quot;) (let ((l (label)) (dest (pop cs))) (abs32 l) (push l cs) (push dest cs)))
+<a id="l300" href="#l300">300</a>           ((string= tok &quot;repeat&quot;) (cell &quot;branch&quot;) (abs32 (pop cs)) (mark (pop cs)))
+<a id="l301" href="#l301">301</a>           ((member tok &#x27;(&quot;do&quot; &quot;?do&quot;) :test #&#x27;string=)
+<a id="l302" href="#l302">302</a>            (cell (if (string= tok &quot;do&quot;) &quot;(do)&quot; &quot;(?do)&quot;))
+<a id="l303" href="#l303">303</a>            (let ((leave (label))) (abs32 leave) (push leave cs) (push (mark (label)) cs)))
+<a id="l304" href="#l304">304</a>           ((member tok &#x27;(&quot;loop&quot; &quot;+loop&quot;) :test #&#x27;string=)
+<a id="l305" href="#l305">305</a>            (cell (if (string= tok &quot;loop&quot;) &quot;(loop)&quot; &quot;(+loop)&quot;)) (abs32 (pop cs)) (mark (pop cs)))
+<a id="l306" href="#l306">306</a>           ((string= tok &quot;recurse&quot;) (cell name))
+<a id="l307" href="#l307">307</a>           ((string= tok &quot;[&#x27;]&quot;) (lit (xt (pop body))))
+<a id="l308" href="#l308">308</a>           ((string= tok &quot;[char]&quot;) (lit (char-code (char (pop body) 0))))
+<a id="l309" href="#l309">309</a>           ((member tok &#x27;(&quot;.\&quot;&quot; &quot;s\&quot;&quot;) :test #&#x27;string=)
+<a id="l310" href="#l310">310</a>            (let ((s (second (pop body))))
+<a id="l311" href="#l311">311</a>              (cell &quot;(s\&quot;)&quot;) (byte8 (length s)) (loop for c across s do (byte8 (char-code c))) (align4)
+<a id="l312" href="#l312">312</a>              (when (string= tok &quot;.\&quot;&quot;) (cell &quot;type&quot;))))
+<a id="l313" href="#l313">313</a>           ((parse-num tok) (lit (parse-num tok)))
+<a id="l314" href="#l314">314</a>           (t (cell tok)))))
+<a id="l315" href="#l315">315</a>     (when cs (error &quot;unbalanced control structure in ~a&quot; name))
+<a id="l316" href="#l316">316</a>     (cell &quot;exit&quot;)))
+<a id="l317" href="#l317">317</a> 
+<a id="l318" href="#l318">318</a> (defun metacompile (path)
+<a id="l319" href="#l319">319</a>   (let ((toks (with-open-file (s path) (let ((str (make-string (file-length s)))) (tokenize (subseq str 0 (read-sequence str s)))))))
+<a id="l320" href="#l320">320</a>     (loop while toks do
+<a id="l321" href="#l321">321</a>       (let ((tok (pop toks)))
+<a id="l322" href="#l322">322</a>         (unless (equal tok &quot;:&quot;) (error &quot;kernel.fs: expected : at ~s&quot; tok))
+<a id="l323" href="#l323">323</a>         (let* ((name (pop toks)) (end (position &quot;;&quot; toks :test #&#x27;equal)) (body (subseq toks 0 end))
+<a id="l324" href="#l324">324</a>                (imm (equal (nth (1+ end) toks) &quot;immediate&quot;)))
+<a id="l325" href="#l325">325</a>           (setf toks (nthcdr (+ end (if imm 2 1)) toks))
+<a id="l326" href="#l326">326</a>           (header name (if imm #x80 0))
+<a id="l327" href="#l327">327</a>           (abs32 *docol* 1)
+<a id="l328" href="#l328">328</a>           (compile-def name body))))))
+<a id="l329" href="#l329">329</a> 
+<a id="l330" href="#l330">330</a> ;;; ---------- image ----------
+<a id="l331" href="#l331">331</a> (defun build (out)
+<a id="l332" href="#l332">332</a>   (new-segment)
+<a id="l333" href="#l333">333</a>   (let ((reset (label)) (fault (label)) (cold-thread (label)))
+<a id="l334" href="#l334">334</a>     (w32 +rstop+) (abs32 reset 1)
+<a id="l335" href="#l335">335</a>     (dotimes (i 14) (abs32 fault 1))
+<a id="l336" href="#l336">336</a>     (runtime-code)
+<a id="l337" href="#l337">337</a>     (primitives)
+<a id="l338" href="#l338">338</a>     (loop for name in *sysvars* for i from 0 do (defconst name (+ +sysvars+ (* 4 i))))
+<a id="l339" href="#l339">339</a>     (defconst &quot;tib&quot; +tib+) (defconst &quot;padend&quot; +padend+) (defconst &quot;sp0&quot; (- +dstop+ 4))
+<a id="l340" href="#l340">340</a>     (defconst &quot;rp0&quot; +rstop+) (defconst &quot;dict-limit&quot; +dict-limit+)
+<a id="l341" href="#l341">341</a>     (defconst &quot;docol&quot; *docol* 1) (defconst &quot;dovar&quot; *dovar* 1) (defconst &quot;docon&quot; *docon* 1)
+<a id="l342" href="#l342">342</a>     (metacompile (merge-pathnames &quot;kernel.fs&quot; *load-truename*))
+<a id="l343" href="#l343">343</a>     (align4) (mark cold-thread) (cell &quot;cold&quot;)
+<a id="l344" href="#l344">344</a>     (reset-code reset fault cold-thread))
+<a id="l345" href="#l345">345</a>   (let ((undefined (loop for k being the hash-keys of *xts* unless (gethash k *defined*) collect k)))
+<a id="l346" href="#l346">346</a>     (when undefined (error &quot;undefined words: ~{~a~^ ~}&quot; undefined)))
+<a id="l347" href="#l347">347</a>   (let ((bytes (segment-bytes)))
+<a id="l348" href="#l348">348</a>     (with-open-file (s out :direction :output :if-exists :supersede :element-type &#x27;(unsigned-byte 8))
+<a id="l349" href="#l349">349</a>       (write-sequence bytes s))
+<a id="l350" href="#l350">350</a>     (format t &quot;kernel image: ~d bytes, ~d words~%&quot; (length bytes) (hash-table-count *defined*))))
+<a id="l351" href="#l351">351</a> 
+<a id="l352" href="#l352">352</a> (build (or (second sb-ext:*posix-argv*) &quot;kernel.bin&quot;))</pre>
+</div></body></html>

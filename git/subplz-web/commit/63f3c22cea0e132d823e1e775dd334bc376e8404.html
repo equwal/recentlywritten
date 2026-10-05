@@ -1,0 +1,733 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 63f3c22c - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 63f3c22cea0e132d823e1e775dd334bc376e8404
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 15:56:40 -0700
+
+Sell monthly plans: 10 or 30 books a month, or unlimited
+
+The owner added three monthly plans: 10 books a month for $4.99, 30 books
+a month for $9.99, and unlimited for $50 a month.
+
+- The subscription carries its plan id (subscription_plan_id). The books
+  of a month do not carry over: a new current_period_end from Stripe sets
+  subscription_credits_used back to 0.
+- A server job spends the credit that ends first: the daily credit, then
+  a book of this month&#x27;s plan, then a free credit, then a bought one. An
+  unlimited plan spends nothing. A failed job gives the book back.
+- Paying for a plan adds no pack credits. A second plan is refused: the
+  customer changes or cancels the plan with Manage plan.
+- A plan that is not in the catalogue gives nothing, so a sold plan must
+  be retired (RETIRED_PLANS), not deleted.
+
+The page, the terms and the README say that pack credits never expire,
+that a plan renews until cancelled, and that its books do not carry over.
+The plans need the customer.subscription.* webhook events and the Stripe
+customer portal.
+
+</pre><pre> README.md                   |  42 ++++++++++--
+ backend/api.py              |   6 ++
+ backend/billing.py          |  68 +++++++++++++++++--
+ backend/db.py               |  10 +++
+ backend/payments.py         |  20 ++++--
+ backend/pricing.py          |  42 ++++++++++--
+ frontend/app.js             |  10 +--
+ frontend/index.html         |   7 +-
+ frontend/terms.html         |   6 +-
+ tests/test_billing.py       |  15 +++--
+ tests/test_migration.py     |   6 +-
+ tests/test_subscriptions.py | 161 ++++++++++++++++++++++++++++++++++++++++++++
+ 12 files changed, 356 insertions(+), 37 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 73f1eca..d59e6cc 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -359,8 +359,22 @@ cancelled gets the credit back.</span>
+   server converted for it (`SUBPLZ_WEB_BOOKS_PER_BONUS_CREDIT`). Books
+   converted in the browser do not count, because the server cannot check them.
+ 
+<span class="d">-A server job spends the daily credit first, then a free credit, then a bought</span>
+<span class="d">-one. The account counts the free credits apart from the bought ones</span>
+<span class="a">+**Monthly plans.** A plan renews each month until the customer cancels it in</span>
+<span class="a">+Stripe&#x27;s customer portal (&quot;Manage plan&quot; on the page).</span>
+<span class="a">+</span>
+<span class="a">+| Plan | Price | Books |</span>
+<span class="a">+|---|---|---|</span>
+<span class="a">+| `month10` | $4.99 a month | 10 a month |</span>
+<span class="a">+| `month30` | $9.99 a month | 30 a month |</span>
+<span class="a">+| `unlimited` | $50.00 a month | no limit, one book at a time |</span>
+<span class="a">+</span>
+<span class="a">+The books of a month do not carry over: a new `current_period_end` from Stripe</span>
+<span class="a">+sets `subscription_credits_used` back to 0. Retire a plan that was sold</span>
+<span class="a">+(`pricing.RETIRED_PLANS`); do not delete it, or its subscribers get nothing.</span>
+<span class="a">+</span>
+<span class="a">+A server job spends the credit that ends first: the daily credit, then a book</span>
+<span class="a">+of this month&#x27;s plan, then a free credit, then a bought one. An unlimited plan</span>
+<span class="a">+spends nothing. The account counts the free credits apart from the bought ones</span>
+ (`free_credits_used`), so a refund of bought credits never pays out a free one.
+ 
+ A switch above the drop zone says where the work is done. Each visit starts
+<span class="h">@@ -401,9 +415,27 @@ tools/set-secret.sh SUBPLZ_WEB_SMTP_PASSWORD           # for sign-in emails</span>
+ 
+ In Stripe: Developers -&gt; Webhooks -&gt; add `https://&lt;host&gt;/api/billing/webhook`
+ with `checkout.session.completed`, `checkout.session.async_payment_succeeded`,
+<span class="d">-`customer.subscription.created`, `.updated` and `.deleted`. Then set</span>
+<span class="d">-`SUBPLZ_WEB_BILLING_ENABLED=true`, `SUBPLZ_WEB_PUBLIC_BASE_URL`,</span>
+<span class="d">-`SUBPLZ_WEB_COOKIE_SECURE=true` and the `SMTP_*` values in `.env` and restart.</span>
+<span class="a">+`customer.subscription.created`, `.updated` and `.deleted`. The monthly plans</span>
+<span class="a">+need the three subscription events, and the customer portal (Settings -&gt;</span>
+<span class="a">+Billing -&gt; Customer portal: let customers cancel at the end of the period and</span>
+<span class="a">+update the card, then save). Then set `SUBPLZ_WEB_BILLING_ENABLED=true`,</span>
+<span class="a">+`SUBPLZ_WEB_PUBLIC_BASE_URL`, `SUBPLZ_WEB_COOKIE_SECURE=true` and the `SMTP_*`</span>
+<span class="a">+values in `.env` and restart.</span>
+<span class="a">+</span>
+<span class="a">+Sign-in email uses plain SMTP, so any provider works. With Resend: add the</span>
+<span class="a">+domain in Resend, add the DNS records that it shows (they sit on a `send`</span>
+<span class="a">+subdomain and `resend._domainkey`, so existing mail forwarding stays), create</span>
+<span class="a">+an API key with sending access, and set:</span>
+<span class="a">+</span>
+<span class="a">+```bash</span>
+<span class="a">+SUBPLZ_WEB_SMTP_HOST=smtp.resend.com</span>
+<span class="a">+SUBPLZ_WEB_SMTP_PORT=587</span>
+<span class="a">+SUBPLZ_WEB_SMTP_USER=resend</span>
+<span class="a">+tools/set-secret.sh SUBPLZ_WEB_SMTP_PASSWORD   # the Resend API key</span>
+<span class="a">+```</span>
+<span class="a">+</span>
+<span class="a">+Opening the emailed link verifies the address. A verified address gets the</span>
+<span class="a">+free credits of an account (see *Free credits*).</span>
+ 
+ Not handled: refunds and disputes (do them in the Stripe dashboard and adjust
+ `purchased_credits` by hand), and tax (Stripe Tax is one checkout parameter away
+diff --git a/backend/api.py b/backend/api.py
+index 6b5a399..8c93a2b 100644
+--- a/backend/api.py
++++ b/backend/api.py
+<span class="h">@@ -184,6 +184,10 @@ class AccountOut(BaseModel):</span>
+     free_credits_with_account: int
+     # Whether a verified account gets one free credit each day.
+     daily_free_credit: bool
+<span class="a">+    # The part of `credits` that is left of this month&#x27;s plan.</span>
+<span class="a">+    plan_credits: int</span>
+<span class="a">+    # A monthly plan with no limit: no server job spends a credit.</span>
+<span class="a">+    unlimited: bool</span>
+     subscribed: bool
+     subscription_ends: str | None
+     cloud_allowed: bool
+<span class="h">@@ -311,6 +315,8 @@ def _account_out(session: Session, account: Account) -&gt; AccountOut:</span>
+             else billing.free_credits_left(session, account, verified=True)
+         ),
+         daily_free_credit=settings.cloud_enabled and settings.daily_free_credit,
+<span class="a">+        plan_credits=ent.plan_credits,</span>
+<span class="a">+        unlimited=ent.unlimited,</span>
+         subscribed=ent.subscribed,
+         subscription_ends=(
+             ent.subscription_ends.isoformat() if ent.subscription_ends else None
+diff --git a/backend/billing.py b/backend/billing.py
+index 0b52213..e3b7bab 100644
+--- a/backend/billing.py
++++ b/backend/billing.py
+<span class="h">@@ -27,6 +27,7 @@ from datetime import date, datetime, timedelta, timezone</span>
+ from sqlalchemy import func, or_, update
+ from sqlalchemy.orm import Session
+ 
+<span class="a">+from . import pricing</span>
+ from .db import Account, Job, JobStatus, SessionLocal, utcnow
+ from .settings import settings
+ 
+<span class="h">@@ -52,16 +53,20 @@ def _aware(when: datetime | None) -&gt; datetime | None:</span>
+ 
+ @dataclass(frozen=True)
+ class Entitlement:
+<span class="d">-    # Every credit the account can spend now: the bought and the free ones.</span>
+<span class="a">+    # Every credit the account can spend now: bought, free and monthly ones.</span>
+     credits: int
+     # The part of `credits` that is free.
+     free_credits: int
+<span class="a">+    # The part of `credits` that is left of this month&#x27;s plan.</span>
+<span class="a">+    plan_credits: int</span>
+     subscribed: bool
+<span class="a">+    # A subscription with no monthly limit: no job spends a credit.</span>
+<span class="a">+    unlimited: bool</span>
+     subscription_ends: datetime | None
+ 
+     @property
+     def cloud_allowed(self) -&gt; bool:
+<span class="d">-        return self.subscribed or self.credits &gt; 0</span>
+<span class="a">+        return self.unlimited or self.credits &gt; 0</span>
+ 
+ 
+ def is_subscribed(account: Account) -&gt; bool:
+<span class="h">@@ -71,6 +76,26 @@ def is_subscribed(account: Account) -&gt; bool:</span>
+     return ends is None or ends + _GRACE &gt; utcnow()
+ 
+ 
+<span class="a">+def subscription_plan(account: Account) -&gt; pricing.Plan | None:</span>
+<span class="a">+    &quot;&quot;&quot;The plan of an active subscription. None without one, or when the plan</span>
+<span class="a">+    is not in the catalogue (a sold plan must be retired, not deleted).&quot;&quot;&quot;</span>
+<span class="a">+    if not is_subscribed(account):</span>
+<span class="a">+        return None</span>
+<span class="a">+    return pricing.get(account.subscription_plan_id or &quot;&quot;, retired=True)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def is_unlimited(account: Account) -&gt; bool:</span>
+<span class="a">+    plan = subscription_plan(account)</span>
+<span class="a">+    return plan is not None and plan.recurring and plan.credits is None</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def plan_credits_left(account: Account) -&gt; int:</span>
+<span class="a">+    plan = subscription_plan(account)</span>
+<span class="a">+    if plan is None or not plan.recurring or plan.credits is None:</span>
+<span class="a">+        return 0</span>
+<span class="a">+    return max(0, plan.credits - account.subscription_credits_used)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def _today() -&gt; date:
+     &quot;&quot;&quot;The day of the daily free credit (UTC). Tests replace this.&quot;&quot;&quot;
+     return utcnow().date()
+<span class="h">@@ -123,14 +148,32 @@ def daily_credit_left(account: Account) -&gt; int:</span>
+ 
+ def check(session: Session, account: Account) -&gt; Entitlement:
+     free = free_credits_left(session, account) + daily_credit_left(account)
+<span class="a">+    monthly = plan_credits_left(account)</span>
+     return Entitlement(
+<span class="d">-        credits=account.purchased_credits + free,</span>
+<span class="a">+        credits=account.purchased_credits + free + monthly,</span>
+         free_credits=free,
+<span class="a">+        plan_credits=monthly,</span>
+         subscribed=is_subscribed(account),
+<span class="a">+        unlimited=is_unlimited(account),</span>
+         subscription_ends=_aware(account.subscription_period_end),
+     )
+ 
+ 
+<span class="a">+def _spend_plan_credit(session: Session, account: Account) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Take one book of this month&#x27;s plan, atomically. False if none is left.&quot;&quot;&quot;</span>
+<span class="a">+    plan = subscription_plan(account)</span>
+<span class="a">+    if plan is None or not plan.recurring or plan.credits is None:</span>
+<span class="a">+        return False</span>
+<span class="a">+    taken = session.execute(</span>
+<span class="a">+        update(Account)</span>
+<span class="a">+        .where(Account.id == account.id,</span>
+<span class="a">+               Account.subscription_credits_used &lt; plan.credits)</span>
+<span class="a">+        .values(subscription_credits_used=Account.subscription_credits_used + 1)</span>
+<span class="a">+    ).rowcount</span>
+<span class="a">+    session.refresh(account)</span>
+<span class="a">+    return bool(taken)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ def _spend_daily_credit(session: Session, account: Account) -&gt; date | None:
+     &quot;&quot;&quot;Take the free credit of today, atomically. Its day, or None.&quot;&quot;&quot;
+     if not daily_credit_left(account):
+<span class="h">@@ -177,18 +220,22 @@ def authorize_start(session: Session, account: Account, job: Job) -&gt; None:</span>
+     &quot;&quot;&quot;Charge what starting `job` costs, or raise PaymentRequired.
+ 
+     Where the job runs sets its tier: a browser job is free, a server job is
+<span class="d">-    a cloud job. A cloud job spends the daily credit first (it does not</span>
+<span class="d">-    carry over), then a free credit, then a bought one.</span>
+<span class="a">+    a cloud job. An unlimited plan pays for a cloud job. Else the job spends</span>
+<span class="a">+    the credit that ends first: the daily credit, then a book of this month&#x27;s</span>
+<span class="a">+    plan, then a free credit, then a bought one.</span>
+     &quot;&quot;&quot;
+     job.tier = FREE if job.local else CLOUD
+     job.billed, job.credit_spent, job.free_credit_spent = 0, 0, 0
+<span class="d">-    job.daily_credit_on = None</span>
+<span class="d">-    if job.local or not settings.billing_enabled or is_subscribed(account):</span>
+<span class="a">+    job.plan_credit_spent, job.daily_credit_on = 0, None</span>
+<span class="a">+    if job.local or not settings.billing_enabled or is_unlimited(account):</span>
+         return
+     day = _spend_daily_credit(session, account)
+     if day is not None:
+         job.daily_credit_on = day
+         return
+<span class="a">+    if _spend_plan_credit(session, account):</span>
+<span class="a">+        job.plan_credit_spent = 1</span>
+<span class="a">+        return</span>
+     if _spend_free_credit(session, account):
+         job.free_credit_spent = 1
+         return
+<span class="h">@@ -217,6 +264,13 @@ def refund(session: Session, job: Job) -&gt; None:</span>
+             .values(free_credits_used=Account.free_credits_used - 1)
+         )
+         job.free_credit_spent = 0
+<span class="a">+    if job.plan_credit_spent:</span>
+<span class="a">+        session.execute(</span>
+<span class="a">+            update(Account)</span>
+<span class="a">+            .where(Account.id == job.account_id, Account.subscription_credits_used &gt; 0)</span>
+<span class="a">+            .values(subscription_credits_used=Account.subscription_credits_used - 1)</span>
+<span class="a">+        )</span>
+<span class="a">+        job.plan_credit_spent = 0</span>
+     if job.daily_credit_on is not None:
+         # Only the credit of the same day comes back: a later day has its own.
+         session.execute(
+diff --git a/backend/db.py b/backend/db.py
+index 414ef45..52f1874 100644
+--- a/backend/db.py
++++ b/backend/db.py
+<span class="h">@@ -97,6 +97,12 @@ class Account(Base):</span>
+     subscription_period_end: Mapped[datetime | None] = mapped_column(
+         DateTime(timezone=True), nullable=True
+     )
+<span class="a">+    # The plan of the subscription (pricing.Plan.id), and how many of its</span>
+<span class="a">+    # books this month&#x27;s jobs used. A new month sets the count back to 0.</span>
+<span class="a">+    subscription_plan_id: Mapped[str | None] = mapped_column(String(32), nullable=True)</span>
+<span class="a">+    subscription_credits_used: Mapped[int] = mapped_column(</span>
+<span class="a">+        Integer, default=0, server_default=text(&quot;0&quot;)</span>
+<span class="a">+    )</span>
+ 
+     # Set when this anonymous row was folded into a signed-in account. A
+     # payment can finish without a browser attached (the webhook), so the
+<span class="h">@@ -171,6 +177,10 @@ class Job(Base):</span>
+     )
+     # Set if this job spent a daily free credit: the day of that credit.
+     daily_credit_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+<span class="a">+    # 1 if this job spent one of the monthly books of a subscription.</span>
+<span class="a">+    plan_credit_spent: Mapped[int] = mapped_column(</span>
+<span class="a">+        Integer, default=0, server_default=text(&quot;0&quot;)</span>
+<span class="a">+    )</span>
+ 
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True), default=utcnow
+diff --git a/backend/payments.py b/backend/payments.py
+index 166d270..a4790db 100644
+--- a/backend/payments.py
++++ b/backend/payments.py
+<span class="h">@@ -72,7 +72,9 @@ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; st</span>
+     stripe = _stripe()
+ 
+     if plan.recurring and billing.is_subscribed(account):
+<span class="d">-        raise PaymentError(&quot;You are already on this plan.&quot;)</span>
+<span class="a">+        raise PaymentError(</span>
+<span class="a">+            &quot;You already have a monthly plan. Change or cancel it with Manage plan.&quot;</span>
+<span class="a">+        )</span>
+ 
+     price = {
+         &quot;currency&quot;: plan.currency,
+<span class="h">@@ -116,7 +118,7 @@ def start_checkout(session: Session, account: Account, plan: pricing.Plan) -&gt; st</span>
+ 
+ 
+ def portal_url(account: Account) -&gt; str:
+<span class="d">-    &quot;&quot;&quot;Stripe&#x27;s own page for cancelling or updating the unlimited plan.&quot;&quot;&quot;</span>
+<span class="a">+    &quot;&quot;&quot;Stripe&#x27;s own page for cancelling a monthly plan or changing the card.&quot;&quot;&quot;</span>
+     stripe = _stripe()
+     if not account.stripe_customer_id:
+         raise PaymentError(&quot;There is no payment history on this account yet.&quot;)
+<span class="h">@@ -168,9 +170,17 @@ def apply_subscription(session: Session, sub: dict) -&gt; None:</span>
+     if account.subscription_id and account.subscription_id != sub.get(&quot;id&quot;) \
+             and sub.get(&quot;status&quot;) in (&quot;canceled&quot;, &quot;incomplete_expired&quot;):
+         return
+<span class="a">+    period_end = _period_end(sub)</span>
+<span class="a">+    # A new subscription, or a new month of it, starts the count of its books</span>
+<span class="a">+    # again: the books of one month do not carry over.</span>
+<span class="a">+    if account.subscription_id != sub.get(&quot;id&quot;) \</span>
+<span class="a">+            or billing._aware(account.subscription_period_end) != period_end:</span>
+<span class="a">+        account.subscription_credits_used = 0</span>
+     account.subscription_id = sub.get(&quot;id&quot;)
+     account.subscription_status = sub.get(&quot;status&quot;)
+<span class="d">-    account.subscription_period_end = _period_end(sub)</span>
+<span class="a">+    account.subscription_period_end = period_end</span>
+<span class="a">+    if meta.get(&quot;plan_id&quot;):</span>
+<span class="a">+        account.subscription_plan_id = meta[&quot;plan_id&quot;]</span>
+     if sub.get(&quot;customer&quot;) and not account.stripe_customer_id:
+         account.stripe_customer_id = sub[&quot;customer&quot;]
+     session.commit()
+<span class="h">@@ -219,7 +229,9 @@ def fulfil(session: Session, checkout: dict) -&gt; Account | None:</span>
+ 
+     if checkout.get(&quot;customer&quot;) and not account.stripe_customer_id:
+         account.stripe_customer_id = checkout[&quot;customer&quot;]
+<span class="d">-    if plan.credits:</span>
+<span class="a">+    # A pack adds credits that never expire. A monthly plan adds none here:</span>
+<span class="a">+    # its books come from the subscription, month by month.</span>
+<span class="a">+    if plan.credits and not plan.recurring:</span>
+         account.purchased_credits += plan.credits
+     session.commit()
+ 
+diff --git a/backend/pricing.py b/backend/pricing.py
+index e50fc68..329ff8a 100644
+--- a/backend/pricing.py
++++ b/backend/pricing.py
+<span class="h">@@ -30,8 +30,6 @@ and nothing else.</span>
+ 
+ A book costs about $0.64 to convert on a rented GPU. Above about $5 a technical
+ buyer wraps the ElevenLabs API; below $3 the fixed card fee takes too much.
+<span class="d">-There is no unlimited plan: use comes in bursts (a backlog, then nothing), and</span>
+<span class="d">-one heavy user of an unlimited plan costs more than the plan brings in.</span>
+ 
+   free              in the browser: no limit, each output
+   10-book pack      $4.99    ($0.50/book)
+<span class="h">@@ -45,9 +43,18 @@ financial advocate: one such sale can hold this one CPU server for about six</span>
+ weeks, so the pack says how fast the server works. The packs sold before that
+ (one book $4.99, five $16.99, twenty $39) are in RETIRED_PLANS.
+ 
+<span class="a">+  10 books a month  $4.99/month</span>
+<span class="a">+  30 books a month  $9.99/month</span>
+<span class="a">+  unlimited         $50.00/month</span>
+<span class="a">+</span>
+<span class="a">+The owner added these monthly plans on 2026-09-22. The books of a month do not</span>
+<span class="a">+carry over. The unlimited plan goes against the earlier advice: use comes in</span>
+<span class="a">+bursts, and one heavy user can hold this one-job-at-a-time server for all</span>
+<span class="a">+other customers.</span>
+<span class="a">+</span>
+ Every number is overridable by env var; these are defaults, not decisions cast
+<span class="d">-in code. An operator who wants a recurring plan can add one with</span>
+<span class="d">-SUBPLZ_WEB_PLANS_JSON (&quot;recurring&quot;: true, &quot;credits&quot;: null).</span>
+<span class="a">+in code (SUBPLZ_WEB_PLANS_JSON). Retire a plan that was sold: do not delete it.</span>
+<span class="a">+A late payment, or a running subscription, still finds it in RETIRED_PLANS.</span>
+ &quot;&quot;&quot;
+ from __future__ import annotations
+ 
+<span class="h">@@ -61,7 +68,8 @@ from dataclasses import asdict, dataclass</span>
+ class Plan:
+     id: str
+     name: str
+<span class="d">-    # None for the subscription, which is not a credit pack.</span>
+<span class="a">+    # Books in a pack, or books each month for a recurring plan. None for an</span>
+<span class="a">+    # unlimited recurring plan.</span>
+     credits: int | None
+     price_cents: int
+     currency: str = &quot;usd&quot;
+<span class="h">@@ -104,6 +112,30 @@ DEFAULT_PLANS: list[Plan] = [</span>
+               &quot;about 2 hours for a 10-hour book, so 500 long books take weeks. &quot;
+               &quot;Credits never expire.&quot;,
+     ),
+<span class="a">+    Plan(</span>
+<span class="a">+        id=&quot;month10&quot;,</span>
+<span class="a">+        name=&quot;10 books a month&quot;,</span>
+<span class="a">+        credits=10,</span>
+<span class="a">+        price_cents=499,</span>
+<span class="a">+        recurring=True,</span>
+<span class="a">+        blurb=&quot;Renews each month until you cancel. Unused books do not carry over.&quot;,</span>
+<span class="a">+    ),</span>
+<span class="a">+    Plan(</span>
+<span class="a">+        id=&quot;month30&quot;,</span>
+<span class="a">+        name=&quot;30 books a month&quot;,</span>
+<span class="a">+        credits=30,</span>
+<span class="a">+        price_cents=999,</span>
+<span class="a">+        recurring=True,</span>
+<span class="a">+        blurb=&quot;Renews each month until you cancel. Unused books do not carry over.&quot;,</span>
+<span class="a">+    ),</span>
+<span class="a">+    Plan(</span>
+<span class="a">+        id=&quot;unlimited&quot;,</span>
+<span class="a">+        name=&quot;Unlimited&quot;,</span>
+<span class="a">+        credits=None,</span>
+<span class="a">+        price_cents=5000,</span>
+<span class="a">+        recurring=True,</span>
+<span class="a">+        blurb=&quot;Every book on our server, one at a time. Renews each month until you cancel.&quot;,</span>
+<span class="a">+    ),</span>
+ ]
+ 
+ # Not for sale. A checkout that started before a plan was retired can still
+diff --git a/frontend/app.js b/frontend/app.js
+index cb9a0c5..5f6fdd7 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+<span class="h">@@ -136,13 +136,14 @@ function renderAccount() {</span>
+   // What is sold is conversion on this server&#x27;s hardware. Nothing is for sale
+   // until that is connected; in this tab each output is free.
+   const selling = a.billing_enabled &amp;&amp; a.cloud_available;
+<span class="d">-  el.buyBtn.hidden = !selling || a.subscribed;</span>
+<span class="a">+  // A monthly plan with a limit can still add a pack; an unlimited one needs none.</span>
+<span class="a">+  el.buyBtn.hidden = !selling || a.unlimited;</span>
+   el.portalBtn.hidden = !(selling &amp;&amp; a.subscribed);
+   el.quota.hidden = !selling;
+   if (selling) {
+     // Say &quot;free&quot; while each credit in hand is a free one.
+     const free = a.credits &gt; 0 &amp;&amp; a.free_credits === a.credits ? &#x27;free &#x27; : &#x27;&#x27;;
+<span class="d">-    el.quota.textContent = a.subscribed ? &#x27;Cloud plan&#x27;</span>
+<span class="a">+    el.quota.textContent = a.unlimited ? &#x27;Unlimited plan&#x27;</span>
+       : `${a.credits} ${free}cloud credit${a.credits === 1 ? &#x27;&#x27; : &#x27;s&#x27;}`;
+   }
+   renderMode();
+<span class="h">@@ -369,7 +370,7 @@ function inBrowser() { return !serverOffered() || el.inBrowser.checked; }</span>
+ function serverPrice() {
+   const a = account;
+   if (!a?.billing_enabled) return &#x27;&#x27;;
+<span class="d">-  if (a.subscribed) return &#x27; Included in your plan.&#x27;;</span>
+<span class="a">+  if (a.unlimited) return &#x27; Included in your plan.&#x27;;</span>
+   if (a.credits &gt; 0) {
+     const free = a.free_credits === a.credits ? &#x27; free&#x27; : &#x27;&#x27;;
+     return ` One credit a book; you have ${a.credits}${free}.`;
+<span class="h">@@ -548,7 +549,8 @@ function showResults(r) {</span>
+   // Not to a customer: someone who pays for credits has done their part.
+   // Free credits do not make a customer, so count the bought ones only.
+   const chipIn = document.getElementById(&#x27;chip-in&#x27;);
+<span class="d">-  const bought = (account?.credits ?? 0) - (account?.free_credits ?? 0);</span>
+<span class="a">+  const bought = (account?.credits ?? 0) - (account?.free_credits ?? 0)</span>
+<span class="a">+    - (account?.plan_credits ?? 0);</span>
+   if (chipIn) chipIn.hidden = Boolean(bought &gt; 0 || account?.subscribed);
+   el.stop.hidden = true;
+   el.stop.disabled = false;
+diff --git a/frontend/index.html b/frontend/index.html
+index 88f7d20..adf8ee0 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+<span class="h">@@ -239,9 +239,10 @@</span>
+   &lt;div id=&quot;plans&quot; class=&quot;plans&quot;&gt;&lt;/div&gt;
+   &lt;p class=&quot;muted small&quot; id=&quot;pricing-foot&quot;&gt;
+     Paid through Stripe; we never see your card. One credit converts one book
+<span class="d">-    on our server, with every output. Credits never expire, and a job that</span>
+<span class="d">-    fails gives its credit back. In this tab a conversion is always free. Paying also creates your account,</span>
+<span class="d">-    under the email you give Stripe.</span>
+<span class="a">+    on our server, with every output. Credits in a pack never expire, and a job that</span>
+<span class="a">+    fails gives its credit back. A monthly plan renews each month until you cancel it</span>
+<span class="a">+    with &quot;Manage plan&quot;; its books do not carry over to the next month. In this tab a</span>
+<span class="a">+    conversion is always free. Paying also creates your account, under the email you give Stripe.</span>
+   &lt;/p&gt;
+ &lt;/dialog&gt;
+ 
+diff --git a/frontend/terms.html b/frontend/terms.html
+index f1cfc35..2b0353c 100644
+--- a/frontend/terms.html
++++ b/frontend/terms.html
+<span class="h">@@ -41,7 +41,11 @@</span>
+   &lt;h2&gt;Payments and refunds&lt;/h2&gt;
+   &lt;ul&gt;
+     &lt;li&gt;Payments are taken by Stripe. We never see your card.&lt;/li&gt;
+<span class="d">-    &lt;li&gt;Credits do not expire.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;Credits in a pack do not expire.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;A monthly plan renews each month until you cancel it. Cancel at any time with &quot;Manage plan&quot;</span>
+<span class="a">+      on the page: the plan then runs to the end of the month that you paid for.&lt;/li&gt;</span>
+<span class="a">+    &lt;li&gt;The books of a monthly plan are for that month. They do not carry over to the next month.</span>
+<span class="a">+      Every plan, the unlimited one too, converts one book at a time.&lt;/li&gt;</span>
+     &lt;li&gt;Free credits have no cash value. We do not refund them.&lt;/li&gt;
+     &lt;li&gt;An account gets its free credits after you open a sign-in link that we email to you. The
+       daily free credit does not carry over to the next day.&lt;/li&gt;
+diff --git a/tests/test_billing.py b/tests/test_billing.py
+index 051690d..51b0fa1 100644
+--- a/tests/test_billing.py
++++ b/tests/test_billing.py
+<span class="h">@@ -165,11 +165,13 @@ def test_checkout_sends_stripe_the_right_order(client, monkeypatch):</span>
+     assert seen[&quot;customer_creation&quot;] == &quot;always&quot;
+ 
+ 
+<span class="d">-def test_ten_books_cost_4_99_and_no_unlimited_plan_is_sold(client):</span>
+<span class="a">+def test_the_packs_and_the_monthly_plans_for_sale(client):</span>
+     plans = client.get(&quot;/api/pricing&quot;).json()[&quot;plans&quot;]
+<span class="d">-    assert [(p[&quot;id&quot;], p[&quot;credits&quot;], p[&quot;price_cents&quot;]) for p in plans] == [</span>
+<span class="a">+    row = lambda p: (p[&quot;id&quot;], p[&quot;credits&quot;], p[&quot;price_cents&quot;])  # noqa: E731</span>
+<span class="a">+    assert [row(p) for p in plans if not p[&quot;recurring&quot;]] == [</span>
+         (&quot;pack10&quot;, 10, 499), (&quot;pack100&quot;, 100, 3999), (&quot;pack500&quot;, 500, 17499)]
+<span class="d">-    assert not any(p[&quot;recurring&quot;] for p in plans)</span>
+<span class="a">+    assert [row(p) for p in plans if p[&quot;recurring&quot;]] == [</span>
+<span class="a">+        (&quot;month10&quot;, 10, 499), (&quot;month30&quot;, 30, 999), (&quot;unlimited&quot;, None, 5000)]</span>
+ 
+ 
+ def test_bigger_packs_cost_less_a_book(client):
+<span class="h">@@ -258,20 +260,21 @@ def test_return_trip_does_not_trust_an_unpaid_session(client, monkeypatch):</span>
+ 
+ # --- subscription ------------------------------------------------------------
+ 
+<span class="d">-def subscription_event(kind, account, status, ends_in=30 * 86400, sub_id=&quot;sub_1&quot;):</span>
+<span class="a">+def subscription_event(kind, account, status, ends_in=30 * 86400, sub_id=&quot;sub_1&quot;,</span>
+<span class="a">+                       plan_id=&quot;monthly&quot;):</span>
+     return {
+         &quot;id&quot;: f&quot;evt_{kind}_{time.time_ns()}&quot;,
+         &quot;type&quot;: f&quot;customer.subscription.{kind}&quot;,
+         &quot;data&quot;: {&quot;object&quot;: {
+             &quot;id&quot;: sub_id, &quot;object&quot;: &quot;subscription&quot;, &quot;status&quot;: status,
+<span class="d">-            &quot;customer&quot;: &quot;cus_sub&quot;, &quot;metadata&quot;: {&quot;account_id&quot;: account},</span>
+<span class="a">+            &quot;customer&quot;: &quot;cus_sub&quot;, &quot;metadata&quot;: {&quot;account_id&quot;: account, &quot;plan_id&quot;: plan_id},</span>
+             # Where newer API versions put it; _period_end reads both places.
+             &quot;items&quot;: {&quot;data&quot;: [{&quot;current_period_end&quot;: int(time.time()) + ends_in}]},
+         }},
+     }
+ 
+ 
+<span class="d">-def test_subscription_lifts_every_limit_then_lapses(client):</span>
+<span class="a">+def test_subscription_lifts_every_limit_then_lapses(client, monthly_plan):</span>
+     acct = account_id(client)
+     assert post_webhook(client, subscription_event(&quot;created&quot;, acct, &quot;active&quot;)).status_code == 200
+ 
+diff --git a/tests/test_migration.py b/tests/test_migration.py
+index 43b3a08..354dc59 100644
+--- a/tests/test_migration.py
++++ b/tests/test_migration.py
+<span class="h">@@ -74,10 +74,12 @@ def test_old_database_is_upgraded_in_place(tmp_path):</span>
+ 
+     con = sqlite3.connect(db)
+     cols = lambda t: {r[1] for r in con.execute(f&quot;PRAGMA table_info({t})&quot;)}  # noqa: E731
+<span class="d">-    assert {&quot;tier&quot;, &quot;credit_spent&quot;, &quot;free_credit_spent&quot;, &quot;daily_credit_on&quot;} &lt;= cols(&quot;jobs&quot;)</span>
+<span class="a">+    assert {&quot;tier&quot;, &quot;credit_spent&quot;, &quot;free_credit_spent&quot;, &quot;daily_credit_on&quot;,</span>
+<span class="a">+            &quot;plan_credit_spent&quot;} &lt;= cols(&quot;jobs&quot;)</span>
+     assert {&quot;merged_into&quot;, &quot;subscription_id&quot;, &quot;subscription_status&quot;,
+             &quot;subscription_period_end&quot;, &quot;free_credits_used&quot;, &quot;email_verified&quot;,
+<span class="d">-            &quot;daily_credit_on&quot;} &lt;= cols(&quot;accounts&quot;)</span>
+<span class="a">+            &quot;daily_credit_on&quot;, &quot;subscription_plan_id&quot;,</span>
+<span class="a">+            &quot;subscription_credits_used&quot;} &lt;= cols(&quot;accounts&quot;)</span>
+     tables = {r[0] for r in con.execute(&quot;SELECT name FROM sqlite_master WHERE type=&#x27;table&#x27;&quot;)}
+     assert {&quot;login_tokens&quot;, &quot;purchases&quot;} &lt;= tables
+     # The unique email index has to exist, or two accounts could share one.
+diff --git a/tests/test_subscriptions.py b/tests/test_subscriptions.py
+new file mode 100644
+index 0000000..586e9ba
+--- /dev/null
++++ b/tests/test_subscriptions.py
+<span class="h">@@ -0,0 +1,161 @@</span>
+<span class="a">+&quot;&quot;&quot;Subscriptions: a plan renews each month until the customer cancels it.</span>
+<span class="a">+</span>
+<span class="a">+  capped     a number of books a month. The books of one month do not carry</span>
+<span class="a">+             over to the next. A server job spends the daily free credit</span>
+<span class="a">+             first (it ends sooner), then the books of the plan, then free</span>
+<span class="a">+             and bought credits.</span>
+<span class="a">+  unlimited  no credit is spent while the plan is active.</span>
+<span class="a">+</span>
+<span class="a">+Stripe tells the server about a plan with customer.subscription.* events. A</span>
+<span class="a">+new month (a new current_period_end) starts the count again.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import json</span>
+<span class="a">+import time</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+import stripe</span>
+<span class="a">+</span>
+<span class="a">+from backend import runner</span>
+<span class="a">+</span>
+<span class="a">+from .conftest import (</span>
+<span class="a">+    FakeStripeObject, account_id, checkout_event, get_account_row, get_job_row,</span>
+<span class="a">+    make_job, post_webhook,</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+# Its own catalogue, so that these tests do not depend on the plans for sale.</span>
+<span class="a">+TEST_PLANS = [</span>
+<span class="a">+    {&quot;id&quot;: &quot;pack10&quot;, &quot;name&quot;: &quot;10 books&quot;, &quot;credits&quot;: 10, &quot;price_cents&quot;: 499},</span>
+<span class="a">+    {&quot;id&quot;: &quot;month10&quot;, &quot;name&quot;: &quot;10 books a month&quot;, &quot;credits&quot;: 10, &quot;price_cents&quot;: 499,</span>
+<span class="a">+     &quot;recurring&quot;: True},</span>
+<span class="a">+    {&quot;id&quot;: &quot;forever&quot;, &quot;name&quot;: &quot;Unlimited&quot;, &quot;credits&quot;: None, &quot;price_cents&quot;: 5000,</span>
+<span class="a">+     &quot;recurring&quot;: True},</span>
+<span class="a">+]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture(autouse=True)</span>
+<span class="a">+def catalogue(monkeypatch):</span>
+<span class="a">+    monkeypatch.setenv(&quot;SUBPLZ_WEB_PLANS_JSON&quot;, json.dumps(TEST_PLANS))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def subscription_event(kind, account, plan_id, status=&quot;active&quot;, period_end=None):</span>
+<span class="a">+    end = period_end or int(time.time()) + 30 * 86400</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;id&quot;: f&quot;evt_{kind}_{time.time_ns()}&quot;,</span>
+<span class="a">+        &quot;type&quot;: f&quot;customer.subscription.{kind}&quot;,</span>
+<span class="a">+        &quot;data&quot;: {&quot;object&quot;: {</span>
+<span class="a">+            &quot;id&quot;: f&quot;sub_{account}&quot;, &quot;object&quot;: &quot;subscription&quot;, &quot;status&quot;: status,</span>
+<span class="a">+            &quot;customer&quot;: f&quot;cus_{account}&quot;,</span>
+<span class="a">+            &quot;metadata&quot;: {&quot;account_id&quot;: account, &quot;plan_id&quot;: plan_id},</span>
+<span class="a">+            &quot;items&quot;: {&quot;data&quot;: [{&quot;current_period_end&quot;: end}]},</span>
+<span class="a">+        }},</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def subscribe(client, plan_id, **kw) -&gt; str:</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    event = subscription_event(&quot;created&quot;, acct, plan_id, **kw)</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+<span class="a">+    return acct</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def start(client, job_id: str):</span>
+<span class="a">+    return client.post(f&quot;/api/jobs/{job_id}/start&quot;, json={&quot;language&quot;: &quot;en&quot;})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def account(client) -&gt; dict:</span>
+<span class="a">+    return client.get(&quot;/api/account&quot;).json()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_capped_plan_checks_out_as_a_monthly_subscription(client, monkeypatch):</span>
+<span class="a">+    seen = {}</span>
+<span class="a">+    monkeypatch.setattr(</span>
+<span class="a">+        stripe.checkout.Session, &quot;create&quot;,</span>
+<span class="a">+        lambda **p: seen.update(p) or FakeStripeObject({&quot;url&quot;: &quot;https://stripe.test/sub&quot;}),</span>
+<span class="a">+    )</span>
+<span class="a">+    assert client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;month10&quot;}).status_code == 200</span>
+<span class="a">+    assert seen[&quot;mode&quot;] == &quot;subscription&quot;</span>
+<span class="a">+    item = seen[&quot;line_items&quot;][0][&quot;price_data&quot;]</span>
+<span class="a">+    assert item[&quot;recurring&quot;] == {&quot;interval&quot;: &quot;month&quot;} and item[&quot;unit_amount&quot;] == 499</span>
+<span class="a">+    assert seen[&quot;subscription_data&quot;][&quot;metadata&quot;][&quot;plan_id&quot;] == &quot;month10&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_paying_for_a_plan_gives_the_books_of_the_month_not_a_pack(client, monkeypatch):</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    sub = subscription_event(&quot;created&quot;, acct, &quot;month10&quot;)[&quot;data&quot;][&quot;object&quot;]</span>
+<span class="a">+    monkeypatch.setattr(stripe.Subscription, &quot;retrieve&quot;, lambda sid: FakeStripeObject(sub))</span>
+<span class="a">+    event = checkout_event(f&quot;cs_{time.time_ns()}&quot;, acct, &quot;month10&quot;,</span>
+<span class="a">+                           email=f&quot;plan-{time.time_ns()}@example.com&quot;, subscription=sub[&quot;id&quot;])</span>
+<span class="a">+    assert post_webhook(client, event).status_code == 200</span>
+<span class="a">+</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;subscribed&quot;] is True and a[&quot;unlimited&quot;] is False</span>
+<span class="a">+    assert a[&quot;plan_credits&quot;] == 10 and a[&quot;credits&quot;] == 10</span>
+<span class="a">+    assert get_account_row(acct).purchased_credits == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_capped_plan_is_spent_and_a_failed_job_gives_it_back(client):</span>
+<span class="a">+    subscribe(client, &quot;month10&quot;)</span>
+<span class="a">+    job_id = make_job(client)</span>
+<span class="a">+    assert start(client, job_id).status_code == 200</span>
+<span class="a">+    job = get_job_row(job_id)</span>
+<span class="a">+    assert job.plan_credit_spent == 1 and job.credit_spent == 0</span>
+<span class="a">+    assert account(client)[&quot;plan_credits&quot;] == 9</span>
+<span class="a">+</span>
+<span class="a">+    runner.run_job(job_id)  # fails: nothing was staged</span>
+<span class="a">+    assert account(client)[&quot;plan_credits&quot;] == 10</span>
+<span class="a">+    assert get_job_row(job_id).plan_credit_spent == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_books_of_a_month_do_not_carry_over(client):</span>
+<span class="a">+    acct = account_id(client)</span>
+<span class="a">+    end = int(time.time()) + 30 * 86400</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;created&quot;, acct, &quot;month10&quot;, period_end=end))</span>
+<span class="a">+    for _ in range(10):</span>
+<span class="a">+        assert start(client, make_job(client)).status_code == 200</span>
+<span class="a">+    assert start(client, make_job(client)).status_code == 402</span>
+<span class="a">+</span>
+<span class="a">+    # The same month, told again: nothing changes.</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;, period_end=end))</span>
+<span class="a">+    assert account(client)[&quot;plan_credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+    # A new month starts the count again.</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;updated&quot;, acct, &quot;month10&quot;,</span>
+<span class="a">+                                            period_end=end + 30 * 86400))</span>
+<span class="a">+    assert account(client)[&quot;plan_credits&quot;] == 10</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_unlimited_plan_spends_nothing(client):</span>
+<span class="a">+    subscribe(client, &quot;forever&quot;)</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;unlimited&quot;] is True and a[&quot;cloud_allowed&quot;] is True</span>
+<span class="a">+    for _ in range(3):</span>
+<span class="a">+        job_id = make_job(client)</span>
+<span class="a">+        assert start(client, job_id).status_code == 200</span>
+<span class="a">+        job = get_job_row(job_id)</span>
+<span class="a">+        assert job.plan_credit_spent == 0 and job.credit_spent == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_cancelled_plan_gives_nothing(client):</span>
+<span class="a">+    acct = subscribe(client, &quot;month10&quot;)</span>
+<span class="a">+    post_webhook(client, subscription_event(&quot;deleted&quot;, acct, &quot;month10&quot;, status=&quot;canceled&quot;))</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;subscribed&quot;] is False and a[&quot;plan_credits&quot;] == 0</span>
+<span class="a">+    assert start(client, make_job(client)).status_code == 402</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_plan_that_is_not_in_the_catalogue_gives_nothing(client):</span>
+<span class="a">+    # Retire a sold plan (pricing.RETIRED_PLANS); do not delete it.</span>
+<span class="a">+    subscribe(client, &quot;gone&quot;)</span>
+<span class="a">+    a = account(client)</span>
+<span class="a">+    assert a[&quot;unlimited&quot;] is False and a[&quot;plan_credits&quot;] == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_second_plan_is_refused(client, monkeypatch):</span>
+<span class="a">+    subscribe(client, &quot;month10&quot;)</span>
+<span class="a">+    monkeypatch.setattr(stripe.checkout.Session, &quot;create&quot;,</span>
+<span class="a">+                        lambda **p: FakeStripeObject({&quot;url&quot;: &quot;x&quot;}))</span>
+<span class="a">+    r = client.post(&quot;/api/billing/checkout&quot;, json={&quot;plan_id&quot;: &quot;forever&quot;})</span>
+<span class="a">+    assert r.status_code == 400 and &quot;Manage plan&quot; in r.json()[&quot;detail&quot;]</span></pre>
+</div></body></html>

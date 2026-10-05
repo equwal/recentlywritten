@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-anki d91de61d - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-anki</h1><span class="desc">One tap makes an Anki card on Android: word, definition, sentence, screenshot, audio. Works with any app, with SubRead Dictionary and SubRead Overlay.</span><p class="url">git clone https://github.com/equwal/subread-anki</p><p><a href="../../subread-anki/index.html">Log</a> | <a href="../../subread-anki/files.html">Files</a> | <a href="../../subread-anki/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit d91de61d45447b0cd65ca1805db0def0213a0b5e
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-09-26 13:19:31 -0700
+
+Fix the faults that a review of the pop-up found
+
+- A sender that gives the dictionary form (食べる) with a sentence that
+  holds another form (食べた) got no bold and the whole text as the
+  sentence. Scans.locate now finds the form of the text with the
+  dictionary, and the card keeps the word of the sender.
+- The sound of a word played after the pop-up closed, and prepare()
+  blocked the UI thread. The player now prepares on its own thread and
+  starts only while the pop-up is open.
+- A long selection lost its lines after the fifth. The text now scrolls
+  in a box of at most three tenths of the pop-up.
+- A pop-up closed with no card now answers RESULT_CANCELED with
+  &quot;cancelled&quot;, as the README says. A picture added to the last card
+  answers RESULT_OK.
+- &quot;+ Anki&quot; before AnkiDroid allowed the app now asks for the permission
+  again, in place of an error from AnkiDroid.
+- A clip cut from the audio of a sender is left out when it is silence,
+  the same as a clip of the capture.
+- Sentences.around, unescape and stripTags had no user left. They are
+  gone; the tests keep their cases with local helpers.
+
+</pre><pre> .../main/kotlin/space/subread/anki/AddActivity.kt  | 76 +++++++++++++++++-----
+ app/src/main/kotlin/space/subread/anki/AudioCut.kt |  4 +-
+ app/src/main/kotlin/space/subread/anki/Miner.kt    |  5 +-
+ .../main/kotlin/space/subread/anki/core/Scans.kt   | 18 +++++
+ .../kotlin/space/subread/anki/core/Sentences.kt    | 21 ------
+ .../kotlin/space/subread/anki/core/CoreTest.kt     | 54 ++++++++++++---
+ 6 files changed, 129 insertions(+), 49 deletions(-)
+</pre><pre>diff --git a/app/src/main/kotlin/space/subread/anki/AddActivity.kt b/app/src/main/kotlin/space/subread/anki/AddActivity.kt
+index 6455f14..ab9bac4 100644
+--- a/app/src/main/kotlin/space/subread/anki/AddActivity.kt
++++ b/app/src/main/kotlin/space/subread/anki/AddActivity.kt
+<span class="h">@@ -116,6 +116,8 @@ class AddActivity : Activity() {</span>
+             return
+         }
+         draw()
+<span class="a">+        // A pop-up that closes with no card answers &quot;cancelled&quot;; each card replaces this answer.</span>
+<span class="a">+        setResult(RESULT_CANCELED, Intent().putExtra(Requests.EXTRA_ERROR, &quot;cancelled&quot;))</span>
+         show(scan)
+         work.execute {
+             val grabbed = runCatching { grab?.get() }.getOrNull()
+<span class="h">@@ -152,15 +154,21 @@ class AddActivity : Activity() {</span>
+         work.execute {
+             val result = runCatching {
+                 val word = scan.word
+<span class="a">+                // Where the word is in the text, also in another form: for the bold and the sentence.</span>
+<span class="a">+                val found = if (scan.offset &gt;= 0 || word == null) null else locate(scan.text, word)</span>
+<span class="a">+                val at = if (scan.offset &gt;= 0) scan.offset else found?.first ?: -1</span>
+                 val card = if (request.definition != null) {
+<span class="d">-                    if (word != null &amp;&amp; scan.offset &gt;= 0) Miner.card(request, scan.text, scan.offset, word.length, null)</span>
+<span class="d">-                    else Miner.card(request, scan.text, -1, 0, null)</span>
+<span class="d">-                } else if (scan.offset &gt;= 0) {</span>
+<span class="d">-                    val entry = DictionaryClient.lookup(this, scan.text, scan.offset).firstOrNull()</span>
+<span class="a">+                    when {</span>
+<span class="a">+                        found != null -&gt; Miner.card(request, scan.text, found.first, found.count(), null)</span>
+<span class="a">+                        word != null &amp;&amp; at &gt;= 0 -&gt; Miner.card(request, scan.text, at, word.length, null)</span>
+<span class="a">+                        else -&gt; Miner.card(request, scan.text, -1, 0, null)</span>
+<span class="a">+                    }</span>
+<span class="a">+                } else if (at &gt;= 0) {</span>
+<span class="a">+                    val entry = DictionaryClient.lookup(this, scan.text, at).firstOrNull()</span>
+                     if (entry != null) {
+<span class="d">-                        Miner.card(request, scan.text, scan.offset, entry.length, entry)</span>
+<span class="a">+                        Miner.card(request, scan.text, at, entry.length, entry)</span>
+                     } else {
+<span class="d">-                        val range = Miner.wordAt(scan.text, scan.offset, selected = isSelection(scan.text, scan.offset))</span>
+<span class="a">+                        val range = Miner.wordAt(scan.text, at, selected = isSelection(scan.text, at))</span>
+                         Miner.card(request, scan.text, range.first, range.count(), null)
+                     }
+                 } else {
+<span class="h">@@ -189,7 +197,8 @@ class AddActivity : Activity() {</span>
+             }
+             Miner.Result.Attached -&gt; {
+                 toast(getString(R.string.picture_attached))
+<span class="d">-                finishWith(null)</span>
+<span class="a">+                setResult(RESULT_OK, Intent().putExtra(Requests.EXTRA_NOTE_ID, store.lastNoteId))</span>
+<span class="a">+                finish()</span>
+             }
+             is Miner.Result.Failed -&gt; {
+                 toast(getString(R.string.failed, result.why))
+<span class="h">@@ -221,7 +230,6 @@ class AddActivity : Activity() {</span>
+         textView = TextView(this).apply {
+             textSize = TEXT_SP + 3
+             setTextColor(Color.BLACK)
+<span class="d">-            maxLines = 5</span>
+             setPadding(dp(16), dp(4), dp(16), dp(4))
+             setOnTouchListener { view, event -&gt;
+                 if (event.action == MotionEvent.ACTION_UP) {
+<span class="h">@@ -247,12 +255,19 @@ class AddActivity : Activity() {</span>
+             addView(smallButton(getString(R.string.settings)) { startActivity(Intent(this@AddActivity, MainActivity::class.java)) })
+             addView(smallButton(getString(R.string.close)) { finish() })
+         }
+<span class="a">+        // A long selection scrolls in its own box, at most three tenths of the pop-up, so that</span>
+<span class="a">+        // each character stays in reach and the terms keep their room.</span>
+<span class="a">+        val textCap = height * 3 / 10</span>
+<span class="a">+        val textBox = object : ScrollView(this) {</span>
+<span class="a">+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) =</span>
+<span class="a">+                super.onMeasure(widthMeasureSpec, MeasureSpec.makeMeasureSpec(textCap, MeasureSpec.AT_MOST))</span>
+<span class="a">+        }.apply { addView(textView) }</span>
+         setContentView(
+             LinearLayout(this).apply {
+                 orientation = LinearLayout.VERTICAL
+                 setBackgroundColor(Color.WHITE)
+                 addView(bar, LinearLayout.LayoutParams(-1, -2))
+<span class="d">-                addView(textView, LinearLayout.LayoutParams(-1, -2))</span>
+<span class="a">+                addView(textBox, LinearLayout.LayoutParams(-1, -2))</span>
+                 addView(status, LinearLayout.LayoutParams(-1, -2))
+                 addView(View(this@AddActivity).apply { setBackgroundColor(Color.LTGRAY) }, LinearLayout.LayoutParams(-1, dp(1)))
+                 addView(ScrollView(this@AddActivity).apply { addView(results) }, LinearLayout.LayoutParams(-1, 0, 1f))
+<span class="h">@@ -264,9 +279,26 @@ class AddActivity : Activity() {</span>
+     private fun show(scan: Scan) {
+         text = scan.text
+         textView.text = text
+<span class="d">-        if (scan.offset &gt;= 0) scanAt(scan.offset) else lookUpWord(scan.word.orEmpty())</span>
+<span class="a">+        if (scan.offset &gt;= 0) {</span>
+<span class="a">+            scanAt(scan.offset)</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        // The word of the sender is not in the text as it is: the dictionary finds its form there.</span>
+<span class="a">+        val word = scan.word.orEmpty()</span>
+<span class="a">+        val run = ++generation</span>
+<span class="a">+        thread {</span>
+<span class="a">+            val range = locate(text, word)</span>
+<span class="a">+            runOnUiThread {</span>
+<span class="a">+                if (run != generation || isFinishing) return@runOnUiThread</span>
+<span class="a">+                if (range != null) scanAt(range.first) else lookUpWord(word)</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+     }
+ 
+<span class="a">+    /** Where [word] is in [text], also in another form, found with the dictionary. Not on the UI thread. */</span>
+<span class="a">+    private fun locate(text: String, word: String): IntRange? =</span>
+<span class="a">+        Scans.locate(text, word) { at -&gt; DictionaryClient.lookup(this, text, at).map { it.expression to it.length } }</span>
+<span class="a">+</span>
+     /** Looks up the terms that start at [at] in the text. */
+     private fun scanAt(at: Int) {
+         val run = ++generation
+<span class="h">@@ -277,7 +309,7 @@ class AddActivity : Activity() {</span>
+         }
+     }
+ 
+<span class="d">-    /** The word of the sender is not in the text: its terms, with nothing marked. */</span>
+<span class="a">+    /** The word of the sender is not in the text in any form: its terms, with nothing marked. */</span>
+     private fun lookUpWord(word: String) {
+         val run = ++generation
+         thread {
+<span class="h">@@ -345,6 +377,12 @@ class AddActivity : Activity() {</span>
+     /** One tap: the card goes to AnkiDroid. The button says when it is there. */
+     private fun addCard(button: Button, entry: DictionaryClient.Entry?, start: Int, length: Int) {
+         val grabbed = grab ?: return
+<span class="a">+        // AnkiDroid has not allowed the app yet: ask again, and keep the button for the next tap.</span>
+<span class="a">+        if (!AnkiClient.hasPermission(this)) {</span>
+<span class="a">+            toast(getString(R.string.anki_no_permission))</span>
+<span class="a">+            requestPermissions(arrayOf(AnkiClient.PERMISSION), PERMISSION)</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+         button.isEnabled = false
+         button.text = &quot;…&quot;
+         val card = Miner.card(request, text, start, length, entry)
+<span class="h">@@ -417,23 +455,27 @@ class AddActivity : Activity() {</span>
+         return parts.joinToString(&quot;   &quot;)
+     }
+ 
+<span class="d">-    /** Plays the audio of the word from the dictionary. */</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Plays the audio of the word from the dictionary. The file is written off the UI thread,</span>
+<span class="a">+     * and the player prepares on its own thread. A pop-up that closed in the meantime plays</span>
+<span class="a">+     * nothing: its onDestroy has already run, and no later player would be released.</span>
+<span class="a">+     */</span>
+     private fun play(entry: DictionaryClient.Entry) {
+         val ask = entry.audio ?: return
+         thread {
+<span class="d">-            val bytes = DictionaryClient.audio(this, ask)</span>
+<span class="a">+            val file = DictionaryClient.audio(this, ask)?.let { bytes -&gt; File(cacheDir, &quot;play.tmp&quot;).apply { writeBytes(bytes) } }</span>
+             runOnUiThread {
+<span class="d">-                if (bytes == null) {</span>
+<span class="a">+                if (isFinishing || isDestroyed) return@runOnUiThread</span>
+<span class="a">+                if (file == null) {</span>
+                     toast(getString(R.string.no_audio))
+                     return@runOnUiThread
+                 }
+                 player?.release()
+<span class="d">-                val file = File(cacheDir, &quot;play.tmp&quot;).apply { writeBytes(bytes) }</span>
+                 player = runCatching {
+                     MediaPlayer().apply {
+                         FileInputStream(file).use { setDataSource(it.fd) }
+<span class="d">-                        prepare()</span>
+<span class="d">-                        start()</span>
+<span class="a">+                        setOnPreparedListener { it.start() }</span>
+<span class="a">+                        prepareAsync()</span>
+                     }
+                 }.getOrNull()
+             }
+diff --git a/app/src/main/kotlin/space/subread/anki/AudioCut.kt b/app/src/main/kotlin/space/subread/anki/AudioCut.kt
+index 13f4c0d..4f85192 100644
+--- a/app/src/main/kotlin/space/subread/anki/AudioCut.kt
++++ b/app/src/main/kotlin/space/subread/anki/AudioCut.kt
+<span class="h">@@ -6,6 +6,7 @@ import android.media.MediaCodec</span>
+ import android.media.MediaExtractor
+ import android.media.MediaFormat
+ import androidx.core.net.toUri
+<span class="a">+import space.subread.anki.core.Loudness</span>
+ import java.io.File
+ import java.nio.ByteOrder
+ 
+<span class="h">@@ -45,7 +46,8 @@ object AudioCut {</span>
+             val decoded = decode(extractor, format, startMs * 1000, endMs * 1000) ?: return null
+             val (pcm, sampleRate, channels) = decoded
+             // Less than a tenth of a second is no sentence: the range was outside the file.
+<span class="d">-            if (pcm.size &lt; sampleRate / 10 * channels) return null</span>
+<span class="a">+            // Silence is no sentence either: the times of the sender missed the speech.</span>
+<span class="a">+            if (pcm.size &lt; sampleRate / 10 * channels || Loudness.isSilent(pcm)) return null</span>
+             AacEncoder.encode(pcm, sampleRate, channels, out)
+             return out
+         } catch (e: Exception) {
+diff --git a/app/src/main/kotlin/space/subread/anki/Miner.kt b/app/src/main/kotlin/space/subread/anki/Miner.kt
+index 7f12cc9..f9b056c 100644
+--- a/app/src/main/kotlin/space/subread/anki/Miner.kt
++++ b/app/src/main/kotlin/space/subread/anki/Miner.kt
+<span class="h">@@ -186,8 +186,11 @@ class Miner(private val context: Context) {</span>
+         fun card(request: MineRequest, text: String, start: Int, length: Int, entry: DictionaryClient.Entry?): Card {
+             val inText = start &gt;= 0 &amp;&amp; length &gt; 0 &amp;&amp; start + length &lt;= text.length
+             val selection = if (inText) text.substring(start, start + length) else &quot;&quot;
+<span class="a">+            // A sender with its own definition names the word of the card. The text can hold</span>
+<span class="a">+            // that word in another form: 食べる of the sender is 食べた in the text.</span>
+<span class="a">+            val given = request.expression?.trim()?.takeIf { it.isNotEmpty() &amp;&amp; request.definition != null }</span>
+             return Card(
+<span class="d">-                expression = entry?.expression ?: selection.ifEmpty { request.expression?.trim().orEmpty() },</span>
+<span class="a">+                expression = entry?.expression ?: given ?: selection.ifEmpty { request.expression?.trim().orEmpty() },</span>
+                 reading = request.reading ?: entry?.reading.orEmpty(),
+                 definition = request.definition ?: entry?.glossary.orEmpty(),
+                 sentence = if (inText) Scans.sentence(text, start, length) else request.sentence?.trim().orEmpty(),
+diff --git a/core/src/main/kotlin/space/subread/anki/core/Scans.kt b/core/src/main/kotlin/space/subread/anki/core/Scans.kt
+index d4399b8..c2d3e76 100644
+--- a/core/src/main/kotlin/space/subread/anki/core/Scans.kt
++++ b/core/src/main/kotlin/space/subread/anki/core/Scans.kt
+<span class="h">@@ -38,6 +38,24 @@ object Scans {</span>
+         return Scan(word, 0, word, false)
+     }
+ 
+<span class="a">+    /**</span>
+<span class="a">+     * Where [expression] is in [text], also in another form. A sender gives the dictionary form</span>
+<span class="a">+     * (`食べる`) and a sentence with the form of the text (`食べた`). [termsAt] gives the terms that</span>
+<span class="a">+     * start at a position of the text, with the characters that each covers: the dictionary finds</span>
+<span class="a">+     * `食べる` at `食べた`. Null when the text holds the expression in no form.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun locate(text: String, expression: String, termsAt: (Int) -&gt; List&lt;Pair&lt;String, Int&gt;&gt;): IntRange? {</span>
+<span class="a">+        if (expression.isEmpty()) return null</span>
+<span class="a">+        val direct = text.indexOf(expression)</span>
+<span class="a">+        if (direct &gt;= 0) return direct until direct + expression.length</span>
+<span class="a">+        for (at in text.indices) {</span>
+<span class="a">+            if (text[at].isWhitespace()) continue</span>
+<span class="a">+            val length = termsAt(at).firstOrNull { it.first == expression }?.second ?: continue</span>
+<span class="a">+            if (length &gt; 0) return at until minOf(text.length, at + length)</span>
+<span class="a">+        }</span>
+<span class="a">+        return null</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     /**
+      * The sentence of the card for a word that starts at [start] and is [length] characters
+      * long: the sentence of [text] around it. Empty when the text is the word alone: a word is
+diff --git a/core/src/main/kotlin/space/subread/anki/core/Sentences.kt b/core/src/main/kotlin/space/subread/anki/core/Sentences.kt
+index f5eb858..b95f083 100644
+--- a/core/src/main/kotlin/space/subread/anki/core/Sentences.kt
++++ b/core/src/main/kotlin/space/subread/anki/core/Sentences.kt
+<span class="h">@@ -42,17 +42,6 @@ object Sentences {</span>
+         return start until end
+     }
+ 
+<span class="d">-    /**</span>
+<span class="d">-     * The sentence of [text] that holds [word], trimmed, or null when the word is not in the</span>
+<span class="d">-     * text. The first occurrence of the word counts.</span>
+<span class="d">-     */</span>
+<span class="d">-    fun around(text: String, word: String): String? {</span>
+<span class="d">-        if (word.isEmpty()) return null</span>
+<span class="d">-        val at = text.indexOf(word)</span>
+<span class="d">-        if (at &lt; 0) return null</span>
+<span class="d">-        return text.substring(rangeAround(text, at)).trim()</span>
+<span class="d">-    }</span>
+<span class="d">-</span>
+     /**
+      * The sentence as HTML, with the first occurrence of [word] in `&lt;b&gt;`. When the word is
+      * not in the sentence, the sentence is only escaped.
+<span class="h">@@ -77,14 +66,4 @@ object Sentences {</span>
+             }
+         }
+     }
+<span class="d">-</span>
+<span class="d">-    /** The reverse of [escape]. */</span>
+<span class="d">-    fun unescape(html: String): String = html</span>
+<span class="d">-        .replace(&quot;&amp;lt;&quot;, &quot;&lt;&quot;)</span>
+<span class="d">-        .replace(&quot;&amp;gt;&quot;, &quot;&gt;&quot;)</span>
+<span class="d">-        .replace(&quot;&amp;quot;&quot;, &quot;\&quot;&quot;)</span>
+<span class="d">-        .replace(&quot;&amp;amp;&quot;, &quot;&amp;&quot;)</span>
+<span class="d">-</span>
+<span class="d">-    /** HTML with its tags removed. Entities stay as they are. */</span>
+<span class="d">-    fun stripTags(html: String): String = html.replace(Regex(&quot;&lt;[^&gt;]*&gt;&quot;), &quot;&quot;)</span>
+ }
+diff --git a/core/src/test/kotlin/space/subread/anki/core/CoreTest.kt b/core/src/test/kotlin/space/subread/anki/core/CoreTest.kt
+index d9f078d..0100e31 100644
+--- a/core/src/test/kotlin/space/subread/anki/core/CoreTest.kt
++++ b/core/src/test/kotlin/space/subread/anki/core/CoreTest.kt
+<span class="h">@@ -128,6 +128,16 @@ class MineRequestTest {</span>
+ /** Sentences around a word. */
+ class SentencesTest {
+ 
+<span class="a">+    /** The sentence of [text] that holds the first [word], or null when the word is not in the text. */</span>
+<span class="a">+    private fun around(text: String, word: String): String? {</span>
+<span class="a">+        val at = text.indexOf(word)</span>
+<span class="a">+        return if (word.isEmpty() || at &lt; 0) null else text.substring(Sentences.rangeAround(text, at)).trim()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** The text of HTML that [Sentences.emphasize] and [Sentences.escape] wrote. */</span>
+<span class="a">+    private fun plain(html: String): String = html.replace(Regex(&quot;&lt;[^&gt;]*&gt;&quot;), &quot;&quot;)</span>
+<span class="a">+        .replace(&quot;&amp;lt;&quot;, &quot;&lt;&quot;).replace(&quot;&amp;gt;&quot;, &quot;&gt;&quot;).replace(&quot;&amp;quot;&quot;, &quot;\&quot;&quot;).replace(&quot;&amp;amp;&quot;, &quot;&amp;&quot;)</span>
+<span class="a">+</span>
+     private val sentenceBody: Arb&lt;String&gt; = text(12, listOf(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;, &quot;d&quot;, &quot;猫&quot;, &quot;ね&quot;, &quot;こ&quot;, &quot; &quot;, &quot;「&quot;, &quot;」&quot;), least = 1)
+     private val terminator: Arb&lt;String&gt; = Arb.element(listOf(&quot;。&quot;, &quot;！&quot;, &quot;？&quot;, &quot;!&quot;, &quot;?&quot;, &quot;…&quot;, &quot;\n&quot;, &quot;。」&quot;, &quot;！？&quot;))
+ 
+<span class="h">@@ -143,7 +153,7 @@ class SentencesTest {</span>
+             val word = body.trim().takeIf { it.isNotEmpty() &amp;&amp; &#x27;」&#x27; !in it &amp;&amp; &#x27;「&#x27; !in it } ?: return@checkAll
+             // The first occurrence of the word counts: skip a word that is in an earlier sentence.
+             if (sentences.take(i).any { it.contains(word) }) return@checkAll
+<span class="d">-            val found = Sentences.around(text, word)</span>
+<span class="a">+            val found = around(text, word)</span>
+             assertEquals(sentences[i].trim(), found)
+         }
+     }
+<span class="h">@@ -151,7 +161,7 @@ class SentencesTest {</span>
+     @Test
+     fun theSentenceIsInTheTextAndHoldsTheWord() = property {
+         checkAll(anyText, text(3, listOf(&quot;a&quot;, &quot;b&quot;, &quot;猫&quot;, &quot;ね&quot;, &quot;。&quot;), least = 1)) { text, word -&gt;
+<span class="d">-            val found = Sentences.around(text, word)</span>
+<span class="a">+            val found = around(text, word)</span>
+             if (!text.contains(word)) {
+                 assertNull(found)
+             } else {
+<span class="h">@@ -164,19 +174,19 @@ class SentencesTest {</span>
+ 
+     @Test
+     fun closersStayWithTheirSentence() {
+<span class="d">-        assertEquals(&quot;「猫だ。」&quot;, Sentences.around(&quot;「猫だ。」犬だ。&quot;, &quot;猫&quot;))</span>
+<span class="d">-        assertEquals(&quot;犬だ。&quot;, Sentences.around(&quot;「猫だ。」犬だ。&quot;, &quot;犬&quot;))</span>
+<span class="d">-        assertEquals(&quot;It rains!?&quot;, Sentences.around(&quot;Sun. It rains!? Yes.&quot;, &quot;rains&quot;))</span>
+<span class="d">-        assertEquals(&quot;two&quot;, Sentences.around(&quot;one\ntwo\nthree&quot;, &quot;two&quot;))</span>
+<span class="d">-        assertEquals(&quot;It is 3.5 km.&quot;, Sentences.around(&quot;Far. It is 3.5 km. Go.&quot;, &quot;km&quot;))</span>
+<span class="d">-        assertEquals(&quot;「猫だ」と言った。&quot;, Sentences.around(&quot;「猫だ」と言った。犬だ。&quot;, &quot;猫&quot;))</span>
+<span class="a">+        assertEquals(&quot;「猫だ。」&quot;, around(&quot;「猫だ。」犬だ。&quot;, &quot;猫&quot;))</span>
+<span class="a">+        assertEquals(&quot;犬だ。&quot;, around(&quot;「猫だ。」犬だ。&quot;, &quot;犬&quot;))</span>
+<span class="a">+        assertEquals(&quot;It rains!?&quot;, around(&quot;Sun. It rains!? Yes.&quot;, &quot;rains&quot;))</span>
+<span class="a">+        assertEquals(&quot;two&quot;, around(&quot;one\ntwo\nthree&quot;, &quot;two&quot;))</span>
+<span class="a">+        assertEquals(&quot;It is 3.5 km.&quot;, around(&quot;Far. It is 3.5 km. Go.&quot;, &quot;km&quot;))</span>
+<span class="a">+        assertEquals(&quot;「猫だ」と言った。&quot;, around(&quot;「猫だ」と言った。犬だ。&quot;, &quot;猫&quot;))</span>
+     }
+ 
+     @Test
+     fun theEmphasisKeepsTheText() = property {
+         checkAll(anyText, anyText.orNull(0.2)) { sentence, word -&gt;
+             val html = Sentences.emphasize(sentence, word)
+<span class="d">-            assertEquals(sentence, Sentences.unescape(Sentences.stripTags(html)))</span>
+<span class="a">+            assertEquals(sentence, plain(html))</span>
+             if (!word.isNullOrEmpty() &amp;&amp; word in sentence) assertTrue(html.contains(&quot;&lt;b&gt;&quot; + Sentences.escape(word) + &quot;&lt;/b&gt;&quot;))
+         }
+     }
+<span class="h">@@ -411,6 +421,32 @@ class ScansTest {</span>
+         }
+     }
+ 
+<span class="a">+    /** A dictionary of two terms: 食べる for 食べ..., and 猫 for 猫. */</span>
+<span class="a">+    private fun termsAt(text: String, at: Int): List&lt;Pair&lt;String, Int&gt;&gt; = buildList {</span>
+<span class="a">+        if (text.startsWith(&quot;食べ&quot;, at)) add(&quot;食べる&quot; to minOf(3, text.length - at))</span>
+<span class="a">+        if (text.startsWith(&quot;猫&quot;, at)) add(&quot;猫&quot; to 1)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun theDictionaryFormIsFoundInTheFormOfTheText() {</span>
+<span class="a">+        // A sender gives 食べる and a sentence with 食べた: the bold and the sentence need 食べた.</span>
+<span class="a">+        assertEquals(4..6, Scans.locate(&quot;猫が魚を食べた。犬だ。&quot;, &quot;食べる&quot;) { termsAt(&quot;猫が魚を食べた。犬だ。&quot;, it) })</span>
+<span class="a">+        assertEquals(0..0, Scans.locate(&quot;猫が魚を食べた。&quot;, &quot;猫&quot;) { termsAt(&quot;猫が魚を食べた。&quot;, it) })</span>
+<span class="a">+        assertNull(Scans.locate(&quot;犬だ。&quot;, &quot;食べる&quot;) { termsAt(&quot;犬だ。&quot;, it) })</span>
+<span class="a">+        assertNull(Scans.locate(&quot;犬だ。&quot;, &quot;&quot;) { termsAt(&quot;犬だ。&quot;, it) })</span>
+<span class="a">+        // The card of such a word gets one sentence, not the whole text.</span>
+<span class="a">+        assertEquals(&quot;猫が魚を食べた。&quot;, Scans.sentence(&quot;猫が魚を食べた。犬だ。&quot;, 4, 3))</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Test</span>
+<span class="a">+    fun aLocatedWordIsInTheText() = property {</span>
+<span class="a">+        checkAll(piece, piece) { text, expression -&gt;</span>
+<span class="a">+            val range = Scans.locate(text, expression) { termsAt(text, it) } ?: return@checkAll</span>
+<span class="a">+            assertTrue(&quot;$range in $text&quot;, range.first &gt;= 0 &amp;&amp; range.last &lt; text.length &amp;&amp; !range.isEmpty())</span>
+<span class="a">+            if (text.contains(expression)) assertEquals(text.indexOf(expression), range.first)</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     @Test
+     fun aWordAloneIsNoSentence() {
+         assertEquals(&quot;&quot;, Scans.sentence(&quot;食べた&quot;, 0, 3))</pre>
+</div></body></html>

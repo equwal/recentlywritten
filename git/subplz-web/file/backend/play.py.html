@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/play.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/play.py (13317 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Google Play purchases of cloud caption hours: the Play build of Subrep.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> Google Play requires its own billing for digital goods that an app from Google
+<a id="l4" href="#l4">4</a> Play sells. So the Play build of Subrep buys the hour packs of captions.PACKS
+<a id="l5" href="#l5">5</a> with Google Play Billing. The Play product ids are the pack ids.
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> The app sends each purchase token here with its device cookie. This module asks
+<a id="l8" href="#l8">8</a> Google for the purchase, adds the hours of the pack to the account once, and
+<a id="l9" href="#l9">9</a> consumes the purchase, so that the user can buy the pack again. The app never
+<a id="l10" href="#l10">10</a> consumes. If this server does not answer, the app sends the purchase again at
+<a id="l11" href="#l11">11</a> its next start.
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> A buyer can get a refund from Google without the owner. So each hour,
+<a id="l14" href="#l14">14</a> main.housekeeping asks Google for the purchases that it refunded or charged
+<a id="l15" href="#l15">15</a> back, and this module takes their hours back once.
+<a id="l16" href="#l16">16</a> &quot;&quot;&quot;
+<a id="l17" href="#l17">17</a> from __future__ import annotations
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> import functools
+<a id="l20" href="#l20">20</a> import hashlib
+<a id="l21" href="#l21">21</a> import logging
+<a id="l22" href="#l22">22</a> from datetime import datetime
+<a id="l23" href="#l23">23</a> from typing import Annotated
+<a id="l24" href="#l24">24</a> from urllib.parse import quote
+<a id="l25" href="#l25">25</a> 
+<a id="l26" href="#l26">26</a> from fastapi import APIRouter, Depends, HTTPException
+<a id="l27" href="#l27">27</a> from pydantic import BaseModel, Field
+<a id="l28" href="#l28">28</a> from sqlalchemy import (
+<a id="l29" href="#l29">29</a>     Boolean,
+<a id="l30" href="#l30">30</a>     DateTime,
+<a id="l31" href="#l31">31</a>     ForeignKey,
+<a id="l32" href="#l32">32</a>     Integer,
+<a id="l33" href="#l33">33</a>     String,
+<a id="l34" href="#l34">34</a>     case,
+<a id="l35" href="#l35">35</a>     select,
+<a id="l36" href="#l36">36</a>     update,
+<a id="l37" href="#l37">37</a> )
+<a id="l38" href="#l38">38</a> from sqlalchemy.exc import IntegrityError
+<a id="l39" href="#l39">39</a> from sqlalchemy.orm import Mapped, Session, mapped_column
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> from . import accounts, captions
+<a id="l42" href="#l42">42</a> from .api import get_account, get_session
+<a id="l43" href="#l43">43</a> from .db import Account, Base, new_id, utcnow
+<a id="l44" href="#l44">44</a> from .settings import settings
+<a id="l45" href="#l45">45</a> 
+<a id="l46" href="#l46">46</a> log = logging.getLogger(__name__)
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a> ANDROIDPUBLISHER = &quot;https://www.googleapis.com/auth/androidpublisher&quot;
+<a id="l49" href="#l49">49</a> API = &quot;https://androidpublisher.googleapis.com/androidpublisher/v3/applications&quot;
+<a id="l50" href="#l50">50</a> PACKAGE = &quot;com.honjimaku.subrep&quot;
+<a id="l51" href="#l51">51</a> NOT_SET_UP = &quot;Google Play purchases are not set up on this server.&quot;
+<a id="l52" href="#l52">52</a> NO_ANSWER = &quot;Google Play did not answer. Try again later.&quot;
+<a id="l53" href="#l53">53</a> # purchases.products.get numbers the states of a purchase in another way than
+<a id="l54" href="#l54">54</a> # the Android library, where PURCHASED is 1. Do not mix the two.
+<a id="l55" href="#l55">55</a> PURCHASED = 0  # purchaseState
+<a id="l56" href="#l56">56</a> CONSUMED = 1  # consumptionState
+<a id="l57" href="#l57">57</a> TEST = 0  # purchaseType: a license tester bought it, and paid nothing
+<a id="l58" href="#l58">58</a> 
+<a id="l59" href="#l59">59</a> 
+<a id="l60" href="#l60">60</a> class PlayError(Exception):
+<a id="l61" href="#l61">61</a>     &quot;&quot;&quot;A purchase that gives no hours now. `status` is the HTTP answer for the app.&quot;&quot;&quot;
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a>     def __init__(self, status: int, detail: str):
+<a id="l64" href="#l64">64</a>         super().__init__(detail)
+<a id="l65" href="#l65">65</a>         self.status = status
+<a id="l66" href="#l66">66</a>         self.detail = detail
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> 
+<a id="l69" href="#l69">69</a> class PlayPurchase(Base):
+<a id="l70" href="#l70">70</a>     &quot;&quot;&quot;Ledger of Google Play purchases.
+<a id="l71" href="#l71">71</a> 
+<a id="l72" href="#l72">72</a>     The unique token hash makes the credit idempotent. The app sends a purchase
+<a id="l73" href="#l73">73</a>     again after a crash or a lost answer, and the hours must come only once.
+<a id="l74" href="#l74">74</a>     Only the hash is kept: no code needs the token after the credit.
+<a id="l75" href="#l75">75</a>     &quot;&quot;&quot;
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a>     __tablename__ = &quot;play_purchases&quot;
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a>     id: Mapped[str] = mapped_column(
+<a id="l80" href="#l80">80</a>         String(64), primary_key=True, default=lambda: new_id(&quot;play&quot;)
+<a id="l81" href="#l81">81</a>     )
+<a id="l82" href="#l82">82</a>     token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+<a id="l83" href="#l83">83</a>     account_id: Mapped[str] = mapped_column(ForeignKey(&quot;accounts.id&quot;), index=True)
+<a id="l84" href="#l84">84</a>     product_id: Mapped[str] = mapped_column(String(32))
+<a id="l85" href="#l85">85</a>     quantity: Mapped[int] = mapped_column(Integer, default=1)
+<a id="l86" href="#l86">86</a>     seconds: Mapped[int] = mapped_column(Integer)
+<a id="l87" href="#l87">87</a>     test: Mapped[bool] = mapped_column(Boolean, default=False)
+<a id="l88" href="#l88">88</a>     # The Google order number on the receipt of the buyer (GPA....). Support
+<a id="l89" href="#l89">89</a>     # finds the account with it. A purchase with a promo code has none.
+<a id="l90" href="#l90">90</a>     order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+<a id="l91" href="#l91">91</a>     created_at: Mapped[datetime] = mapped_column(
+<a id="l92" href="#l92">92</a>         DateTime(timezone=True), default=utcnow
+<a id="l93" href="#l93">93</a>     )
+<a id="l94" href="#l94">94</a>     # The time when this server took the hours back after a refund or a chargeback.
+<a id="l95" href="#l95">95</a>     voided_at: Mapped[datetime | None] = mapped_column(
+<a id="l96" href="#l96">96</a>         DateTime(timezone=True), nullable=True
+<a id="l97" href="#l97">97</a>     )
+<a id="l98" href="#l98">98</a> 
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> def _hash(token: str) -&gt; str:
+<a id="l101" href="#l101">101</a>     return hashlib.sha256(token.encode()).hexdigest()
+<a id="l102" href="#l102">102</a> 
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a> # ---------------------------------------------------------------------------
+<a id="l105" href="#l105">105</a> # the Google Play Developer API
+<a id="l106" href="#l106">106</a> # ---------------------------------------------------------------------------
+<a id="l107" href="#l107">107</a> 
+<a id="l108" href="#l108">108</a> @functools.lru_cache(maxsize=1)
+<a id="l109" href="#l109">109</a> def _credentials(path: str):
+<a id="l110" href="#l110">110</a>     &quot;&quot;&quot;Read the key file once. A missing or bad file is PlayError 503.&quot;&quot;&quot;
+<a id="l111" href="#l111">111</a>     from google.auth import exceptions
+<a id="l112" href="#l112">112</a>     from google.oauth2 import service_account
+<a id="l113" href="#l113">113</a> 
+<a id="l114" href="#l114">114</a>     try:
+<a id="l115" href="#l115">115</a>         return service_account.Credentials.from_service_account_file(
+<a id="l116" href="#l116">116</a>             path, scopes=[ANDROIDPUBLISHER]
+<a id="l117" href="#l117">117</a>         )
+<a id="l118" href="#l118">118</a>     except (OSError, ValueError, exceptions.DefaultCredentialsError) as exc:
+<a id="l119" href="#l119">119</a>         # Log only the type: the message can hold parts of the file.
+<a id="l120" href="#l120">120</a>         log.error(&quot;cannot read the Google Play key file %s: %s&quot;, path, type(exc).__name__)
+<a id="l121" href="#l121">121</a>         raise PlayError(503, NOT_SET_UP) from exc
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a> def _session():
+<a id="l125" href="#l125">125</a>     &quot;&quot;&quot;An HTTP session that signs each request. Tests replace this function.&quot;&quot;&quot;
+<a id="l126" href="#l126">126</a>     from google.auth.transport.requests import AuthorizedSession
+<a id="l127" href="#l127">127</a> 
+<a id="l128" href="#l128">128</a>     return AuthorizedSession(_credentials(settings.play_service_account_file))
+<a id="l129" href="#l129">129</a> 
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a> def _url(product_id: str, token: str) -&gt; str:
+<a id="l132" href="#l132">132</a>     return (f&quot;{API}/{PACKAGE}/purchases/products/{quote(product_id, safe=&#x27;&#x27;)}&quot;
+<a id="l133" href="#l133">133</a>             f&quot;/tokens/{quote(token, safe=&#x27;&#x27;)}&quot;)
+<a id="l134" href="#l134">134</a> 
+<a id="l135" href="#l135">135</a> 
+<a id="l136" href="#l136">136</a> def _call(method: str, url: str):
+<a id="l137" href="#l137">137</a>     &quot;&quot;&quot;Send one request to Google. Never log `url`: it can hold a purchase token.&quot;&quot;&quot;
+<a id="l138" href="#l138">138</a>     import requests
+<a id="l139" href="#l139">139</a>     from google.auth import exceptions
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a>     try:
+<a id="l142" href="#l142">142</a>         with _session() as http:
+<a id="l143" href="#l143">143</a>             response = http.request(method, url, timeout=15)
+<a id="l144" href="#l144">144</a>     except exceptions.RefreshError as exc:
+<a id="l145" href="#l145">145</a>         # A retryable error is a temporary failure of the Google token server,
+<a id="l146" href="#l146">146</a>         # for example 503 after the retries of google-auth. The key can be good.
+<a id="l147" href="#l147">147</a>         if exc.retryable:
+<a id="l148" href="#l148">148</a>             raise PlayError(502, NO_ANSWER) from exc
+<a id="l149" href="#l149">149</a>         log.error(&quot;Google refused the Play key: %s&quot;, type(exc).__name__)
+<a id="l150" href="#l150">150</a>         raise PlayError(503, NOT_SET_UP) from exc
+<a id="l151" href="#l151">151</a>     except (requests.RequestException, exceptions.TransportError) as exc:
+<a id="l152" href="#l152">152</a>         raise PlayError(502, NO_ANSWER) from exc
+<a id="l153" href="#l153">153</a>     if response.status_code in (200, 204):
+<a id="l154" href="#l154">154</a>         return response
+<a id="l155" href="#l155">155</a>     if response.status_code in (400, 404, 410):
+<a id="l156" href="#l156">156</a>         raise PlayError(400, &quot;Google Play does not know this purchase.&quot;)
+<a id="l157" href="#l157">157</a>     if response.status_code in (401, 403):
+<a id="l158" href="#l158">158</a>         log.error(&quot;the Play key has no access to the orders of %s (%d)&quot;,
+<a id="l159" href="#l159">159</a>                   PACKAGE, response.status_code)
+<a id="l160" href="#l160">160</a>         raise PlayError(503, NOT_SET_UP)
+<a id="l161" href="#l161">161</a>     raise PlayError(502, NO_ANSWER)
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a> 
+<a id="l164" href="#l164">164</a> def get(product_id: str, token: str) -&gt; dict:
+<a id="l165" href="#l165">165</a>     &quot;&quot;&quot;The purchase as Google sees it (purchases.products.get).&quot;&quot;&quot;
+<a id="l166" href="#l166">166</a>     return _call(&quot;GET&quot;, _url(product_id, token)).json()
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a> 
+<a id="l169" href="#l169">169</a> def consume(product_id: str, token: str) -&gt; None:
+<a id="l170" href="#l170">170</a>     &quot;&quot;&quot;Close the purchase, so that the user can buy the pack again.&quot;&quot;&quot;
+<a id="l171" href="#l171">171</a>     _call(&quot;POST&quot;, _url(product_id, token) + &quot;:consume&quot;)
+<a id="l172" href="#l172">172</a> 
+<a id="l173" href="#l173">173</a> 
+<a id="l174" href="#l174">174</a> def voided() -&gt; list[str]:
+<a id="l175" href="#l175">175</a>     &quot;&quot;&quot;The tokens of the in-app purchases that Google voided in the last 30 days.
+<a id="l176" href="#l176">176</a> 
+<a id="l177" href="#l177">177</a>     A refund or a chargeback voids a purchase. 30 days is the default and the
+<a id="l178" href="#l178">178</a>     longest time of the API, so a missed hour loses nothing.
+<a id="l179" href="#l179">179</a>     &quot;&quot;&quot;
+<a id="l180" href="#l180">180</a>     tokens: list[str] = []
+<a id="l181" href="#l181">181</a>     page = &quot;&quot;
+<a id="l182" href="#l182">182</a>     while True:
+<a id="l183" href="#l183">183</a>         url = f&quot;{API}/{PACKAGE}/purchases/voidedpurchases&quot;
+<a id="l184" href="#l184">184</a>         if page:
+<a id="l185" href="#l185">185</a>             url += f&quot;?token={quote(page, safe=&#x27;&#x27;)}&quot;
+<a id="l186" href="#l186">186</a>         body = _call(&quot;GET&quot;, url).json()
+<a id="l187" href="#l187">187</a>         tokens += [v[&quot;purchaseToken&quot;] for v in body.get(&quot;voidedPurchases&quot;, [])]
+<a id="l188" href="#l188">188</a>         page = (body.get(&quot;tokenPagination&quot;) or {}).get(&quot;nextPageToken&quot;, &quot;&quot;)
+<a id="l189" href="#l189">189</a>         if not page:
+<a id="l190" href="#l190">190</a>             return tokens
+<a id="l191" href="#l191">191</a> 
+<a id="l192" href="#l192">192</a> 
+<a id="l193" href="#l193">193</a> # ---------------------------------------------------------------------------
+<a id="l194" href="#l194">194</a> # the credit
+<a id="l195" href="#l195">195</a> # ---------------------------------------------------------------------------
+<a id="l196" href="#l196">196</a> 
+<a id="l197" href="#l197">197</a> def credit(session: Session, account: Account, product_id: str, token: str,
+<a id="l198" href="#l198">198</a>            purchase: dict) -&gt; bool:
+<a id="l199" href="#l199">199</a>     &quot;&quot;&quot;Add the hours of one purchase that Google returned, once for each token.
+<a id="l200" href="#l200">200</a> 
+<a id="l201" href="#l201">201</a>     Return True when this call added them, and False when an earlier call did.
+<a id="l202" href="#l202">202</a>     Raise PlayError when the purchase gives no hours.
+<a id="l203" href="#l203">203</a>     &quot;&quot;&quot;
+<a id="l204" href="#l204">204</a>     if purchase.get(&quot;purchaseState&quot;) != PURCHASED:
+<a id="l205" href="#l205">205</a>         raise PlayError(409, &quot;The purchase is not complete yet.&quot;)
+<a id="l206" href="#l206">206</a>     if purchase.get(&quot;productId&quot;, product_id) != product_id:
+<a id="l207" href="#l207">207</a>         raise PlayError(400, &quot;Google Play does not know this purchase.&quot;)
+<a id="l208" href="#l208">208</a>     owner_id = purchase.get(&quot;obfuscatedExternalAccountId&quot;)
+<a id="l209" href="#l209">209</a>     # A purchase made outside the app, for example with a promo code, has no
+<a id="l210" href="#l210">210</a>     # account id. Google says that the app can give it to the user who sends it.
+<a id="l211" href="#l211">211</a>     if owner_id:
+<a id="l212" href="#l212">212</a>         owner = session.get(Account, owner_id)
+<a id="l213" href="#l213">213</a>         if owner is None or accounts.resolve(session, owner).id != account.id:
+<a id="l214" href="#l214">214</a>             raise PlayError(403, &quot;This purchase belongs to another account.&quot;)
+<a id="l215" href="#l215">215</a>     quantity = int(purchase.get(&quot;quantity&quot;) or 1)
+<a id="l216" href="#l216">216</a>     seconds = captions.HOURS[product_id] * 3600 * quantity
+<a id="l217" href="#l217">217</a>     test = purchase.get(&quot;purchaseType&quot;) == TEST
+<a id="l218" href="#l218">218</a>     session.add(PlayPurchase(
+<a id="l219" href="#l219">219</a>         token_hash=_hash(token), account_id=account.id, product_id=product_id,
+<a id="l220" href="#l220">220</a>         quantity=quantity, seconds=seconds, test=test, order_id=purchase.get(&quot;orderId&quot;),
+<a id="l221" href="#l221">221</a>     ))
+<a id="l222" href="#l222">222</a>     try:
+<a id="l223" href="#l223">223</a>         session.flush()
+<a id="l224" href="#l224">224</a>     except IntegrityError:
+<a id="l225" href="#l225">225</a>         session.rollback()  # An earlier call added this token.
+<a id="l226" href="#l226">226</a>         return False
+<a id="l227" href="#l227">227</a>     if purchase.get(&quot;consumptionState&quot;) == CONSUMED:
+<a id="l228" href="#l228">228</a>         # Only this server consumes, and it commits before it consumes. So a
+<a id="l229" href="#l229">229</a>         # consumed token without a row means that the ledger lost the row.
+<a id="l230" href="#l230">230</a>         session.rollback()
+<a id="l231" href="#l231">231</a>         log.warning(&quot;consumed Play purchase %s has no ledger row&quot;,
+<a id="l232" href="#l232">232</a>                     purchase.get(&quot;orderId&quot;) or &quot;(no order id)&quot;)
+<a id="l233" href="#l233">233</a>         raise PlayError(409, &quot;This purchase was used already.&quot;)
+<a id="l234" href="#l234">234</a>     captions.add(session, account.id, seconds)
+<a id="l235" href="#l235">235</a>     session.commit()
+<a id="l236" href="#l236">236</a>     log.info(&quot;play purchase %s: %s x%d for %s%s&quot;,
+<a id="l237" href="#l237">237</a>              purchase.get(&quot;orderId&quot;) or &quot;(no order id)&quot;, product_id, quantity,
+<a id="l238" href="#l238">238</a>              account.id, &quot; (test)&quot; if test else &quot;&quot;)
+<a id="l239" href="#l239">239</a>     return True
+<a id="l240" href="#l240">240</a> 
+<a id="l241" href="#l241">241</a> 
+<a id="l242" href="#l242">242</a> # ---------------------------------------------------------------------------
+<a id="l243" href="#l243">243</a> # refunds
+<a id="l244" href="#l244">244</a> # ---------------------------------------------------------------------------
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a> def take_back(session: Session, tokens: list[str]) -&gt; int:
+<a id="l247" href="#l247">247</a>     &quot;&quot;&quot;Take back the hours of each voided purchase in `tokens`, once.
+<a id="l248" href="#l248">248</a> 
+<a id="l249" href="#l249">249</a>     The hours come from the account that has them now, after any merge. A
+<a id="l250" href="#l250">250</a>     balance never goes below zero, so the hours that the buyer used are lost.
+<a id="l251" href="#l251">251</a>     Return the number of purchases that this call took back.
+<a id="l252" href="#l252">252</a>     &quot;&quot;&quot;
+<a id="l253" href="#l253">253</a>     hashes = {_hash(t) for t in tokens}
+<a id="l254" href="#l254">254</a>     if not hashes:
+<a id="l255" href="#l255">255</a>         return 0
+<a id="l256" href="#l256">256</a>     rows = session.scalars(select(PlayPurchase).where(
+<a id="l257" href="#l257">257</a>         PlayPurchase.token_hash.in_(hashes), PlayPurchase.voided_at.is_(None))).all()
+<a id="l258" href="#l258">258</a>     balance = captions.CaptionBalance
+<a id="l259" href="#l259">259</a>     taken = 0
+<a id="l260" href="#l260">260</a>     for row in rows:
+<a id="l261" href="#l261">261</a>         # Mark the row only if no other pass marked it first. Then two passes
+<a id="l262" href="#l262">262</a>         # at the same time take the hours back once.
+<a id="l263" href="#l263">263</a>         marked = session.execute(
+<a id="l264" href="#l264">264</a>             update(PlayPurchase)
+<a id="l265" href="#l265">265</a>             .where(PlayPurchase.id == row.id, PlayPurchase.voided_at.is_(None))
+<a id="l266" href="#l266">266</a>             .values(voided_at=utcnow())
+<a id="l267" href="#l267">267</a>         ).rowcount
+<a id="l268" href="#l268">268</a>         if marked != 1:
+<a id="l269" href="#l269">269</a>             continue
+<a id="l270" href="#l270">270</a>         owner = accounts.resolve(session, session.get(Account, row.account_id))
+<a id="l271" href="#l271">271</a>         # One UPDATE, like captions.spend: a credit or a spend at the same time
+<a id="l272" href="#l272">272</a>         # cannot write over it.
+<a id="l273" href="#l273">273</a>         session.execute(
+<a id="l274" href="#l274">274</a>             update(balance)
+<a id="l275" href="#l275">275</a>             .where(balance.account_id == owner.id)
+<a id="l276" href="#l276">276</a>             .values(seconds_left=case(
+<a id="l277" href="#l277">277</a>                 (balance.seconds_left &gt; row.seconds, balance.seconds_left - row.seconds),
+<a id="l278" href="#l278">278</a>                 else_=0))
+<a id="l279" href="#l279">279</a>         )
+<a id="l280" href="#l280">280</a>         taken += 1
+<a id="l281" href="#l281">281</a>         log.info(&quot;voided play purchase %s: took back up to %d s from %s&quot;,
+<a id="l282" href="#l282">282</a>                  row.order_id or &quot;(no order id)&quot;, row.seconds, owner.id)
+<a id="l283" href="#l283">283</a>     session.commit()
+<a id="l284" href="#l284">284</a>     return taken
+<a id="l285" href="#l285">285</a> 
+<a id="l286" href="#l286">286</a> 
+<a id="l287" href="#l287">287</a> def take_back_voided(session: Session) -&gt; None:
+<a id="l288" href="#l288">288</a>     &quot;&quot;&quot;One pass of main.housekeeping. A failure waits for the next hour.&quot;&quot;&quot;
+<a id="l289" href="#l289">289</a>     try:
+<a id="l290" href="#l290">290</a>         take_back(session, voided())
+<a id="l291" href="#l291">291</a>     except PlayError as exc:
+<a id="l292" href="#l292">292</a>         log.warning(&quot;could not read the voided Play purchases: %s&quot;, exc.detail)
+<a id="l293" href="#l293">293</a> 
+<a id="l294" href="#l294">294</a> 
+<a id="l295" href="#l295">295</a> # ---------------------------------------------------------------------------
+<a id="l296" href="#l296">296</a> # routes
+<a id="l297" href="#l297">297</a> # ---------------------------------------------------------------------------
+<a id="l298" href="#l298">298</a> 
+<a id="l299" href="#l299">299</a> router = APIRouter(prefix=&quot;/api/captions&quot;)
+<a id="l300" href="#l300">300</a> 
+<a id="l301" href="#l301">301</a> 
+<a id="l302" href="#l302">302</a> class PlayIn(BaseModel):
+<a id="l303" href="#l303">303</a>     product_id: str = Field(max_length=64)
+<a id="l304" href="#l304">304</a>     purchase_token: str = Field(min_length=1, max_length=4096)
+<a id="l305" href="#l305">305</a> 
+<a id="l306" href="#l306">306</a> 
+<a id="l307" href="#l307">307</a> @router.post(&quot;/play-purchase&quot;)
+<a id="l308" href="#l308">308</a> def play_purchase(
+<a id="l309" href="#l309">309</a>     body: PlayIn,
+<a id="l310" href="#l310">310</a>     account: Annotated[Account, Depends(get_account)],
+<a id="l311" href="#l311">311</a>     session: Annotated[Session, Depends(get_session)],
+<a id="l312" href="#l312">312</a> ):
+<a id="l313" href="#l313">313</a>     &quot;&quot;&quot;The Play build sends each purchase here, once or more. It gives hours once.&quot;&quot;&quot;
+<a id="l314" href="#l314">314</a>     if not settings.play_configured:
+<a id="l315" href="#l315">315</a>         raise HTTPException(503, NOT_SET_UP)
+<a id="l316" href="#l316">316</a>     if body.product_id not in captions.HOURS:
+<a id="l317" href="#l317">317</a>         raise HTTPException(404, &quot;No such pack.&quot;)
+<a id="l318" href="#l318">318</a>     try:
+<a id="l319" href="#l319">319</a>         purchase = get(body.product_id, body.purchase_token)
+<a id="l320" href="#l320">320</a>         credit(session, account, body.product_id, body.purchase_token, purchase)
+<a id="l321" href="#l321">321</a>     except PlayError as exc:
+<a id="l322" href="#l322">322</a>         raise HTTPException(exc.status, exc.detail) from exc
+<a id="l323" href="#l323">323</a>     if purchase.get(&quot;consumptionState&quot;) != CONSUMED:
+<a id="l324" href="#l324">324</a>         try:
+<a id="l325" href="#l325">325</a>             consume(body.product_id, body.purchase_token)
+<a id="l326" href="#l326">326</a>         except PlayError as exc:
+<a id="l327" href="#l327">327</a>             # The hours are in the account. The next send of the app consumes it.
+<a id="l328" href="#l328">328</a>             log.warning(&quot;could not consume a Play purchase of %s: %s&quot;, account.id, exc.detail)
+<a id="l329" href="#l329">329</a>     return {&quot;seconds_left&quot;: captions.seconds_left(session, account.id)}</pre>
+</div></body></html>

@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/backend/subrep.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>backend/subrep.py (16003 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Subrep Pro: the plan of the Subrep desktop app, sold with the accounts of this site.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> Subrep (https://honjimaku.com/subrep/) makes live captions of the sound on the
+<a id="l4" href="#l4">4</a> customer&#x27;s own computer. The free edition makes live captions. Pro unlocks the
+<a id="l5" href="#l5">5</a> paid features of the desktop app (FEATURES in subrep/licensing.py of the
+<a id="l6" href="#l6">6</a> Subrep repo). The owner chose the prices on 2026-09-22:
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a>   yearly   $9.99 a year    (first on the page: 16% less than 12 x $0.99)
+<a id="l9" href="#l9">9</a>   monthly  $0.99 a month
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> There is no free trial: the free edition is the trial.
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> How the desktop app gets Pro:
+<a id="l14" href="#l14">14</a> 
+<a id="l15" href="#l15">15</a> 1. The customer pays here. A Stripe subscription makes the account Pro until
+<a id="l16" href="#l16">16</a>    the end of the paid period (SubrepLicence).
+<a id="l17" href="#l17">17</a> 2. The Subrep page (/subrep.html) shows the email of the account and a setup
+<a id="l18" href="#l18">18</a>    key (the refresh key). The customer enters the two in the Licence card of
+<a id="l19" href="#l19">19</a>    the desktop control panel, or runs the link command, once on each
+<a id="l20" href="#l20">20</a>    computer.
+<a id="l21" href="#l21">21</a> 3. The app sends the two to POST /api/subrep/refresh and gets a licence token:
+<a id="l22" href="#l22">22</a>    JSON claims, signed with the Ed25519 key of this server
+<a id="l23" href="#l23">23</a>    (SUBPLZ_WEB_SUBREP_LICENSE_KEY, made by tools/subrep_key.py). The app
+<a id="l24" href="#l24">24</a>    checks the token offline with the public key in its build, and asks for a
+<a id="l25" href="#l25">25</a>    new one before the token ends.
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> The token format is that of sign_token in subrep/licensing.py:
+<a id="l28" href="#l28">28</a> base64url(JSON with sorted keys) &quot;.&quot; base64url(signature). A token ends with
+<a id="l29" href="#l29">29</a> the paid period, and after TOKEN_DAYS at most, so a refund or a chargeback
+<a id="l30" href="#l30">30</a> ends Pro within a month.
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> A Subrep plan is not a book plan: billing.py does not see it, and an account
+<a id="l33" href="#l33">33</a> can have both. payments.py sells the plans and gives each subscription event
+<a id="l34" href="#l34">34</a> to apply_subscription first.
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> The iOS waitlist is here too: the emails that ask to hear when an iPhone app
+<a id="l37" href="#l37">37</a> ships. The owner counts them on 2026-11-30 (waitlist_count): 30 is one of the
+<a id="l38" href="#l38">38</a> conditions to build the app.
+<a id="l39" href="#l39">39</a> &quot;&quot;&quot;
+<a id="l40" href="#l40">40</a> from __future__ import annotations
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> import base64
+<a id="l43" href="#l43">43</a> import hmac
+<a id="l44" href="#l44">44</a> import importlib.util
+<a id="l45" href="#l45">45</a> import json
+<a id="l46" href="#l46">46</a> import logging
+<a id="l47" href="#l47">47</a> import secrets
+<a id="l48" href="#l48">48</a> from datetime import datetime, timedelta
+<a id="l49" href="#l49">49</a> from typing import Annotated
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a> from fastapi import APIRouter, Depends, HTTPException
+<a id="l52" href="#l52">52</a> from fastapi.responses import JSONResponse
+<a id="l53" href="#l53">53</a> from pydantic import BaseModel
+<a id="l54" href="#l54">54</a> from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint
+<a id="l55" href="#l55">55</a> from sqlalchemy.exc import IntegrityError
+<a id="l56" href="#l56">56</a> from sqlalchemy.orm import Mapped, Session, mapped_column
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a> from . import accounts, billing, payments
+<a id="l59" href="#l59">59</a> from .api import get_account, get_session
+<a id="l60" href="#l60">60</a> from .db import Account, Base, utcnow
+<a id="l61" href="#l61">61</a> from .pricing import Plan
+<a id="l62" href="#l62">62</a> from .settings import settings
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> log = logging.getLogger(__name__)
+<a id="l65" href="#l65">65</a> 
+<a id="l66" href="#l66">66</a> # A plan that was sold must stay in this list: a subscription that still runs
+<a id="l67" href="#l67">67</a> # names it. Change a price with a new plan id.
+<a id="l68" href="#l68">68</a> PLANS: list[Plan] = [
+<a id="l69" href="#l69">69</a>     Plan(id=&quot;subrep_year&quot;, name=&quot;Subrep Pro, yearly&quot;, credits=0, price_cents=999,
+<a id="l70" href="#l70">70</a>          recurring=True, interval=&quot;year&quot;,
+<a id="l71" href="#l71">71</a>          blurb=&quot;Renews each year until you cancel. 16% less than monthly.&quot;),
+<a id="l72" href="#l72">72</a>     Plan(id=&quot;subrep_month&quot;, name=&quot;Subrep Pro, monthly&quot;, credits=0, price_cents=99,
+<a id="l73" href="#l73">73</a>          recurring=True, interval=&quot;month&quot;,
+<a id="l74" href="#l74">74</a>          blurb=&quot;Renews each month until you cancel.&quot;),
+<a id="l75" href="#l75">75</a> ]
+<a id="l76" href="#l76">76</a> 
+<a id="l77" href="#l77">77</a> # The longest time that one licence token is good for.
+<a id="l78" href="#l78">78</a> TOKEN_DAYS = 31
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> WAITLISTS = {&quot;ios&quot;}
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> 
+<a id="l83" href="#l83">83</a> class SubrepLicence(Base):
+<a id="l84" href="#l84">84</a>     &quot;&quot;&quot;The Subrep Pro subscription of an account, and its refresh key.&quot;&quot;&quot;
+<a id="l85" href="#l85">85</a> 
+<a id="l86" href="#l86">86</a>     __tablename__ = &quot;subrep_licences&quot;
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a>     account_id: Mapped[str] = mapped_column(
+<a id="l89" href="#l89">89</a>         String(64), ForeignKey(&quot;accounts.id&quot;), primary_key=True
+<a id="l90" href="#l90">90</a>     )
+<a id="l91" href="#l91">91</a>     # The desktop app sends it to get a licence. It is kept as it is, like the
+<a id="l92" href="#l92">92</a>     # device token of an account: the page shows the same link command on
+<a id="l93" href="#l93">93</a>     # each visit, so that each computer of the customer can use it.
+<a id="l94" href="#l94">94</a>     refresh_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+<a id="l95" href="#l95">95</a>     subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+<a id="l96" href="#l96">96</a>     status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+<a id="l97" href="#l97">97</a>     plan_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+<a id="l98" href="#l98">98</a>     period_end: Mapped[datetime | None] = mapped_column(
+<a id="l99" href="#l99">99</a>         DateTime(timezone=True), nullable=True
+<a id="l100" href="#l100">100</a>     )
+<a id="l101" href="#l101">101</a> 
+<a id="l102" href="#l102">102</a> 
+<a id="l103" href="#l103">103</a> class WaitlistEntry(Base):
+<a id="l104" href="#l104">104</a>     &quot;&quot;&quot;An email that asks to hear when an app ships (kind &quot;ios&quot;).&quot;&quot;&quot;
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a>     __tablename__ = &quot;waitlist&quot;
+<a id="l107" href="#l107">107</a>     __table_args__ = (UniqueConstraint(&quot;kind&quot;, &quot;email&quot;),)
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a>     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+<a id="l110" href="#l110">110</a>     kind: Mapped[str] = mapped_column(String(16))
+<a id="l111" href="#l111">111</a>     email: Mapped[str] = mapped_column(String(320))
+<a id="l112" href="#l112">112</a>     account_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+<a id="l113" href="#l113">113</a>     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a> 
+<a id="l116" href="#l116">116</a> def plan(plan_id: str) -&gt; Plan | None:
+<a id="l117" href="#l117">117</a>     return next((p for p in PLANS if p.id == plan_id), None)
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a> 
+<a id="l120" href="#l120">120</a> def licence(session: Session, account_id: str) -&gt; SubrepLicence | None:
+<a id="l121" href="#l121">121</a>     return session.get(SubrepLicence, account_id)
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a> def is_pro(row: SubrepLicence | None, now: datetime | None = None) -&gt; bool:
+<a id="l125" href="#l125">125</a>     &quot;&quot;&quot;Whether the subscription is paid for the current period.&quot;&quot;&quot;
+<a id="l126" href="#l126">126</a>     if row is None or row.status not in billing._SUBSCRIBED:
+<a id="l127" href="#l127">127</a>         return False
+<a id="l128" href="#l128">128</a>     end = billing._aware(row.period_end)
+<a id="l129" href="#l129">129</a>     return end is None or end &gt; (now or utcnow())
+<a id="l130" href="#l130">130</a> 
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a> def can_sign() -&gt; bool:
+<a id="l133" href="#l133">133</a>     &quot;&quot;&quot;A key is set, and the package that signs with it is installed.&quot;&quot;&quot;
+<a id="l134" href="#l134">134</a>     return bool(settings.subrep_license_key) and (
+<a id="l135" href="#l135">135</a>         importlib.util.find_spec(&quot;cryptography&quot;) is not None
+<a id="l136" href="#l136">136</a>     )
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a> 
+<a id="l139" href="#l139">139</a> def available() -&gt; bool:
+<a id="l140" href="#l140">140</a>     &quot;&quot;&quot;Subrep Pro is for sale: the server can take the money and sign a licence.&quot;&quot;&quot;
+<a id="l141" href="#l141">141</a>     return can_sign() and settings.payments_configured
+<a id="l142" href="#l142">142</a> 
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> # ---------------------------------------------------------------------------
+<a id="l145" href="#l145">145</a> # subscriptions
+<a id="l146" href="#l146">146</a> # ---------------------------------------------------------------------------
+<a id="l147" href="#l147">147</a> 
+<a id="l148" href="#l148">148</a> def _plan_of(sub: dict) -&gt; Plan | None:
+<a id="l149" href="#l149">149</a>     &quot;&quot;&quot;The Subrep plan of a subscription, or None if it is not one.
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a>     As in payments._our_plan_id: the lookup key of the price names the plan
+<a id="l152" href="#l152">152</a>     after a switch in the customer portal, and the checkout metadata names it
+<a id="l153" href="#l153">153</a>     before that.
+<a id="l154" href="#l154">154</a>     &quot;&quot;&quot;
+<a id="l155" href="#l155">155</a>     items = (sub.get(&quot;items&quot;) or {}).get(&quot;data&quot;) or []
+<a id="l156" href="#l156">156</a>     price = (items[0].get(&quot;price&quot;) or {}) if items else {}
+<a id="l157" href="#l157">157</a>     for plan_id in (price.get(&quot;lookup_key&quot;), (sub.get(&quot;metadata&quot;) or {}).get(&quot;plan_id&quot;)):
+<a id="l158" href="#l158">158</a>         found = plan(plan_id or &quot;&quot;)
+<a id="l159" href="#l159">159</a>         if found is not None:
+<a id="l160" href="#l160">160</a>             return found
+<a id="l161" href="#l161">161</a>     return None
+<a id="l162" href="#l162">162</a> 
+<a id="l163" href="#l163">163</a> 
+<a id="l164" href="#l164">164</a> def apply_subscription(session: Session, sub: dict) -&gt; bool:
+<a id="l165" href="#l165">165</a>     &quot;&quot;&quot;Mirror a Stripe subscription of a Subrep plan. False if it is not one.&quot;&quot;&quot;
+<a id="l166" href="#l166">166</a>     found = _plan_of(sub)
+<a id="l167" href="#l167">167</a>     if found is None:
+<a id="l168" href="#l168">168</a>         return False
+<a id="l169" href="#l169">169</a>     meta = sub.get(&quot;metadata&quot;) or {}
+<a id="l170" href="#l170">170</a>     account = payments._account_for(session, meta.get(&quot;account_id&quot;), sub.get(&quot;customer&quot;))
+<a id="l171" href="#l171">171</a>     if account is None:
+<a id="l172" href="#l172">172</a>         log.warning(&quot;subrep subscription %s matches no account&quot;, sub.get(&quot;id&quot;))
+<a id="l173" href="#l173">173</a>         return True
+<a id="l174" href="#l174">174</a>     row = licence(session, account.id) or SubrepLicence(account_id=account.id)
+<a id="l175" href="#l175">175</a>     # The end of an old subscription must not end its replacement.
+<a id="l176" href="#l176">176</a>     if row.subscription_id and row.subscription_id != sub.get(&quot;id&quot;) \
+<a id="l177" href="#l177">177</a>             and sub.get(&quot;status&quot;) in (&quot;canceled&quot;, &quot;incomplete_expired&quot;):
+<a id="l178" href="#l178">178</a>         return True
+<a id="l179" href="#l179">179</a>     row.subscription_id = sub.get(&quot;id&quot;)
+<a id="l180" href="#l180">180</a>     row.status = sub.get(&quot;status&quot;)
+<a id="l181" href="#l181">181</a>     row.plan_id = found.id
+<a id="l182" href="#l182">182</a>     row.period_end = payments._period_end(sub)
+<a id="l183" href="#l183">183</a>     session.add(row)
+<a id="l184" href="#l184">184</a>     if sub.get(&quot;customer&quot;) and not account.stripe_customer_id:
+<a id="l185" href="#l185">185</a>         account.stripe_customer_id = sub[&quot;customer&quot;]
+<a id="l186" href="#l186">186</a>     session.commit()
+<a id="l187" href="#l187">187</a>     return True
+<a id="l188" href="#l188">188</a> 
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a> def merge(session: Session, src: Account, dst: Account) -&gt; None:
+<a id="l191" href="#l191">191</a>     &quot;&quot;&quot;Called by accounts.merge: the Subrep plan of `src` goes to `dst`.&quot;&quot;&quot;
+<a id="l192" href="#l192">192</a>     row = licence(session, src.id)
+<a id="l193" href="#l193">193</a>     if row is None:
+<a id="l194" href="#l194">194</a>         return
+<a id="l195" href="#l195">195</a>     target = licence(session, dst.id)
+<a id="l196" href="#l196">196</a>     if target is None or (is_pro(row) and not is_pro(target)):
+<a id="l197" href="#l197">197</a>         target = target or SubrepLicence(account_id=dst.id)
+<a id="l198" href="#l198">198</a>         target.subscription_id, target.status = row.subscription_id, row.status
+<a id="l199" href="#l199">199</a>         target.plan_id, target.period_end = row.plan_id, row.period_end
+<a id="l200" href="#l200">200</a>         session.add(target)
+<a id="l201" href="#l201">201</a>     # The computers that were linked to `src` keep their link command.
+<a id="l202" href="#l202">202</a>     target.refresh_key = target.refresh_key or row.refresh_key
+<a id="l203" href="#l203">203</a>     session.delete(row)
+<a id="l204" href="#l204">204</a> 
+<a id="l205" href="#l205">205</a> 
+<a id="l206" href="#l206">206</a> # ---------------------------------------------------------------------------
+<a id="l207" href="#l207">207</a> # licence tokens
+<a id="l208" href="#l208">208</a> # ---------------------------------------------------------------------------
+<a id="l209" href="#l209">209</a> 
+<a id="l210" href="#l210">210</a> def _b64e(raw: bytes) -&gt; str:
+<a id="l211" href="#l211">211</a>     return base64.urlsafe_b64encode(raw).rstrip(b&quot;=&quot;).decode(&quot;ascii&quot;)
+<a id="l212" href="#l212">212</a> 
+<a id="l213" href="#l213">213</a> 
+<a id="l214" href="#l214">214</a> def _private_key():
+<a id="l215" href="#l215">215</a>     # cryptography only here: a server without Subrep Pro does not need it.
+<a id="l216" href="#l216">216</a>     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a>     text = settings.subrep_license_key
+<a id="l219" href="#l219">219</a>     return Ed25519PrivateKey.from_private_bytes(
+<a id="l220" href="#l220">220</a>         base64.urlsafe_b64decode(text + &quot;=&quot; * (-len(text) % 4))
+<a id="l221" href="#l221">221</a>     )
+<a id="l222" href="#l222">222</a> 
+<a id="l223" href="#l223">223</a> 
+<a id="l224" href="#l224">224</a> def sign(claims: dict) -&gt; str:
+<a id="l225" href="#l225">225</a>     &quot;&quot;&quot;A licence token, in the format of sign_token in subrep/licensing.py.&quot;&quot;&quot;
+<a id="l226" href="#l226">226</a>     payload = json.dumps(claims, separators=(&quot;,&quot;, &quot;:&quot;), sort_keys=True).encode()
+<a id="l227" href="#l227">227</a>     return _b64e(payload) + &quot;.&quot; + _b64e(_private_key().sign(payload))
+<a id="l228" href="#l228">228</a> 
+<a id="l229" href="#l229">229</a> 
+<a id="l230" href="#l230">230</a> def public_key() -&gt; str:
+<a id="l231" href="#l231">231</a>     &quot;&quot;&quot;The key to build into the desktop app (SUBREP_LICENSE_PUBKEY).&quot;&quot;&quot;
+<a id="l232" href="#l232">232</a>     return _b64e(_private_key().public_key().public_bytes_raw())
+<a id="l233" href="#l233">233</a> 
+<a id="l234" href="#l234">234</a> 
+<a id="l235" href="#l235">235</a> class LicenceRefused(Exception):
+<a id="l236" href="#l236">236</a>     def __init__(self, status: int, message: str):
+<a id="l237" href="#l237">237</a>         super().__init__(message)
+<a id="l238" href="#l238">238</a>         self.status = status
+<a id="l239" href="#l239">239</a>         self.message = message
+<a id="l240" href="#l240">240</a> 
+<a id="l241" href="#l241">241</a> 
+<a id="l242" href="#l242">242</a> def token(session: Session, account_id: str, refresh_key: str,
+<a id="l243" href="#l243">243</a>           now: datetime | None = None) -&gt; str:
+<a id="l244" href="#l244">244</a>     &quot;&quot;&quot;A licence token for the desktop app, or LicenceRefused.
+<a id="l245" href="#l245">245</a> 
+<a id="l246" href="#l246">246</a>     `account_id` is the id of the account, or its email: the Licence card of
+<a id="l247" href="#l247">247</a>     the desktop control panel asks for the email that paid.
+<a id="l248" href="#l248">248</a>     &quot;&quot;&quot;
+<a id="l249" href="#l249">249</a>     now = now or utcnow()
+<a id="l250" href="#l250">250</a>     ident = (account_id or &quot;&quot;).strip()
+<a id="l251" href="#l251">251</a>     if &quot;@&quot; in ident:
+<a id="l252" href="#l252">252</a>         account = accounts.by_email(session, ident.lower())
+<a id="l253" href="#l253">253</a>     else:
+<a id="l254" href="#l254">254</a>         account = session.get(Account, ident)
+<a id="l255" href="#l255">255</a>     if account is not None:
+<a id="l256" href="#l256">256</a>         account = accounts.resolve(session, account)
+<a id="l257" href="#l257">257</a>     row = licence(session, account.id) if account is not None else None
+<a id="l258" href="#l258">258</a>     if row is None or not row.refresh_key or not hmac.compare_digest(
+<a id="l259" href="#l259">259</a>             row.refresh_key.encode(), (refresh_key or &quot;&quot;).encode()):
+<a id="l260" href="#l260">260</a>         raise LicenceRefused(
+<a id="l261" href="#l261">261</a>             403, &quot;This link command is not valid. &quot;
+<a id="l262" href="#l262">262</a>                  &quot;Copy it again from the Subrep page of subread.space.&quot;)
+<a id="l263" href="#l263">263</a>     if not is_pro(row, now):
+<a id="l264" href="#l264">264</a>         raise LicenceRefused(402, &quot;This account has no active Subrep Pro plan.&quot;)
+<a id="l265" href="#l265">265</a>     latest = now + timedelta(days=TOKEN_DAYS)
+<a id="l266" href="#l266">266</a>     # &quot;paid&quot; is what the customer sees: the end of the paid period. &quot;exp&quot; is
+<a id="l267" href="#l267">267</a>     # when the app must ask again.
+<a id="l268" href="#l268">268</a>     paid = billing._aware(row.period_end) or latest
+<a id="l269" href="#l269">269</a>     return sign({&quot;sub&quot;: account.email or account.id, &quot;tier&quot;: &quot;pro&quot;,
+<a id="l270" href="#l270">270</a>                  &quot;plan&quot;: row.plan_id, &quot;iat&quot;: int(now.timestamp()),
+<a id="l271" href="#l271">271</a>                  &quot;paid&quot;: int(paid.timestamp()),
+<a id="l272" href="#l272">272</a>                  &quot;exp&quot;: int(min(paid, latest).timestamp())})
+<a id="l273" href="#l273">273</a> 
+<a id="l274" href="#l274">274</a> 
+<a id="l275" href="#l275">275</a> def link(session: Session, account: Account) -&gt; dict:
+<a id="l276" href="#l276">276</a>     &quot;&quot;&quot;The link command of a Pro account. The first call makes its refresh key.&quot;&quot;&quot;
+<a id="l277" href="#l277">277</a>     row = licence(session, account.id)
+<a id="l278" href="#l278">278</a>     if row is None:
+<a id="l279" href="#l279">279</a>         raise LicenceRefused(402, &quot;This account has no Subrep Pro plan.&quot;)
+<a id="l280" href="#l280">280</a>     if not row.refresh_key:
+<a id="l281" href="#l281">281</a>         row.refresh_key = secrets.token_urlsafe(24)
+<a id="l282" href="#l282">282</a>         session.commit()
+<a id="l283" href="#l283">283</a>     server = f&quot;{settings.public_base_url.rstrip(&#x27;/&#x27;)}/api/subrep&quot;
+<a id="l284" href="#l284">284</a>     return {
+<a id="l285" href="#l285">285</a>         &quot;account&quot;: account.id,
+<a id="l286" href="#l286">286</a>         &quot;email&quot;: account.email,
+<a id="l287" href="#l287">287</a>         &quot;refresh_key&quot;: row.refresh_key,
+<a id="l288" href="#l288">288</a>         &quot;server&quot;: server,
+<a id="l289" href="#l289">289</a>         &quot;command&quot;: f&#x27;subrep license --link &quot;{account.id}&quot; &quot;{row.refresh_key}&quot; &quot;{server}&quot;&#x27;,
+<a id="l290" href="#l290">290</a>     }
+<a id="l291" href="#l291">291</a> 
+<a id="l292" href="#l292">292</a> 
+<a id="l293" href="#l293">293</a> # ---------------------------------------------------------------------------
+<a id="l294" href="#l294">294</a> # waitlist
+<a id="l295" href="#l295">295</a> # ---------------------------------------------------------------------------
+<a id="l296" href="#l296">296</a> 
+<a id="l297" href="#l297">297</a> def join(session: Session, kind: str, email: str, account_id: str | None) -&gt; bool:
+<a id="l298" href="#l298">298</a>     &quot;&quot;&quot;Put `email` on a waitlist. False if it was on it already.&quot;&quot;&quot;
+<a id="l299" href="#l299">299</a>     session.add(WaitlistEntry(kind=kind, email=email, account_id=account_id))
+<a id="l300" href="#l300">300</a>     try:
+<a id="l301" href="#l301">301</a>         session.commit()
+<a id="l302" href="#l302">302</a>     except IntegrityError:
+<a id="l303" href="#l303">303</a>         session.rollback()
+<a id="l304" href="#l304">304</a>         return False
+<a id="l305" href="#l305">305</a>     return True
+<a id="l306" href="#l306">306</a> 
+<a id="l307" href="#l307">307</a> 
+<a id="l308" href="#l308">308</a> def waitlist_count(session: Session, kind: str) -&gt; int:
+<a id="l309" href="#l309">309</a>     return session.query(WaitlistEntry).filter(WaitlistEntry.kind == kind).count()
+<a id="l310" href="#l310">310</a> 
+<a id="l311" href="#l311">311</a> 
+<a id="l312" href="#l312">312</a> # ---------------------------------------------------------------------------
+<a id="l313" href="#l313">313</a> # routes
+<a id="l314" href="#l314">314</a> # ---------------------------------------------------------------------------
+<a id="l315" href="#l315">315</a> 
+<a id="l316" href="#l316">316</a> router = APIRouter(prefix=&quot;/api/subrep&quot;)
+<a id="l317" href="#l317">317</a> 
+<a id="l318" href="#l318">318</a> 
+<a id="l319" href="#l319">319</a> class PlanIn(BaseModel):
+<a id="l320" href="#l320">320</a>     plan_id: str
+<a id="l321" href="#l321">321</a> 
+<a id="l322" href="#l322">322</a> 
+<a id="l323" href="#l323">323</a> class RefreshIn(BaseModel):
+<a id="l324" href="#l324">324</a>     account: str = &quot;&quot;
+<a id="l325" href="#l325">325</a>     refresh_key: str = &quot;&quot;
+<a id="l326" href="#l326">326</a> 
+<a id="l327" href="#l327">327</a> 
+<a id="l328" href="#l328">328</a> class WaitlistIn(BaseModel):
+<a id="l329" href="#l329">329</a>     email: str
+<a id="l330" href="#l330">330</a>     kind: str = &quot;ios&quot;
+<a id="l331" href="#l331">331</a> 
+<a id="l332" href="#l332">332</a> 
+<a id="l333" href="#l333">333</a> def _needs_sign_in(account: Account) -&gt; bool:
+<a id="l334" href="#l334">334</a>     # A $0.99 checkout draws card testing. Where email sign-in exists, only a
+<a id="l335" href="#l335">335</a>     # verified account may pay.
+<a id="l336" href="#l336">336</a>     return settings.sign_in_available and not account.email_verified
+<a id="l337" href="#l337">337</a> 
+<a id="l338" href="#l338">338</a> 
+<a id="l339" href="#l339">339</a> @router.get(&quot;&quot;)
+<a id="l340" href="#l340">340</a> def subrep_state(
+<a id="l341" href="#l341">341</a>     account: Annotated[Account, Depends(get_account)],
+<a id="l342" href="#l342">342</a>     session: Annotated[Session, Depends(get_session)],
+<a id="l343" href="#l343">343</a> ):
+<a id="l344" href="#l344">344</a>     row = licence(session, account.id)
+<a id="l345" href="#l345">345</a>     pro = is_pro(row)
+<a id="l346" href="#l346">346</a>     end = billing._aware(row.period_end) if pro and row is not None else None
+<a id="l347" href="#l347">347</a>     return {
+<a id="l348" href="#l348">348</a>         &quot;available&quot;: available(),
+<a id="l349" href="#l349">349</a>         &quot;public_key&quot;: public_key() if can_sign() else None,
+<a id="l350" href="#l350">350</a>         &quot;plans&quot;: [
+<a id="l351" href="#l351">351</a>             {&quot;id&quot;: p.id, &quot;name&quot;: p.name, &quot;interval&quot;: p.interval,
+<a id="l352" href="#l352">352</a>              &quot;price_cents&quot;: p.price_cents, &quot;price_display&quot;: p.price_display,
+<a id="l353" href="#l353">353</a>              &quot;blurb&quot;: p.blurb}
+<a id="l354" href="#l354">354</a>             for p in PLANS
+<a id="l355" href="#l355">355</a>         ],
+<a id="l356" href="#l356">356</a>         &quot;pro&quot;: pro,
+<a id="l357" href="#l357">357</a>         &quot;plan_id&quot;: row.plan_id if pro and row is not None else None,
+<a id="l358" href="#l358">358</a>         &quot;period_end&quot;: end.isoformat() if end else None,
+<a id="l359" href="#l359">359</a>         &quot;link&quot;: link(session, account) if pro else None,
+<a id="l360" href="#l360">360</a>         &quot;needs_sign_in&quot;: _needs_sign_in(account),
+<a id="l361" href="#l361">361</a>         &quot;email&quot;: account.email,
+<a id="l362" href="#l362">362</a>         &quot;can_manage&quot;: bool(account.stripe_customer_id),
+<a id="l363" href="#l363">363</a>     }
+<a id="l364" href="#l364">364</a> 
+<a id="l365" href="#l365">365</a> 
+<a id="l366" href="#l366">366</a> @router.post(&quot;/checkout&quot;)
+<a id="l367" href="#l367">367</a> def subrep_checkout(
+<a id="l368" href="#l368">368</a>     body: PlanIn,
+<a id="l369" href="#l369">369</a>     account: Annotated[Account, Depends(get_account)],
+<a id="l370" href="#l370">370</a>     session: Annotated[Session, Depends(get_session)],
+<a id="l371" href="#l371">371</a> ):
+<a id="l372" href="#l372">372</a>     found = plan(body.plan_id)
+<a id="l373" href="#l373">373</a>     if found is None:
+<a id="l374" href="#l374">374</a>         raise HTTPException(404, &quot;No such plan.&quot;)
+<a id="l375" href="#l375">375</a>     if not available():
+<a id="l376" href="#l376">376</a>         raise HTTPException(503, &quot;Subrep Pro is not for sale on this server yet.&quot;)
+<a id="l377" href="#l377">377</a>     if _needs_sign_in(account):
+<a id="l378" href="#l378">378</a>         raise HTTPException(403, &quot;Sign in with your email first.&quot;)
+<a id="l379" href="#l379">379</a>     if is_pro(licence(session, account.id)):
+<a id="l380" href="#l380">380</a>         raise HTTPException(
+<a id="l381" href="#l381">381</a>             400, &quot;You already have Subrep Pro. Change or cancel it with Manage plan.&quot;)
+<a id="l382" href="#l382">382</a>     try:
+<a id="l383" href="#l383">383</a>         return {&quot;url&quot;: payments.start_checkout(session, account, found, page=&quot;/subrep.html&quot;)}
+<a id="l384" href="#l384">384</a>     except payments.PaymentsUnavailable as exc:
+<a id="l385" href="#l385">385</a>         raise HTTPException(503, str(exc)) from exc
+<a id="l386" href="#l386">386</a>     except payments.PaymentError as exc:
+<a id="l387" href="#l387">387</a>         raise HTTPException(400, str(exc)) from exc
+<a id="l388" href="#l388">388</a> 
+<a id="l389" href="#l389">389</a> 
+<a id="l390" href="#l390">390</a> @router.post(&quot;/refresh&quot;)
+<a id="l391" href="#l391">391</a> def subrep_refresh(
+<a id="l392" href="#l392">392</a>     body: RefreshIn,
+<a id="l393" href="#l393">393</a>     session: Annotated[Session, Depends(get_session)],
+<a id="l394" href="#l394">394</a> ):
+<a id="l395" href="#l395">395</a>     &quot;&quot;&quot;The desktop app asks for a licence (refresh in subrep/licensing.py).
+<a id="l396" href="#l396">396</a> 
+<a id="l397" href="#l397">397</a>     No cookie: the app is not a browser. A refusal is {&quot;error&quot;: ...}, because
+<a id="l398" href="#l398">398</a>     the app shows that text to the customer.
+<a id="l399" href="#l399">399</a>     &quot;&quot;&quot;
+<a id="l400" href="#l400">400</a>     if not can_sign():
+<a id="l401" href="#l401">401</a>         return JSONResponse({&quot;error&quot;: &quot;Subrep Pro is not set up on this server.&quot;},
+<a id="l402" href="#l402">402</a>                             status_code=503)
+<a id="l403" href="#l403">403</a>     try:
+<a id="l404" href="#l404">404</a>         return {&quot;token&quot;: token(session, body.account, body.refresh_key)}
+<a id="l405" href="#l405">405</a>     except LicenceRefused as exc:
+<a id="l406" href="#l406">406</a>         return JSONResponse({&quot;error&quot;: exc.message}, status_code=exc.status)
+<a id="l407" href="#l407">407</a> 
+<a id="l408" href="#l408">408</a> 
+<a id="l409" href="#l409">409</a> @router.post(&quot;/waitlist&quot;)
+<a id="l410" href="#l410">410</a> def subrep_waitlist(
+<a id="l411" href="#l411">411</a>     body: WaitlistIn,
+<a id="l412" href="#l412">412</a>     account: Annotated[Account, Depends(get_account)],
+<a id="l413" href="#l413">413</a>     session: Annotated[Session, Depends(get_session)],
+<a id="l414" href="#l414">414</a> ):
+<a id="l415" href="#l415">415</a>     if body.kind not in WAITLISTS:
+<a id="l416" href="#l416">416</a>         raise HTTPException(404, &quot;No such waitlist.&quot;)
+<a id="l417" href="#l417">417</a>     try:
+<a id="l418" href="#l418">418</a>         email = accounts.normalize_email(body.email)
+<a id="l419" href="#l419">419</a>     except accounts.InvalidEmail as exc:
+<a id="l420" href="#l420">420</a>         raise HTTPException(400, str(exc)) from exc
+<a id="l421" href="#l421">421</a>     join(session, body.kind, email, account.id)
+<a id="l422" href="#l422">422</a>     return {&quot;joined&quot;: True, &quot;kind&quot;: body.kind}</pre>
+</div></body></html>

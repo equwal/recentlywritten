@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subread-extension b829f021 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subread-extension</h1><span class="desc">Show your own .srt over a YouTube video, in time with it. Chrome and Firefox.</span><p class="url">git clone https://github.com/equwal/subread-extension</p><p><a href="../../subread-extension/index.html">Log</a> | <a href="../../subread-extension/files.html">Files</a> | <a href="../../subread-extension/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit b829f021f5f110cab13838b16d96180457d834da
+equwal &lt;truex@equwal.com&gt;
+2026-09-24 12:08:56 -0700
+
+Add a SubRead transcript panel, filled with the loaded SRT
+
+Add a Transcript checkbox next to Show. When on, it builds SubRead&#x27;s
+own transcript panel (not YouTube&#x27;s), lists every cue with its time on
+the video&#x27;s clock, highlights and scrolls to the cue now playing, and
+seeks the video when a line is clicked.
+
+Place the panel at the top of the related-videos column. When that
+column is not there, place it below the player instead. Keep the
+panel through YouTube&#x27;s page changes, and take it down when the
+subtitles are removed.
+
+</pre><pre> src/content.css |  26 ++++++++++++
+ src/content.js  | 122 +++++++++++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 138 insertions(+), 10 deletions(-)
+</pre><pre>diff --git a/src/content.css b/src/content.css
+index abb1895..c0d1807 100644
+--- a/src/content.css
++++ b/src/content.css
+<span class="h">@@ -36,3 +36,29 @@</span>
+ #movie_player .subread-file { max-width: 190px; color: #ccc; font-size: 12px; }
+ #movie_player .subread-help { color: #bbb; display: block; font-size: 12px; }
+ #movie_player .subread-help a { color: #9cc3ff; }
+<span class="a">+</span>
+<span class="a">+/* The transcript panel: SubRead&#x27;s own, styled to sit next to YouTube&#x27;s related videos. */</span>
+<span class="a">+.subread-transcript {</span>
+<span class="a">+  margin: 0 0 12px; border-radius: 12px; overflow: hidden;</span>
+<span class="a">+  background: var(--yt-spec-badge-chip-background, #f2f2f2);</span>
+<span class="a">+  color: var(--yt-spec-text-primary, #0f0f0f);</span>
+<span class="a">+  /* Latin and Cyrillic fonts come first. The Japanese fonts have full-width Cyrillic letters. */</span>
+<span class="a">+  font-family: &quot;Noto Sans&quot;, Roboto, Arial, &quot;Hiragino Sans&quot;, &quot;Yu Gothic&quot;, sans-serif;</span>
+<span class="a">+  font-size: 14px;</span>
+<span class="a">+}</span>
+<span class="a">+.subread-transcript-header {</span>
+<span class="a">+  display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; font-weight: 700;</span>
+<span class="a">+}</span>
+<span class="a">+.subread-transcript-close {</span>
+<span class="a">+  background: none; border: none; color: inherit; font: inherit; font-size: 20px; line-height: 1; padding: 0 4px; cursor: pointer;</span>
+<span class="a">+}</span>
+<span class="a">+.subread-transcript-list { max-height: 60vh; overflow-y: auto; padding: 0 8px 12px; }</span>
+<span class="a">+.subread-transcript-row {</span>
+<span class="a">+  display: flex; gap: 12px; padding: 6px 8px; border-radius: 6px; cursor: pointer; line-height: 1.4;</span>
+<span class="a">+}</span>
+<span class="a">+.subread-transcript-row:hover { background: var(--yt-spec-10-percent-layer, rgba(0, 0, 0, .06)); }</span>
+<span class="a">+.subread-transcript-row.subread-current { background: var(--yt-spec-10-percent-layer, rgba(0, 0, 0, .1)); }</span>
+<span class="a">+.subread-transcript-stamp {</span>
+<span class="a">+  flex: none; width: 44px; color: var(--yt-spec-text-secondary, #606060); font-variant-numeric: tabular-nums;</span>
+<span class="a">+}</span>
+<span class="a">+.subread-transcript-text { white-space: pre-line; }</span>
+diff --git a/src/content.js b/src/content.js
+index 18e17ca..7dcd263 100644
+--- a/src/content.js
++++ b/src/content.js
+<span class="h">@@ -10,14 +10,19 @@</span>
+   if (window.__subreadLoaded) return;
+   window.__subreadLoaded = true;
+ 
+<span class="d">-  const { parse, cueAt, subtitleTime } = globalThis.SubReadSrt;</span>
+<span class="a">+  const { parse, cueAt, subtitleTime, videoTime } = globalThis.SubReadSrt;</span>
+   const store = (typeof chrome !== &#x27;undefined&#x27; &amp;&amp; chrome.storage?.local) || null;
+   const KEEP = 8;                     // videos whose subtitles are kept
+<span class="d">-  const DEFAULTS = { offset: 0, rate: 1, size: 26, shown: true };</span>
+<span class="a">+  const DEFAULTS = { offset: 0, rate: 1, size: 26, shown: true, transcript: false };</span>
+ 
+   let videoId = null, cues = [], settings = { ...DEFAULTS }, fileName = &#x27;&#x27;;
+   let box, panel, button, line, status, shownCue = null;
+ 
+<span class="a">+  // The transcript panel: built once, moved in and out of the page as needed.</span>
+<span class="a">+  let transcriptPanel, transcriptList, transcriptRowByCue = new WeakMap();</span>
+<span class="a">+  let transcriptCuesRef = null, transcriptClock = { offset: NaN, rate: NaN };</span>
+<span class="a">+  let transcriptCurrentRow = null, transcriptUserScrollAt = 0, transcriptLastAutoScroll = 0;</span>
+<span class="a">+</span>
+   const get = (key) =&gt; new Promise((done) =&gt; (store ? store.get(key, (v) =&gt; done(v?.[key])) : done(undefined)));
+   const set = (key, value) =&gt; new Promise((done) =&gt; (store ? store.set({ [key]: value }, done) : done()));
+   const remove = (key) =&gt; new Promise((done) =&gt; (store ? store.remove(key, done) : done()));
+<span class="h">@@ -69,6 +74,8 @@</span>
+     size.addEventListener(&#x27;input&#x27;, () =&gt; change({ size: +size.value }));
+     const shown = el(&#x27;input&#x27;, { type: &#x27;checkbox&#x27; });
+     shown.addEventListener(&#x27;change&#x27;, () =&gt; change({ shown: shown.checked }));
+<span class="a">+    const transcript = el(&#x27;input&#x27;, { type: &#x27;checkbox&#x27; });</span>
+<span class="a">+    transcript.addEventListener(&#x27;change&#x27;, () =&gt; change({ transcript: transcript.checked }));</span>
+     const forget = el(&#x27;button&#x27;, { type: &#x27;button&#x27;, textContent: &#x27;Remove&#x27; });
+     forget.addEventListener(&#x27;click&#x27;, async () =&gt; { await remove(&#x27;v:&#x27; + videoId); cues = []; fileName = &#x27;&#x27;; render(); });
+ 
+<span class="h">@@ -81,14 +88,14 @@</span>
+       el(&#x27;div&#x27;, { className: &#x27;subread-row&#x27; }, [here]),
+       el(&#x27;label&#x27;, { className: &#x27;subread-row&#x27; }, [&#x27;Speed &#x27;, rate]),
+       el(&#x27;label&#x27;, { className: &#x27;subread-row&#x27; }, [&#x27;Size &#x27;, size]),
+<span class="d">-      el(&#x27;label&#x27;, { className: &#x27;subread-row&#x27; }, [shown, &#x27; Show&#x27;, &#x27; &#x27;, forget]),</span>
+<span class="a">+      el(&#x27;label&#x27;, { className: &#x27;subread-row&#x27; }, [shown, &#x27; Show&#x27;, &#x27; &#x27;, transcript, &#x27; Transcript&#x27;, &#x27; &#x27;, forget]),</span>
+       el(&#x27;div&#x27;, { className: &#x27;subread-row subread-help&#x27; }, [
+         &#x27;No subtitles for this book? &#x27;,
+         el(&#x27;a&#x27;, { href: &#x27;https://subread.space&#x27;, target: &#x27;_blank&#x27;, rel: &#x27;noopener&#x27;, textContent: &#x27;Make them from the audiobook and its ebook&#x27; }),
+         &#x27;: free, in your browser.&#x27;,
+       ]),
+     ]);
+<span class="d">-    panel._controls = { offsetOut, rate, size, shown };</span>
+<span class="a">+    panel._controls = { offsetOut, rate, size, shown, transcript };</span>
+     for (const type of [&#x27;click&#x27;, &#x27;dblclick&#x27;, &#x27;keydown&#x27;, &#x27;keyup&#x27;, &#x27;keypress&#x27;, &#x27;wheel&#x27;]) {
+       panel.addEventListener(type, (e) =&gt; e.stopPropagation());       // or the player takes the keys and the clicks
+     }
+<span class="h">@@ -100,6 +107,93 @@</span>
+     return true;
+   }
+ 
+<span class="a">+  /* ------------------------------------------------------------- transcript */</span>
+<span class="a">+</span>
+<span class="a">+  // m:ss, or h:mm:ss past the first hour.</span>
+<span class="a">+  function stamp(t) {</span>
+<span class="a">+    t = Math.max(0, Math.round(t));</span>
+<span class="a">+    const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, s = t % 60;</span>
+<span class="a">+    return (h ? h + &#x27;:&#x27; + String(m).padStart(2, &#x27;0&#x27;) : String(m)) + &#x27;:&#x27; + String(s).padStart(2, &#x27;0&#x27;);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  function buildTranscript() {</span>
+<span class="a">+    const list = el(&#x27;div&#x27;, { className: &#x27;subread-transcript-list&#x27; });</span>
+<span class="a">+    list.addEventListener(&#x27;scroll&#x27;, () =&gt; {</span>
+<span class="a">+      // Setting scrollTop ourselves also fires &#x27;scroll&#x27;; tell it apart by when it happened.</span>
+<span class="a">+      if (Date.now() - transcriptLastAutoScroll &gt; 150) transcriptUserScrollAt = Date.now();</span>
+<span class="a">+    });</span>
+<span class="a">+    const close = el(&#x27;button&#x27;, { type: &#x27;button&#x27;, className: &#x27;subread-transcript-close&#x27;, textContent: &#x27;×&#x27;, title: &#x27;Close the transcript&#x27; });</span>
+<span class="a">+    close.addEventListener(&#x27;click&#x27;, () =&gt; change({ transcript: false }));</span>
+<span class="a">+    const header = el(&#x27;div&#x27;, { className: &#x27;subread-transcript-header&#x27; }, [</span>
+<span class="a">+      el(&#x27;span&#x27;, { className: &#x27;subread-transcript-title&#x27;, textContent: &#x27;SubRead transcript&#x27; }),</span>
+<span class="a">+      close,</span>
+<span class="a">+    ]);</span>
+<span class="a">+    transcriptPanel = el(&#x27;div&#x27;, { className: &#x27;subread-transcript&#x27; }, [header, list]);</span>
+<span class="a">+    transcriptList = list;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // Put the panel at the top of the related-videos column, or below the player when that column is not there.</span>
+<span class="a">+  function attachTranscript() {</span>
+<span class="a">+    const side = document.querySelector(&#x27;#secondary-inner&#x27;) || document.querySelector(&#x27;#secondary&#x27;);</span>
+<span class="a">+    if (side) { side.insertBefore(transcriptPanel, side.firstChild); return; }</span>
+<span class="a">+    const below = document.querySelector(&#x27;#below&#x27;);</span>
+<span class="a">+    if (below) below.insertBefore(transcriptPanel, below.firstChild);</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // One row per cue, with the cue&#x27;s start shown on the clock of the video.</span>
+<span class="a">+  function renderTranscriptRows() {</span>
+<span class="a">+    transcriptList.textContent = &#x27;&#x27;;</span>
+<span class="a">+    transcriptRowByCue = new WeakMap();</span>
+<span class="a">+    transcriptCurrentRow = null;</span>
+<span class="a">+    for (const cue of cues) {</span>
+<span class="a">+      const time = el(&#x27;span&#x27;, { className: &#x27;subread-transcript-stamp&#x27;, textContent: stamp(videoTime(cue.start, settings.offset, settings.rate)) });</span>
+<span class="a">+      const text = el(&#x27;span&#x27;, { className: &#x27;subread-transcript-text&#x27;, textContent: cue.text });</span>
+<span class="a">+      const row = el(&#x27;div&#x27;, { className: &#x27;subread-transcript-row&#x27; }, [time, text]);</span>
+<span class="a">+      row.addEventListener(&#x27;click&#x27;, () =&gt; { const v = video(); if (v) v.currentTime = videoTime(cue.start, settings.offset, settings.rate); });</span>
+<span class="a">+      transcriptList.append(row);</span>
+<span class="a">+      transcriptRowByCue.set(cue, row);</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // The Start offset or Speed changed: the video time shown for each cue moves, but not the rows.</span>
+<span class="a">+  function updateTranscriptStamps() {</span>
+<span class="a">+    const rows = transcriptList.children;</span>
+<span class="a">+    cues.forEach((cue, i) =&gt; { rows[i].firstChild.textContent = stamp(videoTime(cue.start, settings.offset, settings.rate)); });</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // Build, attach, and fill the panel if the toggle is on and there are cues; else take it down.</span>
+<span class="a">+  function ensureTranscript() {</span>
+<span class="a">+    const want = settings.transcript &amp;&amp; cues.length &gt; 0;</span>
+<span class="a">+    if (!want) { if (transcriptPanel) transcriptPanel.remove(); return; }</span>
+<span class="a">+    if (!transcriptPanel) buildTranscript();</span>
+<span class="a">+    if (!transcriptPanel.isConnected) attachTranscript();</span>
+<span class="a">+    if (transcriptCuesRef !== cues) {</span>
+<span class="a">+      renderTranscriptRows();</span>
+<span class="a">+      transcriptCuesRef = cues;</span>
+<span class="a">+      transcriptClock = { offset: settings.offset, rate: settings.rate };</span>
+<span class="a">+    } else if (transcriptClock.offset !== settings.offset || transcriptClock.rate !== settings.rate) {</span>
+<span class="a">+      updateTranscriptStamps();</span>
+<span class="a">+      transcriptClock = { offset: settings.offset, rate: settings.rate };</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+<span class="a">+  // Highlight the row of the cue on screen now, and scroll it into view unless the user just scrolled the list.</span>
+<span class="a">+  function highlightTranscript(cue) {</span>
+<span class="a">+    if (!transcriptPanel || !transcriptPanel.isConnected) return;</span>
+<span class="a">+    const row = cue ? transcriptRowByCue.get(cue) : null;</span>
+<span class="a">+    if (row === transcriptCurrentRow) return;</span>
+<span class="a">+    if (transcriptCurrentRow) transcriptCurrentRow.classList.remove(&#x27;subread-current&#x27;);</span>
+<span class="a">+    transcriptCurrentRow = row || null;</span>
+<span class="a">+    if (!row) return;</span>
+<span class="a">+    row.classList.add(&#x27;subread-current&#x27;);</span>
+<span class="a">+    if (Date.now() - transcriptUserScrollAt &lt; 4000) return;</span>
+<span class="a">+    const list = transcriptList;</span>
+<span class="a">+    const target = Math.max(0, Math.min(row.offsetTop - list.clientHeight / 2 + row.offsetHeight / 2, list.scrollHeight - list.clientHeight));</span>
+<span class="a">+    if (Math.abs(list.scrollTop - target) &lt; 1) return;</span>
+<span class="a">+    transcriptLastAutoScroll = Date.now();</span>
+<span class="a">+    list.scrollTop = target;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+   /* ------------------------------------------------------------------- state */
+ 
+   async function load(source, name) {
+<span class="h">@@ -135,21 +229,25 @@</span>
+     c.rate.value = settings.rate;
+     c.size.value = settings.size;
+     c.shown.checked = settings.shown;
+<span class="a">+    c.transcript.checked = settings.transcript;</span>
+     status.textContent = cues.length ? `${fileName}: ${cues.length} lines` : &#x27;Choose the .srt of this video.&#x27;;
+     box.style.fontSize = settings.size + &#x27;px&#x27;;
+     button.classList.toggle(&#x27;subread-on&#x27;, cues.length &gt; 0 &amp;&amp; settings.shown);
+     shownCue = undefined;               // draw again
+<span class="a">+    ensureTranscript();</span>
+     tick();
+   }
+ 
+   function tick() {
+     const v = video();
+     if (!box || !v) return;
+<span class="d">-    const cue = cues.length &amp;&amp; settings.shown ? cueAt(cues, subtitleTime(v.currentTime, settings.offset, settings.rate)) : null;</span>
+<span class="d">-    if (cue === shownCue) return;</span>
+<span class="d">-    shownCue = cue;</span>
+<span class="d">-    line.textContent = cue ? cue.text : &#x27;&#x27;;</span>
+<span class="d">-    box.hidden = !cue;</span>
+<span class="a">+    const cue = cues.length ? cueAt(cues, subtitleTime(v.currentTime, settings.offset, settings.rate)) : null;</span>
+<span class="a">+    highlightTranscript(cue);</span>
+<span class="a">+    const shown = settings.shown ? cue : null;</span>
+<span class="a">+    if (shown === shownCue) return;</span>
+<span class="a">+    shownCue = shown;</span>
+<span class="a">+    line.textContent = shown ? shown.text : &#x27;&#x27;;</span>
+<span class="a">+    box.hidden = !shown;</span>
+   }
+ 
+   async function arrive() {
+<span class="h">@@ -166,7 +264,11 @@</span>
+ 
+   // YouTube changes pages without loading a new one, and builds its player late.
+   document.addEventListener(&#x27;yt-navigate-finish&#x27;, arrive);
+<span class="d">-  setInterval(() =&gt; { if (currentId() &amp;&amp; (!box || !box.isConnected || currentId() !== videoId)) arrive(); }, 1500);</span>
+<span class="a">+  setInterval(() =&gt; {</span>
+<span class="a">+    if (currentId() &amp;&amp; (!box || !box.isConnected || currentId() !== videoId)) { arrive(); return; }</span>
+<span class="a">+    // The related-videos column can be rebuilt (theatre mode, layout change) without a navigation.</span>
+<span class="a">+    if (transcriptPanel &amp;&amp; settings.transcript &amp;&amp; !transcriptPanel.isConnected) ensureTranscript();</span>
+<span class="a">+  }, 1500);</span>
+   setInterval(tick, 100);
+   arrive();
+ })();</pre>
+</div></body></html>

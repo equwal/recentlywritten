@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync a9bafeef - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit a9bafeef7c3a46a4372aaa240a902144c7bcc03c
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 16:05:08 -0700
+
+Accounts confirm their email address when the server has SMTP
+
+With SBM_SMTP_HOST set, a new account gets an email with a link. The
+account syncs only after someone opens the link. Until then, /api/sync
+answers 403. The account page can send the email again, 5 times an hour.
+
+The store keeps only the SHA-256 of the code. Accounts from before have
+no code, so they count as confirmed. Without SBM_SMTP_HOST, the server
+sends no email and checks no address, as before.
+
+The mailer uses net/smtp: TLS from the start on port 465, else STARTTLS
+when the server offers it. The tests play an SMTP server, with and
+without TLS.
+
+</pre><pre> README.md      |  27 +++++---
+ mail.go        | 101 ++++++++++++++++++++++++++++++
+ mail_test.go   | 190 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ main.go        | 101 ++++++++++++++++++++++++++++--
+ pages.html     |  12 +++-
+ server_test.go | 112 +++++++++++++++++++++++++++++++++-
+ store.go       |  39 +++++++++++-
+ 7 files changed, 567 insertions(+), 15 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index cfa7e65..91ae916 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -49,8 +49,8 @@ Plain HTTP, for any client with curl.</span>
+     POST /api/logout       Authorization: Bearer &lt;token&gt;
+ 
+ Errors come as text: 401 (sign in again), 402 (the subscription or the
+<span class="d">-trial has ended), 413 (the file is larger than 4 MB), 429 (too many sign-in</span>
+<span class="d">-attempts).</span>
+<span class="a">+trial has ended), 403 (confirm the email address first), 413 (the file is</span>
+<span class="a">+larger than 4 MB), 429 (too many sign-in attempts).</span>
+ 
+     curl -d email=me@example.org --data-urlencode password=... https://sbm.subread.space/api/login
+     curl -H &quot;Authorization: Bearer $token&quot; --data-binary @bookmarks \
+<span class="h">@@ -75,10 +75,22 @@ Settings, all through the environment:</span>
+     SBM_TRIAL_DAYS  days of sync before payment, with billing on (default 30)
+     SBM_BILLING_START  date when billing starts, as 2026-10-01: accounts
+                     from before it get the full trial from that date
+<span class="d">-</span>
+<span class="d">-Accounts need no email check. To reset a password, the operator deletes the</span>
+<span class="d">-account in `accounts.json` (with the server stopped), and the user signs up</span>
+<span class="d">-again. The bookmark files stay on the devices.</span>
+<span class="a">+    SBM_SMTP_HOST   SMTP server that sends email (optional)</span>
+<span class="a">+    SBM_SMTP_PORT   its port (default 587, with STARTTLS; 465 uses TLS</span>
+<span class="a">+                    from the start)</span>
+<span class="a">+    SBM_SMTP_USER   user name on the SMTP server</span>
+<span class="a">+    SBM_SMTP_PASSWORD  password on the SMTP server</span>
+<span class="a">+    SBM_MAIL_FROM   sender, as &quot;sbm Sync &lt;sync@example.org&gt;&quot; (default</span>
+<span class="a">+                    SBM_SMTP_USER)</span>
+<span class="a">+</span>
+<span class="a">+Without `SBM_SMTP_HOST`, the server sends no email, and accounts need no</span>
+<span class="a">+email check. With it, each new account gets an email with a link. The</span>
+<span class="a">+account syncs only after someone opens that link. Accounts from a time</span>
+<span class="a">+without `SBM_SMTP_HOST` need no check.</span>
+<span class="a">+</span>
+<span class="a">+To reset a password, the operator deletes the account in `accounts.json`</span>
+<span class="a">+(with the server stopped), and the user signs up again. The bookmark files</span>
+<span class="a">+stay on the devices.</span>
+ 
+ ## Billing
+ 
+<span class="h">@@ -104,7 +116,8 @@ Keep the keys out of git: put them in the environment file of the service.</span>
+ ## Data
+ 
+     data/accounts.json            accounts: email, bcrypt hash, token hashes,
+<span class="d">-                                  Stripe customer and subscription state</span>
+<span class="a">+                                  hash of the email check code, Stripe</span>
+<span class="a">+                                  customer and subscription state</span>
+     data/files/&lt;account&gt;/&lt;sha256&gt; the last 50 versions of each bookmark file
+     data/files/&lt;account&gt;/HEAD     name of the current version
+ 
+diff --git a/mail.go b/mail.go
+new file mode 100644
+index 0000000..699ad17
+--- /dev/null
++++ b/mail.go
+<span class="h">@@ -0,0 +1,101 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;crypto/tls&quot;</span>
+<span class="a">+	&quot;crypto/x509&quot;</span>
+<span class="a">+	&quot;fmt&quot;</span>
+<span class="a">+	&quot;mime&quot;</span>
+<span class="a">+	&quot;net&quot;</span>
+<span class="a">+	&quot;net/mail&quot;</span>
+<span class="a">+	&quot;net/smtp&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// Mailer sends email through an SMTP server. With TLS set (port 465), the</span>
+<span class="a">+// connection uses TLS from the start. Else the mailer starts TLS when the</span>
+<span class="a">+// server offers STARTTLS. net/smtp never sends the password over a</span>
+<span class="a">+// connection without TLS, except to localhost.</span>
+<span class="a">+type Mailer struct {</span>
+<span class="a">+	Addr     string // host:port of the SMTP server</span>
+<span class="a">+	TLS      bool</span>
+<span class="a">+	User     string // empty for a server that needs no sign-in</span>
+<span class="a">+	Password string</span>
+<span class="a">+	From     *mail.Address</span>
+<span class="a">+	Hello    string         // name of this host in EHLO</span>
+<span class="a">+	Roots    *x509.CertPool // nil for the roots of the system; tests replace it</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// send sends a plain text email. The lines of body end in &quot;\n&quot;.</span>
+<span class="a">+func (m *Mailer) send(to, subject, body string) error {</span>
+<span class="a">+	host, _, err := net.SplitHostPort(m.Addr)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	tc := &amp;tls.Config{ServerName: host, RootCAs: m.Roots}</span>
+<span class="a">+	d := &amp;net.Dialer{Timeout: 20 * time.Second}</span>
+<span class="a">+	var conn net.Conn</span>
+<span class="a">+	if m.TLS {</span>
+<span class="a">+		conn, err = tls.DialWithDialer(d, &quot;tcp&quot;, m.Addr, tc)</span>
+<span class="a">+	} else {</span>
+<span class="a">+		conn, err = d.Dial(&quot;tcp&quot;, m.Addr)</span>
+<span class="a">+	}</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	defer conn.Close()</span>
+<span class="a">+	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	c, err := smtp.NewClient(conn, host)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := c.Hello(m.Hello); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if ok, _ := c.Extension(&quot;STARTTLS&quot;); ok &amp;&amp; !m.TLS {</span>
+<span class="a">+		if err := c.StartTLS(tc); err != nil {</span>
+<span class="a">+			return err</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if m.User != &quot;&quot; {</span>
+<span class="a">+		if err := c.Auth(smtp.PlainAuth(&quot;&quot;, m.User, m.Password, host)); err != nil {</span>
+<span class="a">+			return err</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := c.Mail(m.From.Address); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := c.Rcpt(to); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	w, err := c.Data()</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if _, err := w.Write(m.message(to, subject, body)); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := w.Close(); err != nil {</span>
+<span class="a">+		return err</span>
+<span class="a">+	}</span>
+<span class="a">+	return c.Quit()</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// message gives the email with its header. The lines end in CRLF, as SMTP</span>
+<span class="a">+// needs.</span>
+<span class="a">+func (m *Mailer) message(to, subject, body string) []byte {</span>
+<span class="a">+	_, domain, _ := strings.Cut(m.From.Address, &quot;@&quot;)</span>
+<span class="a">+	var b strings.Builder</span>
+<span class="a">+	fmt.Fprintf(&amp;b, &quot;From: %s\r\n&quot;, m.From)</span>
+<span class="a">+	fmt.Fprintf(&amp;b, &quot;To: %s\r\n&quot;, to)</span>
+<span class="a">+	fmt.Fprintf(&amp;b, &quot;Subject: %s\r\n&quot;, mime.QEncoding.Encode(&quot;utf-8&quot;, subject))</span>
+<span class="a">+	fmt.Fprintf(&amp;b, &quot;Date: %s\r\n&quot;, time.Now().Format(time.RFC1123Z))</span>
+<span class="a">+	fmt.Fprintf(&amp;b, &quot;Message-ID: &lt;%s@%s&gt;\r\n&quot;, random(16), domain)</span>
+<span class="a">+	b.WriteString(&quot;MIME-Version: 1.0\r\n&quot;)</span>
+<span class="a">+	b.WriteString(&quot;Content-Type: text/plain; charset=utf-8\r\n&quot;)</span>
+<span class="a">+	b.WriteString(&quot;Content-Transfer-Encoding: 8bit\r\n\r\n&quot;)</span>
+<span class="a">+	b.WriteString(strings.ReplaceAll(body, &quot;\n&quot;, &quot;\r\n&quot;))</span>
+<span class="a">+	return []byte(b.String())</span>
+<span class="a">+}</span>
+diff --git a/mail_test.go b/mail_test.go
+new file mode 100644
+index 0000000..457647c
+--- /dev/null
++++ b/mail_test.go
+<span class="h">@@ -0,0 +1,190 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;crypto/tls&quot;</span>
+<span class="a">+	&quot;crypto/x509&quot;</span>
+<span class="a">+	&quot;encoding/base64&quot;</span>
+<span class="a">+	&quot;net&quot;</span>
+<span class="a">+	&quot;net/http&quot;</span>
+<span class="a">+	&quot;net/http/httptest&quot;</span>
+<span class="a">+	&quot;net/mail&quot;</span>
+<span class="a">+	&quot;net/textproto&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;sync&quot;</span>
+<span class="a">+	&quot;testing&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// fakeSMTP plays an SMTP server and records what the client sends. With</span>
+<span class="a">+// tls set, it offers STARTTLS, or it uses TLS from the start when implicit</span>
+<span class="a">+// is set.</span>
+<span class="a">+type fakeSMTP struct {</span>
+<span class="a">+	ln       net.Listener</span>
+<span class="a">+	tls      *tls.Config</span>
+<span class="a">+	implicit bool</span>
+<span class="a">+</span>
+<span class="a">+	mu       sync.Mutex</span>
+<span class="a">+	auth     string // &quot;user password&quot; of AUTH PLAIN</span>
+<span class="a">+	authTLS  bool   // the connection had TLS at AUTH</span>
+<span class="a">+	from, to string // arguments of MAIL and RCPT</span>
+<span class="a">+	data     string</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func newFakeSMTP(t *testing.T, tc *tls.Config, implicit bool) *fakeSMTP {</span>
+<span class="a">+	ln, err := net.Listen(&quot;tcp&quot;, &quot;127.0.0.1:0&quot;)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	t.Cleanup(func() { ln.Close() })</span>
+<span class="a">+	f := &amp;fakeSMTP{ln: ln, tls: tc, implicit: implicit}</span>
+<span class="a">+	go func() {</span>
+<span class="a">+		for {</span>
+<span class="a">+			conn, err := ln.Accept()</span>
+<span class="a">+			if err != nil {</span>
+<span class="a">+				return</span>
+<span class="a">+			}</span>
+<span class="a">+			go f.session(conn)</span>
+<span class="a">+		}</span>
+<span class="a">+	}()</span>
+<span class="a">+	return f</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func (f *fakeSMTP) session(conn net.Conn) {</span>
+<span class="a">+	defer func() { conn.Close() }()</span>
+<span class="a">+	secure := f.implicit</span>
+<span class="a">+	if secure {</span>
+<span class="a">+		conn = tls.Server(conn, f.tls)</span>
+<span class="a">+	}</span>
+<span class="a">+	tp := textproto.NewConn(conn)</span>
+<span class="a">+	tp.PrintfLine(&quot;220 fake ESMTP&quot;)</span>
+<span class="a">+	for {</span>
+<span class="a">+		line, err := tp.ReadLine()</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			return</span>
+<span class="a">+		}</span>
+<span class="a">+		verb, arg, _ := strings.Cut(line, &quot; &quot;)</span>
+<span class="a">+		f.mu.Lock()</span>
+<span class="a">+		switch strings.ToUpper(verb) {</span>
+<span class="a">+		case &quot;EHLO&quot;:</span>
+<span class="a">+			tp.PrintfLine(&quot;250-fake&quot;)</span>
+<span class="a">+			if f.tls != nil &amp;&amp; !secure {</span>
+<span class="a">+				tp.PrintfLine(&quot;250-STARTTLS&quot;)</span>
+<span class="a">+			}</span>
+<span class="a">+			tp.PrintfLine(&quot;250 AUTH PLAIN&quot;)</span>
+<span class="a">+		case &quot;STARTTLS&quot;:</span>
+<span class="a">+			tp.PrintfLine(&quot;220 go ahead&quot;)</span>
+<span class="a">+			conn = tls.Server(conn, f.tls)</span>
+<span class="a">+			tp = textproto.NewConn(conn)</span>
+<span class="a">+			secure = true</span>
+<span class="a">+		case &quot;AUTH&quot;:</span>
+<span class="a">+			_, resp, _ := strings.Cut(arg, &quot; &quot;)</span>
+<span class="a">+			b, _ := base64.StdEncoding.DecodeString(resp)</span>
+<span class="a">+			f.auth = strings.TrimPrefix(strings.ReplaceAll(string(b), &quot;\x00&quot;, &quot; &quot;), &quot; &quot;)</span>
+<span class="a">+			f.authTLS = secure</span>
+<span class="a">+			tp.PrintfLine(&quot;235 ok&quot;)</span>
+<span class="a">+		case &quot;MAIL&quot;:</span>
+<span class="a">+			f.from = arg</span>
+<span class="a">+			tp.PrintfLine(&quot;250 ok&quot;)</span>
+<span class="a">+		case &quot;RCPT&quot;:</span>
+<span class="a">+			f.to = arg</span>
+<span class="a">+			tp.PrintfLine(&quot;250 ok&quot;)</span>
+<span class="a">+		case &quot;DATA&quot;:</span>
+<span class="a">+			tp.PrintfLine(&quot;354 go on&quot;)</span>
+<span class="a">+			b, _ := tp.ReadDotBytes()</span>
+<span class="a">+			f.data = string(b)</span>
+<span class="a">+			tp.PrintfLine(&quot;250 ok&quot;)</span>
+<span class="a">+		case &quot;QUIT&quot;:</span>
+<span class="a">+			tp.PrintfLine(&quot;221 bye&quot;)</span>
+<span class="a">+			f.mu.Unlock()</span>
+<span class="a">+			return</span>
+<span class="a">+		default:</span>
+<span class="a">+			tp.PrintfLine(&quot;502 no such command&quot;)</span>
+<span class="a">+		}</span>
+<span class="a">+		f.mu.Unlock()</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// testTLS gives a certificate for 127.0.0.1 and a pool that trusts it.</span>
+<span class="a">+func testTLS(t *testing.T) (*tls.Config, *x509.CertPool) {</span>
+<span class="a">+	ts := httptest.NewTLSServer(http.NotFoundHandler())</span>
+<span class="a">+	t.Cleanup(ts.Close)</span>
+<span class="a">+	pool := x509.NewCertPool()</span>
+<span class="a">+	pool.AddCert(ts.Certificate())</span>
+<span class="a">+	return &amp;tls.Config{Certificates: ts.TLS.Certificates}, pool</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func testMailer(f *fakeSMTP) *Mailer {</span>
+<span class="a">+	return &amp;Mailer{Addr: f.ln.Addr().String(), Hello: &quot;localhost&quot;,</span>
+<span class="a">+		From: &amp;mail.Address{Name: &quot;sbm Sync&quot;, Address: &quot;sync@example.org&quot;}}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestMailerSends(t *testing.T) {</span>
+<span class="a">+	f := newFakeSMTP(t, nil, false)</span>
+<span class="a">+	if err := testMailer(f).send(&quot;you@example.org&quot;, &quot;Hello&quot;, &quot;line 1\n.line 2\n&quot;); err != nil {</span>
+<span class="a">+		t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	f.mu.Lock()</span>
+<span class="a">+	defer f.mu.Unlock()</span>
+<span class="a">+	if f.from != &quot;FROM:&lt;sync@example.org&gt;&quot; || f.to != &quot;TO:&lt;you@example.org&gt;&quot; {</span>
+<span class="a">+		t.Errorf(&quot;envelope: %q %q&quot;, f.from, f.to)</span>
+<span class="a">+	}</span>
+<span class="a">+	for _, want := range []string{</span>
+<span class="a">+		&quot;From: \&quot;sbm Sync\&quot; &lt;sync@example.org&gt;\n&quot;,</span>
+<span class="a">+		&quot;To: you@example.org\n&quot;,</span>
+<span class="a">+		&quot;Subject: Hello\n&quot;,</span>
+<span class="a">+		&quot;Message-ID: &lt;&quot;,</span>
+<span class="a">+		&quot;@example.org&gt;\n&quot;,</span>
+<span class="a">+		&quot;Content-Type: text/plain; charset=utf-8\n&quot;,</span>
+<span class="a">+		&quot;\n\nline 1\n.line 2\n&quot;,</span>
+<span class="a">+	} {</span>
+<span class="a">+		if !strings.Contains(f.data, want) {</span>
+<span class="a">+			t.Errorf(&quot;the email lacks %q:\n%s&quot;, want, f.data)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestMailerStartTLS(t *testing.T) {</span>
+<span class="a">+	tc, pool := testTLS(t)</span>
+<span class="a">+	f := newFakeSMTP(t, tc, false)</span>
+<span class="a">+	m := testMailer(f)</span>
+<span class="a">+	m.User, m.Password, m.Roots = &quot;me&quot;, &quot;secret&quot;, pool</span>
+<span class="a">+	if err := m.send(&quot;you@example.org&quot;, &quot;Hello&quot;, &quot;hi\n&quot;); err != nil {</span>
+<span class="a">+		t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	f.mu.Lock()</span>
+<span class="a">+	defer f.mu.Unlock()</span>
+<span class="a">+	if f.auth != &quot;me secret&quot; || !f.authTLS {</span>
+<span class="a">+		t.Errorf(&quot;auth %q, with TLS %v&quot;, f.auth, f.authTLS)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestMailerTLSFromTheStart(t *testing.T) {</span>
+<span class="a">+	tc, pool := testTLS(t)</span>
+<span class="a">+	f := newFakeSMTP(t, tc, true)</span>
+<span class="a">+	m := testMailer(f)</span>
+<span class="a">+	m.TLS, m.User, m.Password, m.Roots = true, &quot;me&quot;, &quot;secret&quot;, pool</span>
+<span class="a">+	if err := m.send(&quot;you@example.org&quot;, &quot;Hello&quot;, &quot;hi\n&quot;); err != nil {</span>
+<span class="a">+		t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	f.mu.Lock()</span>
+<span class="a">+	defer f.mu.Unlock()</span>
+<span class="a">+	if f.auth != &quot;me secret&quot; || !f.authTLS || !strings.Contains(f.data, &quot;hi\n&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;auth %q, with TLS %v, data %q&quot;, f.auth, f.authTLS, f.data)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// A certificate that the system does not trust stops the email before the</span>
+<span class="a">+// password goes out.</span>
+<span class="a">+func TestMailerChecksTheCertificate(t *testing.T) {</span>
+<span class="a">+	tc, _ := testTLS(t)</span>
+<span class="a">+	f := newFakeSMTP(t, tc, false)</span>
+<span class="a">+	m := testMailer(f)</span>
+<span class="a">+	m.User, m.Password = &quot;me&quot;, &quot;secret&quot;</span>
+<span class="a">+	if err := m.send(&quot;you@example.org&quot;, &quot;Hello&quot;, &quot;hi\n&quot;); err == nil {</span>
+<span class="a">+		t.Error(&quot;the mailer trusts any certificate&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	f.mu.Lock()</span>
+<span class="a">+	defer f.mu.Unlock()</span>
+<span class="a">+	if f.auth != &quot;&quot; {</span>
+<span class="a">+		t.Errorf(&quot;the password went out: %q&quot;, f.auth)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+diff --git a/main.go b/main.go
+index 44f4e7f..05f47b5 100644
+--- a/main.go
++++ b/main.go
+<span class="h">@@ -4,7 +4,7 @@</span>
+ // got last time. The server merges the changes of the device into its own
+ // copy, keeps the result and sends it back. Accounts are an email address
+ // and a password. Billing through Stripe is off unless STRIPE_SECRET_KEY is
+<span class="d">-// set.</span>
+<span class="a">+// set. Accounts confirm their email address only when SBM_SMTP_HOST is set.</span>
+ package main
+ 
+ import (
+<span class="h">@@ -16,6 +16,7 @@ import (</span>
+ 	&quot;log&quot;
+ 	&quot;net&quot;
+ 	&quot;net/http&quot;
+<span class="a">+	&quot;net/mail&quot;</span>
+ 	&quot;net/url&quot;
+ 	&quot;os&quot;
+ 	&quot;strconv&quot;
+<span class="h">@@ -43,6 +44,9 @@ type server struct {</span>
+ 	prices  map[string]string // plan (&quot;month&quot;, &quot;year&quot;): Stripe price ID
+ 	labels  map[string]string // plan: price as text
+ 	limit   limiter
+<span class="a">+	// mail sends an email. It is nil when the server has no SMTP server:</span>
+<span class="a">+	// then accounts need no email check.</span>
+<span class="a">+	mail func(to, subject, body string) error</span>
+ }
+ 
+ func main() {
+<span class="h">@@ -92,8 +96,19 @@ func main() {</span>
+ 			}
+ 		}
+ 	}
+<span class="a">+	if host := os.Getenv(&quot;SBM_SMTP_HOST&quot;); host != &quot;&quot; {</span>
+<span class="a">+		from, err := mail.ParseAddress(env(&quot;SBM_MAIL_FROM&quot;, os.Getenv(&quot;SBM_SMTP_USER&quot;)))</span>
+<span class="a">+		if err != nil {</span>
+<span class="a">+			log.Fatalf(&quot;SBM_MAIL_FROM: %v&quot;, err)</span>
+<span class="a">+		}</span>
+<span class="a">+		port := env(&quot;SBM_SMTP_PORT&quot;, &quot;587&quot;)</span>
+<span class="a">+		m := &amp;Mailer{Addr: net.JoinHostPort(host, port), TLS: port == &quot;465&quot;,</span>
+<span class="a">+			User: os.Getenv(&quot;SBM_SMTP_USER&quot;), Password: os.Getenv(&quot;SBM_SMTP_PASSWORD&quot;),</span>
+<span class="a">+			From: from, Hello: u.Hostname()}</span>
+<span class="a">+		s.mail = m.send</span>
+<span class="a">+	}</span>
+ 	addr := env(&quot;SBM_ADDR&quot;, &quot;127.0.0.1:8750&quot;)
+<span class="d">-	log.Printf(&quot;sbm-sync on %s for %s, billing %v&quot;, addr, site, s.stripe != nil)</span>
+<span class="a">+	log.Printf(&quot;sbm-sync on %s for %s, billing %v, email check %v&quot;, addr, site, s.stripe != nil, s.mail != nil)</span>
+ 	hs := &amp;http.Server{
+ 		Addr:              addr,
+ 		Handler:           s.routes(),
+<span class="h">@@ -123,6 +138,8 @@ func (s *server) routes() http.Handler {</span>
+ 	m.HandleFunc(&quot;POST /login&quot;, s.login)
+ 	m.HandleFunc(&quot;POST /logout&quot;, s.logout)
+ 	m.HandleFunc(&quot;GET /account&quot;, s.account)
+<span class="a">+	m.HandleFunc(&quot;POST /account/verify&quot;, s.resend)</span>
+<span class="a">+	m.HandleFunc(&quot;GET /verify&quot;, s.confirm)</span>
+ 	m.HandleFunc(&quot;POST /account/checkout&quot;, s.checkout)
+ 	m.HandleFunc(&quot;POST /account/portal&quot;, s.portal)
+ 	m.HandleFunc(&quot;POST /account/delete&quot;, s.remove)
+<span class="h">@@ -150,7 +167,7 @@ type page struct {</span>
+ 	Title, Error, Email, State, URL, Contact string
+ 	Month, Year                              string
+ 	TrialDays                                int
+<span class="d">-	Billing, CanSubscribe                    bool</span>
+<span class="a">+	Billing, CanSubscribe, Unconfirmed       bool</span>
+ 	Customer                                 string
+ }
+ 
+<span class="h">@@ -222,7 +239,11 @@ func (s *server) signup(w http.ResponseWriter, r *http.Request) {</span>
+ 		s.render(w, http.StatusTooManyRequests, &quot;signup&quot;, p)
+ 		return
+ 	}
+<span class="d">-	a, err := s.store.signup(email, r.PostFormValue(&quot;password&quot;))</span>
+<span class="a">+	code := &quot;&quot;</span>
+<span class="a">+	if s.mail != nil {</span>
+<span class="a">+		code = random(16)</span>
+<span class="a">+	}</span>
+<span class="a">+	a, err := s.store.signup(email, r.PostFormValue(&quot;password&quot;), code)</span>
+ 	if errors.Is(err, errTaken) || errors.Is(err, errEmail) || errors.Is(err, errPassword) {
+ 		p.Error = strings.ToUpper(err.Error()[:1]) + err.Error()[1:] + &quot;.&quot;
+ 		s.render(w, http.StatusBadRequest, &quot;signup&quot;, p)
+<span class="h">@@ -232,9 +253,76 @@ func (s *server) signup(w http.ResponseWriter, r *http.Request) {</span>
+ 		return
+ 	}
+ 	log.Printf(&quot;new account %s&quot;, a.ID)
+<span class="a">+	if code != &quot;&quot; {</span>
+<span class="a">+		// The account page tells how to send the email again.</span>
+<span class="a">+		if err := s.sendCheck(a.Email, code); err != nil {</span>
+<span class="a">+			log.Printf(&quot;email check for %s: %v&quot;, a.ID, err)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+ 	s.startSession(w, r, a)
+ }
+ 
+<span class="a">+// verified tells if the account can sync: its email is confirmed, or the</span>
+<span class="a">+// server sends no email and so checks no address.</span>
+<span class="a">+func (s *server) verified(a Account) bool {</span>
+<span class="a">+	return s.mail == nil || a.Verify == &quot;&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// sendCheck sends the link that confirms the email address.</span>
+<span class="a">+func (s *server) sendCheck(email, code string) error {</span>
+<span class="a">+	return s.mail(email, &quot;Confirm your email address for sbm Sync&quot;,</span>
+<span class="a">+		&quot;Open this link to confirm your email address for sbm Sync:\n\n&quot;+</span>
+<span class="a">+			s.site+&quot;/verify?code=&quot;+code+&quot;\n\n&quot;+</span>
+<span class="a">+			&quot;Sync starts after you confirm. If you did not make an account on\n&quot;+</span>
+<span class="a">+			s.site+&quot;, ignore this email.\n&quot;)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// resend sends the email check again, with a new code.</span>
+<span class="a">+func (s *server) resend(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	u := s.user(r)</span>
+<span class="a">+	if !s.sameSite(w, r) {</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if u == nil || s.verified(s.store.view(u)) {</span>
+<span class="a">+		http.Redirect(w, r, &quot;/account&quot;, http.StatusSeeOther)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	a := s.store.view(u)</span>
+<span class="a">+	if !s.limit.allow(&quot;mail &quot;+a.ID, 5, time.Hour) {</span>
+<span class="a">+		s.showAccount(w, http.StatusTooManyRequests, a, &quot;Too many emails in one hour. Try again later.&quot;)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	code, err := s.store.newCode(u)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	if err := s.sendCheck(a.Email, code); err != nil {</span>
+<span class="a">+		log.Printf(&quot;email check for %s: %v&quot;, a.ID, err)</span>
+<span class="a">+		s.showAccount(w, http.StatusBadGateway, a, &quot;The email did not go out. Try again later.&quot;)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	http.Redirect(w, r, &quot;/account&quot;, http.StatusSeeOther)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// confirm takes the link of the email check.</span>
+<span class="a">+func (s *server) confirm(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	a, err := s.store.confirm(r.URL.Query().Get(&quot;code&quot;))</span>
+<span class="a">+	if errors.Is(err, errCode) {</span>
+<span class="a">+		p := s.page(&quot;Confirm your email address&quot;)</span>
+<span class="a">+		p.Error = &quot;This link does not work: it is wrong, or a newer email replaced it. Sign in to send a new link.&quot;</span>
+<span class="a">+		s.render(w, http.StatusBadRequest, &quot;confirmed&quot;, p)</span>
+<span class="a">+		return</span>
+<span class="a">+	} else if err != nil {</span>
+<span class="a">+		s.fail(w, err)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	log.Printf(&quot;account %s: email confirmed&quot;, a.ID)</span>
+<span class="a">+	p := s.page(&quot;Email address confirmed&quot;)</span>
+<span class="a">+	p.Email = s.store.view(a).Email</span>
+<span class="a">+	s.render(w, http.StatusOK, &quot;confirmed&quot;, p)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func (s *server) login(w http.ResponseWriter, r *http.Request) {
+ 	if !s.sameSite(w, r) {
+ 		return
+<span class="h">@@ -313,6 +401,7 @@ func (s *server) account(w http.ResponseWriter, r *http.Request) {</span>
+ func (s *server) showAccount(w http.ResponseWriter, status int, a Account, problem string) {
+ 	p := s.page(&quot;Your account&quot;)
+ 	p.Email, p.Error, p.Customer = a.Email, problem, a.Customer
+<span class="a">+	p.Unconfirmed = !s.verified(a)</span>
+ 	left := s.trialLeft(a)
+ 	switch {
+ 	case s.stripe == nil:
+<span class="h">@@ -521,6 +610,10 @@ func (s *server) sync(w http.ResponseWriter, r *http.Request) {</span>
+ 		http.Error(w, &quot;not signed in: sign in again&quot;, http.StatusUnauthorized)
+ 		return
+ 	}
+<span class="a">+	if !s.verified(s.store.view(u)) {</span>
+<span class="a">+		http.Error(w, &quot;confirm your email address first: open the link in the email from sbm Sync, or see &quot;+s.site+&quot;/account&quot;, http.StatusForbidden)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+ 	if !s.active(s.store.view(u)) {
+ 		http.Error(w, &quot;sbm Sync is paused for this account: see &quot;+s.site+&quot;/account&quot;, http.StatusPaymentRequired)
+ 		return
+diff --git a/pages.html b/pages.html
+index 31da8f4..efe47ce 100644
+--- a/pages.html
++++ b/pages.html
+<span class="h">@@ -76,6 +76,9 @@ Chrome.&lt;/p&gt;</span>
+ &lt;h1&gt;Your account&lt;/h1&gt;
+ &lt;p&gt;Signed in as {{.Email}}.&lt;/p&gt;
+ {{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{end}}
+<span class="a">+{{if .Unconfirmed}}&lt;p&gt;&lt;b&gt;Confirm your email address.&lt;/b&gt; Open the link in the</span>
+<span class="a">+email that this server sent to {{.Email}}. Sync starts after that.&lt;/p&gt;</span>
+<span class="a">+&lt;form method=&quot;post&quot; action=&quot;/account/verify&quot;&gt;&lt;button&gt;Send the email again&lt;/button&gt;&lt;/form&gt;{{end}}</span>
+ &lt;p&gt;&lt;b&gt;{{.State}}&lt;/b&gt;&lt;/p&gt;
+ {{if .CanSubscribe}}&lt;form method=&quot;post&quot; action=&quot;/account/checkout&quot;&gt;
+ &lt;button name=&quot;plan&quot; value=&quot;year&quot;&gt;Subscribe: {{.Year}}&lt;/button&gt;
+<span class="h">@@ -103,13 +106,20 @@ their bookmark files.&lt;/p&gt;</span>
+ &lt;/form&gt;
+ {{template &quot;foot&quot; .}}{{end}}
+ 
+<span class="a">+{{define &quot;confirmed&quot;}}{{template &quot;head&quot; .}}</span>
+<span class="a">+&lt;h1&gt;{{.Title}}&lt;/h1&gt;</span>
+<span class="a">+{{with .Error}}&lt;p class=&quot;error&quot;&gt;{{.}}&lt;/p&gt;{{else}}&lt;p&gt;Sync is on for {{.Email}}.&lt;/p&gt;{{end}}</span>
+<span class="a">+&lt;p&gt;&lt;a href=&quot;/account&quot;&gt;Your account&lt;/a&gt;&lt;/p&gt;</span>
+<span class="a">+{{template &quot;foot&quot; .}}{{end}}</span>
+<span class="a">+</span>
+ {{define &quot;privacy&quot;}}{{template &quot;head&quot; .}}
+ &lt;h1&gt;Privacy&lt;/h1&gt;
+ &lt;p&gt;This policy is for this sbm Sync server, the sbm app for Android and the
+ sbm add-on for Firefox and Chrome.&lt;/p&gt;
+ &lt;h2&gt;What the server keeps, and why&lt;/h2&gt;
+ &lt;ul&gt;
+<span class="d">-&lt;li&gt;Your email address and a bcrypt hash of your password, never the password itself: to sign you in.&lt;/li&gt;</span>
+<span class="a">+&lt;li&gt;Your email address and a bcrypt hash of your password, never the password itself: to sign you in.</span>
+<span class="a">+When this server checks email addresses, it also sends you an email with a link that confirms your address.&lt;/li&gt;</span>
+ &lt;li&gt;Your bookmark file, the last 50 versions that your devices sent: to sync your devices.&lt;/li&gt;
+ &lt;li&gt;A hash of the sign-in token of each device: to know your devices.&lt;/li&gt;
+ &lt;li&gt;When you subscribe: your Stripe customer ID and the state of your subscription: to bill you.&lt;/li&gt;
+diff --git a/server_test.go b/server_test.go
+index 08b35f9..197a714 100644
+--- a/server_test.go
++++ b/server_test.go
+<span class="h">@@ -4,6 +4,7 @@ import (</span>
+ 	&quot;crypto/hmac&quot;
+ 	&quot;crypto/sha256&quot;
+ 	&quot;encoding/hex&quot;
+<span class="a">+	&quot;errors&quot;</span>
+ 	&quot;fmt&quot;
+ 	&quot;io&quot;
+ 	&quot;net/http&quot;
+<span class="h">@@ -12,6 +13,7 @@ import (</span>
+ 	&quot;net/url&quot;
+ 	&quot;os&quot;
+ 	&quot;path/filepath&quot;
+<span class="a">+	&quot;regexp&quot;</span>
+ 	&quot;strings&quot;
+ 	&quot;sync&quot;
+ 	&quot;testing&quot;
+<span class="h">@@ -58,6 +60,8 @@ type harness struct {</span>
+ 	s      *server
+ 	web    *httptest.Server
+ 	stripe *fakeStripe
+<span class="a">+	mu     sync.Mutex</span>
+<span class="a">+	mails  []string // &quot;to\nsubject\nbody&quot; of each email</span>
+ }
+ 
+ func newEnv(t *testing.T, billing bool) *harness {
+<span class="h">@@ -141,6 +145,44 @@ func (e *harness) body(c *http.Client, path string) string {</span>
+ 	return string(b)
+ }
+ 
+<span class="a">+// withMail turns on the email check. The emails of the server go to</span>
+<span class="a">+// e.mails.</span>
+<span class="a">+func (e *harness) withMail() {</span>
+<span class="a">+	e.s.mail = func(to, subject, body string) error {</span>
+<span class="a">+		e.mu.Lock()</span>
+<span class="a">+		defer e.mu.Unlock()</span>
+<span class="a">+		e.mails = append(e.mails, to+&quot;\n&quot;+subject+&quot;\n&quot;+body)</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func (e *harness) sent() int {</span>
+<span class="a">+	e.mu.Lock()</span>
+<span class="a">+	defer e.mu.Unlock()</span>
+<span class="a">+	return len(e.mails)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+var checkLink = regexp.MustCompile(`http\S+/verify\?code=[0-9a-f]+`)</span>
+<span class="a">+</span>
+<span class="a">+// link gives the link in the last email.</span>
+<span class="a">+func (e *harness) link() string {</span>
+<span class="a">+	e.mu.Lock()</span>
+<span class="a">+	defer e.mu.Unlock()</span>
+<span class="a">+	if len(e.mails) == 0 {</span>
+<span class="a">+		e.t.Fatal(&quot;no email went out&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	return checkLink.FindString(e.mails[len(e.mails)-1])</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func (e *harness) open(link string) int {</span>
+<span class="a">+	resp, err := http.Get(link)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		e.t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	resp.Body.Close()</span>
+<span class="a">+	return resp.StatusCode</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func TestTwoDevicesSync(t *testing.T) {
+ 	e := newEnv(t, false)
+ 	e.signup(&quot;Me@Example.org&quot;)
+<span class="h">@@ -413,7 +455,7 @@ func TestMoney(t *testing.T) {</span>
+ func TestStoreSurvivesRestart(t *testing.T) {
+ 	dir := t.TempDir()
+ 	s, _ := openStore(dir)
+<span class="d">-	a, err := s.signup(&quot;me@example.org&quot;, &quot;password1&quot;)</span>
+<span class="a">+	a, err := s.signup(&quot;me@example.org&quot;, &quot;password1&quot;, &quot;&quot;)</span>
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+<span class="h">@@ -434,7 +476,7 @@ func TestStoreSurvivesRestart(t *testing.T) {</span>
+ 
+ func TestOldVersionsGo(t *testing.T) {
+ 	s, _ := openStore(t.TempDir())
+<span class="d">-	a, _ := s.signup(&quot;me@example.org&quot;, &quot;password1&quot;)</span>
+<span class="a">+	a, _ := s.signup(&quot;me@example.org&quot;, &quot;password1&quot;, &quot;&quot;)</span>
+ 	base := &quot;&quot;
+ 	for i := range maxVersions + 10 {
+ 		_, v, err := s.sync(a, base, fmt.Sprintf(&quot;line %d\n&quot;, i))
+<span class="h">@@ -455,3 +497,69 @@ func TestOldVersionsGo(t *testing.T) {</span>
+ 		t.Errorf(&quot;%d versions kept, want %d&quot;, n, maxVersions)
+ 	}
+ }
+<span class="a">+</span>
+<span class="a">+func TestEmailCheck(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	c := e.signup(&quot;Me@Example.org&quot;)</span>
+<span class="a">+	tok := e.token(&quot;me@example.org&quot;)</span>
+<span class="a">+	if e.sent() != 1 || !strings.HasPrefix(e.mails[0], &quot;me@example.org\nConfirm your email address&quot;) {</span>
+<span class="a">+		t.Fatalf(&quot;emails: %q&quot;, e.mails)</span>
+<span class="a">+	}</span>
+<span class="a">+	first := e.link()</span>
+<span class="a">+	if code, text, _ := e.sync(tok, &quot;&quot;, &quot;a\n&quot;); code != http.StatusForbidden || !strings.Contains(text, &quot;confirm your email address&quot;) {</span>
+<span class="a">+		t.Fatalf(&quot;sync before the check: %d %q&quot;, code, text)</span>
+<span class="a">+	}</span>
+<span class="a">+	if !strings.Contains(e.body(c, &quot;/account&quot;), &quot;Confirm your email address.&quot;) {</span>
+<span class="a">+		t.Error(&quot;the account page does not ask for the check&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	// A new email replaces the link of the first one.</span>
+<span class="a">+	if resp := e.post(c, &quot;/account/verify&quot;, nil); resp.StatusCode != http.StatusSeeOther || e.sent() != 2 {</span>
+<span class="a">+		t.Fatalf(&quot;send again: %s, %d emails&quot;, resp.Status, e.sent())</span>
+<span class="a">+	}</span>
+<span class="a">+	if code := e.open(first); code != http.StatusBadRequest {</span>
+<span class="a">+		t.Errorf(&quot;the replaced link: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code := e.open(e.link()); code != http.StatusOK {</span>
+<span class="a">+		t.Fatalf(&quot;the new link: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code, _, _ := e.sync(tok, &quot;&quot;, &quot;a\n&quot;); code != http.StatusOK {</span>
+<span class="a">+		t.Errorf(&quot;sync after the check: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	if strings.Contains(e.body(c, &quot;/account&quot;), &quot;Confirm your email address.&quot;) {</span>
+<span class="a">+		t.Error(&quot;the account page still asks for the check&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+	if code := e.open(e.link()); code != http.StatusBadRequest {</span>
+<span class="a">+		t.Errorf(&quot;the link works twice: %d&quot;, code)</span>
+<span class="a">+	}</span>
+<span class="a">+	e.post(c, &quot;/account/verify&quot;, nil)</span>
+<span class="a">+	if e.sent() != 2 {</span>
+<span class="a">+		t.Error(&quot;an email went out for a confirmed address&quot;)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestEmailCheckLimit(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.withMail()</span>
+<span class="a">+	c := e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	for range 5 {</span>
+<span class="a">+		e.post(c, &quot;/account/verify&quot;, nil)</span>
+<span class="a">+	}</span>
+<span class="a">+	if resp := e.post(c, &quot;/account/verify&quot;, nil); resp.StatusCode != http.StatusTooManyRequests {</span>
+<span class="a">+		t.Errorf(&quot;the seventh email in an hour: %s&quot;, resp.Status)</span>
+<span class="a">+	}</span>
+<span class="a">+	if e.sent() != 6 {</span>
+<span class="a">+		t.Errorf(&quot;%d emails went out, want 6&quot;, e.sent())</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestEmailThatDoesNotGoOut(t *testing.T) {</span>
+<span class="a">+	e := newEnv(t, false)</span>
+<span class="a">+	e.s.mail = func(string, string, string) error { return errors.New(&quot;no SMTP server&quot;) }</span>
+<span class="a">+	c := e.signup(&quot;me@example.org&quot;)</span>
+<span class="a">+	resp := e.post(c, &quot;/account/verify&quot;, nil)</span>
+<span class="a">+	b, _ := io.ReadAll(resp.Body)</span>
+<span class="a">+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(string(b), &quot;The email did not go out.&quot;) {</span>
+<span class="a">+		t.Errorf(&quot;send again: %s&quot;, resp.Status)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+diff --git a/store.go b/store.go
+index 04fcd11..d391200 100644
+--- a/store.go
++++ b/store.go
+<span class="h">@@ -30,6 +30,7 @@ var (</span>
+ 	errPassword = errors.New(&quot;the password must have 8 to 72 characters&quot;)
+ 	errWrong    = errors.New(&quot;wrong email or password&quot;)
+ 	errGone     = errors.New(&quot;the account does not exist&quot;)
+<span class="a">+	errCode     = errors.New(&quot;no account has this code&quot;)</span>
+ 	hashName    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+ )
+ 
+<span class="h">@@ -43,6 +44,7 @@ type Account struct {</span>
+ 	Customer string    `json:&quot;customer,omitempty&quot;`
+ 	Status   string    `json:&quot;status,omitempty&quot;`    // of the Stripe subscription
+ 	StatusAt int64     `json:&quot;status_at,omitempty&quot;` // time of the Stripe event that set Status
+<span class="a">+	Verify   string    `json:&quot;verify,omitempty&quot;`    // SHA-256 of the code that confirms the email; empty when confirmed</span>
+ }
+ 
+ // Store keeps the accounts in one JSON file, accounts.json, and the versions
+<span class="h">@@ -151,7 +153,9 @@ func cleanEmail(email string) (string, error) {</span>
+ 	return email, nil
+ }
+ 
+<span class="d">-func (s *Store) signup(email, password string) (*Account, error) {</span>
+<span class="a">+// signup makes an account. With a code, the email of the account is not</span>
+<span class="a">+// confirmed until someone opens the link with that code.</span>
+<span class="a">+func (s *Store) signup(email, password, code string) (*Account, error) {</span>
+ 	email, err := cleanEmail(email)
+ 	if err != nil {
+ 		return nil, err
+<span class="h">@@ -169,6 +173,9 @@ func (s *Store) signup(email, password string) (*Account, error) {</span>
+ 		return nil, errTaken
+ 	}
+ 	a := &amp;Account{ID: random(16), Email: email, Hash: string(hash), Created: time.Now().UTC()}
+<span class="a">+	if code != &quot;&quot; {</span>
+<span class="a">+		a.Verify = digest(code)</span>
+<span class="a">+	}</span>
+ 	s.index(a)
+ 	if err := s.save(); err != nil {
+ 		delete(s.accounts, a.ID)
+<span class="h">@@ -270,6 +277,36 @@ func (s *Store) view(a *Account) Account {</span>
+ 	return c
+ }
+ 
+<span class="a">+// newCode gives a new code that confirms the email of the account. It</span>
+<span class="a">+// replaces the old code. Only its hash is kept.</span>
+<span class="a">+func (s *Store) newCode(a *Account) (string, error) {</span>
+<span class="a">+	code := random(16)</span>
+<span class="a">+	s.mu.Lock()</span>
+<span class="a">+	defer s.mu.Unlock()</span>
+<span class="a">+	if s.accounts[a.ID] == nil {</span>
+<span class="a">+		return &quot;&quot;, errGone</span>
+<span class="a">+	}</span>
+<span class="a">+	a.Verify = digest(code)</span>
+<span class="a">+	return code, s.save()</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// confirm marks the email of the account with the code as confirmed.</span>
+<span class="a">+func (s *Store) confirm(code string) (*Account, error) {</span>
+<span class="a">+	if code == &quot;&quot; {</span>
+<span class="a">+		return nil, errCode</span>
+<span class="a">+	}</span>
+<span class="a">+	h := digest(code)</span>
+<span class="a">+	s.mu.Lock()</span>
+<span class="a">+	defer s.mu.Unlock()</span>
+<span class="a">+	for _, a := range s.accounts {</span>
+<span class="a">+		if a.Verify == h {</span>
+<span class="a">+			a.Verify = &quot;&quot;</span>
+<span class="a">+			return a, s.save()</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return nil, errCode</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func (s *Store) setCustomer(a *Account, customer string) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()</pre>
+</div></body></html>

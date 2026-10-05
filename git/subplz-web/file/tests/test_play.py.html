@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/tests/test_play.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tests/test_play.py (29383 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Google Play purchases of cloud caption hours: the Play build of Subrep.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> No test reaches Google. FakeGooglePlay replaces play.get, play.consume and
+<a id="l4" href="#l4">4</a> play.voided, and the tests of the HTTP layer give play._session a fake session.
+<a id="l5" href="#l5">5</a> &quot;&quot;&quot;
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a> from __future__ import annotations
+<a id="l8" href="#l8">8</a> 
+<a id="l9" href="#l9">9</a> import errno
+<a id="l10" href="#l10">10</a> import itertools
+<a id="l11" href="#l11">11</a> import json
+<a id="l12" href="#l12">12</a> import logging
+<a id="l13" href="#l13">13</a> import os
+<a id="l14" href="#l14">14</a> import pathlib
+<a id="l15" href="#l15">15</a> import secrets
+<a id="l16" href="#l16">16</a> from urllib.parse import unquote
+<a id="l17" href="#l17">17</a> 
+<a id="l18" href="#l18">18</a> import pytest
+<a id="l19" href="#l19">19</a> import requests
+<a id="l20" href="#l20">20</a> from google.auth import exceptions as google_errors
+<a id="l21" href="#l21">21</a> from hypothesis import given
+<a id="l22" href="#l22">22</a> from hypothesis import settings as hsettings
+<a id="l23" href="#l23">23</a> from hypothesis import strategies as st
+<a id="l24" href="#l24">24</a> 
+<a id="l25" href="#l25">25</a> from backend import accounts, captions, main, play
+<a id="l26" href="#l26">26</a> from backend.db import Account, SessionLocal
+<a id="l27" href="#l27">27</a> from backend.settings import settings
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> from .conftest import account_id
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> HOUR = 3600
+<a id="l32" href="#l32">32</a> UNKNOWN = &quot;Google Play does not know this purchase.&quot;
+<a id="l33" href="#l33">33</a> _orders = itertools.count(1)
+<a id="l34" href="#l34">34</a> 
+<a id="l35" href="#l35">35</a> 
+<a id="l36" href="#l36">36</a> class FakeGooglePlay:
+<a id="l37" href="#l37">37</a>     &quot;&quot;&quot;Google Play as this server sees it: the purchases of the app, by token.&quot;&quot;&quot;
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a>     def __init__(self):
+<a id="l40" href="#l40">40</a>         self.purchases: dict[str, dict] = {}
+<a id="l41" href="#l41">41</a>         # The consumes that came after the server committed the ledger row.
+<a id="l42" href="#l42">42</a>         self.consumed: list[str] = []
+<a id="l43" href="#l43">43</a>         # The consumes that came before that commit. The fixture `google`
+<a id="l44" href="#l44">44</a>         # fails each test that makes one: if the commit fails after the
+<a id="l45" href="#l45">45</a>         # consume, the buyer paid, and Google closed the purchase, but the
+<a id="l46" href="#l46">46</a>         # account has no hours.
+<a id="l47" href="#l47">47</a>         self.early: list[str] = []
+<a id="l48" href="#l48">48</a>         self.gets: list[tuple[str, str]] = []
+<a id="l49" href="#l49">49</a>         self.down = False
+<a id="l50" href="#l50">50</a>         self.fail_consume = 0
+<a id="l51" href="#l51">51</a>         # The tokens of the purchases that Google refunded or charged back.
+<a id="l52" href="#l52">52</a>         self.voided_tokens: list[str] = []
+<a id="l53" href="#l53">53</a> 
+<a id="l54" href="#l54">54</a>     def buy(self, token: str, account: str | None, product: str = &quot;captions20&quot;,
+<a id="l55" href="#l55">55</a>             state: int = 0, quantity: int | None = None, test: bool = False) -&gt; dict:
+<a id="l56" href="#l56">56</a>         &quot;&quot;&quot;Add a purchase, as purchases.products.get returns it.
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a>         `account` None is a purchase without an account id, for example with
+<a id="l59" href="#l59">59</a>         a promo code in the Play Store app.
+<a id="l60" href="#l60">60</a>         &quot;&quot;&quot;
+<a id="l61" href="#l61">61</a>         purchase = {&quot;kind&quot;: &quot;androidpublisher#productPurchase&quot;, &quot;productId&quot;: product,
+<a id="l62" href="#l62">62</a>                     &quot;purchaseState&quot;: state, &quot;consumptionState&quot;: 0,
+<a id="l63" href="#l63">63</a>                     &quot;orderId&quot;: f&quot;GPA.3300-{next(_orders):04d}&quot;}
+<a id="l64" href="#l64">64</a>         if account is not None:
+<a id="l65" href="#l65">65</a>             purchase[&quot;obfuscatedExternalAccountId&quot;] = account
+<a id="l66" href="#l66">66</a>         if quantity is not None:
+<a id="l67" href="#l67">67</a>             purchase[&quot;quantity&quot;] = quantity
+<a id="l68" href="#l68">68</a>         if test:
+<a id="l69" href="#l69">69</a>             purchase[&quot;purchaseType&quot;] = 0
+<a id="l70" href="#l70">70</a>         self.purchases[token] = purchase
+<a id="l71" href="#l71">71</a>         return purchase
+<a id="l72" href="#l72">72</a> 
+<a id="l73" href="#l73">73</a>     def get(self, product_id: str, token: str) -&gt; dict:
+<a id="l74" href="#l74">74</a>         self.gets.append((product_id, token))
+<a id="l75" href="#l75">75</a>         if self.down:
+<a id="l76" href="#l76">76</a>             raise play.PlayError(502, play.NO_ANSWER)
+<a id="l77" href="#l77">77</a>         if token not in self.purchases:
+<a id="l78" href="#l78">78</a>             raise play.PlayError(400, UNKNOWN)
+<a id="l79" href="#l79">79</a>         return dict(self.purchases[token])
+<a id="l80" href="#l80">80</a> 
+<a id="l81" href="#l81">81</a>     def consume(self, product_id: str, token: str) -&gt; None:
+<a id="l82" href="#l82">82</a>         if self.fail_consume:
+<a id="l83" href="#l83">83</a>             self.fail_consume -= 1
+<a id="l84" href="#l84">84</a>             raise play.PlayError(502, play.NO_ANSWER)
+<a id="l85" href="#l85">85</a>         (self.consumed if ledger(token) else self.early).append(token)
+<a id="l86" href="#l86">86</a>         self.purchases[token][&quot;consumptionState&quot;] = 1
+<a id="l87" href="#l87">87</a> 
+<a id="l88" href="#l88">88</a>     def voided(self) -&gt; list[str]:
+<a id="l89" href="#l89">89</a>         return list(self.voided_tokens)
+<a id="l90" href="#l90">90</a> 
+<a id="l91" href="#l91">91</a> 
+<a id="l92" href="#l92">92</a> @pytest.fixture(autouse=True)
+<a id="l93" href="#l93">93</a> def _no_google(monkeypatch):
+<a id="l94" href="#l94">94</a>     &quot;&quot;&quot;No test may reach Google. A test of the HTTP layer gives its own fake session.&quot;&quot;&quot;
+<a id="l95" href="#l95">95</a>     def refuse():
+<a id="l96" href="#l96">96</a>         raise AssertionError(&quot;a test tried to reach Google Play&quot;)
+<a id="l97" href="#l97">97</a> 
+<a id="l98" href="#l98">98</a>     monkeypatch.setattr(play, &quot;_session&quot;, refuse)
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a> 
+<a id="l101" href="#l101">101</a> @pytest.fixture
+<a id="l102" href="#l102">102</a> def google(monkeypatch, tmp_path):
+<a id="l103" href="#l103">103</a>     &quot;&quot;&quot;A server with a Play key file, and Google Play faked.&quot;&quot;&quot;
+<a id="l104" href="#l104">104</a>     fake = FakeGooglePlay()
+<a id="l105" href="#l105">105</a>     monkeypatch.setattr(play, &quot;get&quot;, fake.get)
+<a id="l106" href="#l106">106</a>     monkeypatch.setattr(play, &quot;consume&quot;, fake.consume)
+<a id="l107" href="#l107">107</a>     monkeypatch.setattr(play, &quot;voided&quot;, fake.voided)
+<a id="l108" href="#l108">108</a>     key = tmp_path / &quot;play-key.json&quot;
+<a id="l109" href="#l109">109</a>     key.write_text(&quot;{}&quot;)  # play.get is fake, so nothing reads the key.
+<a id="l110" href="#l110">110</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, str(key))
+<a id="l111" href="#l111">111</a>     yield fake
+<a id="l112" href="#l112">112</a>     assert fake.early == [], &quot;the server consumed a purchase before it committed its hours&quot;
+<a id="l113" href="#l113">113</a> 
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a> def new_token() -&gt; str:
+<a id="l116" href="#l116">116</a>     &quot;&quot;&quot;A purchase token that no other test uses: the test database lives for the whole run.&quot;&quot;&quot;
+<a id="l117" href="#l117">117</a>     return f&quot;tok.{secrets.token_hex(8)}-_&quot;
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a> 
+<a id="l120" href="#l120">120</a> def post_play(client, token: str, product: str = &quot;captions20&quot;):
+<a id="l121" href="#l121">121</a>     return client.post(&quot;/api/captions/play-purchase&quot;,
+<a id="l122" href="#l122">122</a>                        json={&quot;product_id&quot;: product, &quot;purchase_token&quot;: token})
+<a id="l123" href="#l123">123</a> 
+<a id="l124" href="#l124">124</a> 
+<a id="l125" href="#l125">125</a> def left(client) -&gt; int:
+<a id="l126" href="#l126">126</a>     return client.get(&quot;/api/captions&quot;).json()[&quot;seconds_left&quot;]
+<a id="l127" href="#l127">127</a> 
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a> def ledger(token: str) -&gt; list[play.PlayPurchase]:
+<a id="l130" href="#l130">130</a>     with SessionLocal() as s:
+<a id="l131" href="#l131">131</a>         return s.query(play.PlayPurchase).filter_by(token_hash=play._hash(token)).all()
+<a id="l132" href="#l132">132</a> 
+<a id="l133" href="#l133">133</a> 
+<a id="l134" href="#l134">134</a> def test_the_play_build_can_sell_only_when_the_server_can_check_purchases(
+<a id="l135" href="#l135">135</a>         client, monkeypatch, tmp_path):
+<a id="l136" href="#l136">136</a>     monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;dg_test&quot;)
+<a id="l137" href="#l137">137</a>     monkeypatch.setattr(settings, &quot;stripe_secret_key&quot;, &quot;&quot;)
+<a id="l138" href="#l138">138</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, &quot;&quot;)
+<a id="l139" href="#l139">139</a>     assert client.get(&quot;/api/captions&quot;).json()[&quot;play_available&quot;] is False
+<a id="l140" href="#l140">140</a> 
+<a id="l141" href="#l141">141</a>     key = tmp_path / &quot;play-key.json&quot;
+<a id="l142" href="#l142">142</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, str(key))
+<a id="l143" href="#l143">143</a>     assert client.get(&quot;/api/captions&quot;).json()[&quot;play_available&quot;] is False  # no file yet
+<a id="l144" href="#l144">144</a> 
+<a id="l145" href="#l145">145</a>     key.write_text(&quot;{}&quot;)
+<a id="l146" href="#l146">146</a>     state = client.get(&quot;/api/captions&quot;).json()
+<a id="l147" href="#l147">147</a>     # The Play build does not need Stripe, and the web build does not need Google.
+<a id="l148" href="#l148">148</a>     assert state[&quot;play_available&quot;] is True
+<a id="l149" href="#l149">149</a>     assert state[&quot;available&quot;] is False
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a>     monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;&quot;)
+<a id="l152" href="#l152">152</a>     assert client.get(&quot;/api/captions&quot;).json()[&quot;play_available&quot;] is False
+<a id="l153" href="#l153">153</a> 
+<a id="l154" href="#l154">154</a> 
+<a id="l155" href="#l155">155</a> def assert_only_the_play_sales_stop(client, google):
+<a id="l156" href="#l156">156</a>     &quot;&quot;&quot;The Play build sells nothing. The GitHub build still sells with Stripe.&quot;&quot;&quot;
+<a id="l157" href="#l157">157</a>     token = new_token()
+<a id="l158" href="#l158">158</a>     google.buy(token, account_id(client))
+<a id="l159" href="#l159">159</a>     state = client.get(&quot;/api/captions&quot;)
+<a id="l160" href="#l160">160</a>     assert state.status_code == 200
+<a id="l161" href="#l161">161</a>     assert (state.json()[&quot;play_available&quot;], state.json()[&quot;available&quot;]) == (False, True)
+<a id="l162" href="#l162">162</a>     r = post_play(client, token)
+<a id="l163" href="#l163">163</a>     assert r.status_code == 503 and r.json()[&quot;detail&quot;] == play.NOT_SET_UP
+<a id="l164" href="#l164">164</a>     assert google.gets == []
+<a id="l165" href="#l165">165</a> 
+<a id="l166" href="#l166">166</a> 
+<a id="l167" href="#l167">167</a> def test_a_key_folder_that_the_server_cannot_open_stops_only_the_play_sales(
+<a id="l168" href="#l168">168</a>         client, google, monkeypatch, tmp_path):
+<a id="l169" href="#l169">169</a>     # The service user cannot open the folder of the key, so stat of the key
+<a id="l170" href="#l170">170</a>     # fails with EACCES. The server runs Python 3.11. There, Path.is_file
+<a id="l171" href="#l171">171</a>     # raises PermissionError for this error, and each GET /api/captions
+<a id="l172" href="#l172">172</a>     # answered 500. The tests can run on a newer Python, so this test makes
+<a id="l173" href="#l173">173</a>     # Path.is_file act as on Python 3.11. The test does not make the key file:
+<a id="l174" href="#l174">174</a>     # os.path.isfile gives False for each stat error, EACCES or ENOENT.
+<a id="l175" href="#l175">175</a>     key = str(tmp_path / &quot;locked&quot; / &quot;play-key.json&quot;)
+<a id="l176" href="#l176">176</a>     is_file = pathlib.Path.is_file
+<a id="l177" href="#l177">177</a> 
+<a id="l178" href="#l178">178</a>     def is_file_on_python_3_11(self, *args, **kwargs):
+<a id="l179" href="#l179">179</a>         if str(self) == key:
+<a id="l180" href="#l180">180</a>             raise PermissionError(errno.EACCES, &quot;Permission denied&quot;, key)
+<a id="l181" href="#l181">181</a>         return is_file(self, *args, **kwargs)
+<a id="l182" href="#l182">182</a> 
+<a id="l183" href="#l183">183</a>     monkeypatch.setattr(pathlib.Path, &quot;is_file&quot;, is_file_on_python_3_11)
+<a id="l184" href="#l184">184</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, key)
+<a id="l185" href="#l185">185</a>     monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;dg_test&quot;)
+<a id="l186" href="#l186">186</a>     assert_only_the_play_sales_stop(client, google)
+<a id="l187" href="#l187">187</a>     main.housekeeping()  # The hourly pass does not fail.
+<a id="l188" href="#l188">188</a> 
+<a id="l189" href="#l189">189</a> 
+<a id="l190" href="#l190">190</a> def test_a_key_file_that_the_server_cannot_read_stops_only_the_play_sales(
+<a id="l191" href="#l191">191</a>         client, google, monkeypatch):
+<a id="l192" href="#l192">192</a>     # The key is there, but the service user cannot read it. For example, root
+<a id="l193" href="#l193">193</a>     # owns it with mode 600. Then the server cannot check a purchase, so the
+<a id="l194" href="#l194">194</a>     # Play build must not sell.
+<a id="l195" href="#l195">195</a>     key = settings.play_service_account_file
+<a id="l196" href="#l196">196</a>     access = os.access
+<a id="l197" href="#l197">197</a> 
+<a id="l198" href="#l198">198</a>     def access_of_the_service_user(path, mode, *args, **kwargs):
+<a id="l199" href="#l199">199</a>         if os.fspath(path) == key and mode &amp; os.R_OK:
+<a id="l200" href="#l200">200</a>             return False
+<a id="l201" href="#l201">201</a>         return access(path, mode, *args, **kwargs)
+<a id="l202" href="#l202">202</a> 
+<a id="l203" href="#l203">203</a>     monkeypatch.setattr(os, &quot;access&quot;, access_of_the_service_user)
+<a id="l204" href="#l204">204</a>     monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;dg_test&quot;)
+<a id="l205" href="#l205">205</a>     assert_only_the_play_sales_stop(client, google)
+<a id="l206" href="#l206">206</a> 
+<a id="l207" href="#l207">207</a> 
+<a id="l208" href="#l208">208</a> # --- POST /api/captions/play-purchase -----------------------------------------
+<a id="l209" href="#l209">209</a> 
+<a id="l210" href="#l210">210</a> def test_no_play_key_is_503_and_google_is_not_asked(client, google, monkeypatch, tmp_path):
+<a id="l211" href="#l211">211</a>     token = new_token()
+<a id="l212" href="#l212">212</a>     google.buy(token, account_id(client))
+<a id="l213" href="#l213">213</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, &quot;&quot;)
+<a id="l214" href="#l214">214</a>     r = post_play(client, token)
+<a id="l215" href="#l215">215</a>     assert r.status_code == 503 and r.json()[&quot;detail&quot;] == play.NOT_SET_UP
+<a id="l216" href="#l216">216</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, str(tmp_path / &quot;missing.json&quot;))
+<a id="l217" href="#l217">217</a>     assert post_play(client, token).status_code == 503
+<a id="l218" href="#l218">218</a>     assert google.gets == [] and left(client) == 0
+<a id="l219" href="#l219">219</a> 
+<a id="l220" href="#l220">220</a> 
+<a id="l221" href="#l221">221</a> def test_an_unknown_pack_is_404(client, google):
+<a id="l222" href="#l222">222</a>     token = new_token()
+<a id="l223" href="#l223">223</a>     google.buy(token, account_id(client))
+<a id="l224" href="#l224">224</a>     assert post_play(client, token, product=&quot;pack10&quot;).status_code == 404
+<a id="l225" href="#l225">225</a>     assert google.gets == []
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a> def test_a_paid_purchase_gives_its_hours_and_is_consumed(client, google):
+<a id="l229" href="#l229">229</a>     token = new_token()
+<a id="l230" href="#l230">230</a>     purchase = google.buy(token, account_id(client))
+<a id="l231" href="#l231">231</a>     r = post_play(client, token)
+<a id="l232" href="#l232">232</a>     assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 20 * HOUR}
+<a id="l233" href="#l233">233</a>     assert google.consumed == [token]
+<a id="l234" href="#l234">234</a>     assert left(client) == 20 * HOUR
+<a id="l235" href="#l235">235</a>     [row] = ledger(token)
+<a id="l236" href="#l236">236</a>     assert (row.account_id, row.product_id, row.quantity, row.seconds, row.order_id) == (
+<a id="l237" href="#l237">237</a>         account_id(client), &quot;captions20&quot;, 1, 20 * HOUR, purchase[&quot;orderId&quot;])
+<a id="l238" href="#l238">238</a> 
+<a id="l239" href="#l239">239</a> 
+<a id="l240" href="#l240">240</a> def test_the_same_purchase_twice_gives_its_hours_once(client, google):
+<a id="l241" href="#l241">241</a>     token = new_token()
+<a id="l242" href="#l242">242</a>     google.buy(token, account_id(client))
+<a id="l243" href="#l243">243</a>     assert post_play(client, token).status_code == 200
+<a id="l244" href="#l244">244</a>     r = post_play(client, token)  # The app sends it again after a lost answer.
+<a id="l245" href="#l245">245</a>     assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 20 * HOUR}
+<a id="l246" href="#l246">246</a>     assert google.consumed == [token]
+<a id="l247" href="#l247">247</a>     assert len(ledger(token)) == 1
+<a id="l248" href="#l248">248</a> 
+<a id="l249" href="#l249">249</a> 
+<a id="l250" href="#l250">250</a> def test_a_pending_purchase_gives_nothing_until_it_is_paid(client, google):
+<a id="l251" href="#l251">251</a>     token = new_token()
+<a id="l252" href="#l252">252</a>     google.buy(token, account_id(client), state=2)
+<a id="l253" href="#l253">253</a>     r = post_play(client, token)
+<a id="l254" href="#l254">254</a>     assert r.status_code == 409 and r.json()[&quot;detail&quot;] == &quot;The purchase is not complete yet.&quot;
+<a id="l255" href="#l255">255</a>     assert left(client) == 0 and google.consumed == [] and ledger(token) == []
+<a id="l256" href="#l256">256</a> 
+<a id="l257" href="#l257">257</a>     google.purchases[token][&quot;purchaseState&quot;] = 0
+<a id="l258" href="#l258">258</a>     assert post_play(client, token).status_code == 200
+<a id="l259" href="#l259">259</a>     assert left(client) == 20 * HOUR and google.consumed == [token]
+<a id="l260" href="#l260">260</a> 
+<a id="l261" href="#l261">261</a> 
+<a id="l262" href="#l262">262</a> def test_a_cancelled_purchase_gives_nothing(client, google):
+<a id="l263" href="#l263">263</a>     token = new_token()
+<a id="l264" href="#l264">264</a>     google.buy(token, account_id(client), state=1)
+<a id="l265" href="#l265">265</a>     assert post_play(client, token).status_code == 409
+<a id="l266" href="#l266">266</a>     assert left(client) == 0 and google.consumed == [] and ledger(token) == []
+<a id="l267" href="#l267">267</a> 
+<a id="l268" href="#l268">268</a> 
+<a id="l269" href="#l269">269</a> def test_a_purchase_for_another_account_gives_nothing(client, second_client, google):
+<a id="l270" href="#l270">270</a>     token, stranger = new_token(), new_token()
+<a id="l271" href="#l271">271</a>     google.buy(token, account_id(client))
+<a id="l272" href="#l272">272</a>     google.buy(stranger, &quot;acct_0000000000000000&quot;)  # No such account on this server.
+<a id="l273" href="#l273">273</a>     for sender, sent in ((second_client, token), (client, stranger)):
+<a id="l274" href="#l274">274</a>         r = post_play(sender, sent)
+<a id="l275" href="#l275">275</a>         assert r.status_code == 403
+<a id="l276" href="#l276">276</a>         assert r.json()[&quot;detail&quot;] == &quot;This purchase belongs to another account.&quot;
+<a id="l277" href="#l277">277</a>     assert left(client) == 0 and left(second_client) == 0 and google.consumed == []
+<a id="l278" href="#l278">278</a> 
+<a id="l279" href="#l279">279</a>     assert post_play(client, token).status_code == 200
+<a id="l280" href="#l280">280</a>     assert left(client) == 20 * HOUR and left(second_client) == 0
+<a id="l281" href="#l281">281</a> 
+<a id="l282" href="#l282">282</a> 
+<a id="l283" href="#l283">283</a> def test_a_purchase_without_an_account_id_goes_to_the_caller_once(client, second_client, google):
+<a id="l284" href="#l284">284</a>     token = new_token()
+<a id="l285" href="#l285">285</a>     google.buy(token, None)
+<a id="l286" href="#l286">286</a>     assert post_play(client, token).status_code == 200
+<a id="l287" href="#l287">287</a>     r = post_play(second_client, token)
+<a id="l288" href="#l288">288</a>     assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 0}
+<a id="l289" href="#l289">289</a>     assert left(client) == 20 * HOUR and left(second_client) == 0
+<a id="l290" href="#l290">290</a>     assert google.consumed == [token]
+<a id="l291" href="#l291">291</a> 
+<a id="l292" href="#l292">292</a> 
+<a id="l293" href="#l293">293</a> def test_a_purchase_from_before_a_merge_goes_to_the_merged_account(client, second_client, google):
+<a id="l294" href="#l294">294</a>     token = new_token()
+<a id="l295" href="#l295">295</a>     old, survivor = account_id(client), account_id(second_client)
+<a id="l296" href="#l296">296</a>     google.buy(token, old)
+<a id="l297" href="#l297">297</a>     with SessionLocal() as s:
+<a id="l298" href="#l298">298</a>         accounts.merge(s, s.get(Account, old), s.get(Account, survivor))
+<a id="l299" href="#l299">299</a>         s.commit()
+<a id="l300" href="#l300">300</a>     assert post_play(second_client, token).status_code == 200
+<a id="l301" href="#l301">301</a>     assert left(second_client) == 20 * HOUR
+<a id="l302" href="#l302">302</a> 
+<a id="l303" href="#l303">303</a> 
+<a id="l304" href="#l304">304</a> def test_a_failed_consume_keeps_the_hours_and_the_next_call_consumes(client, google):
+<a id="l305" href="#l305">305</a>     token = new_token()
+<a id="l306" href="#l306">306</a>     google.buy(token, account_id(client))
+<a id="l307" href="#l307">307</a>     google.fail_consume = 1
+<a id="l308" href="#l308">308</a>     r = post_play(client, token)
+<a id="l309" href="#l309">309</a>     assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 20 * HOUR}
+<a id="l310" href="#l310">310</a>     assert google.consumed == []
+<a id="l311" href="#l311">311</a> 
+<a id="l312" href="#l312">312</a>     assert post_play(client, token).status_code == 200
+<a id="l313" href="#l313">313</a>     assert google.consumed == [token] and left(client) == 20 * HOUR
+<a id="l314" href="#l314">314</a> 
+<a id="l315" href="#l315">315</a> 
+<a id="l316" href="#l316">316</a> def test_a_failed_credit_leaves_no_row_and_no_consume(client, google, monkeypatch):
+<a id="l317" href="#l317">317</a>     # The ledger row and the hours go in one commit, and the consume comes
+<a id="l318" href="#l318">318</a>     # after that commit. So when the database stops between the row and the
+<a id="l319" href="#l319">319</a>     # hours, Google keeps the purchase open, and the next send gives the hours.
+<a id="l320" href="#l320">320</a>     token = new_token()
+<a id="l321" href="#l321">321</a>     google.buy(token, account_id(client))
+<a id="l322" href="#l322">322</a>     add = captions.add
+<a id="l323" href="#l323">323</a> 
+<a id="l324" href="#l324">324</a>     def database_stops(*args):
+<a id="l325" href="#l325">325</a>         raise RuntimeError(&quot;the database stopped&quot;)
+<a id="l326" href="#l326">326</a> 
+<a id="l327" href="#l327">327</a>     monkeypatch.setattr(captions, &quot;add&quot;, database_stops)
+<a id="l328" href="#l328">328</a>     with pytest.raises(RuntimeError):
+<a id="l329" href="#l329">329</a>         post_play(client, token)
+<a id="l330" href="#l330">330</a>     assert ledger(token) == [] and google.consumed == [] and google.early == []
+<a id="l331" href="#l331">331</a> 
+<a id="l332" href="#l332">332</a>     monkeypatch.setattr(captions, &quot;add&quot;, add)
+<a id="l333" href="#l333">333</a>     assert post_play(client, token).status_code == 200
+<a id="l334" href="#l334">334</a>     assert left(client) == 20 * HOUR and google.consumed == [token]
+<a id="l335" href="#l335">335</a> 
+<a id="l336" href="#l336">336</a> 
+<a id="l337" href="#l337">337</a> def test_no_answer_from_google_gives_nothing(client, google):
+<a id="l338" href="#l338">338</a>     token = new_token()
+<a id="l339" href="#l339">339</a>     google.buy(token, account_id(client))
+<a id="l340" href="#l340">340</a>     google.down = True
+<a id="l341" href="#l341">341</a>     r = post_play(client, token)
+<a id="l342" href="#l342">342</a>     assert r.status_code == 502 and r.json()[&quot;detail&quot;] == play.NO_ANSWER
+<a id="l343" href="#l343">343</a>     assert left(client) == 0 and ledger(token) == []
+<a id="l344" href="#l344">344</a> 
+<a id="l345" href="#l345">345</a> 
+<a id="l346" href="#l346">346</a> def test_a_token_that_google_does_not_know_is_400(client, google):
+<a id="l347" href="#l347">347</a>     r = post_play(client, new_token())
+<a id="l348" href="#l348">348</a>     assert r.status_code == 400 and r.json()[&quot;detail&quot;] == UNKNOWN
+<a id="l349" href="#l349">349</a>     assert left(client) == 0
+<a id="l350" href="#l350">350</a> 
+<a id="l351" href="#l351">351</a> 
+<a id="l352" href="#l352">352</a> def test_a_purchase_for_another_pack_is_400(client, google):
+<a id="l353" href="#l353">353</a>     token = new_token()
+<a id="l354" href="#l354">354</a>     google.buy(token, account_id(client), product=&quot;captions80&quot;)
+<a id="l355" href="#l355">355</a>     r = post_play(client, token, product=&quot;captions20&quot;)
+<a id="l356" href="#l356">356</a>     assert r.status_code == 400 and r.json()[&quot;detail&quot;] == UNKNOWN
+<a id="l357" href="#l357">357</a>     assert left(client) == 0 and google.consumed == [] and ledger(token) == []
+<a id="l358" href="#l358">358</a> 
+<a id="l359" href="#l359">359</a> 
+<a id="l360" href="#l360">360</a> def test_the_quantity_multiplies_the_hours(client, google):
+<a id="l361" href="#l361">361</a>     token = new_token()
+<a id="l362" href="#l362">362</a>     google.buy(token, account_id(client), quantity=3)
+<a id="l363" href="#l363">363</a>     assert post_play(client, token).json() == {&quot;seconds_left&quot;: 60 * HOUR}
+<a id="l364" href="#l364">364</a> 
+<a id="l365" href="#l365">365</a> 
+<a id="l366" href="#l366">366</a> def test_the_log_never_holds_the_token(client, google, caplog):
+<a id="l367" href="#l367">367</a>     caplog.set_level(logging.DEBUG)
+<a id="l368" href="#l368">368</a>     token, lost = new_token(), new_token()
+<a id="l369" href="#l369">369</a>     google.buy(token, account_id(client))
+<a id="l370" href="#l370">370</a>     google.buy(lost, account_id(client))[&quot;consumptionState&quot;] = 1
+<a id="l371" href="#l371">371</a>     google.fail_consume = 1
+<a id="l372" href="#l372">372</a>     assert post_play(client, token).status_code == 200  # The hours, and a failed consume.
+<a id="l373" href="#l373">373</a>     assert post_play(client, token).status_code == 200  # The consume.
+<a id="l374" href="#l374">374</a>     assert post_play(client, lost).status_code == 409  # Consumed, but not in the ledger.
+<a id="l375" href="#l375">375</a>     assert &quot;play purchase&quot; in caplog.text and &quot;could not consume&quot; in caplog.text
+<a id="l376" href="#l376">376</a>     assert token not in caplog.text and lost not in caplog.text
+<a id="l377" href="#l377">377</a> 
+<a id="l378" href="#l378">378</a> 
+<a id="l379" href="#l379">379</a> def test_a_consumed_purchase_without_a_row_gives_nothing(client, google):
+<a id="l380" href="#l380">380</a>     token = new_token()
+<a id="l381" href="#l381">381</a>     google.buy(token, account_id(client))[&quot;consumptionState&quot;] = 1
+<a id="l382" href="#l382">382</a>     r = post_play(client, token)
+<a id="l383" href="#l383">383</a>     assert r.status_code == 409 and r.json()[&quot;detail&quot;] == &quot;This purchase was used already.&quot;
+<a id="l384" href="#l384">384</a>     assert left(client) == 0 and google.consumed == [] and ledger(token) == []
+<a id="l385" href="#l385">385</a> 
+<a id="l386" href="#l386">386</a> 
+<a id="l387" href="#l387">387</a> def test_a_test_purchase_is_marked_in_the_ledger(client, google):
+<a id="l388" href="#l388">388</a>     tested, paid = new_token(), new_token()
+<a id="l389" href="#l389">389</a>     google.buy(tested, account_id(client), test=True)
+<a id="l390" href="#l390">390</a>     google.buy(paid, account_id(client))
+<a id="l391" href="#l391">391</a>     assert post_play(client, tested).status_code == 200
+<a id="l392" href="#l392">392</a>     assert post_play(client, paid).status_code == 200
+<a id="l393" href="#l393">393</a>     assert [row.test for row in ledger(tested)] == [True]
+<a id="l394" href="#l394">394</a>     assert [row.test for row in ledger(paid)] == [False]
+<a id="l395" href="#l395">395</a> 
+<a id="l396" href="#l396">396</a> 
+<a id="l397" href="#l397">397</a> def test_a_bad_body_is_422(client, google):
+<a id="l398" href="#l398">398</a>     token = new_token()
+<a id="l399" href="#l399">399</a>     google.buy(token, account_id(client))
+<a id="l400" href="#l400">400</a>     assert post_play(client, &quot;&quot;).status_code == 422
+<a id="l401" href="#l401">401</a>     assert post_play(client, &quot;x&quot; * 4097).status_code == 422
+<a id="l402" href="#l402">402</a>     assert google.gets == []
+<a id="l403" href="#l403">403</a> 
+<a id="l404" href="#l404">404</a> 
+<a id="l405" href="#l405">405</a> # --- the HTTP layer -----------------------------------------------------------
+<a id="l406" href="#l406">406</a> 
+<a id="l407" href="#l407">407</a> class FakeResponse:
+<a id="l408" href="#l408">408</a>     def __init__(self, status_code: int, body: dict | None = None):
+<a id="l409" href="#l409">409</a>         self.status_code = status_code
+<a id="l410" href="#l410">410</a>         self._body = body or {}
+<a id="l411" href="#l411">411</a> 
+<a id="l412" href="#l412">412</a>     def json(self) -&gt; dict:
+<a id="l413" href="#l413">413</a>         return self._body
+<a id="l414" href="#l414">414</a> 
+<a id="l415" href="#l415">415</a> 
+<a id="l416" href="#l416">416</a> class FakeHttp:
+<a id="l417" href="#l417">417</a>     &quot;&quot;&quot;Stands in for the signed session: records each request and gives the next answer.&quot;&quot;&quot;
+<a id="l418" href="#l418">418</a> 
+<a id="l419" href="#l419">419</a>     def __init__(self):
+<a id="l420" href="#l420">420</a>         self.answers: list = []
+<a id="l421" href="#l421">421</a>         self.seen: list[tuple[str, str]] = []
+<a id="l422" href="#l422">422</a> 
+<a id="l423" href="#l423">423</a>     def __enter__(self):
+<a id="l424" href="#l424">424</a>         return self
+<a id="l425" href="#l425">425</a> 
+<a id="l426" href="#l426">426</a>     def __exit__(self, *exc):
+<a id="l427" href="#l427">427</a>         return False
+<a id="l428" href="#l428">428</a> 
+<a id="l429" href="#l429">429</a>     def request(self, method: str, url: str, timeout: float | None = None):
+<a id="l430" href="#l430">430</a>         assert timeout  # A request without a timeout can hang a worker.
+<a id="l431" href="#l431">431</a>         self.seen.append((method, url))
+<a id="l432" href="#l432">432</a>         answer = self.answers.pop(0)
+<a id="l433" href="#l433">433</a>         if isinstance(answer, Exception):
+<a id="l434" href="#l434">434</a>             raise answer
+<a id="l435" href="#l435">435</a>         return answer
+<a id="l436" href="#l436">436</a> 
+<a id="l437" href="#l437">437</a> 
+<a id="l438" href="#l438">438</a> @pytest.fixture
+<a id="l439" href="#l439">439</a> def http(monkeypatch):
+<a id="l440" href="#l440">440</a>     fake = FakeHttp()
+<a id="l441" href="#l441">441</a>     monkeypatch.setattr(play, &quot;_session&quot;, lambda: fake)
+<a id="l442" href="#l442">442</a>     return fake
+<a id="l443" href="#l443">443</a> 
+<a id="l444" href="#l444">444</a> 
+<a id="l445" href="#l445">445</a> def test_get_asks_google_for_the_pack_and_the_token(http):
+<a id="l446" href="#l446">446</a>     http.answers = [FakeResponse(200, {&quot;purchaseState&quot;: 0})]
+<a id="l447" href="#l447">447</a>     assert play.get(&quot;captions20&quot;, &quot;abc.DEF-_1&quot;) == {&quot;purchaseState&quot;: 0}
+<a id="l448" href="#l448">448</a>     url = (&quot;https://androidpublisher.googleapis.com/androidpublisher/v3/applications/&quot;
+<a id="l449" href="#l449">449</a>            &quot;com.honjimaku.subrep/purchases/products/captions20/tokens/abc.DEF-_1&quot;)
+<a id="l450" href="#l450">450</a>     assert http.seen == [(&quot;GET&quot;, url)]
+<a id="l451" href="#l451">451</a> 
+<a id="l452" href="#l452">452</a> 
+<a id="l453" href="#l453">453</a> def test_consume_posts_to_the_consume_address(http):
+<a id="l454" href="#l454">454</a>     http.answers = [FakeResponse(204)]
+<a id="l455" href="#l455">455</a>     play.consume(&quot;captions80&quot;, &quot;abc&quot;)
+<a id="l456" href="#l456">456</a>     [(method, url)] = http.seen
+<a id="l457" href="#l457">457</a>     assert method == &quot;POST&quot;
+<a id="l458" href="#l458">458</a>     assert url.endswith(&quot;/com.honjimaku.subrep/purchases/products/captions80/tokens/abc:consume&quot;)
+<a id="l459" href="#l459">459</a> 
+<a id="l460" href="#l460">460</a> 
+<a id="l461" href="#l461">461</a> @pytest.mark.parametrize(&quot;google_status, status&quot;, [
+<a id="l462" href="#l462">462</a>     (400, 400), (404, 400), (410, 400), (401, 503), (403, 503), (429, 502), (500, 502), (503, 502),
+<a id="l463" href="#l463">463</a> ])
+<a id="l464" href="#l464">464</a> def test_google_errors_become_clear_answers(http, google_status, status):
+<a id="l465" href="#l465">465</a>     http.answers = [FakeResponse(google_status)]
+<a id="l466" href="#l466">466</a>     with pytest.raises(play.PlayError) as caught:
+<a id="l467" href="#l467">467</a>         play.get(&quot;captions20&quot;, &quot;abc&quot;)
+<a id="l468" href="#l468">468</a>     assert caught.value.status == status
+<a id="l469" href="#l469">469</a> 
+<a id="l470" href="#l470">470</a> 
+<a id="l471" href="#l471">471</a> @pytest.mark.parametrize(&quot;error&quot;, [
+<a id="l472" href="#l472">472</a>     requests.ConnectionError(&quot;no route to host&quot;),
+<a id="l473" href="#l473">473</a>     requests.Timeout(&quot;read timed out&quot;),
+<a id="l474" href="#l474">474</a>     google_errors.TransportError(&quot;no route to the token server&quot;),
+<a id="l475" href="#l475">475</a>     # google-auth raises this after its own retries, when the Google token
+<a id="l476" href="#l476">476</a>     # server answers 408, 429, 500, 503 or 504.
+<a id="l477" href="#l477">477</a>     google_errors.RefreshError(&quot;temporarily_unavailable&quot;, retryable=True),
+<a id="l478" href="#l478">478</a> ])
+<a id="l479" href="#l479">479</a> def test_no_connection_to_google_is_502(http, error, caplog):
+<a id="l480" href="#l480">480</a>     http.answers = [error]
+<a id="l481" href="#l481">481</a>     with pytest.raises(play.PlayError) as caught:
+<a id="l482" href="#l482">482</a>         play.get(&quot;captions20&quot;, &quot;abc&quot;)
+<a id="l483" href="#l483">483</a>     assert (caught.value.status, caught.value.detail) == (502, play.NO_ANSWER)
+<a id="l484" href="#l484">484</a>     # The key can be good. So the log must not tell the operator that Google refused it.
+<a id="l485" href="#l485">485</a>     assert [r for r in caplog.records if r.levelno &gt;= logging.ERROR] == []
+<a id="l486" href="#l486">486</a> 
+<a id="l487" href="#l487">487</a> 
+<a id="l488" href="#l488">488</a> def test_a_key_that_google_refuses_is_503(http):
+<a id="l489" href="#l489">489</a>     http.answers = [google_errors.RefreshError(&quot;invalid_grant: account not found&quot;)]
+<a id="l490" href="#l490">490</a>     with pytest.raises(play.PlayError) as caught:
+<a id="l491" href="#l491">491</a>         play.get(&quot;captions20&quot;, &quot;abc&quot;)
+<a id="l492" href="#l492">492</a>     assert (caught.value.status, caught.value.detail) == (503, play.NOT_SET_UP)
+<a id="l493" href="#l493">493</a> 
+<a id="l494" href="#l494">494</a> 
+<a id="l495" href="#l495">495</a> def test_the_key_file_gives_credentials_for_the_play_api(tmp_path):
+<a id="l496" href="#l496">496</a>     from cryptography.hazmat.primitives import serialization
+<a id="l497" href="#l497">497</a>     from cryptography.hazmat.primitives.asymmetric import rsa
+<a id="l498" href="#l498">498</a> 
+<a id="l499" href="#l499">499</a>     pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+<a id="l500" href="#l500">500</a>         serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+<a id="l501" href="#l501">501</a>         serialization.NoEncryption()).decode()
+<a id="l502" href="#l502">502</a>     key = tmp_path / &quot;play-key.json&quot;
+<a id="l503" href="#l503">503</a>     key.write_text(json.dumps({
+<a id="l504" href="#l504">504</a>         &quot;type&quot;: &quot;service_account&quot;, &quot;project_id&quot;: &quot;subrep-test&quot;, &quot;private_key_id&quot;: &quot;k1&quot;,
+<a id="l505" href="#l505">505</a>         &quot;private_key&quot;: pem, &quot;client_email&quot;: &quot;play@subrep-test.iam.gserviceaccount.com&quot;,
+<a id="l506" href="#l506">506</a>         &quot;client_id&quot;: &quot;1&quot;, &quot;token_uri&quot;: &quot;https://oauth2.googleapis.com/token&quot;,
+<a id="l507" href="#l507">507</a>     }))
+<a id="l508" href="#l508">508</a>     credentials = play._credentials(str(key))
+<a id="l509" href="#l509">509</a>     assert credentials.scopes == [&quot;https://www.googleapis.com/auth/androidpublisher&quot;]
+<a id="l510" href="#l510">510</a>     assert credentials.service_account_email == &quot;play@subrep-test.iam.gserviceaccount.com&quot;
+<a id="l511" href="#l511">511</a> 
+<a id="l512" href="#l512">512</a> 
+<a id="l513" href="#l513">513</a> @pytest.mark.parametrize(&quot;content&quot;, [&quot;{}&quot;, &quot;not json&quot;, None])
+<a id="l514" href="#l514">514</a> def test_a_bad_key_file_is_503(tmp_path, content):
+<a id="l515" href="#l515">515</a>     key = tmp_path / &quot;play-key.json&quot;
+<a id="l516" href="#l516">516</a>     if content is not None:
+<a id="l517" href="#l517">517</a>         key.write_text(content)
+<a id="l518" href="#l518">518</a>     with pytest.raises(play.PlayError) as caught:
+<a id="l519" href="#l519">519</a>         play._credentials(str(key))
+<a id="l520" href="#l520">520</a>     assert caught.value.status == 503
+<a id="l521" href="#l521">521</a> 
+<a id="l522" href="#l522">522</a> 
+<a id="l523" href="#l523">523</a> def test_the_voided_list_reads_every_page(http):
+<a id="l524" href="#l524">524</a>     http.answers = [
+<a id="l525" href="#l525">525</a>         FakeResponse(200, {&quot;voidedPurchases&quot;: [{&quot;purchaseToken&quot;: &quot;a&quot;, &quot;orderId&quot;: &quot;GPA.1&quot;}],
+<a id="l526" href="#l526">526</a>                            &quot;tokenPagination&quot;: {&quot;nextPageToken&quot;: &quot;p2&quot;}}),
+<a id="l527" href="#l527">527</a>         FakeResponse(200, {&quot;voidedPurchases&quot;: [{&quot;purchaseToken&quot;: &quot;b&quot;, &quot;orderId&quot;: &quot;GPA.2&quot;}]}),
+<a id="l528" href="#l528">528</a>         FakeResponse(200, {}),
+<a id="l529" href="#l529">529</a>     ]
+<a id="l530" href="#l530">530</a>     assert play.voided() == [&quot;a&quot;, &quot;b&quot;]
+<a id="l531" href="#l531">531</a>     assert play.voided() == []  # No refunds in the last 30 days.
+<a id="l532" href="#l532">532</a>     url = (&quot;https://androidpublisher.googleapis.com/androidpublisher/v3/applications/&quot;
+<a id="l533" href="#l533">533</a>            &quot;com.honjimaku.subrep/purchases/voidedpurchases&quot;)
+<a id="l534" href="#l534">534</a>     assert http.seen == [(&quot;GET&quot;, url), (&quot;GET&quot;, url + &quot;?token=p2&quot;), (&quot;GET&quot;, url)]
+<a id="l535" href="#l535">535</a> 
+<a id="l536" href="#l536">536</a> 
+<a id="l537" href="#l537">537</a> # --- refunds ------------------------------------------------------------------
+<a id="l538" href="#l538">538</a> # These tests use SessionLocal and no TestClient: each TestClient starts a pass
+<a id="l539" href="#l539">539</a> # of the housekeeping in the background.
+<a id="l540" href="#l540">540</a> 
+<a id="l541" href="#l541">541</a> def paid(product: str = &quot;captions20&quot;, account: str | None = None) -&gt; dict:
+<a id="l542" href="#l542">542</a>     &quot;&quot;&quot;A paid purchase that nobody consumed yet, as Google returns it.&quot;&quot;&quot;
+<a id="l543" href="#l543">543</a>     purchase = {&quot;purchaseState&quot;: 0, &quot;consumptionState&quot;: 0, &quot;productId&quot;: product}
+<a id="l544" href="#l544">544</a>     if account is not None:
+<a id="l545" href="#l545">545</a>         purchase[&quot;obfuscatedExternalAccountId&quot;] = account
+<a id="l546" href="#l546">546</a>     return purchase
+<a id="l547" href="#l547">547</a> 
+<a id="l548" href="#l548">548</a> 
+<a id="l549" href="#l549">549</a> def test_a_refund_takes_back_the_hours_once():
+<a id="l550" href="#l550">550</a>     token = new_token()
+<a id="l551" href="#l551">551</a>     with SessionLocal() as s:
+<a id="l552" href="#l552">552</a>         me = accounts.new_account(s)
+<a id="l553" href="#l553">553</a>         captions.add(s, me.id, 5 * HOUR)  # Hours from an earlier purchase.
+<a id="l554" href="#l554">554</a>         s.commit()
+<a id="l555" href="#l555">555</a>         assert play.credit(s, me, &quot;captions20&quot;, token, paid(account=me.id))
+<a id="l556" href="#l556">556</a>         assert play.take_back(s, [token]) == 1
+<a id="l557" href="#l557">557</a>         assert play.take_back(s, [token]) == 0
+<a id="l558" href="#l558">558</a>         assert captions.seconds_left(s, me.id) == 5 * HOUR
+<a id="l559" href="#l559">559</a>         [row] = s.query(play.PlayPurchase).filter_by(token_hash=play._hash(token)).all()
+<a id="l560" href="#l560">560</a>         assert row.voided_at is not None
+<a id="l561" href="#l561">561</a> 
+<a id="l562" href="#l562">562</a> 
+<a id="l563" href="#l563">563</a> def test_two_passes_at_the_same_time_take_the_hours_back_once(monkeypatch):
+<a id="l564" href="#l564">564</a>     token = new_token()
+<a id="l565" href="#l565">565</a>     with SessionLocal() as s, SessionLocal() as other:
+<a id="l566" href="#l566">566</a>         me = accounts.new_account(s)
+<a id="l567" href="#l567">567</a>         captions.add(s, me.id, 5 * HOUR)
+<a id="l568" href="#l568">568</a>         s.commit()
+<a id="l569" href="#l569">569</a>         assert play.credit(s, me, &quot;captions20&quot;, token, paid(account=me.id))
+<a id="l570" href="#l570">570</a>         # The other pass runs after this pass found the row, and before it
+<a id="l571" href="#l571">571</a>         # marks the row.
+<a id="l572" href="#l572">572</a>         other_pass = []
+<a id="l573" href="#l573">573</a>         execute = s.execute
+<a id="l574" href="#l574">574</a> 
+<a id="l575" href="#l575">575</a>         def execute_after_the_other_pass(*args, **kwargs):
+<a id="l576" href="#l576">576</a>             if not other_pass:
+<a id="l577" href="#l577">577</a>                 other_pass.append(play.take_back(other, [token]))
+<a id="l578" href="#l578">578</a>             return execute(*args, **kwargs)
+<a id="l579" href="#l579">579</a> 
+<a id="l580" href="#l580">580</a>         monkeypatch.setattr(s, &quot;execute&quot;, execute_after_the_other_pass)
+<a id="l581" href="#l581">581</a>         assert play.take_back(s, [token]) == 0
+<a id="l582" href="#l582">582</a>         assert other_pass == [1]
+<a id="l583" href="#l583">583</a>         me_id = me.id
+<a id="l584" href="#l584">584</a>     with SessionLocal() as s:
+<a id="l585" href="#l585">585</a>         assert captions.seconds_left(s, me_id) == 5 * HOUR
+<a id="l586" href="#l586">586</a> 
+<a id="l587" href="#l587">587</a> 
+<a id="l588" href="#l588">588</a> def test_a_refund_after_a_merge_takes_the_hours_from_the_survivor():
+<a id="l589" href="#l589">589</a>     token = new_token()
+<a id="l590" href="#l590">590</a>     with SessionLocal() as s:
+<a id="l591" href="#l591">591</a>         old, survivor = accounts.new_account(s), accounts.new_account(s)
+<a id="l592" href="#l592">592</a>         s.commit()
+<a id="l593" href="#l593">593</a>         assert play.credit(s, old, &quot;captions20&quot;, token, paid(account=old.id))
+<a id="l594" href="#l594">594</a>         accounts.merge(s, old, survivor)
+<a id="l595" href="#l595">595</a>         s.commit()
+<a id="l596" href="#l596">596</a>         assert captions.seconds_left(s, survivor.id) == 20 * HOUR
+<a id="l597" href="#l597">597</a>         assert play.take_back(s, [token]) == 1
+<a id="l598" href="#l598">598</a>         assert captions.seconds_left(s, survivor.id) == 0
+<a id="l599" href="#l599">599</a>         assert captions.seconds_left(s, old.id) == 0
+<a id="l600" href="#l600">600</a> 
+<a id="l601" href="#l601">601</a> 
+<a id="l602" href="#l602">602</a> def test_housekeeping_takes_back_refunds_only_when_play_is_set_up(google, monkeypatch):
+<a id="l603" href="#l603">603</a>     token = new_token()
+<a id="l604" href="#l604">604</a>     with SessionLocal() as s:
+<a id="l605" href="#l605">605</a>         me = accounts.new_account(s)
+<a id="l606" href="#l606">606</a>         s.commit()
+<a id="l607" href="#l607">607</a>         assert play.credit(s, me, &quot;captions20&quot;, token, paid(account=me.id))
+<a id="l608" href="#l608">608</a>         me_id = me.id
+<a id="l609" href="#l609">609</a>     google.voided_tokens = [token]
+<a id="l610" href="#l610">610</a>     asked = []
+<a id="l611" href="#l611">611</a> 
+<a id="l612" href="#l612">612</a>     def spy():
+<a id="l613" href="#l613">613</a>         asked.append(True)
+<a id="l614" href="#l614">614</a>         return google.voided()
+<a id="l615" href="#l615">615</a> 
+<a id="l616" href="#l616">616</a>     monkeypatch.setattr(play, &quot;voided&quot;, spy)
+<a id="l617" href="#l617">617</a>     key = settings.play_service_account_file
+<a id="l618" href="#l618">618</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, &quot;&quot;)
+<a id="l619" href="#l619">619</a>     main.housekeeping()
+<a id="l620" href="#l620">620</a>     assert asked == []
+<a id="l621" href="#l621">621</a> 
+<a id="l622" href="#l622">622</a>     monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, key)
+<a id="l623" href="#l623">623</a>     main.housekeeping()
+<a id="l624" href="#l624">624</a>     assert asked == [True]
+<a id="l625" href="#l625">625</a>     with SessionLocal() as s:
+<a id="l626" href="#l626">626</a>         assert captions.seconds_left(s, me_id) == 0
+<a id="l627" href="#l627">627</a> 
+<a id="l628" href="#l628">628</a> 
+<a id="l629" href="#l629">629</a> def test_a_google_failure_does_not_stop_housekeeping(google, monkeypatch, caplog):
+<a id="l630" href="#l630">630</a>     def down():
+<a id="l631" href="#l631">631</a>         raise play.PlayError(502, play.NO_ANSWER)
+<a id="l632" href="#l632">632</a> 
+<a id="l633" href="#l633">633</a>     monkeypatch.setattr(play, &quot;voided&quot;, down)
+<a id="l634" href="#l634">634</a>     main.housekeeping()
+<a id="l635" href="#l635">635</a>     warnings = [record for record in caplog.records
+<a id="l636" href="#l636">636</a>                 if record.name == &quot;backend.play&quot; and record.levelno == logging.WARNING]
+<a id="l637" href="#l637">637</a>     assert len(warnings) == 1 and play.NO_ANSWER in warnings[0].getMessage()
+<a id="l638" href="#l638">638</a> 
+<a id="l639" href="#l639">639</a> 
+<a id="l640" href="#l640">640</a> # --- properties ---------------------------------------------------------------
+<a id="l641" href="#l641">641</a> 
+<a id="l642" href="#l642">642</a> @hsettings(max_examples=50, deadline=None)
+<a id="l643" href="#l643">643</a> @given(buys=st.lists(st.tuples(st.sampled_from(sorted(captions.HOURS)), st.integers(1, 3),
+<a id="l644" href="#l644">644</a>                                st.sampled_from([&quot;me&quot;, &quot;other&quot;, &quot;none&quot;])),
+<a id="l645" href="#l645">645</a>                      min_size=1, max_size=4),
+<a id="l646" href="#l646">646</a>        calls=st.lists(st.tuples(st.integers(0, 3), st.sampled_from([0, 1, 2]),
+<a id="l647" href="#l647">647</a>                                 st.sampled_from([0, 1])),
+<a id="l648" href="#l648">648</a>                       max_size=25))
+<a id="l649" href="#l649">649</a> def test_a_token_gives_its_hours_once_and_only_when_paid_for_this_account(buys, calls):
+<a id="l650" href="#l650">650</a>     run = secrets.token_hex(6)  # The database lives across examples.
+<a id="l651" href="#l651">651</a>     with SessionLocal() as s:
+<a id="l652" href="#l652">652</a>         me, other = accounts.new_account(s), accounts.new_account(s)
+<a id="l653" href="#l653">653</a>         s.commit()
+<a id="l654" href="#l654">654</a>         ids = {&quot;me&quot;: me.id, &quot;other&quot;: other.id, &quot;none&quot;: None}
+<a id="l655" href="#l655">655</a>         expected, added = {}, {}
+<a id="l656" href="#l656">656</a>         for i, state, consumed in calls:
+<a id="l657" href="#l657">657</a>             if i &gt;= len(buys):
+<a id="l658" href="#l658">658</a>                 continue
+<a id="l659" href="#l659">659</a>             product, quantity, owner = buys[i]
+<a id="l660" href="#l660">660</a>             token = f&quot;{run}.{i}&quot;
+<a id="l661" href="#l661">661</a>             google = {&quot;purchaseState&quot;: state, &quot;consumptionState&quot;: consumed,
+<a id="l662" href="#l662">662</a>                       &quot;productId&quot;: product, &quot;quantity&quot;: quantity}
+<a id="l663" href="#l663">663</a>             if ids[owner]:
+<a id="l664" href="#l664">664</a>                 google[&quot;obfuscatedExternalAccountId&quot;] = ids[owner]
+<a id="l665" href="#l665">665</a>             try:
+<a id="l666" href="#l666">666</a>                 if play.credit(s, me, product, token, google):
+<a id="l667" href="#l667">667</a>                     added[token] = added.get(token, 0) + 1
+<a id="l668" href="#l668">668</a>             except play.PlayError:
+<a id="l669" href="#l669">669</a>                 pass
+<a id="l670" href="#l670">670</a>             # Hours come only from a call that saw the purchase paid and not consumed.
+<a id="l671" href="#l671">671</a>             if state == 0 and consumed == 0 and owner != &quot;other&quot;:
+<a id="l672" href="#l672">672</a>                 expected[token] = captions.HOURS[product] * HOUR * quantity
+<a id="l673" href="#l673">673</a>         assert captions.seconds_left(s, ids[&quot;me&quot;]) == sum(expected.values())
+<a id="l674" href="#l674">674</a>         assert captions.seconds_left(s, ids[&quot;other&quot;]) == 0
+<a id="l675" href="#l675">675</a>         assert added == {token: 1 for token in expected}
+<a id="l676" href="#l676">676</a>         assert s.query(play.PlayPurchase).filter_by(account_id=ids[&quot;me&quot;]).count() == len(expected)
+<a id="l677" href="#l677">677</a> 
+<a id="l678" href="#l678">678</a> 
+<a id="l679" href="#l679">679</a> @hsettings(max_examples=50, deadline=None)
+<a id="l680" href="#l680">680</a> @given(bought=st.lists(st.sampled_from(sorted(captions.HOURS)), min_size=1, max_size=4),
+<a id="l681" href="#l681">681</a>        spent=st.integers(0, 300 * HOUR),
+<a id="l682" href="#l682">682</a>        voids=st.lists(st.lists(st.integers(0, 5), max_size=6), max_size=4))
+<a id="l683" href="#l683">683</a> def test_a_refund_takes_back_the_hours_once_and_never_below_zero(bought, spent, voids):
+<a id="l684" href="#l684">684</a>     run = secrets.token_hex(6)  # The database lives across examples.
+<a id="l685" href="#l685">685</a>     with SessionLocal() as s:
+<a id="l686" href="#l686">686</a>         me = accounts.new_account(s)
+<a id="l687" href="#l687">687</a>         s.commit()
+<a id="l688" href="#l688">688</a>         for i, product in enumerate(bought):
+<a id="l689" href="#l689">689</a>             assert play.credit(s, me, product, f&quot;{run}.{i}&quot;, paid(product, me.id))
+<a id="l690" href="#l690">690</a>         total = sum(captions.HOURS[product] * HOUR for product in bought)
+<a id="l691" href="#l691">691</a>         used = min(spent, total)
+<a id="l692" href="#l692">692</a>         assert captions.spend(s, me.id, used)
+<a id="l693" href="#l693">693</a>         voided: set[int] = set()
+<a id="l694" href="#l694">694</a>         taken = 0
+<a id="l695" href="#l695">695</a>         for indexes in voids:  # An index past the purchases is a token that this server never saw.
+<a id="l696" href="#l696">696</a>             taken += play.take_back(s, [f&quot;{run}.{i}&quot; for i in indexes])
+<a id="l697" href="#l697">697</a>             voided |= {i for i in indexes if i &lt; len(bought)}
+<a id="l698" href="#l698">698</a>         back = sum(captions.HOURS[bought[i]] * HOUR for i in voided)
+<a id="l699" href="#l699">699</a>         assert captions.seconds_left(s, me.id) == max(0, total - used - back)
+<a id="l700" href="#l700">700</a>         assert taken == len(voided)
+<a id="l701" href="#l701">701</a>         assert s.query(play.PlayPurchase).filter(
+<a id="l702" href="#l702">702</a>             play.PlayPurchase.account_id == me.id,
+<a id="l703" href="#l703">703</a>             play.PlayPurchase.voided_at.is_not(None)).count() == len(voided)
+<a id="l704" href="#l704">704</a> 
+<a id="l705" href="#l705">705</a> 
+<a id="l706" href="#l706">706</a> @given(st.text(min_size=1))
+<a id="l707" href="#l707">707</a> def test_any_token_is_one_path_segment_of_the_address(token):
+<a id="l708" href="#l708">708</a>     url = play._url(&quot;captions20&quot;, token)
+<a id="l709" href="#l709">709</a>     assert &quot;?&quot; not in url and &quot;#&quot; not in url
+<a id="l710" href="#l710">710</a>     head, tail = url.split(&quot;/tokens/&quot;, 1)
+<a id="l711" href="#l711">711</a>     assert head.endswith(&quot;/com.honjimaku.subrep/purchases/products/captions20&quot;)
+<a id="l712" href="#l712">712</a>     assert &quot;/&quot; not in tail
+<a id="l713" href="#l713">713</a>     assert unquote(tail) == token</pre>
+</div></body></html>

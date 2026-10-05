@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>forthlisp-z80/lisp.fs - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>forthlisp-z80</h1><span class="desc">Z80 target for forthlisp: Z80 Forth kernel built by an SBCL assembler, z80pack cpmsim</span><p class="url">git clone https://github.com/equwal/forthlisp-z80</p><p><a href="../../forthlisp-z80/index.html">Log</a> | <a href="../../forthlisp-z80/files.html">Files</a> | <a href="../../forthlisp-z80/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>lisp.fs (12768 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> \ lisp.fs -- layer 4: a small Scheme written in Forth words, loaded through the Z80 Forth.
+<a id="l2" href="#l2">2</a> \ Values are 16-bit. A heap object is one 4-byte cell (car, cdr) plus a type byte:
+<a id="l3" href="#l3">3</a> \ 1 pair  2 symbol (car: counted name, cdr: global value)  3 closure ((params . body) . env)
+<a id="l4" href="#l4">4</a> \ 4 primitive (car: xt)  5 number (32-bit: car low, cdr high)  6 string (car: char list)
+<a id="l5" href="#l5">5</a> \ 7 vector (car: element list)  8 macro (car: transformer closure).  Bit 7: GC mark.
+<a id="l6" href="#l6">6</a> \ Immediates: () = 0, #f = 2, #t = 4, unspecified = 6, unbound = 8.
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> : tuck swap over ;
+<a id="l9" href="#l9">9</a> : -rot rot rot ;
+<a id="l10" href="#l10">10</a> : 2swap rot &gt;r rot r&gt; ;
+<a id="l11" href="#l11">11</a> : 0&lt;&gt; 0= 0= ;
+<a id="l12" href="#l12">12</a> : abs dup 0&lt; if negate then ;
+<a id="l13" href="#l13">13</a> : dnegate invert swap invert swap 1 0 d+ ;
+<a id="l14" href="#l14">14</a> : d- dnegate d+ ;
+<a id="l15" href="#l15">15</a> : dabs dup 0&lt; if dnegate then ;
+<a id="l16" href="#l16">16</a> : d= rot = &gt;r = r&gt; and ;
+<a id="l17" href="#l17">17</a> : d&lt; rot 2dup = if 2drop u&lt; else &gt; nip nip then ;
+<a id="l18" href="#l18">18</a> : d&gt; 2swap d&lt; ;
+<a id="l19" href="#l19">19</a> : d&lt;= d&gt; 0= ;
+<a id="l20" href="#l20">20</a> : d&gt;= d&lt; 0= ;
+<a id="l21" href="#l21">21</a> : d* &gt;r swap &gt;r 2dup um* 2swap r&gt; * swap r&gt; * + + ;
+<a id="l22" href="#l22">22</a> : mu/mod &gt;r 0 r@ um/mod r&gt; swap &gt;r um/mod r&gt; ;
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> 0 constant nil
+<a id="l25" href="#l25">25</a> 2 constant false
+<a id="l26" href="#l26">26</a> 4 constant true
+<a id="l27" href="#l27">27</a> 6 constant unspec
+<a id="l28" href="#l28">28</a> 8 constant unbound
+<a id="l29" href="#l29">29</a> : bool if true else false then ;
+<a id="l30" href="#l30">30</a> 
+<a id="l31" href="#l31">31</a> \ ---- heap and garbage collector (mark-sweep; stacks are scanned conservatively)
+<a id="l32" href="#l32">32</a> 7000 constant #cells
+<a id="l33" href="#l33">33</a> create heap0 #cells 4 * 4 + allot
+<a id="l34" href="#l34">34</a> heap0 3 + -4 and constant heap
+<a id="l35" href="#l35">35</a> create types #cells allot
+<a id="l36" href="#l36">36</a> variable free
+<a id="l37" href="#l37">37</a> variable symlist
+<a id="l38" href="#l38">38</a> variable errobj
+<a id="l39" href="#l39">39</a> variable errmsg
+<a id="l40" href="#l40">40</a> variable errlen
+<a id="l41" href="#l41">41</a> variable display?
+<a id="l42" href="#l42">42</a> : cell# heap - 2/ 2/ ;
+<a id="l43" href="#l43">43</a> : type@ cell# types + c@ 127 and ;
+<a id="l44" href="#l44">44</a> : heap? dup heap - #cells 4 * u&lt; over 3 and 0= and if cell# types + c@ 127 and 0&lt;&gt; else drop 0 then ;
+<a id="l45" href="#l45">45</a> : car @ ;
+<a id="l46" href="#l46">46</a> : cdr 2 + @ ;
+<a id="l47" href="#l47">47</a> : cadr cdr car ;
+<a id="l48" href="#l48">48</a> : cddr cdr cdr ;
+<a id="l49" href="#l49">49</a> : caddr cddr car ;
+<a id="l50" href="#l50">50</a> : set-cdr 2 + ! ;
+<a id="l51" href="#l51">51</a> : typ? over heap? if swap type@ = else 2drop 0 then ;
+<a id="l52" href="#l52">52</a> : pair? 1 typ? ;
+<a id="l53" href="#l53">53</a> : lerror errlen ! errmsg ! errobj ! -100 throw ;
+<a id="l54" href="#l54">54</a> : mark
+<a id="l55" href="#l55">55</a>   begin dup heap? while
+<a id="l56" href="#l56">56</a>     dup cell# types + dup c@ dup 128 and if 2drop drop exit then
+<a id="l57" href="#l57">57</a>     128 or swap c!
+<a id="l58" href="#l58">58</a>     dup type@ dup 1 = over 3 = or swap 8 = or if dup car recurse cdr else
+<a id="l59" href="#l59">59</a>     dup type@ 2 = if cdr else
+<a id="l60" href="#l60">60</a>     dup type@ dup 6 = swap 7 = or if car else drop 0 then then then
+<a id="l61" href="#l61">61</a>   repeat drop ;
+<a id="l62" href="#l62">62</a> : scan-data sp@ begin dup while dup @ mark 2 + repeat drop ;
+<a id="l63" href="#l63">63</a> : scan-return rp@ begin dup r0 u&lt; while dup @ mark 2 + repeat drop ;
+<a id="l64" href="#l64">64</a> : sweep 0 free ! 0
+<a id="l65" href="#l65">65</a>   begin dup #cells &lt; while
+<a id="l66" href="#l66">66</a>     dup types + dup c@ dup 128 and
+<a id="l67" href="#l67">67</a>     if 127 and swap c! else drop 0 swap c! dup 4 * heap + free @ over set-cdr free ! then
+<a id="l68" href="#l68">68</a>   1+ repeat drop ;
+<a id="l69" href="#l69">69</a> : gc symlist @ mark scan-data scan-return sweep ;
+<a id="l70" href="#l70">70</a> : alloc free @ 0= if gc free @ 0= if 0 s&quot; out of memory&quot; lerror then then
+<a id="l71" href="#l71">71</a>   free @ dup cdr free ! tuck cell# types + c! ;
+<a id="l72" href="#l72">72</a> : mk2 alloc tuck set-cdr tuck ! ;
+<a id="l73" href="#l73">73</a> : cons 1 mk2 ;
+<a id="l74" href="#l74">74</a> : mknum 5 mk2 ;
+<a id="l75" href="#l75">75</a> : num@ dup car swap cdr ;
+<a id="l76" href="#l76">76</a> : num? 5 typ? ;
+<a id="l77" href="#l77">77</a> : n@ dup num? 0= if s&quot; not a number&quot; lerror then num@ ;
+<a id="l78" href="#l78">78</a> : &gt;num dup 0&lt; mknum ;
+<a id="l79" href="#l79">79</a> : snoc 0 cons over if tuck swap set-cdr else nip nip dup then ;
+<a id="l80" href="#l80">80</a> : len 0 swap begin dup pair? while swap 1+ swap cdr repeat drop ;
+<a id="l81" href="#l81">81</a> types #cells 0 fill
+<a id="l82" href="#l82">82</a> sweep
+<a id="l83" href="#l83">83</a> 
+<a id="l84" href="#l84">84</a> \ ---- symbols
+<a id="l85" href="#l85">85</a> : sym-name car count ;
+<a id="l86" href="#l86">86</a> : name= sym-name rot over = if s= else 2drop drop 0 then ;
+<a id="l87" href="#l87">87</a> : mksym here &gt;r dup c, here swap dup allot cmove r&gt; unbound 2 mk2 dup symlist @ cons symlist ! ;
+<a id="l88" href="#l88">88</a> : intern symlist @ begin dup while &gt;r 2dup r@ car name= if 2drop r&gt; car exit then r&gt; cdr repeat drop mksym ;
+<a id="l89" href="#l89">89</a> s&quot; quote&quot; intern constant &#x27;quote
+<a id="l90" href="#l90">90</a> s&quot; if&quot; intern constant &#x27;if
+<a id="l91" href="#l91">91</a> s&quot; define&quot; intern constant &#x27;define
+<a id="l92" href="#l92">92</a> s&quot; set!&quot; intern constant &#x27;set!
+<a id="l93" href="#l93">93</a> s&quot; lambda&quot; intern constant &#x27;lambda
+<a id="l94" href="#l94">94</a> s&quot; begin&quot; intern constant &#x27;begin
+<a id="l95" href="#l95">95</a> s&quot; define-macro&quot; intern constant &#x27;define-macro
+<a id="l96" href="#l96">96</a> 
+<a id="l97" href="#l97">97</a> \ ---- environments: a list of frames, each frame an alist; globals live in the symbol
+<a id="l98" href="#l98">98</a> : assq begin dup while 2dup car car = if nip car exit then cdr repeat nip ;
+<a id="l99" href="#l99">99</a> : lookup begin dup while 2dup car assq ?dup if nip nip cdr exit then cdr repeat
+<a id="l100" href="#l100">100</a>   drop dup cdr dup unbound = if drop s&quot; unbound variable&quot; lerror then nip ;
+<a id="l101" href="#l101">101</a> : set-var begin dup while 2dup car assq ?dup if nip nip set-cdr exit then cdr repeat drop set-cdr ;
+<a id="l102" href="#l102">102</a> : define-var dup if &gt;r swap cons r@ car cons r&gt; ! else drop set-cdr then ;
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a> \ ---- evaluator; eval-step returns ( x&#x27; env&#x27; 0 ) for a tail call or ( v -1 ) when done
+<a id="l105" href="#l105">105</a> variable &#x27;eval
+<a id="l106" href="#l106">106</a> : eval* &#x27;eval @ execute ;
+<a id="l107" href="#l107">107</a> : evlis 0 0 2swap begin over while over car over eval* &gt;r 2swap r&gt; snoc 2swap swap cdr swap repeat 2drop drop ;
+<a id="l108" href="#l108">108</a> : bind over 0= if 2drop 0 exit then
+<a id="l109" href="#l109">109</a>   over 2 typ? if cons 0 cons exit then
+<a id="l110" href="#l110">110</a>   over car over car cons &gt;r cdr swap cdr swap recurse r&gt; swap cons ;
+<a id="l111" href="#l111">111</a> : eval-body begin over cdr while over car over eval* drop swap cdr swap repeat swap car swap ;
+<a id="l112" href="#l112">112</a> : closure-env over car car swap bind over cdr cons swap car cdr swap ;
+<a id="l113" href="#l113">113</a> : apply-proc over 4 typ? if swap car execute exit then
+<a id="l114" href="#l114">114</a>   over 3 typ? if closure-env eval-body eval* exit then
+<a id="l115" href="#l115">115</a>   drop s&quot; not a procedure&quot; lerror ;
+<a id="l116" href="#l116">116</a> : expand car swap 0 cons apply-proc ;
+<a id="l117" href="#l117">117</a> : replace dup pair? 0= if 0 cons &#x27;begin swap cons then
+<a id="l118" href="#l118">118</a>   2dup car swap ! cdr swap set-cdr ;
+<a id="l119" href="#l119">119</a> : macro-of dup 2 typ? if cdr dup 8 typ? if exit then then drop 0 ;
+<a id="l120" href="#l120">120</a> : do-if &gt;r cdr dup car r@ eval* false = if cddr dup if car else drop unspec then else cadr then r&gt; ;
+<a id="l121" href="#l121">121</a> : define-form dup car dup pair? if dup car &gt;r cdr swap cdr cons &#x27;lambda swap cons r&gt; swap exit then swap cadr ;
+<a id="l122" href="#l122">122</a> : do-define &gt;r cdr define-form r@ eval* over r&gt; define-var ;
+<a id="l123" href="#l123">123</a> : do-set &gt;r cdr dup cadr r@ eval* swap car r&gt; set-var unspec ;
+<a id="l124" href="#l124">124</a> : do-defmacro &gt;r cdr dup cadr r&gt; eval* 0 8 mk2 swap car tuck set-cdr ;
+<a id="l125" href="#l125">125</a> : eval-step
+<a id="l126" href="#l126">126</a>   over heap? 0= if drop -1 exit then
+<a id="l127" href="#l127">127</a>   over 2 typ? if lookup -1 exit then
+<a id="l128" href="#l128">128</a>   over pair? 0= if drop -1 exit then
+<a id="l129" href="#l129">129</a>   over car
+<a id="l130" href="#l130">130</a>   dup &#x27;quote = if 2drop cadr -1 exit then
+<a id="l131" href="#l131">131</a>   dup &#x27;if = if drop do-if 0 exit then
+<a id="l132" href="#l132">132</a>   dup &#x27;define = if drop do-define -1 exit then
+<a id="l133" href="#l133">133</a>   dup &#x27;set! = if drop do-set -1 exit then
+<a id="l134" href="#l134">134</a>   dup &#x27;lambda = if drop swap cdr swap 3 mk2 -1 exit then
+<a id="l135" href="#l135">135</a>   dup &#x27;begin = if drop swap cdr dup 0= if 2drop unspec -1 exit then swap eval-body 0 exit then
+<a id="l136" href="#l136">136</a>   dup &#x27;define-macro = if drop do-defmacro -1 exit then
+<a id="l137" href="#l137">137</a>   dup macro-of ?dup if nip &gt;r over r&gt; expand &gt;r over r&gt; replace 0 exit then
+<a id="l138" href="#l138">138</a>   drop over car over eval* &gt;r swap cdr swap evlis r&gt; swap
+<a id="l139" href="#l139">139</a>   over 3 typ? if closure-env eval-body 0 exit then
+<a id="l140" href="#l140">140</a>   apply-proc -1 ;
+<a id="l141" href="#l141">141</a> : eval begin eval-step until ;
+<a id="l142" href="#l142">142</a> &#x27; eval &#x27;eval !
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> \ ---- printer
+<a id="l145" href="#l145">145</a> : ud. 10 mu/mod 2dup or if recurse else 2drop then 48 + emit ;
+<a id="l146" href="#l146">146</a> : .num dup 0&lt; if 45 emit dnegate then ud. ;
+<a id="l147" href="#l147">147</a> : .string display? @ if car begin dup while dup car car emit cdr repeat drop exit then
+<a id="l148" href="#l148">148</a>   34 emit car begin dup while dup car car dup 34 = over 92 = or if 92 emit then emit cdr repeat drop 34 emit ;
+<a id="l149" href="#l149">149</a> : print
+<a id="l150" href="#l150">150</a>   dup nil = if drop .&quot; ()&quot; exit then
+<a id="l151" href="#l151">151</a>   dup false = if drop .&quot; #f&quot; exit then
+<a id="l152" href="#l152">152</a>   dup true = if drop .&quot; #t&quot; exit then
+<a id="l153" href="#l153">153</a>   dup unspec = if drop exit then
+<a id="l154" href="#l154">154</a>   dup heap? 0= if drop .&quot; #&lt;?&gt;&quot; exit then
+<a id="l155" href="#l155">155</a>   dup type@
+<a id="l156" href="#l156">156</a>   dup 5 = if drop num@ .num exit then
+<a id="l157" href="#l157">157</a>   dup 2 = if drop sym-name type exit then
+<a id="l158" href="#l158">158</a>   dup 6 = if drop .string exit then
+<a id="l159" href="#l159">159</a>   dup 7 = if drop 35 emit car recurse exit then
+<a id="l160" href="#l160">160</a>   dup 8 = if 2drop .&quot; #&lt;macro&gt;&quot; exit then
+<a id="l161" href="#l161">161</a>   dup 1 = if drop 40 emit dup car recurse cdr
+<a id="l162" href="#l162">162</a>     begin dup pair? while 32 emit dup car recurse cdr repeat
+<a id="l163" href="#l163">163</a>     dup if .&quot;  . &quot; recurse else drop then 41 emit exit then
+<a id="l164" href="#l164">164</a>   2drop .&quot; #&lt;procedure&gt;&quot; ;
+<a id="l165" href="#l165">165</a> 
+<a id="l166" href="#l166">166</a> \ ---- reader
+<a id="l167" href="#l167">167</a> : adv 1 &gt;in +! ;
+<a id="l168" href="#l168">168</a> : skip-ws begin more? if in-char dup 59 = if drop #tib @ &gt;in ! 0 else 33 &lt; then else 0 then while adv repeat ;
+<a id="l169" href="#l169">169</a> : delim? dup 33 &lt; over 40 = or over 41 = or over 34 = or swap 59 = or ;
+<a id="l170" href="#l170">170</a> : token tib &gt;in @ + 0 begin more? if in-char delim? 0= else 0 then while 1+ adv repeat ;
+<a id="l171" href="#l171">171</a> : snumber over c@ 45 = dup &gt;r if 1- swap 1+ swap then dup 0= if 2drop r&gt; drop 0 exit then
+<a id="l172" href="#l172">172</a>   0 0 2swap begin dup while over c@ 48 - dup 10 u&lt; 0= if 2drop 2drop drop r&gt; drop 0 exit then
+<a id="l173" href="#l173">173</a>     &gt;r 2swap 10 0 d* r&gt; 0 d+ 2swap 1- swap 1+ swap repeat
+<a id="l174" href="#l174">174</a>   2drop r&gt; if dnegate then mknum -1 ;
+<a id="l175" href="#l175">175</a> : read-atom token 2dup snumber if nip nip exit then intern ;
+<a id="l176" href="#l176">176</a> variable &#x27;read
+<a id="l177" href="#l177">177</a> : read* &#x27;read @ execute ;
+<a id="l178" href="#l178">178</a> : dot? in-char 46 = if &gt;in @ 1+ #tib @ &lt; if tib &gt;in @ 1+ + c@ delim? else -1 then else 0 then ;
+<a id="l179" href="#l179">179</a> : read-tail 0 0 begin skip-ws more? 0= if 0 s&quot; unbalanced (&quot; lerror then in-char 41 &lt;&gt; while
+<a id="l180" href="#l180">180</a>     dot? if adv read* swap set-cdr skip-ws adv exit then
+<a id="l181" href="#l181">181</a>     read* snoc repeat adv drop ;
+<a id="l182" href="#l182">182</a> : read-hash adv in-char 40 = if adv read-tail 0 7 mk2 exit then
+<a id="l183" href="#l183">183</a>   token drop c@ 116 = if true else false then ;
+<a id="l184" href="#l184">184</a> : read-string adv 0 0 begin more? if in-char 34 &lt;&gt; else 0 then while
+<a id="l185" href="#l185">185</a>     in-char 92 = if adv in-char 110 = if 10 else in-char then else in-char then adv &gt;num snoc repeat
+<a id="l186" href="#l186">186</a>   adv drop 0 6 mk2 ;
+<a id="l187" href="#l187">187</a> : read skip-ws in-char
+<a id="l188" href="#l188">188</a>   dup 40 = if drop adv read-tail exit then
+<a id="l189" href="#l189">189</a>   dup 39 = if drop adv read* 0 cons &#x27;quote swap cons exit then
+<a id="l190" href="#l190">190</a>   dup 34 = if drop read-string exit then
+<a id="l191" href="#l191">191</a>   dup 35 = if drop read-hash exit then
+<a id="l192" href="#l192">192</a>   dup 41 = if drop adv 0 s&quot; unexpected )&quot; lerror then
+<a id="l193" href="#l193">193</a>   drop read-atom ;
+<a id="l194" href="#l194">194</a> &#x27; read &#x27;read !
+<a id="l195" href="#l195">195</a> 
+<a id="l196" href="#l196">196</a> \ ---- primitives: each takes the evaluated argument list and returns a value
+<a id="l197" href="#l197">197</a> : prim: parse-name intern &gt;r 4 alloc tuck ! r&gt; set-cdr ;
+<a id="l198" href="#l198">198</a> : pcar car dup pair? 0= if s&quot; car: not a pair&quot; lerror then car ;
+<a id="l199" href="#l199">199</a> : pcdr car dup pair? 0= if s&quot; cdr: not a pair&quot; lerror then cdr ;
+<a id="l200" href="#l200">200</a> : pcons dup car swap cadr cons ;
+<a id="l201" href="#l201">201</a> : pset-car dup cadr swap car ! unspec ;
+<a id="l202" href="#l202">202</a> : pset-cdr dup cadr swap car set-cdr unspec ;
+<a id="l203" href="#l203">203</a> : eqv 2dup = if 2drop -1 exit then over num? over num? and if num@ rot num@ d= exit then 2drop 0 ;
+<a id="l204" href="#l204">204</a> : equal 2dup eqv if 2drop -1 exit then
+<a id="l205" href="#l205">205</a>   over pair? over pair? and if over car over car recurse if cdr swap cdr recurse exit then 2drop 0 exit then
+<a id="l206" href="#l206">206</a>   over heap? over heap? and if over type@ over type@ = if over type@ dup 6 = swap 7 = or if car swap car recurse exit then then then
+<a id="l207" href="#l207">207</a>   2drop 0 ;
+<a id="l208" href="#l208">208</a> : peq dup car swap cadr = bool ;
+<a id="l209" href="#l209">209</a> : peqv dup car swap cadr eqv bool ;
+<a id="l210" href="#l210">210</a> : pequal dup car swap cadr equal bool ;
+<a id="l211" href="#l211">211</a> : pnot car false = bool ;
+<a id="l212" href="#l212">212</a> : pnull car 0= bool ;
+<a id="l213" href="#l213">213</a> : ppair car pair? bool ;
+<a id="l214" href="#l214">214</a> : psymbol car 2 typ? bool ;
+<a id="l215" href="#l215">215</a> : pproc car dup 3 typ? swap 4 typ? or bool ;
+<a id="l216" href="#l216">216</a> : pnumber car num? bool ;
+<a id="l217" href="#l217">217</a> : pstring car 6 typ? bool ;
+<a id="l218" href="#l218">218</a> : pvector? car 7 typ? bool ;
+<a id="l219" href="#l219">219</a> : pboolean car dup true = swap false = or bool ;
+<a id="l220" href="#l220">220</a> : p+ 0 0 rot begin dup while &gt;r r@ car n@ d+ r&gt; cdr repeat drop mknum ;
+<a id="l221" href="#l221">221</a> : p* 1 0 rot begin dup while &gt;r r@ car n@ d* r&gt; cdr repeat drop mknum ;
+<a id="l222" href="#l222">222</a> : p- dup cdr 0= if car n@ dnegate mknum exit then
+<a id="l223" href="#l223">223</a>   dup car n@ rot cdr begin dup while &gt;r r@ car n@ d- r&gt; cdr repeat drop mknum ;
+<a id="l224" href="#l224">224</a> : chain &gt;r begin dup cdr while dup car n@ 2 pick cadr n@ r@ execute 0= if drop r&gt; drop false exit then cdr repeat
+<a id="l225" href="#l225">225</a>   drop r&gt; drop true ;
+<a id="l226" href="#l226">226</a> : p= [&#x27;] d= chain ;
+<a id="l227" href="#l227">227</a> : p&lt; [&#x27;] d&lt; chain ;
+<a id="l228" href="#l228">228</a> : p&gt; [&#x27;] d&gt; chain ;
+<a id="l229" href="#l229">229</a> : p&lt;= [&#x27;] d&lt;= chain ;
+<a id="l230" href="#l230">230</a> : p&gt;= [&#x27;] d&gt;= chain ;
+<a id="l231" href="#l231">231</a> : divargs dup car n@ rot cadr n@ over 0&lt; &lt;&gt; if 2drop 0 s&quot; divisor out of 16-bit range&quot; lerror then
+<a id="l232" href="#l232">232</a>   dup 0= if 0 s&quot; division by zero&quot; lerror then ;
+<a id="l233" href="#l233">233</a> : sdiv over &gt;r dup &gt;r abs &gt;r dabs r&gt; mu/mod r&gt; r@ xor 0&lt; if dnegate then rot r&gt; 0&lt; if negate then -rot ;
+<a id="l234" href="#l234">234</a> : pquotient divargs sdiv mknum nip ;
+<a id="l235" href="#l235">235</a> : premainder divargs sdiv 2drop &gt;num ;
+<a id="l236" href="#l236">236</a> : pmodulo divargs dup &gt;r sdiv 2drop dup if dup 0&lt; r@ 0&lt; &lt;&gt; if r@ + then then r&gt; drop &gt;num ;
+<a id="l237" href="#l237">237</a> : mklist 0 rot begin dup while &gt;r over swap cons r&gt; 1- repeat drop nip ;
+<a id="l238" href="#l238">238</a> : pmake-vector dup car n@ drop swap cdr dup if car else drop unspec then mklist 0 7 mk2 ;
+<a id="l239" href="#l239">239</a> : pvector 0 7 mk2 ;
+<a id="l240" href="#l240">240</a> : nth begin dup while swap cdr swap 1- repeat drop ;
+<a id="l241" href="#l241">241</a> : pvector-ref dup car car swap cadr n@ drop nth car ;
+<a id="l242" href="#l242">242</a> : pvector-set dup caddr swap dup car car swap cadr n@ drop nth ! unspec ;
+<a id="l243" href="#l243">243</a> : pvector-length car car len &gt;num ;
+<a id="l244" href="#l244">244</a> : plist-&gt;vector car 0 7 mk2 ;
+<a id="l245" href="#l245">245</a> : pstring-length car car len &gt;num ;
+<a id="l246" href="#l246">246</a> : pdisplay car -1 display? ! print 0 display? ! unspec ;
+<a id="l247" href="#l247">247</a> : pwrite car print unspec ;
+<a id="l248" href="#l248">248</a> : pnewline drop cr unspec ;
+<a id="l249" href="#l249">249</a> : spread dup cdr 0= if car exit then dup car swap cdr recurse cons ;
+<a id="l250" href="#l250">250</a> : papply dup car swap cdr spread apply-proc ;
+<a id="l251" href="#l251">251</a> : pforth drop -200 throw ;
+<a id="l252" href="#l252">252</a> : proom drop 0 free @ begin dup while swap 1+ swap cdr repeat drop &gt;num ;
+<a id="l253" href="#l253">253</a> &#x27; pcar prim: car
+<a id="l254" href="#l254">254</a> &#x27; pcdr prim: cdr
+<a id="l255" href="#l255">255</a> &#x27; pcons prim: cons
+<a id="l256" href="#l256">256</a> &#x27; pset-car prim: set-car!
+<a id="l257" href="#l257">257</a> &#x27; pset-cdr prim: set-cdr!
+<a id="l258" href="#l258">258</a> &#x27; peq prim: eq?
+<a id="l259" href="#l259">259</a> &#x27; peqv prim: eqv?
+<a id="l260" href="#l260">260</a> &#x27; pequal prim: equal?
+<a id="l261" href="#l261">261</a> &#x27; pnot prim: not
+<a id="l262" href="#l262">262</a> &#x27; pnull prim: null?
+<a id="l263" href="#l263">263</a> &#x27; ppair prim: pair?
+<a id="l264" href="#l264">264</a> &#x27; psymbol prim: symbol?
+<a id="l265" href="#l265">265</a> &#x27; pproc prim: procedure?
+<a id="l266" href="#l266">266</a> &#x27; pnumber prim: number?
+<a id="l267" href="#l267">267</a> &#x27; pnumber prim: integer?
+<a id="l268" href="#l268">268</a> &#x27; pstring prim: string?
+<a id="l269" href="#l269">269</a> &#x27; pvector? prim: vector?
+<a id="l270" href="#l270">270</a> &#x27; pboolean prim: boolean?
+<a id="l271" href="#l271">271</a> &#x27; p+ prim: +
+<a id="l272" href="#l272">272</a> &#x27; p* prim: *
+<a id="l273" href="#l273">273</a> &#x27; p- prim: -
+<a id="l274" href="#l274">274</a> &#x27; p= prim: =
+<a id="l275" href="#l275">275</a> &#x27; p&lt; prim: &lt;
+<a id="l276" href="#l276">276</a> &#x27; p&gt; prim: &gt;
+<a id="l277" href="#l277">277</a> &#x27; p&lt;= prim: &lt;=
+<a id="l278" href="#l278">278</a> &#x27; p&gt;= prim: &gt;=
+<a id="l279" href="#l279">279</a> &#x27; pquotient prim: quotient
+<a id="l280" href="#l280">280</a> &#x27; premainder prim: remainder
+<a id="l281" href="#l281">281</a> &#x27; pmodulo prim: modulo
+<a id="l282" href="#l282">282</a> &#x27; pmake-vector prim: make-vector
+<a id="l283" href="#l283">283</a> &#x27; pvector prim: vector
+<a id="l284" href="#l284">284</a> &#x27; pvector-ref prim: vector-ref
+<a id="l285" href="#l285">285</a> &#x27; pvector-set prim: vector-set!
+<a id="l286" href="#l286">286</a> &#x27; pvector-length prim: vector-length
+<a id="l287" href="#l287">287</a> : pinner car car ;
+<a id="l288" href="#l288">288</a> &#x27; pinner prim: vector-&gt;list
+<a id="l289" href="#l289">289</a> &#x27; plist-&gt;vector prim: list-&gt;vector
+<a id="l290" href="#l290">290</a> &#x27; pinner prim: string-&gt;list
+<a id="l291" href="#l291">291</a> &#x27; pstring-length prim: string-length
+<a id="l292" href="#l292">292</a> &#x27; pdisplay prim: display
+<a id="l293" href="#l293">293</a> &#x27; pwrite prim: write
+<a id="l294" href="#l294">294</a> &#x27; pnewline prim: newline
+<a id="l295" href="#l295">295</a> &#x27; papply prim: apply
+<a id="l296" href="#l296">296</a> &#x27; pforth prim: forth
+<a id="l297" href="#l297">297</a> &#x27; proom prim: room
+<a id="l298" href="#l298">298</a> : plist ;
+<a id="l299" href="#l299">299</a> &#x27; plist prim: list
+<a id="l300" href="#l300">300</a> 
+<a id="l301" href="#l301">301</a> \ ---- REPL: one or more expressions per line; (forth) returns to the Forth prompt
+<a id="l302" href="#l302">302</a> : .lerror dup -100 = if drop .&quot; error: &quot; errmsg @ errlen @ type space errobj @ print else .&quot; error &quot; . then ;
+<a id="l303" href="#l303">303</a> : eval-line begin skip-ws more? while read cr nil eval 0 display? ! print repeat ;
+<a id="l304" href="#l304">304</a> : lisp begin cr .&quot; &gt; &quot; refill [&#x27;] eval-line catch ?dup if dup -200 = if drop exit then cr .lerror then again ;</pre>
+</div></body></html>

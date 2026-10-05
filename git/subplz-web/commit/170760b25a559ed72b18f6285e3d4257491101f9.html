@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web 170760b2 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 170760b25a559ed72b18f6285e3d4257491101f9
+equwal &lt;truex@equwal.com&gt;
+2026-09-26 18:31:37 -0700
+
+Do not answer 500 when the server cannot read the Google Play key
+
+On Python 3.11, Path.is_file raises PermissionError when the service user cannot open the folder of the key. Then settings.play_configured raised, and GET /api/captions answered 500 to each Subrep user. The GitHub build also lost its Stripe packs. POST /api/captions/play-purchase answered 500, and each hourly housekeeping pass failed.
+
+Use os.path.isfile, which gives False for each error. Also make sure that the service user can read the key. An unreadable key now stops only the Play sales, and the server does not sell Play hours that it cannot check.
+
+The README now tells the operator to let subplz open /etc/subplz-web, and to check play_available after the restart.
+
+</pre><pre> README.md           | 10 +++++++---
+ backend/settings.py | 10 ++++++++--
+ tests/test_play.py  | 56 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 71 insertions(+), 5 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index c040b0e..609df09 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -489,14 +489,18 @@ To turn it on:</span>
+ 6. For Subrep, grant View financial data and Manage orders and subscriptions.
+    The access can take some hours to start.
+ 7. On the server, put the key at `/etc/subplz-web/play-service-account.json`,
+<span class="d">-   owned by `subplz`, with mode 600.</span>
+<span class="a">+   owned by `subplz`, with mode 600. The user `subplz` must also be able to</span>
+<span class="a">+   open the folder `/etc/subplz-web`, for example with owner `subplz` and</span>
+<span class="a">+   mode 700.</span>
+ 8. Add `SUBPLZ_WEB_PLAY_SERVICE_ACCOUNT_FILE=/etc/subplz-web/play-service-account.json`
+    to `.env`.
+ 9. Restart the server.
+<span class="a">+10. Make sure that `GET /api/captions` shows `&quot;play_available&quot;: true`.</span>
+ 
+ The server reads the key file once. After you replace the file, restart the
+<span class="d">-server. Without the file, `GET /api/captions` shows `&quot;play_available&quot;: false`,</span>
+<span class="d">-the Play build shows no packs, and the endpoint answers 503.</span>
+<span class="a">+server. If `subplz` cannot read the file, `GET /api/captions` shows</span>
+<span class="a">+`&quot;play_available&quot;: false`, the Play build shows no packs, and the endpoint</span>
+<span class="a">+answers 503.</span>
+ 
+ ---
+ 
+diff --git a/backend/settings.py b/backend/settings.py
+index 04badcf..968841c 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -1,5 +1,6 @@</span>
+ &quot;&quot;&quot;Configuration. Every scale-out seam is an env var with a localhost-friendly default.&quot;&quot;&quot;
+ 
+<span class="a">+import os</span>
+ import shutil
+ from pathlib import Path
+ from typing import Literal
+<span class="h">@@ -144,7 +145,8 @@ class Settings(BaseSettings):</span>
+     # --- Google Play (Subrep Play build) ------------------------------------
+     # The path of the JSON key of a service account that can read and consume
+     # the orders of Subrep in Play Console. Keep the file outside the checkout,
+<span class="d">-    # owned by the service user, with mode 600. Without the file, the server</span>
+<span class="a">+    # owned by the service user, with mode 600, in a folder that the service</span>
+<span class="a">+    # user can open. If the service user cannot read the file, the server</span>
+     # tells the Play build that it cannot sell hours (play_available), and
+     # POST /api/captions/play-purchase answers 503. See play.py.
+     play_service_account_file: str = &quot;&quot;
+<span class="h">@@ -170,8 +172,12 @@ class Settings(BaseSettings):</span>
+ 
+     @property
+     def play_configured(self) -&gt; bool:
+<span class="a">+        # Do not use Path.is_file here. On Python 3.11, it raises</span>
+<span class="a">+        # PermissionError when the service user cannot open the folder of the</span>
+<span class="a">+        # key, and then each GET /api/captions answers 500. os.path.isfile</span>
+<span class="a">+        # gives False for each error.</span>
+         path = self.play_service_account_file
+<span class="d">-        return bool(path) and Path(path).is_file()</span>
+<span class="a">+        return bool(path) and os.path.isfile(path) and os.access(path, os.R_OK)</span>
+ 
+     @property
+     def email_configured(self) -&gt; bool:
+diff --git a/tests/test_play.py b/tests/test_play.py
+index 5c0e3e5..39a174c 100644
+--- a/tests/test_play.py
++++ b/tests/test_play.py
+<span class="h">@@ -6,9 +6,12 @@ play.voided, and the tests of the HTTP layer give play._session a fake session.</span>
+ 
+ from __future__ import annotations
+ 
+<span class="a">+import errno</span>
+ import itertools
+ import json
+ import logging
+<span class="a">+import os</span>
+<span class="a">+import pathlib</span>
+ import secrets
+ from urllib.parse import unquote
+ 
+<span class="h">@@ -142,6 +145,59 @@ def test_the_play_build_can_sell_only_when_the_server_can_check_purchases(</span>
+     assert client.get(&quot;/api/captions&quot;).json()[&quot;play_available&quot;] is False
+ 
+ 
+<span class="a">+def assert_only_the_play_sales_stop(client, google):</span>
+<span class="a">+    &quot;&quot;&quot;The Play build sells nothing. The GitHub build still sells with Stripe.&quot;&quot;&quot;</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    state = client.get(&quot;/api/captions&quot;)</span>
+<span class="a">+    assert state.status_code == 200</span>
+<span class="a">+    assert (state.json()[&quot;play_available&quot;], state.json()[&quot;available&quot;]) == (False, True)</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 503 and r.json()[&quot;detail&quot;] == play.NOT_SET_UP</span>
+<span class="a">+    assert google.gets == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_key_folder_that_the_server_cannot_open_stops_only_the_play_sales(</span>
+<span class="a">+        client, google, monkeypatch, tmp_path):</span>
+<span class="a">+    # The service user cannot open the folder of the key, so stat of the key</span>
+<span class="a">+    # fails with EACCES. The server runs Python 3.11. There, Path.is_file</span>
+<span class="a">+    # raises PermissionError for this error, and each GET /api/captions</span>
+<span class="a">+    # answered 500. The tests can run on a newer Python, so this test makes</span>
+<span class="a">+    # Path.is_file act as on Python 3.11. The test does not make the key file:</span>
+<span class="a">+    # os.path.isfile gives False for each stat error, EACCES or ENOENT.</span>
+<span class="a">+    key = str(tmp_path / &quot;locked&quot; / &quot;play-key.json&quot;)</span>
+<span class="a">+    is_file = pathlib.Path.is_file</span>
+<span class="a">+</span>
+<span class="a">+    def is_file_on_python_3_11(self, *args, **kwargs):</span>
+<span class="a">+        if str(self) == key:</span>
+<span class="a">+            raise PermissionError(errno.EACCES, &quot;Permission denied&quot;, key)</span>
+<span class="a">+        return is_file(self, *args, **kwargs)</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(pathlib.Path, &quot;is_file&quot;, is_file_on_python_3_11)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, key)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;dg_test&quot;)</span>
+<span class="a">+    assert_only_the_play_sales_stop(client, google)</span>
+<span class="a">+    main.housekeeping()  # The hourly pass does not fail.</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_key_file_that_the_server_cannot_read_stops_only_the_play_sales(</span>
+<span class="a">+        client, google, monkeypatch):</span>
+<span class="a">+    # The key is there, but the service user cannot read it. For example, root</span>
+<span class="a">+    # owns it with mode 600. Then the server cannot check a purchase, so the</span>
+<span class="a">+    # Play build must not sell.</span>
+<span class="a">+    key = settings.play_service_account_file</span>
+<span class="a">+    access = os.access</span>
+<span class="a">+</span>
+<span class="a">+    def access_of_the_service_user(path, mode, *args, **kwargs):</span>
+<span class="a">+        if os.fspath(path) == key and mode &amp; os.R_OK:</span>
+<span class="a">+            return False</span>
+<span class="a">+        return access(path, mode, *args, **kwargs)</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(os, &quot;access&quot;, access_of_the_service_user)</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;dg_test&quot;)</span>
+<span class="a">+    assert_only_the_play_sales_stop(client, google)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+ # --- POST /api/captions/play-purchase -----------------------------------------
+ 
+ def test_no_play_key_is_503_and_google_is_not_asked(client, google, monkeypatch, tmp_path):</pre>
+</div></body></html>

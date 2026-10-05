@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/src/usage.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/usage.js (7857 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Token use and price for each project. Claude Code writes one JSONL transcript for each session in
+<a id="l2" href="#l2">2</a> // ~/.claude/projects. Each answer of the model carries its model name and its token counts, and each
+<a id="l3" href="#l3">3</a> // line carries the folder of the session. This module adds those numbers up for each day, project,
+<a id="l4" href="#l4">4</a> // and model, and it puts a price on them.
+<a id="l5" href="#l5">5</a> //
+<a id="l6" href="#l6">6</a> // The scan is incremental: usage-scan.json keeps the size of each transcript that it read, so a new
+<a id="l7" href="#l7">7</a> // scan reads only the new bytes. `ideamine usage` prints the table, and the dashboard shows it.
+<a id="l8" href="#l8">8</a> //
+<a id="l9" href="#l9">9</a> // The price is the price of the API. A Claude subscription does not bill for each token, so for a
+<a id="l10" href="#l10">10</a> // subscription the number is what the same work would cost through the API.
+<a id="l11" href="#l11">11</a> 
+<a id="l12" href="#l12">12</a> import fs from &#x27;node:fs&#x27;;
+<a id="l13" href="#l13">13</a> import os from &#x27;node:os&#x27;;
+<a id="l14" href="#l14">14</a> import path from &#x27;node:path&#x27;;
+<a id="l15" href="#l15">15</a> import * as store from &#x27;./store.js&#x27;;
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> /**
+<a id="l18" href="#l18">18</a>  * Price in dollars for each million tokens (2026-09-22). `read` is the price of a cache read.
+<a id="l19" href="#l19">19</a>  * A cache write costs 1.25 times the input price with the 5-minute lifetime, and 2 times with the
+<a id="l20" href="#l20">20</a>  * 1-hour lifetime.
+<a id="l21" href="#l21">21</a>  */
+<a id="l22" href="#l22">22</a> export const PRICES = {
+<a id="l23" href="#l23">23</a>   &#x27;claude-fable-5-1&#x27;: { input: 10, output: 50, read: 0.25 },
+<a id="l24" href="#l24">24</a>   &#x27;claude-mythos-5-1&#x27;: { input: 10, output: 50, read: 0.25 },
+<a id="l25" href="#l25">25</a>   &#x27;claude-fable-5&#x27;: { input: 10, output: 50, read: 1 },
+<a id="l26" href="#l26">26</a>   &#x27;claude-mythos-5&#x27;: { input: 10, output: 50, read: 1 },
+<a id="l27" href="#l27">27</a>   &#x27;claude-opus-5-5&#x27;: { input: 4, output: 20, read: 0.2 },
+<a id="l28" href="#l28">28</a>   &#x27;claude-opus-5&#x27;: { input: 5, output: 25, read: 0.5 },
+<a id="l29" href="#l29">29</a>   &#x27;claude-opus-4-8&#x27;: { input: 5, output: 25, read: 0.5 },
+<a id="l30" href="#l30">30</a>   &#x27;claude-opus-4-7&#x27;: { input: 5, output: 25, read: 0.5 },
+<a id="l31" href="#l31">31</a>   &#x27;claude-opus-4-6&#x27;: { input: 5, output: 25, read: 0.5 },
+<a id="l32" href="#l32">32</a>   &#x27;claude-sonnet-5&#x27;: { input: 2, output: 10, read: 0.2 },
+<a id="l33" href="#l33">33</a>   &#x27;claude-sonnet-4-6&#x27;: { input: 3, output: 15, read: 0.3 },
+<a id="l34" href="#l34">34</a>   &#x27;claude-haiku-4-5&#x27;: { input: 1, output: 5, read: 0.1 },
+<a id="l35" href="#l35">35</a> };
+<a id="l36" href="#l36">36</a> 
+<a id="l37" href="#l37">37</a> const MILLION = 1e6;
+<a id="l38" href="#l38">38</a> const WRITE_5M = 1.25; // times the input price
+<a id="l39" href="#l39">39</a> const WRITE_1H = 2;
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> const statePath = () =&gt; path.join(store.home(), &#x27;usage-scan.json&#x27;);
+<a id="l42" href="#l42">42</a> 
+<a id="l43" href="#l43">43</a> /** The name of the model without the date at its end, for example claude-haiku-4-5-20251001. */
+<a id="l44" href="#l44">44</a> export function modelName(raw) {
+<a id="l45" href="#l45">45</a>   return String(raw || &#x27;&#x27;)
+<a id="l46" href="#l46">46</a>     .trim()
+<a id="l47" href="#l47">47</a>     .replace(/-\d{8}$/, &#x27;&#x27;);
+<a id="l48" href="#l48">48</a> }
+<a id="l49" href="#l49">49</a> 
+<a id="l50" href="#l50">50</a> /** The price of one row in dollars. An unknown model costs 0, and `priced` says so. */
+<a id="l51" href="#l51">51</a> export function cost(row) {
+<a id="l52" href="#l52">52</a>   const p = PRICES[modelName(row.model)];
+<a id="l53" href="#l53">53</a>   if (!p) return 0;
+<a id="l54" href="#l54">54</a>   const write = (row.write5m || 0) * p.input * WRITE_5M + (row.write1h || 0) * p.input * WRITE_1H;
+<a id="l55" href="#l55">55</a>   return ((row.input || 0) * p.input + (row.output || 0) * p.output + (row.read || 0) * p.read + write) / MILLION;
+<a id="l56" href="#l56">56</a> }
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a> /** True when the price list knows this model. */
+<a id="l59" href="#l59">59</a> export const priced = (model) =&gt; Boolean(PRICES[modelName(model)]);
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> const rowKey = (r) =&gt; `${r.day}|${r.project}|${r.model}`;
+<a id="l62" href="#l62">62</a> const emptyRow = (day, project, model) =&gt; ({ day, project, model, messages: 0, input: 0, output: 0, read: 0, write5m: 0, write1h: 0 });
+<a id="l63" href="#l63">63</a> 
+<a id="l64" href="#l64">64</a> /**
+<a id="l65" href="#l65">65</a>  * Add the numbers of one transcript line to `rows`. A line without token counts, or from a model
+<a id="l66" href="#l66">66</a>  * that answered nothing, changes nothing.
+<a id="l67" href="#l67">67</a>  */
+<a id="l68" href="#l68">68</a> export function addLine(rows, entry, seen) {
+<a id="l69" href="#l69">69</a>   const usage = entry?.message?.usage;
+<a id="l70" href="#l70">70</a>   if (!usage || entry.type !== &#x27;assistant&#x27;) return false;
+<a id="l71" href="#l71">71</a>   const model = modelName(entry.message.model);
+<a id="l72" href="#l72">72</a>   if (!model || model === &#x27;&lt;synthetic&gt;&#x27;) return false;
+<a id="l73" href="#l73">73</a>   const id = entry.message.id;
+<a id="l74" href="#l74">74</a>   if (id &amp;&amp; seen) {
+<a id="l75" href="#l75">75</a>     if (seen.has(id)) return false; // the same answer twice in one file
+<a id="l76" href="#l76">76</a>     seen.add(id);
+<a id="l77" href="#l77">77</a>   }
+<a id="l78" href="#l78">78</a>   const day = String(entry.timestamp || &#x27;&#x27;).slice(0, 10);
+<a id="l79" href="#l79">79</a>   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return false;
+<a id="l80" href="#l80">80</a>   const project = entry.cwd || &#x27;unknown&#x27;;
+<a id="l81" href="#l81">81</a>   const key = `${day}|${project}|${model}`;
+<a id="l82" href="#l82">82</a>   const row = rows.get(key) || emptyRow(day, project, model);
+<a id="l83" href="#l83">83</a>   const created = usage.cache_creation || {};
+<a id="l84" href="#l84">84</a>   row.messages += 1;
+<a id="l85" href="#l85">85</a>   row.input += usage.input_tokens || 0;
+<a id="l86" href="#l86">86</a>   row.output += usage.output_tokens || 0;
+<a id="l87" href="#l87">87</a>   row.read += usage.cache_read_input_tokens || 0;
+<a id="l88" href="#l88">88</a>   // Older transcripts have only the total of the cache writes. Those count as the 5-minute price.
+<a id="l89" href="#l89">89</a>   const w1h = created.ephemeral_1h_input_tokens || 0;
+<a id="l90" href="#l90">90</a>   const w5m = created.ephemeral_5m_input_tokens ?? Math.max(0, (usage.cache_creation_input_tokens || 0) - w1h);
+<a id="l91" href="#l91">91</a>   row.write5m += w5m;
+<a id="l92" href="#l92">92</a>   row.write1h += w1h;
+<a id="l93" href="#l93">93</a>   rows.set(key, row);
+<a id="l94" href="#l94">94</a>   return true;
+<a id="l95" href="#l95">95</a> }
+<a id="l96" href="#l96">96</a> 
+<a id="l97" href="#l97">97</a> /** Read one transcript from byte `from` to its end, and add its lines to `rows`. */
+<a id="l98" href="#l98">98</a> function readFile(file, from, rows) {
+<a id="l99" href="#l99">99</a>   const fd = fs.openSync(file, &#x27;r&#x27;);
+<a id="l100" href="#l100">100</a>   try {
+<a id="l101" href="#l101">101</a>     const size = fs.fstatSync(fd).size;
+<a id="l102" href="#l102">102</a>     if (size &lt;= from) return size;
+<a id="l103" href="#l103">103</a>     const buf = Buffer.alloc(size - from);
+<a id="l104" href="#l104">104</a>     fs.readSync(fd, buf, 0, buf.length, from);
+<a id="l105" href="#l105">105</a>     const text = buf.toString(&#x27;utf8&#x27;);
+<a id="l106" href="#l106">106</a>     // A read that starts inside a line drops that half line, and the next scan gets the whole file.
+<a id="l107" href="#l107">107</a>     const seen = new Set();
+<a id="l108" href="#l108">108</a>     for (const line of text.split(&#x27;\n&#x27;)) {
+<a id="l109" href="#l109">109</a>       if (!line.startsWith(&#x27;{&#x27;)) continue;
+<a id="l110" href="#l110">110</a>       try {
+<a id="l111" href="#l111">111</a>         addLine(rows, JSON.parse(line), seen);
+<a id="l112" href="#l112">112</a>       } catch {
+<a id="l113" href="#l113">113</a>         // A line that a crash cut in half, or a line that is not JSON.
+<a id="l114" href="#l114">114</a>       }
+<a id="l115" href="#l115">115</a>     }
+<a id="l116" href="#l116">116</a>     return size;
+<a id="l117" href="#l117">117</a>   } finally {
+<a id="l118" href="#l118">118</a>     fs.closeSync(fd);
+<a id="l119" href="#l119">119</a>   }
+<a id="l120" href="#l120">120</a> }
+<a id="l121" href="#l121">121</a> 
+<a id="l122" href="#l122">122</a> function readState() {
+<a id="l123" href="#l123">123</a>   try {
+<a id="l124" href="#l124">124</a>     const state = JSON.parse(fs.readFileSync(statePath(), &#x27;utf8&#x27;));
+<a id="l125" href="#l125">125</a>     if (state &amp;&amp; state.version === 1) return state;
+<a id="l126" href="#l126">126</a>   } catch {
+<a id="l127" href="#l127">127</a>     // No scan yet, or a file that another version wrote.
+<a id="l128" href="#l128">128</a>   }
+<a id="l129" href="#l129">129</a>   return { version: 1, files: {}, rows: [] };
+<a id="l130" href="#l130">130</a> }
+<a id="l131" href="#l131">131</a> 
+<a id="l132" href="#l132">132</a> function writeState(state) {
+<a id="l133" href="#l133">133</a>   fs.mkdirSync(store.home(), { recursive: true });
+<a id="l134" href="#l134">134</a>   store.writeAtomic(statePath(), `${JSON.stringify(state)}\n`);
+<a id="l135" href="#l135">135</a> }
+<a id="l136" href="#l136">136</a> 
+<a id="l137" href="#l137">137</a> /** The folder with the transcripts of Claude Code, the same one that the prompt log reads. */
+<a id="l138" href="#l138">138</a> export const transcriptsDir = () =&gt; path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), &#x27;.claude&#x27;), &#x27;projects&#x27;);
+<a id="l139" href="#l139">139</a> 
+<a id="l140" href="#l140">140</a> /**
+<a id="l141" href="#l141">141</a>  * Read the new bytes of each transcript, add them to the numbers from before, and save the state.
+<a id="l142" href="#l142">142</a>  * Resolves to { rows, files, read }: the rows for each day, project, and model, how many transcripts
+<a id="l143" href="#l143">143</a>  * there are, and how many of them had new bytes.
+<a id="l144" href="#l144">144</a>  */
+<a id="l145" href="#l145">145</a> export function scan({ dir = transcriptsDir() } = {}) {
+<a id="l146" href="#l146">146</a>   const state = readState();
+<a id="l147" href="#l147">147</a>   const rows = new Map(state.rows.map((r) =&gt; [rowKey(r), r]));
+<a id="l148" href="#l148">148</a>   let files = [];
+<a id="l149" href="#l149">149</a>   try {
+<a id="l150" href="#l150">150</a>     files = fs.readdirSync(dir, { recursive: true }).filter((f) =&gt; String(f).endsWith(&#x27;.jsonl&#x27;));
+<a id="l151" href="#l151">151</a>   } catch {
+<a id="l152" href="#l152">152</a>     return { rows: [...rows.values()], files: 0, read: 0 };
+<a id="l153" href="#l153">153</a>   }
+<a id="l154" href="#l154">154</a>   let read = 0;
+<a id="l155" href="#l155">155</a>   for (const name of files) {
+<a id="l156" href="#l156">156</a>     const file = path.join(dir, String(name));
+<a id="l157" href="#l157">157</a>     const from = state.files[String(name)] || 0;
+<a id="l158" href="#l158">158</a>     let size;
+<a id="l159" href="#l159">159</a>     try {
+<a id="l160" href="#l160">160</a>       size = readFile(file, from, rows);
+<a id="l161" href="#l161">161</a>     } catch {
+<a id="l162" href="#l162">162</a>       continue; // a file that another process writes, or that is gone
+<a id="l163" href="#l163">163</a>     }
+<a id="l164" href="#l164">164</a>     if (size !== from) read += 1;
+<a id="l165" href="#l165">165</a>     state.files[String(name)] = size;
+<a id="l166" href="#l166">166</a>   }
+<a id="l167" href="#l167">167</a>   state.rows = [...rows.values()];
+<a id="l168" href="#l168">168</a>   writeState(state);
+<a id="l169" href="#l169">169</a>   return { rows: state.rows, files: files.length, read };
+<a id="l170" href="#l170">170</a> }
+<a id="l171" href="#l171">171</a> 
+<a id="l172" href="#l172">172</a> /** The rows of the last `days` days, newest day first. 0 days means every day. */
+<a id="l173" href="#l173">173</a> export function since(rows, days) {
+<a id="l174" href="#l174">174</a>   if (!days) return rows;
+<a id="l175" href="#l175">175</a>   const day = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+<a id="l176" href="#l176">176</a>   return rows.filter((r) =&gt; r.day &gt;= day);
+<a id="l177" href="#l177">177</a> }
+<a id="l178" href="#l178">178</a> 
+<a id="l179" href="#l179">179</a> /** One row for each project: the tokens, the price, and the price for each model. */
+<a id="l180" href="#l180">180</a> export function byProject(rows) {
+<a id="l181" href="#l181">181</a>   const out = new Map();
+<a id="l182" href="#l182">182</a>   for (const r of rows) {
+<a id="l183" href="#l183">183</a>     const p = out.get(r.project) || { project: r.project, messages: 0, input: 0, output: 0, read: 0, write5m: 0, write1h: 0, cost: 0, models: {} };
+<a id="l184" href="#l184">184</a>     for (const k of [&#x27;messages&#x27;, &#x27;input&#x27;, &#x27;output&#x27;, &#x27;read&#x27;, &#x27;write5m&#x27;, &#x27;write1h&#x27;]) p[k] += r[k] || 0;
+<a id="l185" href="#l185">185</a>     const m = p.models[r.model] || { model: r.model, messages: 0, input: 0, output: 0, read: 0, write5m: 0, write1h: 0, cost: 0 };
+<a id="l186" href="#l186">186</a>     for (const k of [&#x27;messages&#x27;, &#x27;input&#x27;, &#x27;output&#x27;, &#x27;read&#x27;, &#x27;write5m&#x27;, &#x27;write1h&#x27;]) m[k] += r[k] || 0;
+<a id="l187" href="#l187">187</a>     m.cost += cost(r);
+<a id="l188" href="#l188">188</a>     p.models[r.model] = m;
+<a id="l189" href="#l189">189</a>     p.cost += cost(r);
+<a id="l190" href="#l190">190</a>     out.set(r.project, p);
+<a id="l191" href="#l191">191</a>   }
+<a id="l192" href="#l192">192</a>   return [...out.values()].sort((a, b) =&gt; b.cost - a.cost);
+<a id="l193" href="#l193">193</a> }</pre>
+</div></body></html>

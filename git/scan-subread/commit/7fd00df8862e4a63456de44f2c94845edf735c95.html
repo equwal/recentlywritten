@@ -1,0 +1,820 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 7fd00df8 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 7fd00df8862e4a63456de44f2c94845edf735c95
+truex &lt;truex@equwal.com&gt;
+2026-09-26 19:01:46 -0700
+
+Make an Anki card from a long press on a word
+
+A press of 500 ms on the page, without a move of more than 10 CSS
+pixels, sends a card to SubRead Anki. nav.ts gives the long press from
+the same pointer events as the swipe, so a tap, a swipe and a long
+press never mix: a move stops the long press, a long press is no
+swipe, and the click after a long press does no lookup. The page shows
+no context menu and no selection for the press.
+
+ankiCard makes the card from the tokens:
+
+- The sentence is the text of the marked cue when the word is in the
+  span of that cue, else sentenceAround.
+- A CJK token gives the text only: OCR does not show where a Japanese
+  word ends, so the user taps the word in SubRead Anki.
+- A Latin token also gives the word: the tokens of its word id without
+  the punctuation at the edges (&quot;hills,&quot; gives &quot;hills&quot;).
+- The source is &quot;&lt;book&gt;, p. &lt;page&gt;&quot;.
+
+&quot;Pause on lookup&quot; pauses the player while the card shows (withPause,
+now shared with the lookup). The strip says &quot;Card added to Anki.&quot;, the
+SubRead Anki link, or &quot;SubRead Anki could not start.&quot;; a closed card
+says nothing. The web says &quot;Anki cards need SubRead Anki on Android.&quot;
+The hint of the menu names the gesture.
+
+</pre><pre> index.html             |   4 +-
+ src/anki-card.ts       |  76 ++++++++++++++++++++
+ src/main.ts            | 113 ++++++++++++++++++++++--------
+ src/messages.ts        |  17 +++++
+ src/nav.ts             |  74 +++++++++++++++++---
+ src/paging.ts          |  11 +++
+ src/style.css          |   4 ++
+ src/suite.ts           |  12 ++--
+ test/anki-card.test.ts | 185 +++++++++++++++++++++++++++++++++++++++++++++++++
+ test/messages.test.ts  |  22 ++++++
+ test/paging.test.ts    |  21 ++++++
+ test/suite.test.ts     |   9 ++-
+ 12 files changed, 503 insertions(+), 45 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index d316283..2d84221 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -75,8 +75,8 @@</span>
+     &lt;aside id=&quot;panel&quot;&gt;
+       &lt;h1&gt;Scan Subread&lt;/h1&gt;
+       &lt;p class=&quot;hint&quot;&gt;
+<span class="d">-        Load a PDF and the subtitles of its audiobook. The page follows the player. Tap a word to</span>
+<span class="d">-        look it up.</span>
+<span class="a">+        Load a PDF and the subtitles of its audiobook. The page follows the player. Tap a word:</span>
+<span class="a">+        dictionary. Long press: Anki card.</span>
+       &lt;/p&gt;
+ 
+       &lt;label&gt;PDF (scan or text) &lt;input id=&quot;pdf-file&quot; type=&quot;file&quot; accept=&quot;application/pdf&quot; /&gt;&lt;/label&gt;
+diff --git a/src/anki-card.ts b/src/anki-card.ts
+new file mode 100644
+index 0000000..f4297ef
+--- /dev/null
++++ b/src/anki-card.ts
+<span class="h">@@ -0,0 +1,76 @@</span>
+<span class="a">+// The fields of a SubRead Anki card for a long press on the page. Pure: no DOM.</span>
+<span class="a">+</span>
+<span class="a">+import type { OcrToken, TokenSpan } from &#x27;./align&#x27;;</span>
+<span class="a">+import { isCjk, joinWords } from &#x27;./book-text&#x27;;</span>
+<span class="a">+import { sentenceAround } from &#x27;./sentence&#x27;;</span>
+<span class="a">+import type { AnkiCard } from &#x27;./subread&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Punctuation and symbols at the start and at the end of a word. */</span>
+<span class="a">+const EDGES = /^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The word of token `index`: the text of the tokens with its page, line</span>
+<span class="a">+ * and word id, without punctuation and symbols at its edges. &quot;hills,&quot;</span>
+<span class="a">+ * gives &quot;hills&quot;, and &quot;don&#x27;t&quot; stays &quot;don&#x27;t&quot;.</span>
+<span class="a">+ */</span>
+<span class="a">+export function wordAt(tokens: readonly OcrToken[], index: number): string {</span>
+<span class="a">+  const token = tokens[index];</span>
+<span class="a">+  if (!token) return &#x27;&#x27;;</span>
+<span class="a">+  const same = (t: OcrToken | undefined): boolean =&gt;</span>
+<span class="a">+    t !== undefined &amp;&amp; t.page === token.page &amp;&amp; t.line === token.line &amp;&amp; t.word === token.word;</span>
+<span class="a">+  let start = index;</span>
+<span class="a">+  let end = index + 1;</span>
+<span class="a">+  while (same(tokens[start - 1])) start--;</span>
+<span class="a">+  while (same(tokens[end])) end++;</span>
+<span class="a">+  return tokens</span>
+<span class="a">+    .slice(start, end)</span>
+<span class="a">+    .map((t) =&gt; t.text)</span>
+<span class="a">+    .join(&#x27;&#x27;)</span>
+<span class="a">+    .replace(EDGES, &#x27;&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Where the sentence of a card is from: &quot;&lt;book name without .pdf&gt;, p. &lt;page number&gt;&quot;. */</span>
+<span class="a">+export function cardSource(bookName: string, page: number): string {</span>
+<span class="a">+  return `${bookName.replace(/\.pdf$/i, &#x27;&#x27;)}, p. ${page + 1}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface CardInput {</span>
+<span class="a">+  tokens: readonly OcrToken[];</span>
+<span class="a">+  /** The pressed token. */</span>
+<span class="a">+  index: number;</span>
+<span class="a">+  /** The span of each cue, from the alignment. */</span>
+<span class="a">+  spans: readonly TokenSpan[];</span>
+<span class="a">+  /** The cue with the mark on the page, or -1. */</span>
+<span class="a">+  markedCue: number;</span>
+<span class="a">+  /** The texts of the cues. */</span>
+<span class="a">+  cues: readonly { text: string }[];</span>
+<span class="a">+  /** Where the sentence is from: see cardSource. */</span>
+<span class="a">+  source: string;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The card for a long press on token `index`, or null when there is no</span>
+<span class="a">+ * such token.</span>
+<span class="a">+ *</span>
+<span class="a">+ * - The sentence is the text of the marked cue when the token is in the</span>
+<span class="a">+ *   span of that cue, else the sentence around the token (sentenceAround).</span>
+<span class="a">+ * - A CJK token gives `{ text, source }`. OCR does not show where a</span>
+<span class="a">+ *   Japanese word ends, so SubRead Anki shows the sentence, and the user</span>
+<span class="a">+ *   taps the word.</span>
+<span class="a">+ * - Another token gives `{ word, sentence, source }`. A token of</span>
+<span class="a">+ *   punctuation only has no word: it gives `{ text, source }`.</span>
+<span class="a">+ */</span>
+<span class="a">+export function ankiCard(input: CardInput): AnkiCard | null {</span>
+<span class="a">+  const { tokens, index, source } = input;</span>
+<span class="a">+  const token = tokens[index];</span>
+<span class="a">+  if (!token) return null;</span>
+<span class="a">+  const span = input.spans[input.markedCue];</span>
+<span class="a">+  const cue = input.cues[input.markedCue];</span>
+<span class="a">+  const inCue = !!span &amp;&amp; !!cue &amp;&amp; span.matched &amp;&amp; span.start &lt;= index &amp;&amp; index &lt; span.end;</span>
+<span class="a">+  const sentence = inCue</span>
+<span class="a">+    ? joinWords(cue.text.split(&#x27;\n&#x27;).map((line) =&gt; line.trim()))</span>
+<span class="a">+    : sentenceAround(tokens, index);</span>
+<span class="a">+  if (isCjk(token.text)) return { text: sentence, source };</span>
+<span class="a">+  const word = wordAt(tokens, index);</span>
+<span class="a">+  return word ? { word, sentence, source } : { text: sentence, source };</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index d7559cf..f3ab66a 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -7,6 +7,7 @@</span>
+ 
+ import { App } from &#x27;@capacitor/app&#x27;;
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+<span class="a">+import { ankiCard, cardSource } from &#x27;./anki-card&#x27;;</span>
+ import { backStep, keepScreenOn } from &#x27;./app-state&#x27;;
+ import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;
+ import { bookText } from &#x27;./book-text&#x27;;
+<span class="h">@@ -17,6 +18,8 @@ import { follow, type FollowEvent, type FollowMode } from &#x27;./follower&#x27;;</span>
+ import { lookupText, tapTolerance, tokenAt } from &#x27;./hit-test&#x27;;
+ import { lineBoxes, padBox } from &#x27;./line-boxes&#x27;;
+ import {
+<span class="a">+  ANKI_WEB_TEXT,</span>
+<span class="a">+  ankiText,</span>
+   CLEAR_ALL_QUESTION,
+   clearBookQuestion,
+   clockText,
+<span class="h">@@ -50,7 +53,7 @@ import type { PdfDoc } from &#x27;./pdf&#x27;;</span>
+ import { nextPage } from &#x27;./read-order&#x27;;
+ import { scrollTarget } from &#x27;./scroll&#x27;;
+ import { fill, onAction, say, showPlayer, showReading } from &#x27;./status&#x27;;
+<span class="d">-import { isAndroid, SubRead, type SubtitlesResult, type SuiteApps } from &#x27;./subread&#x27;;</span>
+<span class="a">+import { isAndroid, SubRead, type AnkiCard, type SubtitlesResult, type SuiteApps } from &#x27;./subread&#x27;;</span>
+ import { suiteChecklist } from &#x27;./suite&#x27;;
+ import { decodeSubtitles, lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+ import {
+<span class="h">@@ -201,6 +204,7 @@ const nav = setupNav(</span>
+     drawerOpen: drawer.covers,
+   },
+   turnByUser,
+<span class="a">+  longPress,</span>
+ );
+ 
+ // --- Settings ---
+<span class="h">@@ -1243,34 +1247,79 @@ async function showPage(index: number): Promise&lt;void&gt; {</span>
+ 
+ // --- Tap on a word ---
+ 
+<span class="d">-/** Tap on the page: send the text under the tap to the dictionary. */</span>
+<span class="d">-ui.page.addEventListener(&#x27;click&#x27;, (e) =&gt; {</span>
+<span class="a">+/**</span>
+<span class="a">+ * The token under a point of the screen, in client pixels: an index of</span>
+<span class="a">+ * state.tokens, or -1 when no token is near. Null when the point is not on</span>
+<span class="a">+ * the page, or the page is not read yet: then the strip tells how many</span>
+<span class="a">+ * pages are read.</span>
+<span class="a">+ */</span>
+<span class="a">+function tokenAtPoint(clientX: number, clientY: number): number | null {</span>
+   const canvas = ui.page.querySelector(&#x27;canvas&#x27;);
+   const pdf = state.pdf;
+<span class="d">-  if (!canvas || !pdf) return;</span>
+<span class="a">+  if (!canvas || !pdf || ui.page.hidden) return null;</span>
+<span class="a">+  const rect = canvas.getBoundingClientRect();</span>
+<span class="a">+  const inside =</span>
+<span class="a">+    clientX &gt;= rect.left &amp;&amp; clientX &lt;= rect.right &amp;&amp; clientY &gt;= rect.top &amp;&amp; clientY &lt;= rect.bottom;</span>
+<span class="a">+  if (!inside) return null;</span>
+   const size = state.pages[state.currentPage];
+   if (!size) {
+     say(notReadText(state.pages.filter((p) =&gt; p).length, pdf.numPages));
+<span class="d">-    return;</span>
+<span class="a">+    return null;</span>
+   }
+<span class="d">-  const rect = canvas.getBoundingClientRect();</span>
+<span class="d">-  const x = ((e.clientX - rect.left) / rect.width) * size.width;</span>
+<span class="d">-  const y = ((e.clientY - rect.top) / rect.height) * size.height;</span>
+<span class="a">+  const x = ((clientX - rect.left) / rect.width) * size.width;</span>
+<span class="a">+  const y = ((clientY - rect.top) / rect.height) * size.height;</span>
+   const zoom = window.visualViewport?.scale ?? 1;
+<span class="d">-  const t = tokenAt(</span>
+<span class="d">-    state.tokens,</span>
+<span class="d">-    state.currentPage,</span>
+<span class="d">-    x,</span>
+<span class="d">-    y,</span>
+<span class="d">-    tapTolerance(size.width, rect.width, zoom),</span>
+<span class="d">-  );</span>
+<span class="d">-  if (t &lt; 0) return;</span>
+<span class="a">+  return tokenAt(state.tokens, state.currentPage, x, y, tapTolerance(size.width, rect.width, zoom));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Tap on the page: send the text under the tap to the dictionary. */</span>
+<span class="a">+ui.page.addEventListener(&#x27;click&#x27;, (e) =&gt; {</span>
+<span class="a">+  const t = tokenAtPoint(e.clientX, e.clientY);</span>
+<span class="a">+  if (t === null || t &lt; 0) return;</span>
+   const text = lookupText(state.tokens, t);
+   // A tap on punctuation only gives no text.
+   if (text === &#x27;&#x27;) return;
+   void (isAndroid ? lookUp(text) : copy(text));
+ });
+ 
+<span class="a">+/**</span>
+<span class="a">+ * Long press on the page: a card in SubRead Anki for the word and its</span>
+<span class="a">+ * sentence (ankiCard). Gives true when the press was on a word, so that</span>
+<span class="a">+ * the click after it does no lookup.</span>
+<span class="a">+ */</span>
+<span class="a">+function longPress(clientX: number, clientY: number): boolean {</span>
+<span class="a">+  const index = tokenAtPoint(clientX, clientY);</span>
+<span class="a">+  const file = state.file;</span>
+<span class="a">+  if (index === null || index &lt; 0 || !file) return false;</span>
+<span class="a">+  if (!isAndroid) {</span>
+<span class="a">+    say(ANKI_WEB_TEXT);</span>
+<span class="a">+    return true;</span>
+<span class="a">+  }</span>
+<span class="a">+  const card = ankiCard({</span>
+<span class="a">+    tokens: state.tokens,</span>
+<span class="a">+    index,</span>
+<span class="a">+    spans: state.spans,</span>
+<span class="a">+    markedCue: state.markedCue,</span>
+<span class="a">+    cues: state.cues,</span>
+<span class="a">+    source: cardSource(file.name, state.tokens[index]!.page),</span>
+<span class="a">+  });</span>
+<span class="a">+  if (card) void addCard(card);</span>
+<span class="a">+  return true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Sends the card to SubRead Anki. &quot;Pause on lookup&quot; pauses the player while the card shows. */</span>
+<span class="a">+async function addCard(card: AnkiCard): Promise&lt;void&gt; {</span>
+<span class="a">+  await withPause(async () =&gt; {</span>
+<span class="a">+    try {</span>
+<span class="a">+      const m = ankiText(await SubRead.ankiAdd(card));</span>
+<span class="a">+      if (m) say(m);</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      say(`Anki card failed: ${String(err)}`);</span>
+<span class="a">+    }</span>
+<span class="a">+    return true;</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The web has no dictionary app: the text goes to the clipboard. */
+ async function copy(text: string): Promise&lt;void&gt; {
+   try {
+<span class="h">@@ -1281,13 +1330,27 @@ async function copy(text: string): Promise&lt;void&gt; {</span>
+   }
+ }
+ 
+<span class="d">-/**</span>
+<span class="d">- * Sends the text to the dictionary app. With &quot;Pause on lookup&quot;, the</span>
+<span class="d">- * player pauses first and plays again when the dictionary closes. When</span>
+<span class="d">- * the pause fails, the lookup still runs.</span>
+<span class="d">- */</span>
+<span class="a">+/** Sends the text to the dictionary app, with &quot;Pause on lookup&quot;. */</span>
+ async function lookUp(text: string): Promise&lt;void&gt; {
+   say(`Lookup: &quot;${text}&quot;`);
+<span class="a">+  await withPause(async () =&gt; {</span>
+<span class="a">+    // Play again when the dictionary closed, or when it did not open.</span>
+<span class="a">+    try {</span>
+<span class="a">+      return (await SubRead.lookup({ text })).closed;</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      say(`Lookup failed: ${String(err)}`);</span>
+<span class="a">+      return true;</span>
+<span class="a">+    }</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Runs `open`, an app over the reader: the dictionary or SubRead Anki.</span>
+<span class="a">+ * With &quot;Pause on lookup&quot;, the player pauses first, and plays again when</span>
+<span class="a">+ * `open` gives true: the app closed. When the pause fails, `open` still</span>
+<span class="a">+ * runs.</span>
+<span class="a">+ */</span>
+<span class="a">+async function withPause(open: () =&gt; Promise&lt;boolean&gt;): Promise&lt;void&gt; {</span>
+   const pause = ui.pauseLookup.checked &amp;&amp; state.clock?.playing === true &amp;&amp; !state.lookupPaused;
+   let paused = false;
+   if (pause) {
+<span class="h">@@ -1299,13 +1362,7 @@ async function lookUp(text: string): Promise&lt;void&gt; {</span>
+       sayError(err);
+     }
+   }
+<span class="d">-  // Play again when the dictionary closed, or when it did not open.</span>
+<span class="d">-  let resume = true;</span>
+<span class="d">-  try {</span>
+<span class="d">-    ({ closed: resume } = await SubRead.lookup({ text }));</span>
+<span class="d">-  } catch (err) {</span>
+<span class="d">-    say(`Lookup failed: ${String(err)}`);</span>
+<span class="d">-  }</span>
+<span class="a">+  const resume = await open();</span>
+   try {
+     if (paused &amp;&amp; resume) await clock.play();
+   } catch (err) {
+diff --git a/src/messages.ts b/src/messages.ts
+index fec7795..b745df4 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -14,6 +14,23 @@ export interface Message {</span>
+ 
+ export const OVERLAY_RELEASES = &#x27;https://github.com/equwal/subread-overlay/releases/latest&#x27;;
+ export const SUBREAD_RELEASES = &#x27;https://github.com/equwal/subread-android/releases/latest&#x27;;
+<span class="a">+export const DICTIONARY_RELEASES = &#x27;https://github.com/equwal/subread-dictionary/releases/latest&#x27;;</span>
+<span class="a">+export const ANKI_RELEASES = &#x27;https://github.com/equwal/subread-anki/releases/latest&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** A long press on the web: there is no SubRead Anki. */</span>
+<span class="a">+export const ANKI_WEB_TEXT = &#x27;Anki cards need SubRead Anki on Android.&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The result of SubRead Anki in the strip. Null when the user closed the card. */</span>
+<span class="a">+export function ankiText(result: { added?: boolean; error?: string }): Message | null {</span>
+<span class="a">+  if (result.error === &#x27;not_installed&#x27;) {</span>
+<span class="a">+    return {</span>
+<span class="a">+      text: &#x27;SubRead Anki is not installed.&#x27;,</span>
+<span class="a">+      link: { href: ANKI_RELEASES, text: &#x27;Get SubRead Anki&#x27; },</span>
+<span class="a">+    };</span>
+<span class="a">+  }</span>
+<span class="a">+  if (result.error !== undefined) return { text: &#x27;SubRead Anki could not start.&#x27; };</span>
+<span class="a">+  return result.added ? { text: &#x27;Card added to Anki.&#x27; } : null;</span>
+<span class="a">+}</span>
+ 
+ /** &quot;1 page&quot;, &quot;2 pages&quot;. */
+ function count(n: number, noun: string): string {
+diff --git a/src/nav.ts b/src/nav.ts
+index 48f6c88..a5a2042 100644
+--- a/src/nav.ts
++++ b/src/nav.ts
+<span class="h">@@ -1,11 +1,21 @@</span>
+ // Page turns by the user: the arrows of the top bar, the keys, a swipe on
+<span class="d">-// the viewer, and the page jump of the page label. The decisions are in</span>
+<span class="d">-// paging.ts.</span>
+<span class="a">+// the viewer, and the page jump of the page label. Also the long press on</span>
+<span class="a">+// the viewer, because it shares the pointer events of the swipe. The</span>
+<span class="a">+// decisions are in paging.ts.</span>
+ 
+<span class="d">-import { arrowsOff, arrowStep, keyStep, parsePage, swipeStep, type Step } from &#x27;./paging&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  arrowsOff,</span>
+<span class="a">+  arrowStep,</span>
+<span class="a">+  keyStep,</span>
+<span class="a">+  LONG_PRESS_MS,</span>
+<span class="a">+  movedTooFar,</span>
+<span class="a">+  parsePage,</span>
+<span class="a">+  swipeStep,</span>
+<span class="a">+  type Step,</span>
+<span class="a">+} from &#x27;./paging&#x27;;</span>
+ import { say } from &#x27;./status&#x27;;
+ 
+<span class="d">-/** A click this soon after the end of a swipe comes from the swipe, and does no lookup. */</span>
+<span class="a">+/** A click this soon after the end of a swipe or a long press comes from it, and does no lookup. */</span>
+ const CLICK_AFTER_SWIPE_MS = 400;
+ 
+ /** A click this soon after the tap that cancels the page jump comes from that tap. */
+<span class="h">@@ -46,8 +56,17 @@ function zoomed(): boolean {</span>
+   return (window.visualViewport?.scale ?? 1) &gt; ZOOMED;
+ }
+ 
+<span class="d">-/** `turnTo(index)` shows the page that the user asked for. */</span>
+<span class="d">-export function setupNav(ui: NavElements, s: NavState, turnTo: (index: number) =&gt; void): Nav {</span>
+<span class="a">+/**</span>
+<span class="a">+ * `turnTo(index)` shows the page that the user asked for. `longPress(x, y)`</span>
+<span class="a">+ * gets a long press on the viewer, in client pixels, and gives true when</span>
+<span class="a">+ * it used it. Then the click that follows does nothing.</span>
+<span class="a">+ */</span>
+<span class="a">+export function setupNav(</span>
+<span class="a">+  ui: NavElements,</span>
+<span class="a">+  s: NavState,</span>
+<span class="a">+  turnTo: (index: number) =&gt; void,</span>
+<span class="a">+  longPress: (x: number, y: number) =&gt; boolean,</span>
+<span class="a">+): Nav {</span>
+   function go(step: Step): void {
+     const to = s.current() + step;
+     if (to &gt;= 0 &amp;&amp; to &lt; s.pages()) turnTo(to);
+<span class="h">@@ -92,20 +111,57 @@ export function setupNav(ui: NavElements, s: NavState, turnTo: (index: number) =</span>
+   window.visualViewport?.addEventListener(&#x27;resize&#x27;, markZoom);
+   markZoom();
+ 
+<span class="d">-  let start: { id: number; x: number; y: number } | null = null;</span>
+<span class="a">+  // One finger on the viewer gives a tap, a swipe or a long press, never</span>
+<span class="a">+  // two of them. A move of more than LONG_PRESS_MOVE stops the long press,</span>
+<span class="a">+  // and a long press is no swipe.</span>
+<span class="a">+</span>
+<span class="a">+  /** The finger on the viewer: where it went down, and true after its long press. */</span>
+<span class="a">+  let start: { id: number; x: number; y: number; pressed: boolean } | null = null;</span>
+<span class="a">+  let pressTimer: ReturnType&lt;typeof setTimeout&gt; | undefined;</span>
+   let swipedAt = -Infinity;
+   ui.viewer.addEventListener(&#x27;pointerdown&#x27;, (e) =&gt; {
+<span class="d">-    // A second finger makes a pinch, not a swipe.</span>
+<span class="d">-    start = e.isPrimary ? { id: e.pointerId, x: e.clientX, y: e.clientY } : null;</span>
+<span class="a">+    clearTimeout(pressTimer);</span>
+<span class="a">+    // A second finger makes a pinch. The right mouse button opens the menu of the browser.</span>
+<span class="a">+    if (!e.isPrimary || e.button !== 0) {</span>
+<span class="a">+      start = null;</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+<span class="a">+    const finger = { id: e.pointerId, x: e.clientX, y: e.clientY, pressed: false };</span>
+<span class="a">+    start = finger;</span>
+<span class="a">+    pressTimer = setTimeout(() =&gt; {</span>
+<span class="a">+      if (start !== finger || s.drawerOpen()) return;</span>
+<span class="a">+      finger.pressed = longPress(finger.x, finger.y);</span>
+<span class="a">+    }, LONG_PRESS_MS);</span>
+<span class="a">+  });</span>
+<span class="a">+  ui.viewer.addEventListener(&#x27;pointermove&#x27;, (e) =&gt; {</span>
+<span class="a">+    if (</span>
+<span class="a">+      start &amp;&amp;</span>
+<span class="a">+      e.pointerId === start.id &amp;&amp;</span>
+<span class="a">+      movedTooFar(e.clientX - start.x, e.clientY - start.y)</span>
+<span class="a">+    ) {</span>
+<span class="a">+      clearTimeout(pressTimer);</span>
+<span class="a">+    }</span>
+   });
+   ui.viewer.addEventListener(&#x27;pointercancel&#x27;, () =&gt; {
+<span class="a">+    clearTimeout(pressTimer);</span>
+     start = null;
+   });
+<span class="a">+  // Android shows a menu for a long press on the page. The long press makes a card instead.</span>
+<span class="a">+  ui.viewer.addEventListener(&#x27;contextmenu&#x27;, (e) =&gt; {</span>
+<span class="a">+    if (start) e.preventDefault();</span>
+<span class="a">+  });</span>
+   ui.viewer.addEventListener(&#x27;pointerup&#x27;, (e) =&gt; {
+     if (!start || e.pointerId !== start.id) return;
+<span class="a">+    clearTimeout(pressTimer);</span>
+     const dx = e.clientX - start.x;
+     const dy = e.clientY - start.y;
+<span class="a">+    const pressed = start.pressed;</span>
+     start = null;
+<span class="a">+    // The click after a long press is not a tap on a word.</span>
+<span class="a">+    if (pressed) {</span>
+<span class="a">+      swipedAt = e.timeStamp;</span>
+<span class="a">+      return;</span>
+<span class="a">+    }</span>
+     if (s.drawerOpen()) return;
+     const v = ui.viewer;
+     const step = swipeStep(
+diff --git a/src/paging.ts b/src/paging.ts
+index 5946d3e..9a8c257 100644
+--- a/src/paging.ts
++++ b/src/paging.ts
+<span class="h">@@ -12,6 +12,17 @@ export const SWIPE_MIN = 50;</span>
+ /** A swipe turns a page only when its horizontal move is more than this times its vertical move. */
+ export const SWIPE_RATIO = 1.5;
+ 
+<span class="a">+/** A press this long, in milliseconds, without a move is a long press: an Anki card. */</span>
+<span class="a">+export const LONG_PRESS_MS = 500;</span>
+<span class="a">+</span>
+<span class="a">+/** A finger that moves more than this, in CSS pixels, makes no long press. */</span>
+<span class="a">+export const LONG_PRESS_MOVE = 10;</span>
+<span class="a">+</span>
+<span class="a">+/** True when the finger moved too far for a long press. Such a move can be a swipe. */</span>
+<span class="a">+export function movedTooFar(dx: number, dy: number): boolean {</span>
+<span class="a">+  return Math.hypot(dx, dy) &gt; LONG_PRESS_MOVE;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The step of a key, or 0 for a key that turns no page. */
+ export function keyStep(key: string, rtl: boolean): Step | 0 {
+   switch (key) {
+diff --git a/src/style.css b/src/style.css
+index d8ad45d..b4d0d1a 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -412,6 +412,10 @@ body.zoomed #viewer {</span>
+   margin: 0 auto;
+   width: 100%;
+   max-width: 1000px;
+<span class="a">+  /* A long press makes an Anki card: no selection, no image menu. */</span>
+<span class="a">+  -webkit-user-select: none;</span>
+<span class="a">+  user-select: none;</span>
+<span class="a">+  -webkit-touch-callout: none;</span>
+ }
+ 
+ #page canvas {
+diff --git a/src/suite.ts b/src/suite.ts
+index a4328ce..40f8656 100644
+--- a/src/suite.ts
++++ b/src/suite.ts
+<span class="h">@@ -1,12 +1,16 @@</span>
+ // The checklist of the SubRead suite: which apps are on the device, and
+ // what to do for an app that is missing. Pure: no DOM.
+ 
+<span class="d">-import { OPEN_OVERLAY, OVERLAY_RELEASES, SUBREAD_RELEASES, type Message } from &#x27;./messages&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  ANKI_RELEASES,</span>
+<span class="a">+  DICTIONARY_RELEASES,</span>
+<span class="a">+  OPEN_OVERLAY,</span>
+<span class="a">+  OVERLAY_RELEASES,</span>
+<span class="a">+  SUBREAD_RELEASES,</span>
+<span class="a">+  type Message,</span>
+<span class="a">+} from &#x27;./messages&#x27;;</span>
+ import type { SuiteApps } from &#x27;./subread&#x27;;
+ 
+<span class="d">-export const DICTIONARY_RELEASES = &#x27;https://github.com/equwal/subread-dictionary/releases/latest&#x27;;</span>
+<span class="d">-export const ANKI_RELEASES = &#x27;https://github.com/equwal/subread-anki/releases/latest&#x27;;</span>
+<span class="d">-</span>
+ /** One line of the checklist. `ok` is true when the app is ready. */
+ export interface ChecklistItem extends Message {
+   ok: boolean;
+diff --git a/test/anki-card.test.ts b/test/anki-card.test.ts
+new file mode 100644
+index 0000000..82472ed
+--- /dev/null
++++ b/test/anki-card.test.ts
+<span class="h">@@ -0,0 +1,185 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import type { OcrToken, TokenSpan } from &#x27;../src/align&#x27;;</span>
+<span class="a">+import { ankiCard, cardSource, wordAt } from &#x27;../src/anki-card&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const box = { x0: 0, y0: 0, x1: 1, y1: 1 };</span>
+<span class="a">+</span>
+<span class="a">+/** Tokens for one page, one per character: each line is a list of words. */</span>
+<span class="a">+function pageTokens(lines: readonly (readonly string[])[], page = 0): OcrToken[] {</span>
+<span class="a">+  const out: OcrToken[] = [];</span>
+<span class="a">+  lines.forEach((words, li) =&gt; {</span>
+<span class="a">+    words.forEach((word, wi) =&gt; {</span>
+<span class="a">+      for (const ch of word) {</span>
+<span class="a">+        out.push({</span>
+<span class="a">+          text: ch,</span>
+<span class="a">+          page,</span>
+<span class="a">+          line: page * 1000 + li,</span>
+<span class="a">+          word: page * 1000 + li * 100 + wi,</span>
+<span class="a">+          bbox: box,</span>
+<span class="a">+        });</span>
+<span class="a">+      }</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The index of token number `n` (from 0) with the text `ch`. */</span>
+<span class="a">+function find(tokens: readonly OcrToken[], ch: string, n = 0): number {</span>
+<span class="a">+  let seen = 0;</span>
+<span class="a">+  for (let i = 0; i &lt; tokens.length; i++) {</span>
+<span class="a">+    if (tokens[i]!.text !== ch) continue;</span>
+<span class="a">+    if (seen === n) return i;</span>
+<span class="a">+    seen++;</span>
+<span class="a">+  }</span>
+<span class="a">+  throw new Error(`No token ${ch} number ${n}.`);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// The first page of sample-eng-2p: two cues on two lines.</span>
+<span class="a">+const eng = pageTokens([</span>
+<span class="a">+  [&#x27;The&#x27;, &#x27;morning&#x27;, &#x27;sun&#x27;, &#x27;rose&#x27;, &#x27;over&#x27;, &#x27;the&#x27;, &#x27;quiet&#x27;, &#x27;hills,&#x27;],</span>
+<span class="a">+  [&#x27;and&#x27;, &#x27;the&#x27;, &#x27;village&#x27;, &#x27;below&#x27;, &#x27;began&#x27;, &#x27;to&#x27;, &#x27;stir.&#x27;],</span>
+<span class="a">+]);</span>
+<span class="a">+const engCues = [</span>
+<span class="a">+  { text: &#x27;The morning sun rose over the quiet hills,&#x27; },</span>
+<span class="a">+  { text: &#x27;and the village below began to stir.&#x27; },</span>
+<span class="a">+];</span>
+<span class="a">+const firstLine = eng.filter((t) =&gt; t.line === 0).length;</span>
+<span class="a">+const engSpans: TokenSpan[] = [</span>
+<span class="a">+  { start: 0, end: firstLine, matched: true },</span>
+<span class="a">+  { start: firstLine, end: eng.length, matched: true },</span>
+<span class="a">+];</span>
+<span class="a">+</span>
+<span class="a">+// sample-jpn: one OCR word for a whole line, as Japanese OCR gives.</span>
+<span class="a">+const jpn = pageTokens([[&#x27;吾輩は猫である。名前はまだ無い。&#x27;]]);</span>
+<span class="a">+const jpnCues = [{ text: &#x27;吾輩は猫である。&#x27; }, { text: &#x27;名前はまだ無い。&#x27; }];</span>
+<span class="a">+const jpnSpans: TokenSpan[] = [</span>
+<span class="a">+  { start: 0, end: 8, matched: true },</span>
+<span class="a">+  { start: 8, end: 16, matched: true },</span>
+<span class="a">+];</span>
+<span class="a">+</span>
+<span class="a">+const source = &#x27;sample-eng-2p, p. 1&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;ankiCard&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;gives the word without its comma, and the marked cue as the sentence&#x27;, () =&gt; {</span>
+<span class="a">+    const card = ankiCard({</span>
+<span class="a">+      tokens: eng,</span>
+<span class="a">+      index: find(eng, &#x27;,&#x27;),</span>
+<span class="a">+      spans: engSpans,</span>
+<span class="a">+      markedCue: 0,</span>
+<span class="a">+      cues: engCues,</span>
+<span class="a">+      source,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(card).toEqual({</span>
+<span class="a">+      word: &#x27;hills&#x27;,</span>
+<span class="a">+      sentence: &#x27;The morning sun rose over the quiet hills,&#x27;,</span>
+<span class="a">+      source,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the sentence around the token when the token is not in the marked cue&#x27;, () =&gt; {</span>
+<span class="a">+    const input = { tokens: eng, spans: engSpans, cues: engCues, source };</span>
+<span class="a">+    // The first &quot;v&quot; is in &quot;over&quot;.</span>
+<span class="a">+    const village = find(eng, &#x27;v&#x27;, 1);</span>
+<span class="a">+    const sentence =</span>
+<span class="a">+      &#x27;The morning sun rose over the quiet hills, and the village below began to stir.&#x27;;</span>
+<span class="a">+    expect(ankiCard({ ...input, index: village, markedCue: 0 })).toEqual({</span>
+<span class="a">+      word: &#x27;village&#x27;,</span>
+<span class="a">+      sentence,</span>
+<span class="a">+      source,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(ankiCard({ ...input, index: village, markedCue: -1 })).toEqual({</span>
+<span class="a">+      word: &#x27;village&#x27;,</span>
+<span class="a">+      sentence,</span>
+<span class="a">+      source,</span>
+<span class="a">+    });</span>
+<span class="a">+    const unmatched = [engSpans[0]!, { start: 0, end: 0, matched: false }];</span>
+<span class="a">+    expect(ankiCard({ ...input, spans: unmatched, index: village, markedCue: 1 })).toEqual({</span>
+<span class="a">+      word: &#x27;village&#x27;,</span>
+<span class="a">+      sentence,</span>
+<span class="a">+      source,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives a CJK token the text only, so the user taps the word in SubRead Anki&#x27;, () =&gt; {</span>
+<span class="a">+    const input = { tokens: jpn, spans: jpnSpans, cues: jpnCues, source: &#x27;sample-jpn, p. 1&#x27; };</span>
+<span class="a">+    expect(ankiCard({ ...input, index: find(jpn, &#x27;猫&#x27;), markedCue: 0 })).toEqual({</span>
+<span class="a">+      text: &#x27;吾輩は猫である。&#x27;,</span>
+<span class="a">+      source: &#x27;sample-jpn, p. 1&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(ankiCard({ ...input, index: find(jpn, &#x27;前&#x27;), markedCue: -1 })).toEqual({</span>
+<span class="a">+      text: &#x27;名前はまだ無い。&#x27;,</span>
+<span class="a">+      source: &#x27;sample-jpn, p. 1&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;joins the lines of a cue: a space between Latin lines, none between CJK lines&#x27;, () =&gt; {</span>
+<span class="a">+    const cues = [{ text: &#x27;was clear and bright,\nover the hills.&#x27; }];</span>
+<span class="a">+    const spans: TokenSpan[] = [{ start: 0, end: eng.length, matched: true }];</span>
+<span class="a">+    expect(ankiCard({ tokens: eng, index: 0, spans, markedCue: 0, cues, source })?.sentence).toBe(</span>
+<span class="a">+      &#x27;was clear and bright, over the hills.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+    const jpnCue = [{ text: &#x27;吾輩は猫\nである。&#x27; }];</span>
+<span class="a">+    const all: TokenSpan[] = [{ start: 0, end: jpn.length, matched: true }];</span>
+<span class="a">+    expect(</span>
+<span class="a">+      ankiCard({ tokens: jpn, index: 0, spans: all, markedCue: 0, cues: jpnCue, source })?.text,</span>
+<span class="a">+    ).toBe(&#x27;吾輩は猫である。&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the text only for a token of punctuation with no word&#x27;, () =&gt; {</span>
+<span class="a">+    const dash = pageTokens([[&#x27;Wait&#x27;, &#x27;—&#x27;, &#x27;no.&#x27;]]);</span>
+<span class="a">+    const card = ankiCard({</span>
+<span class="a">+      tokens: dash,</span>
+<span class="a">+      index: find(dash, &#x27;—&#x27;),</span>
+<span class="a">+      spans: [],</span>
+<span class="a">+      markedCue: -1,</span>
+<span class="a">+      cues: [],</span>
+<span class="a">+      source,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(card).toEqual({ text: &#x27;Wait — no.&#x27;, source });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null for a token that does not exist&#x27;, () =&gt; {</span>
+<span class="a">+    const input = { tokens: eng, spans: engSpans, markedCue: 0, cues: engCues, source };</span>
+<span class="a">+    expect(ankiCard({ ...input, index: eng.length })).toBeNull();</span>
+<span class="a">+    expect(ankiCard({ ...input, index: -1 })).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;wordAt&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;keeps the punctuation inside a word&#x27;, () =&gt; {</span>
+<span class="a">+    const tokens = pageTokens([[&#x27;&quot;don\&#x27;t&quot;&#x27;, &#x27;go.&#x27;]]);</span>
+<span class="a">+    expect(wordAt(tokens, find(tokens, &#x27;d&#x27;))).toBe(&quot;don&#x27;t&quot;);</span>
+<span class="a">+    expect(wordAt(tokens, find(tokens, &#x27;&quot;&#x27;, 1))).toBe(&quot;don&#x27;t&quot;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives a word with no punctuation at its edges, from the letters of its line&#x27;, () =&gt; {</span>
+<span class="a">+    const ch = fc.constantFrom(&#x27;a&#x27;, &#x27;Z&#x27;, &#x27;7&#x27;, &#x27;,&#x27;, &#x27;.&#x27;, &#x27;&quot;&#x27;, &#x27;!&#x27;, &#x27;(&#x27;, &#x27;)&#x27;, &quot;&#x27;&quot;, &#x27;-&#x27;);</span>
+<span class="a">+    const word = fc.array(ch, { minLength: 1, maxLength: 6 }).map((cs) =&gt; cs.join(&#x27;&#x27;));</span>
+<span class="a">+    const lines = fc.array(fc.array(word, { minLength: 1, maxLength: 4 }), {</span>
+<span class="a">+      minLength: 1,</span>
+<span class="a">+      maxLength: 3,</span>
+<span class="a">+    });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(lines, fc.nat(), (text, pick) =&gt; {</span>
+<span class="a">+        const tokens = pageTokens(text);</span>
+<span class="a">+        const index = pick % tokens.length;</span>
+<span class="a">+        const got = wordAt(tokens, index);</span>
+<span class="a">+        expect(got).not.toMatch(/^[\p{P}\p{S}]|[\p{P}\p{S}]$/u);</span>
+<span class="a">+        const t = tokens[index]!;</span>
+<span class="a">+        const own = tokens</span>
+<span class="a">+          .filter((o) =&gt; o.line === t.line &amp;&amp; o.word === t.word)</span>
+<span class="a">+          .map((o) =&gt; o.text)</span>
+<span class="a">+          .join(&#x27;&#x27;);</span>
+<span class="a">+        expect(own).toContain(got);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;cardSource&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;names the book without .pdf and the page from 1&#x27;, () =&gt; {</span>
+<span class="a">+    expect(cardSource(&#x27;sample-eng-2p.pdf&#x27;, 0)).toBe(&#x27;sample-eng-2p, p. 1&#x27;);</span>
+<span class="a">+    expect(cardSource(&#x27;吾輩は猫である.PDF&#x27;, 9)).toBe(&#x27;吾輩は猫である, p. 10&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index 54bb67e..98d160b 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -2,6 +2,9 @@ import fc from &#x27;fast-check&#x27;;</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+ import { PlayerError, type ClockState } from &#x27;../src/clock-source&#x27;;
+ import {
+<span class="a">+  ANKI_RELEASES,</span>
+<span class="a">+  ANKI_WEB_TEXT,</span>
+<span class="a">+  ankiText,</span>
+   clockText,
+   errorMessage,
+   matchedText,
+<span class="h">@@ -207,6 +210,25 @@ describe(&#x27;the end of the reading&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="a">+describe(&#x27;ankiText&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;tells the result of SubRead Anki&#x27;, () =&gt; {</span>
+<span class="a">+    expect(ankiText({ added: true })).toEqual({ text: &#x27;Card added to Anki.&#x27; });</span>
+<span class="a">+    expect(ankiText({ error: &#x27;not_installed&#x27; })).toEqual({</span>
+<span class="a">+      text: &#x27;SubRead Anki is not installed.&#x27;,</span>
+<span class="a">+      link: { href: ANKI_RELEASES, text: &#x27;Get SubRead Anki&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(ankiText({ error: &#x27;cannot_start&#x27; })).toEqual({ text: &#x27;SubRead Anki could not start.&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;says nothing when the user closed the card&#x27;, () =&gt; {</span>
+<span class="a">+    expect(ankiText({ added: false })).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells the web that cards need Android&#x27;, () =&gt; {</span>
+<span class="a">+    expect(ANKI_WEB_TEXT).toBe(&#x27;Anki cards need SubRead Anki on Android.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;SubRead texts&#x27;, () =&gt; {
+   it(&#x27;tells how far the reading is while SubRead waits&#x27;, () =&gt; {
+     expect(waitPagesText(3, 40)).toBe(&#x27;Reading pages 3/40 first...&#x27;);
+diff --git a/test/paging.test.ts b/test/paging.test.ts
+index 62f3be9..95887b1 100644
+--- a/test/paging.test.ts
++++ b/test/paging.test.ts
+<span class="h">@@ -5,6 +5,8 @@ import {</span>
+   arrowStep,
+   defaultRtl,
+   keyStep,
+<span class="a">+  LONG_PRESS_MOVE,</span>
+<span class="a">+  movedTooFar,</span>
+   parsePage,
+   SWIPE_MIN,
+   SWIPE_RATIO,
+<span class="h">@@ -14,6 +16,25 @@ import {</span>
+ 
+ const flat = { zoomed: false, wide: false };
+ 
+<span class="a">+describe(&#x27;movedTooFar&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;lets a finger shake up to 10 CSS pixels in a long press&#x27;, () =&gt; {</span>
+<span class="a">+    expect(LONG_PRESS_MOVE).toBe(10);</span>
+<span class="a">+    expect(movedTooFar(0, 0)).toBe(false);</span>
+<span class="a">+    expect(movedTooFar(6, -8)).toBe(false);</span>
+<span class="a">+    expect(movedTooFar(7, 8)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;never gives a long press for a swipe that turns a page&#x27;, () =&gt; {</span>
+<span class="a">+    // A swipe, a tap and a long press never mix.</span>
+<span class="a">+    const move = fc.integer({ min: -400, max: 400 });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(move, move, fc.boolean(), (dx, dy, rtl) =&gt; {</span>
+<span class="a">+        if (swipeStep({ dx, dy, ...flat }, rtl) !== 0) expect(movedTooFar(dx, dy)).toBe(true);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ describe(&#x27;keyStep&#x27;, () =&gt; {
+   it(&#x27;turns with the arrow keys and the page keys&#x27;, () =&gt; {
+     expect(keyStep(&#x27;ArrowRight&#x27;, false)).toBe(1);
+diff --git a/test/suite.test.ts b/test/suite.test.ts
+index b9d04ce..d6b0e4e 100644
+--- a/test/suite.test.ts
++++ b/test/suite.test.ts
+<span class="h">@@ -1,7 +1,12 @@</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import { OVERLAY_RELEASES, SUBREAD_RELEASES } from &#x27;../src/messages&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  ANKI_RELEASES,</span>
+<span class="a">+  DICTIONARY_RELEASES,</span>
+<span class="a">+  OVERLAY_RELEASES,</span>
+<span class="a">+  SUBREAD_RELEASES,</span>
+<span class="a">+} from &#x27;../src/messages&#x27;;</span>
+ import type { SuiteApps } from &#x27;../src/subread&#x27;;
+<span class="d">-import { ANKI_RELEASES, DICTIONARY_RELEASES, suiteChecklist } from &#x27;../src/suite&#x27;;</span>
+<span class="a">+import { suiteChecklist } from &#x27;../src/suite&#x27;;</span>
+ 
+ const openOverlay = { id: &#x27;open-overlay&#x27;, text: &#x27;Open SubRead Overlay&#x27; };
+ </pre>
+</div></body></html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread/src/ocr.ts - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../../scan-subread/index.html">Log</a> | <a href="../../../scan-subread/files.html">Files</a> | <a href="../../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/ocr.ts (7388 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // tesseract.js wrapper for the browser.
+<a id="l2" href="#l2">2</a> //
+<a id="l3" href="#l3">3</a> // The app serves the worker script of tesseract.js and its WebAssembly core
+<a id="l4" href="#l4">4</a> // from its own files, so the code of OCR needs no network. The language data
+<a id="l5" href="#l5">5</a> // comes from jsDelivr at the first OCR run of each language. tesseract.js
+<a id="l6" href="#l6">6</a> // keeps it in IndexedDB after that.
+<a id="l7" href="#l7">7</a> 
+<a id="l8" href="#l8">8</a> import { createWorker, PSM, type ImageLike, type Worker as TesseractWorker } from &#x27;tesseract.js&#x27;;
+<a id="l9" href="#l9">9</a> // Vite copies the two files into the build and gives their URLs.
+<a id="l10" href="#l10">10</a> import workerPath from &#x27;tesseract.js/dist/worker.min.js?url&#x27;;
+<a id="l11" href="#l11">11</a> // One core file that holds the WebAssembly, so the worker makes one request.
+<a id="l12" href="#l12">12</a> // The app uses OEM 1 (LSTM only). Android WebView 91 and later and all
+<a id="l13" href="#l13">13</a> // current browsers have WebAssembly SIMD.
+<a id="l14" href="#l14">14</a> import corePath from &#x27;tesseract.js-core/tesseract-core-simd-lstm.wasm.js?url&#x27;;
+<a id="l15" href="#l15">15</a> import type { OcrToken } from &#x27;./align&#x27;;
+<a id="l16" href="#l16">16</a> import { OcrStartError } from &#x27;./ocr-job&#x27;;
+<a id="l17" href="#l17">17</a> import { pageToTokens } from &#x27;./ocr-tokens&#x27;;
+<a id="l18" href="#l18">18</a> import { imageToPpm } from &#x27;./ppm&#x27;;
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> export { OcrStartError };
+<a id="l21" href="#l21">21</a> 
+<a id="l22" href="#l22">22</a> export interface Ocr {
+<a id="l23" href="#l23">23</a>   /** Rejects when the OCR stops, or its worker fails, before the page is read. */
+<a id="l24" href="#l24">24</a>   recognize(image: HTMLCanvasElement, pageIndex: number): Promise&lt;OcrToken[]&gt;;
+<a id="l25" href="#l25">25</a>   terminate(): Promise&lt;void&gt;;
+<a id="l26" href="#l26">26</a> }
+<a id="l27" href="#l27">27</a> 
+<a id="l28" href="#l28">28</a> /**
+<a id="l29" href="#l29">29</a>  * Start an OCR worker for `lang` (&quot;eng&quot;, &quot;jpn&quot;, &quot;jpn_vert&quot;, &quot;jpn+eng&quot;, ...).
+<a id="l30" href="#l30">30</a>  * `onProgress` gets values in [0, 1] while a page is recognized. Rejects with
+<a id="l31" href="#l31">31</a>  * OcrStartError when the worker cannot start, and then the worker stops. An
+<a id="l32" href="#l32">32</a>  * abort of `signal` before the worker started stops the start in the same
+<a id="l33" href="#l33">33</a>  * way: see createOcrJob.
+<a id="l34" href="#l34">34</a>  */
+<a id="l35" href="#l35">35</a> export async function createOcr(
+<a id="l36" href="#l36">36</a>   lang: string,
+<a id="l37" href="#l37">37</a>   onProgress: (p: number) =&gt; void,
+<a id="l38" href="#l38">38</a>   signal?: AbortSignal,
+<a id="l39" href="#l39">39</a> ): Promise&lt;Ocr&gt; {
+<a id="l40" href="#l40">40</a>   let worker: TesseractWorker;
+<a id="l41" href="#l41">41</a>   try {
+<a id="l42" href="#l42">42</a>     worker = await startWorker(lang, onProgress, signal);
+<a id="l43" href="#l43">43</a>   } catch (err) {
+<a id="l44" href="#l44">44</a>     throw err instanceof OcrStartError ? err : new OcrStartError(err);
+<a id="l45" href="#l45">45</a>   }
+<a id="l46" href="#l46">46</a>   if (lang.includes(&#x27;vert&#x27;)) {
+<a id="l47" href="#l47">47</a>     try {
+<a id="l48" href="#l48">48</a>       await worker.setParameters({ tessedit_pageseg_mode: PSM.SINGLE_BLOCK_VERT_TEXT });
+<a id="l49" href="#l49">49</a>     } catch (err) {
+<a id="l50" href="#l50">50</a>       await worker.terminate().catch(() =&gt; undefined);
+<a id="l51" href="#l51">51</a>       throw new OcrStartError(err);
+<a id="l52" href="#l52">52</a>     }
+<a id="l53" href="#l53">53</a>   }
+<a id="l54" href="#l54">54</a>   // tesseract.js does not settle a job that runs when its worker stops or
+<a id="l55" href="#l55">55</a>   // fails. So each page also waits for the stop and for an error event of
+<a id="l56" href="#l56">56</a>   // the worker, and the reading does not wait for ever for such a page.
+<a id="l57" href="#l57">57</a>   let stop: (reason: Error) =&gt; void = () =&gt; undefined;
+<a id="l58" href="#l58">58</a>   const stopped = new Promise&lt;never&gt;((_resolve, reject) =&gt; {
+<a id="l59" href="#l59">59</a>     stop = reject;
+<a id="l60" href="#l60">60</a>   });
+<a id="l61" href="#l61">61</a>   // A stop while no page runs is no error.
+<a id="l62" href="#l62">62</a>   stopped.catch(() =&gt; undefined);
+<a id="l63" href="#l63">63</a>   webWorker(worker)?.addEventListener(&#x27;error&#x27;, (event) =&gt; {
+<a id="l64" href="#l64">64</a>     stop(new Error(&#x27;The OCR worker failed.&#x27;, { cause: event }));
+<a id="l65" href="#l65">65</a>   });
+<a id="l66" href="#l66">66</a>   return {
+<a id="l67" href="#l67">67</a>     async recognize(canvas, pageIndex) {
+<a id="l68" href="#l68">68</a>       const page = worker
+<a id="l69" href="#l69">69</a>         .recognize(ppmOf(canvas), {}, { blocks: true, text: false })
+<a id="l70" href="#l70">70</a>         .then(({ data }) =&gt; pageToTokens(data, pageIndex));
+<a id="l71" href="#l71">71</a>       return Promise.race([page, stopped]);
+<a id="l72" href="#l72">72</a>     },
+<a id="l73" href="#l73">73</a>     async terminate() {
+<a id="l74" href="#l74">74</a>       stop(new Error(&#x27;OCR stopped.&#x27;));
+<a id="l75" href="#l75">75</a>       await worker.terminate();
+<a id="l76" href="#l76">76</a>     },
+<a id="l77" href="#l77">77</a>   };
+<a id="l78" href="#l78">78</a> }
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> /**
+<a id="l81" href="#l81">81</a>  * The Web Worker of a tesseract.js worker, for its error event. tesseract.js
+<a id="l82" href="#l82">82</a>  * keeps it in the property `worker`, which its types do not list.
+<a id="l83" href="#l83">83</a>  */
+<a id="l84" href="#l84">84</a> function webWorker(worker: TesseractWorker): EventTarget | undefined {
+<a id="l85" href="#l85">85</a>   const inner: unknown = &#x27;worker&#x27; in worker ? worker.worker : undefined;
+<a id="l86" href="#l86">86</a>   return inner instanceof EventTarget ? inner : undefined;
+<a id="l87" href="#l87">87</a> }
+<a id="l88" href="#l88">88</a> 
+<a id="l89" href="#l89">89</a> /**
+<a id="l90" href="#l90">90</a>  * The pixels of a page canvas as a PPM file. tesseract.js makes a PNG file of
+<a id="l91" href="#l91">91</a>  * a canvas with canvas.toBlob, and in the Android WebView of the test phone
+<a id="l92" href="#l92">92</a>  * that took about 13 s for each page. The PPM file has the same pixels, so the
+<a id="l93" href="#l93">93</a>  * OCR gives the same tokens (test/e2e/ocr-ppm.test.ts). The ImageData is not
+<a id="l94" href="#l94">94</a>  * kept after the conversion.
+<a id="l95" href="#l95">95</a>  */
+<a id="l96" href="#l96">96</a> function ppmOf(canvas: HTMLCanvasElement): ImageLike {
+<a id="l97" href="#l97">97</a>   // pdf.js made the context with willReadFrequently (its default without
+<a id="l98" href="#l98">98</a>   // enableHWA), so getImageData reads memory and not the GPU.
+<a id="l99" href="#l99">99</a>   const context = canvas.getContext(&#x27;2d&#x27;, { willReadFrequently: true });
+<a id="l100" href="#l100">100</a>   if (!context) throw new Error(&#x27;The page canvas has no 2D context.&#x27;);
+<a id="l101" href="#l101">101</a>   const ppm = imageToPpm(context.getImageData(0, 0, canvas.width, canvas.height));
+<a id="l102" href="#l102">102</a>   // tesseract.js uses the bytes of an image file as they are: its loadImage
+<a id="l103" href="#l103">103</a>   // returns `new Uint8Array(image)` for an input that is not a string, an
+<a id="l104" href="#l104">104</a>   // element, a canvas or a Blob (src/worker/browser/loadImage.js). Its type
+<a id="l105" href="#l105">105</a>   // ImageLike does not list Uint8Array.
+<a id="l106" href="#l106">106</a>   return ppm as unknown as ImageLike;
+<a id="l107" href="#l107">107</a> }
+<a id="l108" href="#l108">108</a> 
+<a id="l109" href="#l109">109</a> /**
+<a id="l110" href="#l110">110</a>  * Starts the worker of tesseract.js. When the language data does not load,
+<a id="l111" href="#l111">111</a>  * tesseract.js gives the error to errorHandler, and the promise of
+<a id="l112" href="#l112">112</a>  * createWorker does not settle (src/createWorker.js rejects it only when
+<a id="l113" href="#l113">113</a>  * the core does not load). So the first error rejects the start.
+<a id="l114" href="#l114">114</a>  *
+<a id="l115" href="#l115">115</a>  * tesseract.js does not stop the Web Worker of a start that failed, and it
+<a id="l116" href="#l116">116</a>  * gives the app the worker only after the start. So the start keeps the Web
+<a id="l117" href="#l117">117</a>  * Worker (see spawnedBy) and stops it when the start fails. Without this,
+<a id="l118" href="#l118">118</a>  * each Retry, book or setting change left one more worker, each with the
+<a id="l119" href="#l119">119</a>  * WebAssembly core in its memory. An abort of `signal` during the start
+<a id="l120" href="#l120">120</a>  * fails the start with the reason of the abort.
+<a id="l121" href="#l121">121</a>  */
+<a id="l122" href="#l122">122</a> function startWorker(
+<a id="l123" href="#l123">123</a>   lang: string,
+<a id="l124" href="#l124">124</a>   onProgress: (p: number) =&gt; void,
+<a id="l125" href="#l125">125</a>   signal?: AbortSignal,
+<a id="l126" href="#l126">126</a> ): Promise&lt;TesseractWorker&gt; {
+<a id="l127" href="#l127">127</a>   return new Promise((resolve, reject) =&gt; {
+<a id="l128" href="#l128">128</a>     if (signal?.aborted) {
+<a id="l129" href="#l129">129</a>       reject(signal.reason);
+<a id="l130" href="#l130">130</a>       return;
+<a id="l131" href="#l131">131</a>     }
+<a id="l132" href="#l132">132</a>     let settled = false;
+<a id="l133" href="#l133">133</a>     let spawned: Worker | undefined;
+<a id="l134" href="#l134">134</a>     const fail = (err: unknown): void =&gt; {
+<a id="l135" href="#l135">135</a>       // After the start, an error belongs to a page: OcrJob stops the worker.
+<a id="l136" href="#l136">136</a>       if (settled) return;
+<a id="l137" href="#l137">137</a>       settled = true;
+<a id="l138" href="#l138">138</a>       spawned?.terminate();
+<a id="l139" href="#l139">139</a>       reject(err);
+<a id="l140" href="#l140">140</a>     };
+<a id="l141" href="#l141">141</a>     const made = spawnedBy(() =&gt;
+<a id="l142" href="#l142">142</a>       createWorker(lang, 1, {
+<a id="l143" href="#l143">143</a>         workerPath,
+<a id="l144" href="#l144">144</a>         corePath,
+<a id="l145" href="#l145">145</a>         logger: (m) =&gt; {
+<a id="l146" href="#l146">146</a>           if (m.status === &#x27;recognizing text&#x27;) onProgress(m.progress);
+<a id="l147" href="#l147">147</a>         },
+<a id="l148" href="#l148">148</a>         // Also after the start: without an errorHandler, tesseract.js throws
+<a id="l149" href="#l149">149</a>         // each error of a job in the message handler of the worker.
+<a id="l150" href="#l150">150</a>         errorHandler: fail,
+<a id="l151" href="#l151">151</a>       }),
+<a id="l152" href="#l152">152</a>     );
+<a id="l153" href="#l153">153</a>     spawned = made.worker;
+<a id="l154" href="#l154">154</a>     signal?.addEventListener(&#x27;abort&#x27;, () =&gt; fail(signal.reason), { once: true });
+<a id="l155" href="#l155">155</a>     made.result.then((worker) =&gt; {
+<a id="l156" href="#l156">156</a>       settled = true;
+<a id="l157" href="#l157">157</a>       resolve(worker);
+<a id="l158" href="#l158">158</a>     }, fail);
+<a id="l159" href="#l159">159</a>   });
+<a id="l160" href="#l160">160</a> }
+<a id="l161" href="#l161">161</a> 
+<a id="l162" href="#l162">162</a> /**
+<a id="l163" href="#l163">163</a>  * Runs `create`, and gives its result and the Web Worker that it made, if
+<a id="l164" href="#l164">164</a>  * any. createWorker of tesseract.js makes its Web Worker in the synchronous
+<a id="l165" href="#l165">165</a>  * part of the call (src/createWorker.js calls spawnWorker before it
+<a id="l166" href="#l166">166</a>  * returns). So during the call, a Worker class that keeps each new worker
+<a id="l167" href="#l167">167</a>  * stands in for the Worker class of the browser. The class of the browser
+<a id="l168" href="#l168">168</a>  * comes back before any other code runs.
+<a id="l169" href="#l169">169</a>  */
+<a id="l170" href="#l170">170</a> function spawnedBy&lt;T&gt;(create: () =&gt; T): { result: T; worker: Worker | undefined } {
+<a id="l171" href="#l171">171</a>   const Native = globalThis.Worker;
+<a id="l172" href="#l172">172</a>   // Node has no Worker: tesseract.js uses worker_threads there.
+<a id="l173" href="#l173">173</a>   if (typeof Native !== &#x27;function&#x27;) return { result: create(), worker: undefined };
+<a id="l174" href="#l174">174</a>   let worker: Worker | undefined;
+<a id="l175" href="#l175">175</a>   globalThis.Worker = class extends Native {
+<a id="l176" href="#l176">176</a>     constructor(url: string | URL, options?: WorkerOptions) {
+<a id="l177" href="#l177">177</a>       super(url, options);
+<a id="l178" href="#l178">178</a>       worker = this;
+<a id="l179" href="#l179">179</a>     }
+<a id="l180" href="#l180">180</a>   };
+<a id="l181" href="#l181">181</a>   try {
+<a id="l182" href="#l182">182</a>     const result = create();
+<a id="l183" href="#l183">183</a>     return { result, worker };
+<a id="l184" href="#l184">184</a>   } finally {
+<a id="l185" href="#l185">185</a>     globalThis.Worker = Native;
+<a id="l186" href="#l186">186</a>   }
+<a id="l187" href="#l187">187</a> }</pre>
+</div></body></html>

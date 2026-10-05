@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-webpublish f36b6f28 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-webpublish</h1><span class="desc">Publish an sbm bookmark file as a list of links on a web site</span><p class="url">git clone https://github.com/equwal/sbm-webpublish</p><p><a href="../../sbm-webpublish/index.html">Log</a> | <a href="../../sbm-webpublish/files.html">Files</a> | <a href="../../sbm-webpublish/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit f36b6f28526cf674433a5a45f5a5b8e57a7856b4
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-09-25 01:17:36 -0700
+
+Serve the links as plain text and Atom, not JSON
+
+Remove /links/links.json. Add /links/links.txt: the links as sbm lines, for cut, awk, dmenu and bm --merge. Add /links/atom.xml: an Atom feed for sfeed and other feed readers. Add /links/list.html: an HTML fragment that a page includes with nginx SSI, so that the page needs no script.
+
+A feed needs the time of each link. So the admin page writes a date line above the links that it adds. bm ignores the line.
+
+Add deploy/deploy.sh. It installs the program and the nginx snippet.
+
+</pre><pre> .gitattributes                |   1 +
+ README.md                     |  88 ++++++++++++++----
+ admin.html                    |   2 +-
+ deploy/deploy.sh              |  43 +++++++++
+ deploy/nginx-location.conf    |  14 ++-
+ deploy/sbm-webpublish.service |  10 +-
+ links.go                      |  43 ++++++++-
+ links_test.go                 |  51 +++++++++++
+ main.go                       |  92 ++++++++-----------
+ public.go                     | 186 +++++++++++++++++++++++++++++++++++++
+ server_test.go                | 208 +++++++++++++++++++++++++++++++++++++-----
+ 11 files changed, 632 insertions(+), 106 deletions(-)
+</pre><pre>diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..dfdb8b7
+--- /dev/null
++++ b/.gitattributes
+<span class="h">@@ -0,0 +1 @@</span>
+<span class="a">+*.sh text eol=lf</span>
+diff --git a/README.md b/README.md
+index 5811fd0..1d71cda 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -4,29 +4,64 @@ sbm-webpublish publishes an [sbm](https://github.com/equwal/sbm) bookmark</span>
+ file as a list of links on a web site. The links page of
+ [recentlywritten.com](https://recentlywritten.com/links.html) uses it.
+ 
+<span class="d">-It is one small Go program with no dependencies outside the standard</span>
+<span class="d">-library. It keeps the links in one plain sbm file: one line for each link,</span>
+<span class="a">+It is one small Go program. At run time it needs only the Go standard</span>
+<span class="a">+library. The tests use rapid for property tests. The program keeps the</span>
+<span class="a">+links in one plain sbm file, one line for each link:</span>
+ 
+     URL&lt;tab&gt;description&lt;tab&gt;tag tag tag
+ 
+<span class="d">-so `bm` can read and edit the same file.</span>
+<span class="a">+so `bm`, `cut`, `awk` and `grep` can read the same file.</span>
+ 
+<span class="d">-## Pages</span>
+<span class="a">+## Get the links</span>
+ 
+<span class="d">-| Path | Who | What |</span>
+<span class="d">-|---|---|---|</span>
+<span class="d">-| `GET /links/links.json` | everyone | The links, newest first, as JSON: `url`, `title`, `host`, `tags`. Only http and https links are in the list. |</span>
+<span class="d">-| `GET /links/admin` | owner | Add a link, delete a link, import a file. |</span>
+<span class="a">+The program makes each output from the file at each request. The outputs</span>
+<span class="a">+contain only http and https links.</span>
+<span class="a">+</span>
+<span class="a">+| Path | Format |</span>
+<span class="a">+|---|---|</span>
+<span class="a">+| `/links/links.txt` | The links as sbm lines, oldest first. |</span>
+<span class="a">+| `/links/atom.xml` | An Atom feed, newest first. Each tag of a link is a category. |</span>
+<span class="a">+| `/links/list.html` | The links as an HTML fragment, under each of their tags. A page of the site includes it with nginx SSI. |</span>
+<span class="a">+</span>
+<span class="a">+Each output sends `Last-Modified` and answers `If-Modified-Since` with</span>
+<span class="a">+`304 Not Modified`.</span>
+<span class="a">+</span>
+<span class="a">+To follow the links in [sfeed](https://codemadness.org/sfeed.html), add</span>
+<span class="a">+a line to `feeds()` in your sfeedrc:</span>
+<span class="a">+</span>
+<span class="a">+    feed &#x27;recentlywritten links&#x27; &#x27;https://recentlywritten.com/links/atom.xml&#x27;</span>
+<span class="a">+</span>
+<span class="a">+The plain text works with the usual tools:</span>
+<span class="a">+</span>
+<span class="a">+    curl -s https://recentlywritten.com/links/links.txt | cut -f1</span>
+<span class="a">+    curl -s https://recentlywritten.com/links/links.txt | bm --merge</span>
+<span class="a">+    curl -s https://recentlywritten.com/links/links.txt | dmenu -l 20 | cut -f1 | xargs xdg-open</span>
+<span class="a">+</span>
+<span class="a">+## Dates</span>
+<span class="a">+</span>
+<span class="a">+A feed needs the time of each link, and an sbm line has no time. So the</span>
+<span class="a">+admin page writes a date line above the links that it adds:</span>
+ 
+<span class="d">-The admin pages use HTTP basic auth. Any user name works. The password is</span>
+<span class="d">-the value of `ADMIN_PASSWORD`. The server refuses a form POST that comes</span>
+<span class="d">-from another site.</span>
+<span class="a">+    # 2026-09-25T08:00:00Z</span>
+<span class="a">+    https://suckless.org/	software that sucks less	code unix</span>
+<span class="a">+</span>
+<span class="a">+`bm` ignores each line that starts with `#`, so the file stays an sbm file.</span>
+<span class="a">+In the feed, a link gets the time of the last date line above it. A link</span>
+<span class="a">+below no date line gets the time of the file. If you add links to the file</span>
+<span class="a">+with an editor, write a date line above them.</span>
+<span class="a">+</span>
+<span class="a">+## The admin page</span>
+<span class="a">+</span>
+<span class="a">+`/links/admin` lets the owner add a link, delete a link and import a file.</span>
+<span class="a">+It uses HTTP basic auth. Any user name works. The password is the value of</span>
+<span class="a">+`ADMIN_PASSWORD`. The server refuses a form POST that comes from another</span>
+<span class="a">+site.</span>
+ 
+ The import takes an sbm file or the Netscape HTML that browsers export.
+<span class="d">-The folders of a browser bookmark become its tags. A URL that is a link</span>
+<span class="d">-already is skipped. Two URLs are the same link when they differ only in</span>
+<span class="d">-scheme, a leading `www.`, trailing slashes or the case of the host, as in</span>
+<span class="d">-`bm`.</span>
+<span class="a">+The folders of a browser bookmark become its tags. The import skips a URL</span>
+<span class="a">+that is a link already. Two URLs are the same link when they differ only</span>
+<span class="a">+in scheme, a leading `www.`, trailing slashes or the case of the host, as</span>
+<span class="a">+in `bm`.</span>
+ 
+ ## Run
+ 
+<span class="h">@@ -36,15 +71,30 @@ Then open http://127.0.0.1:8082/links/admin.</span>
+ 
+ | Variable | Default | Meaning |
+ |---|---|---|
+<span class="d">-| `ADMIN_PASSWORD` | none, required | The password of the admin pages. |</span>
+<span class="a">+| `ADMIN_PASSWORD` | none, required | The password of the admin page. |</span>
+ | `LINKS_FILE` | `links.sbm` | The sbm file of the links. |
+ | `ADDR` | `127.0.0.1:8082` | The address to listen on. |
+ 
+<span class="a">+The feed has no settings. It gets its address and name from the request.</span>
+<span class="a">+</span>
+ ## Put it on a site
+ 
+<span class="d">-1. Install the service with `deploy/sbm-webpublish.service`.</span>
+<span class="d">-2. Add `deploy/nginx-location.conf` to the nginx server block of the site.</span>
+<span class="d">-3. On a page of the site, get `links/links.json` and show the links. See</span>
+<span class="a">+1. Install the program on a server with systemd and nginx:</span>
+<span class="a">+</span>
+<span class="a">+       sh deploy/deploy.sh root@example.com</span>
+<span class="a">+</span>
+<span class="a">+   The script builds the program, installs `deploy/sbm-webpublish.service`,</span>
+<span class="a">+   makes an admin password when there is none, and installs</span>
+<span class="a">+   `deploy/nginx-location.conf` as `/etc/nginx/snippets/sbm-webpublish.conf`.</span>
+<span class="a">+2. Add `include snippets/sbm-webpublish.conf;` to the server block of the</span>
+<span class="a">+   site, then run `nginx -t &amp;&amp; systemctl reload nginx`. The snippet sends</span>
+<span class="a">+   `/links/` to the program and turns on SSI for `/links.html`.</span>
+<span class="a">+3. Put this line in the page of the links:</span>
+<span class="a">+</span>
+<span class="a">+       &lt;!--# include virtual=&quot;/links/list.html&quot; --&gt;</span>
+<span class="a">+</span>
+<span class="a">+   Put `&lt;link rel=&quot;alternate&quot; type=&quot;application/atom+xml&quot; href=&quot;links/atom.xml&quot;&gt;`</span>
+<span class="a">+   in its head, so that feed readers and `sfeed_web` find the feed. See</span>
+    `pages/links.md` in
+    [recentlywritten](https://github.com/equwal/recentlywritten) for an
+    example.
+diff --git a/admin.html b/admin.html
+index bab0bca..0a5f265 100644
+--- a/admin.html
++++ b/admin.html
+<span class="h">@@ -16,7 +16,7 @@ li form { display: inline; }</span>
+ &lt;/head&gt;
+ &lt;body&gt;
+ &lt;h1&gt;Links&lt;/h1&gt;
+<span class="d">-&lt;p&gt;&lt;a href=&quot;links.json&quot;&gt;links.json&lt;/a&gt; · &lt;a href=&quot;/links.html&quot;&gt;public page&lt;/a&gt;&lt;/p&gt;</span>
+<span class="a">+&lt;p&gt;&lt;a href=&quot;links.txt&quot;&gt;links.txt&lt;/a&gt; · &lt;a href=&quot;atom.xml&quot;&gt;atom.xml&lt;/a&gt; · &lt;a href=&quot;/links.html&quot;&gt;public page&lt;/a&gt;&lt;/p&gt;</span>
+ {{with .Message}}&lt;p class=&quot;message&quot;&gt;{{.}}&lt;/p&gt;{{end}}
+ 
+ &lt;h2&gt;Add a link&lt;/h2&gt;
+diff --git a/deploy/deploy.sh b/deploy/deploy.sh
+new file mode 100644
+index 0000000..93af47b
+--- /dev/null
++++ b/deploy/deploy.sh
+<span class="h">@@ -0,0 +1,43 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+# deploy.sh: build sbm-webpublish for Linux and install it on a server with</span>
+<span class="a">+# systemd and nginx.</span>
+<span class="a">+#</span>
+<span class="a">+#     sh deploy/deploy.sh root@example.com</span>
+<span class="a">+#</span>
+<span class="a">+# When the server has no admin password, the script makes one. Read it on</span>
+<span class="a">+# the server with: cat /etc/sbm-webpublish.env</span>
+<span class="a">+set -e</span>
+<span class="a">+host=${1:?usage: sh deploy/deploy.sh user@host}</span>
+<span class="a">+cd &quot;$(dirname &quot;$0&quot;)/..&quot;</span>
+<span class="a">+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -o sbm-webpublish .</span>
+<span class="a">+scp sbm-webpublish deploy/sbm-webpublish.service deploy/nginx-location.conf &quot;$host:/tmp/&quot;</span>
+<span class="a">+rm sbm-webpublish</span>
+<span class="a">+ssh &quot;$host&quot; sh -s &lt;&lt; &#x27;EOF&#x27;</span>
+<span class="a">+set -e</span>
+<span class="a">+install -m 755 /tmp/sbm-webpublish /usr/local/bin/sbm-webpublish</span>
+<span class="a">+install -m 644 /tmp/sbm-webpublish.service /etc/systemd/system/sbm-webpublish.service</span>
+<span class="a">+install -m 644 /tmp/nginx-location.conf /etc/nginx/snippets/sbm-webpublish.conf</span>
+<span class="a">+rm /tmp/sbm-webpublish /tmp/sbm-webpublish.service /tmp/nginx-location.conf</span>
+<span class="a">+if [ ! -s /etc/sbm-webpublish.env ]; then</span>
+<span class="a">+    (umask 077 &amp;&amp; printf &#x27;ADMIN_PASSWORD=%s\n&#x27; &quot;$(head -c 18 /dev/urandom | base64)&quot; &gt; /etc/sbm-webpublish.env)</span>
+<span class="a">+    echo &quot;made an admin password: cat /etc/sbm-webpublish.env&quot;</span>
+<span class="a">+fi</span>
+<span class="a">+systemctl daemon-reload</span>
+<span class="a">+systemctl enable sbm-webpublish</span>
+<span class="a">+systemctl restart sbm-webpublish</span>
+<span class="a">+sleep 1</span>
+<span class="a">+if ! systemctl is-active --quiet sbm-webpublish; then</span>
+<span class="a">+    journalctl -u sbm-webpublish -n 20 --no-pager</span>
+<span class="a">+    exit 1</span>
+<span class="a">+fi</span>
+<span class="a">+echo &quot;sbm-webpublish is running&quot;</span>
+<span class="a">+if grep -qs &#x27;snippets/sbm-webpublish.conf&#x27; /etc/nginx/sites-enabled/*; then</span>
+<span class="a">+    nginx -t</span>
+<span class="a">+    systemctl reload nginx</span>
+<span class="a">+    echo &quot;nginx reloaded&quot;</span>
+<span class="a">+else</span>
+<span class="a">+    echo &quot;Add this line to the server block of the site:&quot;</span>
+<span class="a">+    echo &quot;    include snippets/sbm-webpublish.conf;&quot;</span>
+<span class="a">+    echo &quot;Then run: nginx -t &amp;&amp; systemctl reload nginx&quot;</span>
+<span class="a">+fi</span>
+<span class="a">+EOF</span>
+diff --git a/deploy/nginx-location.conf b/deploy/nginx-location.conf
+index a13b214..c863f4a 100644
+--- a/deploy/nginx-location.conf
++++ b/deploy/nginx-location.conf
+<span class="h">@@ -1,10 +1,20 @@</span>
+<span class="d">-# Example for nginx. Add this block to the server block of the site.</span>
+<span class="a">+# nginx snippet for sbm-webpublish. deploy.sh installs it as</span>
+<span class="a">+# /etc/nginx/snippets/sbm-webpublish.conf. Include it in the server block of</span>
+<span class="a">+# the site:</span>
+<span class="a">+#</span>
+<span class="a">+#     include snippets/sbm-webpublish.conf;</span>
+<span class="a">+#</span>
+ # nginx continues to serve the static site. It sends only /links/ to
+ # sbm-webpublish. Serve the site over HTTPS: the admin page uses basic auth.
+ location /links/ {
+     proxy_pass http://127.0.0.1:8082;
+     proxy_set_header Host $host;
+<span class="d">-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;</span>
+     proxy_set_header X-Forwarded-Proto $scheme;
+     client_max_body_size 10m;
+ }
+<span class="a">+</span>
+<span class="a">+# The page of the links includes /links/list.html with SSI. Change the path</span>
+<span class="a">+# to the path of your page. This location gets the root of the server block.</span>
+<span class="a">+location = /links.html {</span>
+<span class="a">+    ssi on;</span>
+<span class="a">+}</span>
+diff --git a/deploy/sbm-webpublish.service b/deploy/sbm-webpublish.service
+index 9c746c5..4c4d2d1 100644
+--- a/deploy/sbm-webpublish.service
++++ b/deploy/sbm-webpublish.service
+<span class="h">@@ -1,10 +1,6 @@</span>
+<span class="d">-# systemd unit for sbm-webpublish.</span>
+<span class="d">-# Install:</span>
+<span class="d">-#   GOOS=linux GOARCH=amd64 go build -o sbm-webpublish .</span>
+<span class="d">-#   copy the binary to /usr/local/bin/sbm-webpublish</span>
+<span class="d">-#   put ADMIN_PASSWORD=... in /etc/sbm-webpublish.env (mode 600)</span>
+<span class="d">-#   copy this file to /etc/systemd/system/sbm-webpublish.service</span>
+<span class="d">-#   systemctl daemon-reload &amp;&amp; systemctl enable --now sbm-webpublish</span>
+<span class="a">+# systemd unit for sbm-webpublish. deploy.sh installs it as</span>
+<span class="a">+# /etc/systemd/system/sbm-webpublish.service. /etc/sbm-webpublish.env</span>
+<span class="a">+# (mode 600) holds ADMIN_PASSWORD=...</span>
+ [Unit]
+ Description=sbm-webpublish: links from an sbm bookmark file
+ After=network-online.target
+diff --git a/links.go b/links.go
+index 18d2699..9c960df 100644
+--- a/links.go
++++ b/links.go
+<span class="h">@@ -6,12 +6,20 @@ package main</span>
+ //
+ // The parse, import and duplicate rules are the rules of bm and sbm-sync,
+ // so a file from bm works here, and the file here works in bm.
+<span class="a">+//</span>
+<span class="a">+// A feed needs the time of each link, and a bm line has no time. So the</span>
+<span class="a">+// admin page writes a date line above the links that it adds:</span>
+<span class="a">+//</span>
+<span class="a">+//	# 2026-09-25T08:00:00Z</span>
+<span class="a">+//</span>
+<span class="a">+// bm ignores each line that starts with &quot;#&quot;, so the file stays an sbm file.</span>
+ 
+ import (
+ 	&quot;html&quot;
+ 	&quot;regexp&quot;
+ 	&quot;slices&quot;
+ 	&quot;strings&quot;
+<span class="a">+	&quot;time&quot;</span>
+ )
+ 
+ var (
+<span class="h">@@ -20,10 +28,12 @@ var (</span>
+ 	imported = regexp.MustCompile(`^(https?|ftp|file)://`)
+ )
+ 
+<span class="d">-// Link is one link of the file.</span>
+<span class="a">+// Link is one link of the file. Added is the time of the last date line</span>
+<span class="a">+// above the link, or zero when there is no date line above it.</span>
+ type Link struct {
+ 	URL, Desc string
+ 	Tags      []string
+<span class="a">+	Added     time.Time</span>
+ }
+ 
+ // Title gives the text of the link.
+<span class="h">@@ -119,11 +129,30 @@ func parseLine(line string) (Link, bool) {</span>
+ 	return l, l.URL != &quot;&quot;
+ }
+ 
+<span class="a">+// dateLine gives the date line of t.</span>
+<span class="a">+func dateLine(t time.Time) string {</span>
+<span class="a">+	return &quot;# &quot; + t.UTC().Format(time.RFC3339)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// dateOf gives the time of a date line, and false for all other lines.</span>
+<span class="a">+func dateOf(line string) (time.Time, bool) {</span>
+<span class="a">+	s, ok := strings.CutPrefix(line, &quot;#&quot;)</span>
+<span class="a">+	if !ok {</span>
+<span class="a">+		return time.Time{}, false</span>
+<span class="a">+	}</span>
+<span class="a">+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(s))</span>
+<span class="a">+	return t, err == nil</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // parse gives the links of a file, in the order of the file.
+ func parse(text string) []Link {
+ 	var out []Link
+<span class="a">+	var added time.Time</span>
+ 	for _, s := range lines(text) {
+<span class="d">-		if l, ok := parseLine(s); ok {</span>
+<span class="a">+		if t, ok := dateOf(s); ok {</span>
+<span class="a">+			added = t</span>
+<span class="a">+		} else if l, ok := parseLine(s); ok {</span>
+<span class="a">+			l.Added = added</span>
+ 			out = append(out, l)
+ 		}
+ 	}
+<span class="h">@@ -244,6 +273,16 @@ func merge(text string, rows []string) (string, int, int) {</span>
+ 	return join(ls), added, skipped
+ }
+ 
+<span class="a">+// addDated adds rows to text as merge does, below a date line of t. It</span>
+<span class="a">+// writes the date line only when it adds a row.</span>
+<span class="a">+func addDated(text string, rows []string, t time.Time) (string, int, int) {</span>
+<span class="a">+	out, added, skipped := merge(join(append(lines(text), dateLine(t))), rows)</span>
+<span class="a">+	if added == 0 {</span>
+<span class="a">+		return text, 0, skipped</span>
+<span class="a">+	}</span>
+<span class="a">+	return out, added, skipped</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // remove gives text without the lines whose URL has the normal form k.
+ func remove(text, k string) string {
+ 	var out []string
+diff --git a/links_test.go b/links_test.go
+index 4354436..a41970f 100644
+--- a/links_test.go
++++ b/links_test.go
+<span class="h">@@ -4,6 +4,7 @@ import (</span>
+ 	&quot;slices&quot;
+ 	&quot;strings&quot;
+ 	&quot;testing&quot;
+<span class="a">+	&quot;time&quot;</span>
+ 
+ 	&quot;pgregory.net/rapid&quot;
+ )
+<span class="h">@@ -81,6 +82,56 @@ func TestRemove(t *testing.T) {</span>
+ 	})
+ }
+ 
+<span class="a">+func TestDateLineParsesBack(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		// From the year 1 to the year 9999: RFC 3339 has four digits for</span>
+<span class="a">+		// the year.</span>
+<span class="a">+		u := time.Unix(rapid.Int64Range(-62135596800, 253402300799).Draw(t, &quot;unix&quot;), rapid.Int64Range(0, 999999999).Draw(t, &quot;ns&quot;))</span>
+<span class="a">+		got, ok := dateOf(dateLine(u))</span>
+<span class="a">+		if !ok || !got.Equal(u.Truncate(time.Second)) {</span>
+<span class="a">+			t.Fatalf(&quot;%q gave %v %v&quot;, dateLine(u), got, ok)</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestParseDates(t *testing.T) {</span>
+<span class="a">+	d := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)</span>
+<span class="a">+	e := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)</span>
+<span class="a">+	ls := parse(&quot;a.com\tA\t\n# 2026-01-02T03:04:05Z\nb.com\tB\t\n# a comment\nc.com\tC\t\n#2026-01-01T00:00:00Z\nd.com\tD\t\n&quot;)</span>
+<span class="a">+	want := []time.Time{{}, d, d, e}</span>
+<span class="a">+	if len(ls) != len(want) {</span>
+<span class="a">+		t.Fatalf(&quot;got %d links&quot;, len(ls))</span>
+<span class="a">+	}</span>
+<span class="a">+	for i, l := range ls {</span>
+<span class="a">+		if !l.Added.Equal(want[i]) {</span>
+<span class="a">+			t.Errorf(&quot;%s: added %v, want %v&quot;, l.URL, l.Added, want[i])</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestAddDatedDatesOnlyTheNewLinks(t *testing.T) {</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		base, _, _ := merge(&quot;&quot;, rapid.SliceOf(rapid.Custom(genRow)).Draw(t, &quot;base&quot;))</span>
+<span class="a">+		rows := rapid.SliceOf(rapid.Custom(genRow)).Draw(t, &quot;rows&quot;)</span>
+<span class="a">+		when := time.Unix(rapid.Int64Range(0, 4102444800).Draw(t, &quot;when&quot;), 0)</span>
+<span class="a">+		out, added, _ := addDated(base, rows, when)</span>
+<span class="a">+		old, ls := parse(base), parse(out)</span>
+<span class="a">+		switch {</span>
+<span class="a">+		case added == 0 &amp;&amp; out != base:</span>
+<span class="a">+			t.Fatalf(&quot;no link added, but the text changed to %q&quot;, out)</span>
+<span class="a">+		case added &gt; 0 &amp;&amp; !strings.HasPrefix(out, base+dateLine(when)+&quot;\n&quot;):</span>
+<span class="a">+			t.Fatalf(&quot;no date line after the old links in %q&quot;, out)</span>
+<span class="a">+		case len(ls) != len(old)+added:</span>
+<span class="a">+			t.Fatalf(&quot;%d links, want %d + %d&quot;, len(ls), len(old), added)</span>
+<span class="a">+		}</span>
+<span class="a">+		for i, l := range ls {</span>
+<span class="a">+			if i &lt; len(old) &amp;&amp; !l.Added.Equal(old[i].Added) || i &gt;= len(old) &amp;&amp; !l.Added.Equal(when) {</span>
+<span class="a">+				t.Fatalf(&quot;link %d %q has the time %v&quot;, i, l.URL, l.Added)</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func TestHrefIsOnlyHTTP(t *testing.T) {
+ 	for u, want := range map[string]string{
+ 		&quot;https://a.com&quot;:         &quot;https://a.com&quot;,
+diff --git a/main.go b/main.go
+index 48878bb..69a98df 100644
+--- a/main.go
++++ b/main.go
+<span class="h">@@ -1,12 +1,12 @@</span>
+ // sbm-webpublish publishes an sbm bookmark file as a list of links on a
+<span class="d">-// web site. The site gets the links as JSON from /links/links.json. The</span>
+<span class="d">-// owner adds, deletes and imports links on /links/admin.</span>
+<span class="a">+// web site. Everyone can get the links as sbm lines, as an Atom feed and as</span>
+<span class="a">+// HTML (see public.go). The owner adds, deletes and imports links on</span>
+<span class="a">+// /links/admin.</span>
+ package main
+ 
+ import (
+ 	&quot;crypto/subtle&quot;
+ 	_ &quot;embed&quot;
+<span class="d">-	&quot;encoding/json&quot;</span>
+ 	&quot;errors&quot;
+ 	&quot;html/template&quot;
+ 	&quot;io&quot;
+<span class="h">@@ -18,6 +18,7 @@ import (</span>
+ 	&quot;slices&quot;
+ 	&quot;strconv&quot;
+ 	&quot;sync&quot;
+<span class="a">+	&quot;time&quot;</span>
+ )
+ 
+ //go:embed admin.html
+<span class="h">@@ -34,30 +35,47 @@ type store struct {</span>
+ 	path string
+ }
+ 
+<span class="d">-func (s *store) read() (string, error) {</span>
+<span class="d">-	b, err := os.ReadFile(s.path)</span>
+<span class="a">+// read gives the text of the file and the time of its last change. A</span>
+<span class="a">+// missing file is an empty file.</span>
+<span class="a">+func (s *store) read() (string, time.Time, error) {</span>
+<span class="a">+	f, err := os.Open(s.path)</span>
+ 	if errors.Is(err, fs.ErrNotExist) {
+<span class="d">-		return &quot;&quot;, nil</span>
+<span class="a">+		return &quot;&quot;, time.Time{}, nil</span>
+ 	}
+<span class="d">-	return string(b), err</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return &quot;&quot;, time.Time{}, err</span>
+<span class="a">+	}</span>
+<span class="a">+	defer f.Close()</span>
+<span class="a">+	// The time comes from the open file and not from its name, so that the</span>
+<span class="a">+	// time and the text are of the same version of the file.</span>
+<span class="a">+	st, err := f.Stat()</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		return &quot;&quot;, time.Time{}, err</span>
+<span class="a">+	}</span>
+<span class="a">+	b, err := io.ReadAll(f)</span>
+<span class="a">+	return string(b), st.ModTime(), err</span>
+ }
+ 
+<span class="d">-// change reads the file, gives its text to f, and writes the result. It</span>
+<span class="d">-// writes a temporary file and renames it, so that a reader never sees half</span>
+<span class="d">-// a file.</span>
+<span class="a">+// change reads the file, gives its text to f, and writes the result when it</span>
+<span class="a">+// is different. It writes a temporary file and renames it, so that a reader</span>
+<span class="a">+// never sees half a file.</span>
+ func (s *store) change(f func(string) string) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+<span class="d">-	text, err := s.read()</span>
+<span class="a">+	text, _, err := s.read()</span>
+ 	if err != nil {
+ 		return err
+ 	}
+<span class="a">+	out := f(text)</span>
+<span class="a">+	if out == text {</span>
+<span class="a">+		return nil</span>
+<span class="a">+	}</span>
+ 	tmp, err := os.CreateTemp(filepath.Dir(s.path), &quot;.links-*&quot;)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	defer os.Remove(tmp.Name())
+<span class="d">-	if _, err := tmp.WriteString(f(text)); err != nil {</span>
+<span class="a">+	if _, err := tmp.WriteString(out); err != nil {</span>
+ 		tmp.Close()
+ 		return err
+ 	}
+<span class="h">@@ -70,42 +88,8 @@ func (s *store) change(f func(string) string) error {</span>
+ type server struct {
+ 	links    *store
+ 	password string
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-// jsonLink is one link in links.json.</span>
+<span class="d">-type jsonLink struct {</span>
+<span class="d">-	URL   string   `json:&quot;url&quot;`</span>
+<span class="d">-	Title string   `json:&quot;title&quot;`</span>
+<span class="d">-	Host  string   `json:&quot;host&quot;`</span>
+<span class="d">-	Tags  []string `json:&quot;tags&quot;`</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-// publicLinks gives the links that the page can show: only the links with</span>
+<span class="d">-// an http or https address. The newest link is first.</span>
+<span class="d">-func publicLinks(text string) []jsonLink {</span>
+<span class="d">-	out := []jsonLink{}</span>
+<span class="d">-	for _, l := range parse(text) {</span>
+<span class="d">-		if h := l.Href(); h != &quot;&quot; {</span>
+<span class="d">-			tags := l.Tags</span>
+<span class="d">-			if tags == nil {</span>
+<span class="d">-				tags = []string{}</span>
+<span class="d">-			}</span>
+<span class="d">-			out = append([]jsonLink{{h, l.Title(), l.Host(), tags}}, out...)</span>
+<span class="d">-		}</span>
+<span class="d">-	}</span>
+<span class="d">-	return out</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-func (s *server) linksJSON(w http.ResponseWriter, r *http.Request) {</span>
+<span class="d">-	text, err := s.links.read()</span>
+<span class="d">-	if err != nil {</span>
+<span class="d">-		http.Error(w, &quot;cannot read the links&quot;, http.StatusInternalServerError)</span>
+<span class="d">-		log.Print(err)</span>
+<span class="d">-		return</span>
+<span class="d">-	}</span>
+<span class="d">-	w.Header().Set(&quot;Content-Type&quot;, &quot;application/json; charset=utf-8&quot;)</span>
+<span class="d">-	w.Header().Set(&quot;Cache-Control&quot;, &quot;max-age=60&quot;)</span>
+<span class="d">-	json.NewEncoder(w).Encode(publicLinks(text))</span>
+<span class="a">+	// now gives the time for the date lines. Tests set a fixed time.</span>
+<span class="a">+	now func() time.Time</span>
+ }
+ 
+ // admin lets only the owner through: HTTP basic auth with any user name
+<span class="h">@@ -128,7 +112,7 @@ type adminData struct {</span>
+ }
+ 
+ func (s *server) show(w http.ResponseWriter, message string) {
+<span class="d">-	text, err := s.links.read()</span>
+<span class="a">+	text, _, err := s.links.read()</span>
+ 	if err != nil {
+ 		http.Error(w, &quot;cannot read the links&quot;, http.StatusInternalServerError)
+ 		log.Print(err)
+<span class="h">@@ -159,7 +143,7 @@ func (s *server) add(w http.ResponseWriter, r *http.Request) {</span>
+ 	}
+ 	var added int
+ 	err := s.links.change(func(text string) string {
+<span class="d">-		text, added, _ = merge(text, []string{row})</span>
+<span class="a">+		text, added, _ = addDated(text, []string{row}, s.now())</span>
+ 		return text
+ 	})
+ 	switch {
+<span class="h">@@ -198,7 +182,7 @@ func (s *server) importFile(w http.ResponseWriter, r *http.Request) {</span>
+ 	}
+ 	var added, skipped int
+ 	err = s.links.change(func(text string) string {
+<span class="d">-		text, added, skipped = merge(text, importRows(string(b)))</span>
+<span class="a">+		text, added, skipped = addDated(text, importRows(string(b)), s.now())</span>
+ 		return text
+ 	})
+ 	if err != nil {
+<span class="h">@@ -213,7 +197,9 @@ func (s *server) importFile(w http.ResponseWriter, r *http.Request) {</span>
+ // so that nginx can send /links/ here and serve the rest of the site.
+ func (s *server) routes() http.Handler {
+ 	mux := http.NewServeMux()
+<span class="d">-	mux.HandleFunc(&quot;GET /links/links.json&quot;, s.linksJSON)</span>
+<span class="a">+	mux.HandleFunc(&quot;GET /links/links.txt&quot;, s.plain)</span>
+<span class="a">+	mux.HandleFunc(&quot;GET /links/atom.xml&quot;, s.feed)</span>
+<span class="a">+	mux.HandleFunc(&quot;GET /links/list.html&quot;, s.list)</span>
+ 	mux.HandleFunc(&quot;GET /links/admin&quot;, s.admin(s.adminPage))
+ 	mux.HandleFunc(&quot;POST /links/admin/add&quot;, s.admin(s.add))
+ 	mux.HandleFunc(&quot;POST /links/admin/delete&quot;, s.admin(s.delete))
+<span class="h">@@ -235,7 +221,7 @@ func main() {</span>
+ 	if pw == &quot;&quot; {
+ 		log.Fatal(&quot;set ADMIN_PASSWORD&quot;)
+ 	}
+<span class="d">-	s := &amp;server{links: &amp;store{path: env(&quot;LINKS_FILE&quot;, &quot;links.sbm&quot;)}, password: pw}</span>
+<span class="a">+	s := &amp;server{links: &amp;store{path: env(&quot;LINKS_FILE&quot;, &quot;links.sbm&quot;)}, password: pw, now: time.Now}</span>
+ 	addr := env(&quot;ADDR&quot;, &quot;127.0.0.1:8082&quot;)
+ 	log.Printf(&quot;listening on %s, links file %s&quot;, addr, s.links.path)
+ 	log.Fatal(http.ListenAndServe(addr, s.routes()))
+diff --git a/public.go b/public.go
+new file mode 100644
+index 0000000..c9a32f3
+--- /dev/null
++++ b/public.go
+<span class="h">@@ -0,0 +1,186 @@</span>
+<span class="a">+package main</span>
+<span class="a">+</span>
+<span class="a">+// The public outputs. The server makes each one from the links file at each</span>
+<span class="a">+// request, and puts in only the links with an http or https address:</span>
+<span class="a">+//</span>
+<span class="a">+//	/links/links.txt   the links as sbm lines, for cut, awk, dmenu and bm</span>
+<span class="a">+//	/links/atom.xml    an Atom feed, for sfeed and other feed readers</span>
+<span class="a">+//	/links/list.html   the links as HTML, for a page of the site to include</span>
+<span class="a">+</span>
+<span class="a">+import (</span>
+<span class="a">+	&quot;bytes&quot;</span>
+<span class="a">+	&quot;encoding/xml&quot;</span>
+<span class="a">+	&quot;html/template&quot;</span>
+<span class="a">+	&quot;log&quot;</span>
+<span class="a">+	&quot;maps&quot;</span>
+<span class="a">+	&quot;net/http&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+<span class="a">+	&quot;strings&quot;</span>
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+)</span>
+<span class="a">+</span>
+<span class="a">+// published gives the links of text that the outputs show, in the order of</span>
+<span class="a">+// the file. The URL of each link is the address that Href gives.</span>
+<span class="a">+func published(text string) []Link {</span>
+<span class="a">+	var out []Link</span>
+<span class="a">+	for _, l := range parse(text) {</span>
+<span class="a">+		if l.URL = l.Href(); l.URL != &quot;&quot; {</span>
+<span class="a">+			out = append(out, l)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// serve sends the output that render makes from the links. The time of the</span>
+<span class="a">+// file is the Last-Modified time, so that a client can send</span>
+<span class="a">+// If-Modified-Since and get 304 Not Modified.</span>
+<span class="a">+func (s *server) serve(w http.ResponseWriter, r *http.Request, contentType string, render func([]Link, time.Time) []byte) {</span>
+<span class="a">+	text, mod, err := s.links.read()</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		log.Print(err)</span>
+<span class="a">+		http.Error(w, &quot;cannot read the links&quot;, http.StatusInternalServerError)</span>
+<span class="a">+		return</span>
+<span class="a">+	}</span>
+<span class="a">+	w.Header().Set(&quot;Content-Type&quot;, contentType)</span>
+<span class="a">+	http.ServeContent(w, r, &quot;&quot;, mod, bytes.NewReader(render(published(text), mod)))</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// plain sends the links as sbm lines, oldest first: URL, description and</span>
+<span class="a">+// tags, with a tab between them.</span>
+<span class="a">+func (s *server) plain(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	s.serve(w, r, &quot;text/plain; charset=utf-8&quot;, func(ls []Link, _ time.Time) []byte {</span>
+<span class="a">+		var b strings.Builder</span>
+<span class="a">+		for _, l := range ls {</span>
+<span class="a">+			b.WriteString(line(l.URL, l.Desc, strings.Join(l.Tags, &quot; &quot;)) + &quot;\n&quot;)</span>
+<span class="a">+		}</span>
+<span class="a">+		return []byte(b.String())</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// The Atom feed (RFC 4287).</span>
+<span class="a">+type atomFeed struct {</span>
+<span class="a">+	XMLName xml.Name    `xml:&quot;http://www.w3.org/2005/Atom feed&quot;`</span>
+<span class="a">+	Title   string      `xml:&quot;title&quot;`</span>
+<span class="a">+	ID      string      `xml:&quot;id&quot;`</span>
+<span class="a">+	Link    atomLink    `xml:&quot;link&quot;`</span>
+<span class="a">+	Updated string      `xml:&quot;updated&quot;`</span>
+<span class="a">+	Author  string      `xml:&quot;author&gt;name&quot;`</span>
+<span class="a">+	Entries []atomEntry `xml:&quot;entry&quot;`</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+type atomEntry struct {</span>
+<span class="a">+	Title      string         `xml:&quot;title&quot;`</span>
+<span class="a">+	Link       atomLink       `xml:&quot;link&quot;`</span>
+<span class="a">+	ID         string         `xml:&quot;id&quot;`</span>
+<span class="a">+	Updated    string         `xml:&quot;updated&quot;`</span>
+<span class="a">+	Categories []atomCategory `xml:&quot;category&quot;`</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+type atomLink struct {</span>
+<span class="a">+	Rel  string `xml:&quot;rel,attr,omitempty&quot;`</span>
+<span class="a">+	Href string `xml:&quot;href,attr&quot;`</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+type atomCategory struct {</span>
+<span class="a">+	Term string `xml:&quot;term,attr&quot;`</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func atomTime(t time.Time) string {</span>
+<span class="a">+	return t.UTC().Format(time.RFC3339)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// proto gives the scheme that the client used. Behind nginx,</span>
+<span class="a">+// X-Forwarded-Proto gives it.</span>
+<span class="a">+func proto(r *http.Request) string {</span>
+<span class="a">+	if r.TLS != nil || r.Header.Get(&quot;X-Forwarded-Proto&quot;) == &quot;https&quot; {</span>
+<span class="a">+		return &quot;https&quot;</span>
+<span class="a">+	}</span>
+<span class="a">+	return &quot;http&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// feed sends the links as an Atom feed, newest first. The time of a link is</span>
+<span class="a">+// the time of its date line. A link without a date line gets the time of the</span>
+<span class="a">+// file. Each tag is a category. The feed gets its address and name from the</span>
+<span class="a">+// request, so it needs no settings.</span>
+<span class="a">+func (s *server) feed(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	s.serve(w, r, &quot;application/atom+xml; charset=utf-8&quot;, func(ls []Link, mod time.Time) []byte {</span>
+<span class="a">+		self := proto(r) + &quot;://&quot; + r.Host + r.URL.Path</span>
+<span class="a">+		f := atomFeed{</span>
+<span class="a">+			Title:   r.Host + &quot; links&quot;,</span>
+<span class="a">+			ID:      self,</span>
+<span class="a">+			Link:    atomLink{Rel: &quot;self&quot;, Href: self},</span>
+<span class="a">+			Updated: atomTime(mod),</span>
+<span class="a">+			Author:  r.Host,</span>
+<span class="a">+		}</span>
+<span class="a">+		for _, l := range slices.Backward(ls) {</span>
+<span class="a">+			t := l.Added</span>
+<span class="a">+			if t.IsZero() {</span>
+<span class="a">+				t = mod</span>
+<span class="a">+			}</span>
+<span class="a">+			e := atomEntry{Title: l.Title(), Link: atomLink{Href: l.URL}, ID: l.URL, Updated: atomTime(t)}</span>
+<span class="a">+			for _, tag := range l.Tags {</span>
+<span class="a">+				e.Categories = append(e.Categories, atomCategory{tag})</span>
+<span class="a">+			}</span>
+<span class="a">+			f.Entries = append(f.Entries, e)</span>
+<span class="a">+		}</span>
+<span class="a">+		// Marshal fails only for types that XML cannot hold, and the feed</span>
+<span class="a">+		// has only strings. It writes U+FFFD for each character that XML</span>
+<span class="a">+		// cannot hold.</span>
+<span class="a">+		b, _ := xml.MarshalIndent(f, &quot;&quot;, &quot;\t&quot;)</span>
+<span class="a">+		return append([]byte(xml.Header), append(b, &#x27;\n&#x27;)...)</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// group is the links of one tag, for list.html.</span>
+<span class="a">+type group struct {</span>
+<span class="a">+	Tag   string</span>
+<span class="a">+	Links []Link</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// groups puts each link under each of its tags, newest link first. The tags</span>
+<span class="a">+// are in alphabetical order. The links without tags come last, under</span>
+<span class="a">+// &quot;untagged&quot;.</span>
+<span class="a">+func groups(ls []Link) []group {</span>
+<span class="a">+	byTag := map[string][]Link{}</span>
+<span class="a">+	for _, l := range slices.Backward(ls) {</span>
+<span class="a">+		tags := l.Tags</span>
+<span class="a">+		if len(tags) == 0 {</span>
+<span class="a">+			tags = []string{&quot;&quot;}</span>
+<span class="a">+		}</span>
+<span class="a">+		for _, t := range slices.Compact(slices.Sorted(slices.Values(tags))) {</span>
+<span class="a">+			byTag[t] = append(byTag[t], l)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	var out []group</span>
+<span class="a">+	for _, t := range slices.Sorted(maps.Keys(byTag)) {</span>
+<span class="a">+		if t != &quot;&quot; {</span>
+<span class="a">+			out = append(out, group{t, byTag[t]})</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+	if untagged := byTag[&quot;&quot;]; untagged != nil {</span>
+<span class="a">+		out = append(out, group{&quot;untagged&quot;, untagged})</span>
+<span class="a">+	}</span>
+<span class="a">+	return out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+var listTmpl = template.Must(template.New(&quot;list&quot;).Parse(`{{with .}}&lt;p&gt;{{range .}}&lt;a href=&quot;#{{.Tag}}&quot;&gt;{{.Tag}}&lt;/a&gt; {{end}}&lt;/p&gt;</span>
+<span class="a">+{{range .}}&lt;h2 id=&quot;{{.Tag}}&quot;&gt;{{.Tag}}&lt;/h2&gt;</span>
+<span class="a">+&lt;ul&gt;</span>
+<span class="a">+{{range .Links}}&lt;li&gt;&lt;a href=&quot;{{.URL}}&quot;&gt;{{.Title}}&lt;/a&gt; &lt;small&gt;{{.Host}}&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+{{end}}&lt;/ul&gt;</span>
+<span class="a">+{{end}}{{else}}&lt;p&gt;No links yet.&lt;/p&gt;</span>
+<span class="a">+{{end}}`))</span>
+<span class="a">+</span>
+<span class="a">+// list sends the links as an HTML fragment, under each of their tags. A page</span>
+<span class="a">+// of the site includes it with nginx SSI, so the page needs no script:</span>
+<span class="a">+//</span>
+<span class="a">+//	&lt;!--# include virtual=&quot;/links/list.html&quot; --&gt;</span>
+<span class="a">+func (s *server) list(w http.ResponseWriter, r *http.Request) {</span>
+<span class="a">+	s.serve(w, r, &quot;text/html; charset=utf-8&quot;, func(ls []Link, _ time.Time) []byte {</span>
+<span class="a">+		var b bytes.Buffer</span>
+<span class="a">+		if err := listTmpl.Execute(&amp;b, groups(ls)); err != nil {</span>
+<span class="a">+			log.Print(err)</span>
+<span class="a">+		}</span>
+<span class="a">+		return b.Bytes()</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+diff --git a/server_test.go b/server_test.go
+index a02a218..04bf1c8 100644
+--- a/server_test.go
++++ b/server_test.go
+<span class="h">@@ -2,19 +2,33 @@ package main</span>
+ 
+ import (
+ 	&quot;bytes&quot;
+<span class="d">-	&quot;encoding/json&quot;</span>
+<span class="a">+	&quot;encoding/xml&quot;</span>
+ 	&quot;mime/multipart&quot;
+ 	&quot;net/http&quot;
+ 	&quot;net/http/httptest&quot;
+ 	&quot;net/url&quot;
+ 	&quot;os&quot;
+ 	&quot;path/filepath&quot;
+<span class="a">+	&quot;reflect&quot;</span>
+<span class="a">+	&quot;slices&quot;</span>
+ 	&quot;strings&quot;
+ 	&quot;testing&quot;
+<span class="a">+	&quot;time&quot;</span>
+<span class="a">+</span>
+<span class="a">+	&quot;pgregory.net/rapid&quot;</span>
+ )
+ 
+<span class="a">+// day is the time of the clock of the test server.</span>
+<span class="a">+var day = time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)</span>
+<span class="a">+</span>
+<span class="a">+const dayLine = &quot;# 2026-09-25T08:00:00Z\n&quot;</span>
+<span class="a">+</span>
+ func newServer(t *testing.T) (*server, http.Handler) {
+<span class="d">-	s := &amp;server{links: &amp;store{path: filepath.Join(t.TempDir(), &quot;links.sbm&quot;)}, password: &quot;pw&quot;}</span>
+<span class="a">+	s := &amp;server{</span>
+<span class="a">+		links:    &amp;store{path: filepath.Join(t.TempDir(), &quot;links.sbm&quot;)},</span>
+<span class="a">+		password: &quot;pw&quot;,</span>
+<span class="a">+		now:      func() time.Time { return day },</span>
+<span class="a">+	}</span>
+ 	return s, s.routes()
+ }
+ 
+<span class="h">@@ -27,19 +41,33 @@ func do(h http.Handler, r *http.Request, auth bool) *httptest.ResponseRecorder {</span>
+ 	return w
+ }
+ 
+<span class="a">+func get(h http.Handler, path string) *httptest.ResponseRecorder {</span>
+<span class="a">+	return do(h, httptest.NewRequest(&quot;GET&quot;, path, nil), false)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ func form(path string, v url.Values) *http.Request {
+ 	r := httptest.NewRequest(&quot;POST&quot;, path, strings.NewReader(v.Encode()))
+ 	r.Header.Set(&quot;Content-Type&quot;, &quot;application/x-www-form-urlencoded&quot;)
+ 	return r
+ }
+ 
+<span class="d">-func publicJSON(t *testing.T, h http.Handler) []jsonLink {</span>
+<span class="d">-	w := do(h, httptest.NewRequest(&quot;GET&quot;, &quot;/links/links.json&quot;, nil), false)</span>
+<span class="d">-	var ls []jsonLink</span>
+<span class="d">-	if err := json.Unmarshal(w.Body.Bytes(), &amp;ls); err != nil {</span>
+<span class="d">-		t.Fatal(err, w.Body.String())</span>
+<span class="a">+// fataler is *testing.T or *rapid.T.</span>
+<span class="a">+type fataler interface {</span>
+<span class="a">+	Fatalf(format string, args ...any)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func write(t fataler, s *server, text string) {</span>
+<span class="a">+	if err := os.WriteFile(s.links.path, []byte(text), 0o644); err != nil {</span>
+<span class="a">+		t.Fatalf(&quot;%v&quot;, err)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func feedOf(t fataler, w *httptest.ResponseRecorder) atomFeed {</span>
+<span class="a">+	var f atomFeed</span>
+<span class="a">+	if err := xml.Unmarshal(w.Body.Bytes(), &amp;f); err != nil {</span>
+<span class="a">+		t.Fatalf(&quot;%v in %s&quot;, err, w.Body)</span>
+ 	}
+<span class="d">-	return ls</span>
+<span class="a">+	return f</span>
+ }
+ 
+ func TestAdminNeedsPassword(t *testing.T) {
+<span class="h">@@ -59,13 +87,13 @@ func TestAdminNeedsPassword(t *testing.T) {</span>
+ 	}
+ }
+ 
+<span class="d">-func TestAddDeleteAndJSON(t *testing.T) {</span>
+<span class="a">+func TestAddAndDelete(t *testing.T) {</span>
+ 	s, h := newServer(t)
+<span class="d">-	if ls := publicJSON(t, h); len(ls) != 0 {</span>
+<span class="d">-		t.Fatalf(&quot;empty store gave %v&quot;, ls)</span>
+<span class="a">+	if body := get(h, &quot;/links/links.txt&quot;).Body.String(); body != &quot;&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;empty store gave %q&quot;, body)</span>
+ 	}
+ 	do(h, form(&quot;/links/admin/add&quot;, url.Values{&quot;url&quot;: {&quot;https://a.com&quot;}, &quot;desc&quot;: {&quot;A&quot;}, &quot;tags&quot;: {&quot;x y&quot;}}), true)
+<span class="d">-	w := do(h, form(&quot;/links/admin/add&quot;, url.Values{&quot;url&quot;: {&quot;https://b.com&quot;}}), true)</span>
+<span class="a">+	w := do(h, form(&quot;/links/admin/add&quot;, url.Values{&quot;url&quot;: {&quot;b.com&quot;}}), true)</span>
+ 	if w.Code != http.StatusSeeOther || w.Header().Get(&quot;Location&quot;) != &quot;/links/admin?m=Added.&quot; {
+ 		t.Fatalf(&quot;add: %d %q&quot;, w.Code, w.Header().Get(&quot;Location&quot;))
+ 	}
+<span class="h">@@ -73,28 +101,164 @@ func TestAddDeleteAndJSON(t *testing.T) {</span>
+ 	if !strings.Contains(w.Header().Get(&quot;Location&quot;), &quot;already&quot;) {
+ 		t.Fatalf(&quot;duplicate add: %q&quot;, w.Header().Get(&quot;Location&quot;))
+ 	}
+<span class="d">-	ls := publicJSON(t, h)</span>
+<span class="d">-	if len(ls) != 2 || ls[0].URL != &quot;https://b.com&quot; || ls[1].Title != &quot;A&quot; || len(ls[1].Tags) != 2 {</span>
+<span class="d">-		t.Fatalf(&quot;json: %+v&quot;, ls)</span>
+<span class="a">+	if body := get(h, &quot;/links/links.txt&quot;).Body.String(); body != &quot;https://a.com\tA\tx y\nhttps://b.com\t\t\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;links.txt: %q&quot;, body)</span>
+ 	}
+ 	do(h, form(&quot;/links/admin/delete&quot;, url.Values{&quot;url&quot;: {&quot;https://b.com&quot;}}), true)
+<span class="a">+	// The date line of the deleted link stays. bm ignores it.</span>
+ 	b, _ := os.ReadFile(s.links.path)
+<span class="d">-	if string(b) != &quot;https://a.com\tA\tx y\n&quot; {</span>
+<span class="a">+	if string(b) != dayLine+&quot;https://a.com\tA\tx y\n&quot;+dayLine {</span>
+ 		t.Fatalf(&quot;file: %q&quot;, b)
+ 	}
+ }
+ 
+<span class="d">-func TestJSONHidesUnsafeLinks(t *testing.T) {</span>
+<span class="a">+func TestOutputsHideUnsafeLinks(t *testing.T) {</span>
+<span class="a">+	s, h := newServer(t)</span>
+<span class="a">+	write(t, s, &quot;javascript:alert(1)\tx\t\ndata:text/html,x\ty\t\nhttps://a.com\tA\t\n&quot;)</span>
+<span class="a">+	for _, path := range []string{&quot;/links/links.txt&quot;, &quot;/links/atom.xml&quot;, &quot;/links/list.html&quot;} {</span>
+<span class="a">+		body := get(h, path).Body.String()</span>
+<span class="a">+		if strings.Contains(body, &quot;javascript&quot;) || strings.Contains(body, &quot;data:&quot;) || !strings.Contains(body, &quot;https://a.com&quot;) {</span>
+<span class="a">+			t.Errorf(&quot;%s: %s&quot;, path, body)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestAtom(t *testing.T) {</span>
+ 	s, h := newServer(t)
+<span class="d">-	os.WriteFile(s.links.path, []byte(&quot;javascript:alert(1)\tx\t\nhttps://a.com\tA\t\n&quot;), 0o644)</span>
+<span class="d">-	if ls := publicJSON(t, h); len(ls) != 1 || ls[0].URL != &quot;https://a.com&quot; {</span>
+<span class="d">-		t.Fatalf(&quot;json: %+v&quot;, ls)</span>
+<span class="a">+	write(t, s, &quot;https://old.com\tOld\t\n# 2026-01-02T03:04:05Z\nhttps://a.com\tA &amp; B\tx y\n# a comment\nb.com\t\t\n&quot;)</span>
+<span class="a">+	r := httptest.NewRequest(&quot;GET&quot;, &quot;/links/atom.xml&quot;, nil)</span>
+<span class="a">+	r.Host = &quot;example.org&quot;</span>
+<span class="a">+	r.Header.Set(&quot;X-Forwarded-Proto&quot;, &quot;https&quot;)</span>
+<span class="a">+	w := do(h, r, false)</span>
+<span class="a">+	if ct := w.Header().Get(&quot;Content-Type&quot;); ct != &quot;application/atom+xml; charset=utf-8&quot; {</span>
+<span class="a">+		t.Errorf(&quot;Content-Type %q&quot;, ct)</span>
+<span class="a">+	}</span>
+<span class="a">+	f := feedOf(t, w)</span>
+<span class="a">+	self := &quot;https://example.org/links/atom.xml&quot;</span>
+<span class="a">+	if f.ID != self || f.Link != (atomLink{&quot;self&quot;, self}) || f.Title != &quot;example.org links&quot; || f.Author != &quot;example.org&quot; {</span>
+<span class="a">+		t.Errorf(&quot;feed: %+v&quot;, f)</span>
+<span class="a">+	}</span>
+<span class="a">+	st, err := os.Stat(s.links.path)</span>
+<span class="a">+	if err != nil {</span>
+<span class="a">+		t.Fatal(err)</span>
+<span class="a">+	}</span>
+<span class="a">+	mod := atomTime(st.ModTime())</span>
+<span class="a">+	if f.Updated != mod {</span>
+<span class="a">+		t.Errorf(&quot;feed updated %q, want the time of the file %q&quot;, f.Updated, mod)</span>
+<span class="a">+	}</span>
+<span class="a">+	date := &quot;2026-01-02T03:04:05Z&quot;</span>
+<span class="a">+	want := []atomEntry{</span>
+<span class="a">+		{Title: &quot;https://b.com&quot;, Link: atomLink{Href: &quot;https://b.com&quot;}, ID: &quot;https://b.com&quot;, Updated: date},</span>
+<span class="a">+		{Title: &quot;A &amp; B&quot;, Link: atomLink{Href: &quot;https://a.com&quot;}, ID: &quot;https://a.com&quot;, Updated: date,</span>
+<span class="a">+			Categories: []atomCategory{{&quot;x&quot;}, {&quot;y&quot;}}},</span>
+<span class="a">+		{Title: &quot;Old&quot;, Link: atomLink{Href: &quot;https://old.com&quot;}, ID: &quot;https://old.com&quot;, Updated: mod},</span>
+<span class="a">+	}</span>
+<span class="a">+	if !reflect.DeepEqual(f.Entries, want) {</span>
+<span class="a">+		t.Errorf(&quot;entries:\n%+v\nwant:\n%+v&quot;, f.Entries, want)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// genPublicRow makes a file line with the characters that XML and HTML must</span>
+<span class="a">+// escape, and with links that the outputs must leave out.</span>
+<span class="a">+func genPublicRow(t *rapid.T) string {</span>
+<span class="a">+	u := rapid.SampledFrom([]string{&quot;https://a.com/&quot;, &quot;http://b.org/?x=1&amp;y=&lt;2&gt;&quot;, &quot;c.net/&quot;, &quot;javascript:alert(1)//&quot;, &quot;ftp://d.com/&quot;}).Draw(t, &quot;url&quot;)</span>
+<span class="a">+	path := rapid.StringMatching(`[a-z]{0,3}`).Draw(t, &quot;path&quot;)</span>
+<span class="a">+	desc := rapid.StringMatching(`[a-z&lt;&gt;&amp;&quot;&#x27; \]\t]{0,10}`).Draw(t, &quot;desc&quot;)</span>
+<span class="a">+	tags := rapid.StringMatching(`[a-z&lt;&gt;&amp;&quot; ]{0,8}`).Draw(t, &quot;tags&quot;)</span>
+<span class="a">+	return line(u+path, desc, tags)</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// TestOutputsRoundTrip: links.txt parses back to the published links, and the</span>
+<span class="a">+// feed gives each published link, newest first, with its time and tags.</span>
+<span class="a">+func TestOutputsRoundTrip(t *testing.T) {</span>
+<span class="a">+	s, h := newServer(t)</span>
+<span class="a">+	rapid.Check(t, func(t *rapid.T) {</span>
+<span class="a">+		text := &quot;&quot;</span>
+<span class="a">+		for range rapid.IntRange(0, 3).Draw(t, &quot;batches&quot;) {</span>
+<span class="a">+			rows := rapid.SliceOf(rapid.Custom(genPublicRow)).Draw(t, &quot;rows&quot;)</span>
+<span class="a">+			when := time.Unix(rapid.Int64Range(0, 4102444800).Draw(t, &quot;when&quot;), 0)</span>
+<span class="a">+			text, _, _ = addDated(text, rows, when)</span>
+<span class="a">+		}</span>
+<span class="a">+		write(t, s, text)</span>
+<span class="a">+		want := published(text)</span>
+<span class="a">+</span>
+<span class="a">+		got := parse(get(h, &quot;/links/links.txt&quot;).Body.String())</span>
+<span class="a">+		if len(got) != len(want) {</span>
+<span class="a">+			t.Fatalf(&quot;links.txt has %d links, want %d&quot;, len(got), len(want))</span>
+<span class="a">+		}</span>
+<span class="a">+		for i := range want {</span>
+<span class="a">+			if got[i].URL != want[i].URL || got[i].Desc != want[i].Desc || !slices.Equal(got[i].Tags, want[i].Tags) {</span>
+<span class="a">+				t.Fatalf(&quot;links.txt link %d is %+v, want %+v&quot;, i, got[i], want[i])</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+</span>
+<span class="a">+		f := feedOf(t, get(h, &quot;/links/atom.xml&quot;))</span>
+<span class="a">+		if len(f.Entries) != len(want) {</span>
+<span class="a">+			t.Fatalf(&quot;feed has %d entries, want %d&quot;, len(f.Entries), len(want))</span>
+<span class="a">+		}</span>
+<span class="a">+		for i, e := range f.Entries {</span>
+<span class="a">+			l := want[len(want)-1-i]</span>
+<span class="a">+			var tags []string</span>
+<span class="a">+			for _, c := range e.Categories {</span>
+<span class="a">+				tags = append(tags, c.Term)</span>
+<span class="a">+			}</span>
+<span class="a">+			if e.Title != l.Title() || e.Link.Href != l.URL || e.ID != l.URL || e.Updated != atomTime(l.Added) || !slices.Equal(tags, l.Tags) {</span>
+<span class="a">+				t.Fatalf(&quot;entry %d is %+v, want %+v&quot;, i, e, l)</span>
+<span class="a">+			}</span>
+<span class="a">+		}</span>
+<span class="a">+	})</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestAtomReplacesCharactersThatXMLCannotHold(t *testing.T) {</span>
+<span class="a">+	s, h := newServer(t)</span>
+<span class="a">+	write(t, s, &quot;https://a.com\tbell \x07 and ]]&gt;\t\n&quot;)</span>
+<span class="a">+	if f := feedOf(t, get(h, &quot;/links/atom.xml&quot;)); f.Entries[0].Title != &quot;bell � and ]]&gt;&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;title %q&quot;, f.Entries[0].Title)</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestNotModified(t *testing.T) {</span>
+<span class="a">+	s, h := newServer(t)</span>
+<span class="a">+	write(t, s, &quot;https://a.com\tA\t\n&quot;)</span>
+<span class="a">+	for _, path := range []string{&quot;/links/links.txt&quot;, &quot;/links/atom.xml&quot;, &quot;/links/list.html&quot;} {</span>
+<span class="a">+		lm := get(h, path).Header().Get(&quot;Last-Modified&quot;)</span>
+<span class="a">+		r := httptest.NewRequest(&quot;GET&quot;, path, nil)</span>
+<span class="a">+		r.Header.Set(&quot;If-Modified-Since&quot;, lm)</span>
+<span class="a">+		if w := do(h, r, false); lm == &quot;&quot; || w.Code != http.StatusNotModified {</span>
+<span class="a">+			t.Errorf(&quot;%s: Last-Modified %q, code %d&quot;, path, lm, w.Code)</span>
+<span class="a">+		}</span>
+<span class="a">+	}</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+func TestList(t *testing.T) {</span>
+<span class="a">+	s, h := newServer(t)</span>
+<span class="a">+	if body := get(h, &quot;/links/list.html&quot;).Body.String(); body != &quot;&lt;p&gt;No links yet.&lt;/p&gt;\n&quot; {</span>
+<span class="a">+		t.Fatalf(&quot;empty list: %q&quot;, body)</span>
+<span class="a">+	}</span>
+<span class="a">+	write(t, s, &quot;https://a.com\t&lt;A&gt;\tx y\nhttps://b.com\tB\t\nhttps://c.com\tC\ty y\n&quot;)</span>
+<span class="a">+	want := `&lt;p&gt;&lt;a href=&quot;#x&quot;&gt;x&lt;/a&gt; &lt;a href=&quot;#y&quot;&gt;y&lt;/a&gt; &lt;a href=&quot;#untagged&quot;&gt;untagged&lt;/a&gt; &lt;/p&gt;</span>
+<span class="a">+&lt;h2 id=&quot;x&quot;&gt;x&lt;/h2&gt;</span>
+<span class="a">+&lt;ul&gt;</span>
+<span class="a">+&lt;li&gt;&lt;a href=&quot;https://a.com&quot;&gt;&amp;lt;A&amp;gt;&lt;/a&gt; &lt;small&gt;a.com&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+&lt;/ul&gt;</span>
+<span class="a">+&lt;h2 id=&quot;y&quot;&gt;y&lt;/h2&gt;</span>
+<span class="a">+&lt;ul&gt;</span>
+<span class="a">+&lt;li&gt;&lt;a href=&quot;https://c.com&quot;&gt;C&lt;/a&gt; &lt;small&gt;c.com&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+&lt;li&gt;&lt;a href=&quot;https://a.com&quot;&gt;&amp;lt;A&amp;gt;&lt;/a&gt; &lt;small&gt;a.com&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+&lt;/ul&gt;</span>
+<span class="a">+&lt;h2 id=&quot;untagged&quot;&gt;untagged&lt;/h2&gt;</span>
+<span class="a">+&lt;ul&gt;</span>
+<span class="a">+&lt;li&gt;&lt;a href=&quot;https://b.com&quot;&gt;B&lt;/a&gt; &lt;small&gt;b.com&lt;/small&gt;&lt;/li&gt;</span>
+<span class="a">+&lt;/ul&gt;</span>
+<span class="a">+`</span>
+<span class="a">+	if body := get(h, &quot;/links/list.html&quot;).Body.String(); body != want {</span>
+<span class="a">+		t.Fatalf(&quot;list:\n%s\nwant:\n%s&quot;, body, want)</span>
+ 	}
+ }
+ 
+ func TestImport(t *testing.T) {
+ 	s, h := newServer(t)
+<span class="d">-	os.WriteFile(s.links.path, []byte(&quot;https://a.com\tA\t\n&quot;), 0o644)</span>
+<span class="a">+	write(t, s, &quot;https://a.com\tA\t\n&quot;)</span>
+ 	var body bytes.Buffer
+ 	mw := multipart.NewWriter(&amp;body)
+ 	f, _ := mw.CreateFormFile(&quot;file&quot;, &quot;bookmarks.sbm&quot;)
+<span class="h">@@ -107,7 +271,7 @@ func TestImport(t *testing.T) {</span>
+ 		t.Fatalf(&quot;import: %d %q&quot;, w.Code, loc)
+ 	}
+ 	b, _ := os.ReadFile(s.links.path)
+<span class="d">-	if string(b) != &quot;https://a.com\tA\t\nhttps://b.com\tB\tt\n&quot; {</span>
+<span class="a">+	if string(b) != &quot;https://a.com\tA\t\n&quot;+dayLine+&quot;https://b.com\tB\tt\n&quot; {</span>
+ 		t.Fatalf(&quot;file: %q&quot;, b)
+ 	}
+ }</pre>
+</div></body></html>

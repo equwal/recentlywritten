@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread e25c0880 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit e25c0880517ba0bcf4c11c13de6d6c6325fd1d00
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:12:23 -0700
+
+Show the status in a strip under the top bar
+
+The player status, the reading of the pages and the messages were in
+the drawer, so a phone with a closed drawer showed none of them. A slim
+strip under the top bar now shows three parts: the player (the time and
+the play state, or the problem and what to do), the reading of the
+pages with the OCR progress of the page, and the last event, which
+fades after 6 seconds. Only the event part is a live region.
+
+A PlayerError now gives a text that tells what to do. A seek from the
+cue list catches its error. &quot;PDF loaded&quot; uses the singular for one
+page. The texts are in the pure module messages.ts.
+
+</pre><pre> index.html            |  11 ++--
+ src/main.ts           | 135 ++++++++++++++++++++++----------------------------
+ src/messages.ts       |  86 ++++++++++++++++++++++++++++++++
+ src/status.ts         |  68 +++++++++++++++++++++++++
+ src/style.css         |  62 +++++++++++++++++------
+ test/messages.test.ts | 100 +++++++++++++++++++++++++++++++++++++
+ 6 files changed, 365 insertions(+), 97 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index 783f041..a60f7f1 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -18,6 +18,12 @@</span>
+       &lt;/button&gt;
+     &lt;/header&gt;
+ 
+<span class="a">+    &lt;div id=&quot;strip&quot;&gt;</span>
+<span class="a">+      &lt;span id=&quot;player-status&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+      &lt;span id=&quot;pages-status&quot; hidden&gt;&lt;/span&gt;</span>
+<span class="a">+      &lt;span id=&quot;status&quot; aria-live=&quot;polite&quot;&gt;&lt;/span&gt;</span>
+<span class="a">+    &lt;/div&gt;</span>
+<span class="a">+</span>
+     &lt;aside id=&quot;panel&quot;&gt;
+       &lt;h1&gt;Scan Subread&lt;/h1&gt;
+       &lt;p class=&quot;hint&quot;&gt;
+<span class="h">@@ -52,11 +58,6 @@</span>
+         &lt;audio id=&quot;audio&quot; controls&gt;&lt;/audio&gt;
+       &lt;/section&gt;
+ 
+<span class="d">-      &lt;div id=&quot;player-status&quot; class=&quot;hint&quot;&gt;Player: not read yet.&lt;/div&gt;</span>
+<span class="d">-      &lt;div id=&quot;pages-status&quot; class=&quot;hint&quot;&gt;&lt;/div&gt;</span>
+<span class="d">-      &lt;div id=&quot;status&quot; aria-live=&quot;polite&quot;&gt;&lt;/div&gt;</span>
+<span class="d">-      &lt;progress id=&quot;progress&quot; max=&quot;1&quot; value=&quot;0&quot; hidden&gt;&lt;/progress&gt;</span>
+<span class="d">-</span>
+       &lt;fieldset id=&quot;follow&quot;&gt;
+         &lt;legend&gt;Follow the audio&lt;/legend&gt;
+         &lt;label
+diff --git a/src/main.ts b/src/main.ts
+index 2bfe1d8..a0b27df 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -8,9 +8,18 @@ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from</span>
+ import { cueMoved, follow, type FollowMode } from &#x27;./follower&#x27;;
+ import { lookupText, tokenAt } from &#x27;./hit-test&#x27;;
+ import { lineBoxes } from &#x27;./line-boxes&#x27;;
+<span class="a">+import {</span>
+<span class="a">+  clockText,</span>
+<span class="a">+  errorMessage,</span>
+<span class="a">+  pagesReadText,</span>
+<span class="a">+  pdfLoadedText,</span>
+<span class="a">+  playerMessage,</span>
+<span class="a">+  readingText,</span>
+<span class="a">+} from &#x27;./messages&#x27;;</span>
+ import { createOcr, type Ocr } from &#x27;./ocr&#x27;;
+ import { loadPdf, type PdfDoc } from &#x27;./pdf&#x27;;
+ import { nextPage } from &#x27;./read-order&#x27;;
+<span class="a">+import { say, showPlayer, showReading } from &#x27;./status&#x27;;</span>
+ import { isAndroid, SubRead } from &#x27;./subread&#x27;;
+ import { cueIndexAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+ import {
+<span class="h">@@ -36,7 +45,6 @@ const BOX_PAD = 2;</span>
+ /** Milliseconds to wait after a page is read before the cues are aligned again. */
+ const ALIGN_DEBOUNCE = 300;
+ 
+<span class="d">-const OVERLAY_RELEASES = &#x27;https://github.com/equwal/subread-overlay/releases/latest&#x27;;</span>
+ const SUBREAD_RELEASES = &#x27;https://github.com/equwal/subread-android/releases/latest&#x27;;
+ 
+ function el&lt;T extends HTMLElement&gt;(id: string): T {
+<span class="h">@@ -60,10 +68,6 @@ const ui = {</span>
+   audioRow: el&lt;HTMLElement&gt;(&#x27;audio-row&#x27;),
+   audioFile: el&lt;HTMLInputElement&gt;(&#x27;audio-file&#x27;),
+   audio: el&lt;HTMLAudioElement&gt;(&#x27;audio&#x27;),
+<span class="d">-  playerStatus: el&lt;HTMLDivElement&gt;(&#x27;player-status&#x27;),</span>
+<span class="d">-  pagesStatus: el&lt;HTMLDivElement&gt;(&#x27;pages-status&#x27;),</span>
+<span class="d">-  status: el&lt;HTMLDivElement&gt;(&#x27;status&#x27;),</span>
+<span class="d">-  progress: el&lt;HTMLProgressElement&gt;(&#x27;progress&#x27;),</span>
+   follow: el&lt;HTMLFieldSetElement&gt;(&#x27;follow&#x27;),
+   lang: el&lt;HTMLSelectElement&gt;(&#x27;lang&#x27;),
+   forceOcr: el&lt;HTMLInputElement&gt;(&#x27;force-ocr&#x27;),
+<span class="h">@@ -154,16 +158,9 @@ ui.forceOcr.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+   void readBook();
+ });
+ 
+<span class="d">-function setStatus(text: string, link?: { href: string; text: string }): void {</span>
+<span class="d">-  ui.status.textContent = text;</span>
+<span class="d">-  if (link) {</span>
+<span class="d">-    const a = document.createElement(&#x27;a&#x27;);</span>
+<span class="d">-    a.href = link.href;</span>
+<span class="d">-    a.target = &#x27;_blank&#x27;;</span>
+<span class="d">-    a.rel = &#x27;noopener&#x27;;</span>
+<span class="d">-    a.textContent = link.text;</span>
+<span class="d">-    ui.status.append(&#x27; &#x27;, a);</span>
+<span class="d">-  }</span>
+<span class="a">+/** Shows a command that failed in the strip. */</span>
+<span class="a">+function sayError(err: unknown): void {</span>
+<span class="a">+  say(errorMessage(err, isAndroid));</span>
+ }
+ 
+ // --- Drawer ---
+<span class="h">@@ -204,13 +201,13 @@ ui.pdfFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+     state.activeCue = -1;
+     state.markedCue = -1;
+     ui.makeSubs.disabled = false;
+<span class="d">-    setStatus(`PDF loaded: ${state.pdf.numPages} pages.`);</span>
+<span class="a">+    say(pdfLoadedText(state.pdf.numPages));</span>
+     await showPage(0);
+     const saved = await getSrt(bookKey(file));
+     if (saved) loadSubtitles(saved, &#x27;the last SubRead run&#x27;);
+     void readBook();
+   } catch (err) {
+<span class="d">-    setStatus(`Cannot open PDF: ${String(err)}`);</span>
+<span class="a">+    say(`Cannot open PDF: ${String(err)}`);</span>
+   }
+ });
+ 
+<span class="h">@@ -259,24 +256,27 @@ async function readBook(): Promise&lt;void&gt; {</span>
+   state.spans = [];
+   state.cuePages = [];
+   state.markedCue = -1;
+<span class="d">-  ui.pagesStatus.textContent = `Pages: 0/${pdf.numPages} read.`;</span>
+<span class="d">-  const pending = new Set(Array.from({ length: pdf.numPages }, (_, i) =&gt; i));</span>
+<span class="a">+  const total = pdf.numPages;</span>
+<span class="a">+  const pending = new Set(Array.from({ length: total }, (_, i) =&gt; i));</span>
+<span class="a">+  const counts = { text: 0, ocr: 0 };</span>
+<span class="a">+  const read = (): number =&gt; counts.text + counts.ocr;</span>
+<span class="a">+  /** The page that is read now. */</span>
+<span class="a">+  let page = -1;</span>
+   // The OCR worker starts on the first page that needs it.
+   const ocr: { started?: Promise&lt;Ocr&gt; } = {};
+   const getOcr = (): Promise&lt;Ocr&gt; =&gt; {
+     ocr.started ??= createOcr(ui.lang.value, (p) =&gt; {
+<span class="d">-      ui.progress.value = p;</span>
+<span class="a">+      if (seq === state.readSeq) {</span>
+<span class="a">+        showReading(readingText(read(), total, `page ${page + 1}: OCR ${Math.round(p * 100)}%`));</span>
+<span class="a">+      }</span>
+     });
+     return ocr.started;
+   };
+<span class="d">-  const counts = { text: 0, ocr: 0 };</span>
+   try {
+     while (pending.size &gt; 0) {
+<span class="d">-      const page = nextPage(pending, state.currentPage);</span>
+<span class="a">+      page = nextPage(pending, state.currentPage);</span>
+       pending.delete(page);
+<span class="d">-      ui.progress.hidden = false;</span>
+<span class="d">-      ui.progress.value = 0;</span>
+<span class="d">-      setStatus(`Reading page ${page + 1} of ${pdf.numPages}...`);</span>
+<span class="a">+      showReading(readingText(read(), total, `page ${page + 1}`));</span>
+       const entry = await readPage(pdf, file, page, getOcr);
+       if (seq !== state.readSeq) return; // Another book or another setting took over.
+       counts[entry.source]++;
+<span class="h">@@ -284,18 +284,21 @@ async function readBook(): Promise&lt;void&gt; {</span>
+       // Put the tokens of the page at their place in page order.
+       const at = state.pages.slice(0, page).reduce((n, p) =&gt; n + (p?.tokens.length ?? 0), 0);
+       state.tokens.splice(at, 0, ...entry.tokens);
+<span class="d">-      setStatus(`Page ${page + 1}: ${entry.source === &#x27;text&#x27; ? &#x27;text layer&#x27; : &#x27;OCR&#x27;}.`);</span>
+<span class="d">-      ui.pagesStatus.textContent =</span>
+<span class="d">-        `Pages: ${counts.text + counts.ocr}/${pdf.numPages} read ` +</span>
+<span class="d">-        `(${counts.text} text layer, ${counts.ocr} OCR).`;</span>
+<span class="a">+      const how = entry.source === &#x27;text&#x27; ? &#x27;text layer&#x27; : &#x27;OCR&#x27;;</span>
+<span class="a">+      showReading(readingText(read(), total, `page ${page + 1}: ${how}`));</span>
+       if (page === state.currentPage) drawBoxes();
+       scheduleAlign();
+     }
+<span class="a">+    const matched = align();</span>
+<span class="a">+    say(</span>
+<span class="a">+      pagesReadText(counts) +</span>
+<span class="a">+        (matched === null ? &#x27;&#x27; : ` ${matched}/${state.cues.length} cues matched.`),</span>
+<span class="a">+    );</span>
+   } catch (err) {
+<span class="d">-    if (seq === state.readSeq) setStatus(`Cannot read the pages: ${String(err)}`);</span>
+<span class="a">+    if (seq === state.readSeq) say(`Cannot read the pages: ${String(err)}`);</span>
+   } finally {
+     if (ocr.started) await (await ocr.started).terminate().catch(() =&gt; undefined);
+<span class="d">-    if (seq === state.readSeq) ui.progress.hidden = true;</span>
+<span class="a">+    if (seq === state.readSeq) showReading(null);</span>
+   }
+ }
+ 
+<span class="h">@@ -307,7 +310,7 @@ function allPagesRead(): boolean {</span>
+ 
+ ui.clearCache.addEventListener(&#x27;click&#x27;, async () =&gt; {
+   await clearPages();
+<span class="d">-  setStatus(&#x27;Page cache cleared.&#x27;);</span>
+<span class="a">+  say(&#x27;Page cache cleared.&#x27;);</span>
+ });
+ 
+ // --- Subtitles ---
+<span class="h">@@ -321,10 +324,13 @@ function loadSubtitles(text: string, source: string): void {</span>
+   state.cuePages = [];
+   state.activeCue = -1;
+   state.markedCue = -1;
+<span class="d">-  setStatus(`${state.cues.length} cues loaded from ${source}.`);</span>
+   ui.syncPage.disabled = state.cues.length === 0;
+   renderCueList();
+<span class="d">-  align();</span>
+<span class="a">+  const matched = align();</span>
+<span class="a">+  say(</span>
+<span class="a">+    `${state.cues.length} cues loaded from ${source}.` +</span>
+<span class="a">+      (matched === null ? &#x27;&#x27; : ` ${matched} matched to the pages read so far.`),</span>
+<span class="a">+  );</span>
+   offerSrt(text);
+ }
+ 
+<span class="h">@@ -345,7 +351,7 @@ function offerSrt(text: string): void {</span>
+     ui.srtDownload.download = name;
+   }
+   ui.srtShare.onclick = () =&gt; {
+<span class="d">-    SubRead.shareText({ name, text }).catch((err) =&gt; setStatus(String(err)));</span>
+<span class="a">+    SubRead.shareText({ name, text }).catch(sayError);</span>
+   };
+ }
+ 
+<span class="h">@@ -399,15 +405,17 @@ function scheduleAlign(): void {</span>
+   state.alignTimer = setTimeout(align, ALIGN_DEBOUNCE);
+ }
+ 
+<span class="d">-/** Align the cues to the pages read so far. */</span>
+<span class="d">-function align(): void {</span>
+<span class="a">+/**</span>
+<span class="a">+ * Align the cues to the pages read so far. Gives the count of matched</span>
+<span class="a">+ * cues, or null when there is nothing to align.</span>
+<span class="a">+ */</span>
+<span class="a">+function align(): number | null {</span>
+<span class="a">+  if (state.alignTimer) clearTimeout(state.alignTimer);</span>
+   state.alignTimer = null;
+<span class="d">-  if (!state.aligner || state.cues.length === 0 || state.tokens.length === 0) return;</span>
+<span class="a">+  if (!state.aligner || state.cues.length === 0 || state.tokens.length === 0) return null;</span>
+   const before = state.cuePages;
+   state.spans = state.aligner.spans(state.pages.map((p) =&gt; p?.tokens));
+   state.cuePages = state.spans.map((s) =&gt; (s.matched ? state.tokens[s.start]!.page : null));
+<span class="d">-  const matched = state.cuePages.filter((p) =&gt; p !== null).length;</span>
+<span class="d">-  setStatus(`${matched}/${state.cues.length} cues matched to the page text.`);</span>
+   renderCueList();
+   // Follow again only when the alignment moved the cue of now, for
+   // example when it became matched. A page read in the background must not
+<span class="h">@@ -415,6 +423,7 @@ function align(): void {</span>
+   if (state.clock &amp;&amp; cueMoved(before, state.cuePages, clockCue(state.clock))) {
+     applyClock({ ...state.clock, seeked: true });
+   }
+<span class="a">+  return state.cuePages.filter((p) =&gt; p !== null).length;</span>
+ }
+ 
+ // --- Cue list ---
+<span class="h">@@ -428,7 +437,7 @@ function renderCueList(): void {</span>
+       const span = state.spans[i];
+       if (span &amp;&amp; !span.matched) li.classList.add(&#x27;unmatched&#x27;);
+       if (i === state.activeCue) li.classList.add(&#x27;active&#x27;);
+<span class="d">-      li.addEventListener(&#x27;click&#x27;, () =&gt; void clock.seek(cue.start * 1000));</span>
+<span class="a">+      li.addEventListener(&#x27;click&#x27;, () =&gt; void clock.seek(cue.start * 1000).catch(sayError));</span>
+       return li;
+     }),
+   );
+<span class="h">@@ -446,35 +455,10 @@ function markCueInList(i: number): void {</span>
+ 
+ // --- The follow ---
+ 
+<span class="d">-function clockText(ms: number): string {</span>
+<span class="d">-  const s = Math.floor(ms / 1000);</span>
+<span class="d">-  const pad = (n: number): string =&gt; String(n).padStart(2, &#x27;0&#x27;);</span>
+<span class="d">-  const h = Math.floor(s / 3600);</span>
+<span class="d">-  return `${h &gt; 0 ? `${h}:` : &#x27;&#x27;}${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+ function showPlayerStatus(s: ClockState): void {
+<span class="d">-  ui.playerStatus.replaceChildren();</span>
+   ui.play.disabled = s.error === &#x27;no_overlay&#x27; || (!isAndroid &amp;&amp; s.error === &#x27;no_player&#x27;);
+   ui.play.textContent = s.playing ? &#x27;⏸&#x27; : &#x27;▶&#x27;;
+<span class="d">-  const name = isAndroid ? &#x27;Player&#x27; : &#x27;Audio&#x27;;</span>
+<span class="d">-  if (s.error === &#x27;no_overlay&#x27;) {</span>
+<span class="d">-    ui.playerStatus.append(&#x27;SubRead Overlay not installed. &#x27;);</span>
+<span class="d">-    const a = document.createElement(&#x27;a&#x27;);</span>
+<span class="d">-    a.href = OVERLAY_RELEASES;</span>
+<span class="d">-    a.target = &#x27;_blank&#x27;;</span>
+<span class="d">-    a.rel = &#x27;noopener&#x27;;</span>
+<span class="d">-    a.textContent = &#x27;Get it&#x27;;</span>
+<span class="d">-    ui.playerStatus.append(a);</span>
+<span class="d">-  } else if (s.error === &#x27;no_notification_access&#x27;) {</span>
+<span class="d">-    ui.playerStatus.textContent = &#x27;Allow notification access in SubRead Overlay.&#x27;;</span>
+<span class="d">-  } else if (s.error === &#x27;no_player&#x27;) {</span>
+<span class="d">-    ui.playerStatus.textContent = isAndroid ? &#x27;No player.&#x27; : &#x27;No audio file.&#x27;;</span>
+<span class="d">-  } else if (s.positionMs === null) {</span>
+<span class="d">-    ui.playerStatus.textContent = `${name}: no position.`;</span>
+<span class="d">-  } else {</span>
+<span class="d">-    ui.playerStatus.textContent = `${name}: ${clockText(s.positionMs)}, ${s.playing ? &#x27;playing&#x27; : &#x27;paused&#x27;}`;</span>
+<span class="d">-  }</span>
+<span class="a">+  showPlayer(playerMessage(s, isAndroid));</span>
+ }
+ 
+ /** The cue at the position of a clock state, or -1. */
+<span class="h">@@ -511,20 +495,17 @@ clock.start(applyClock);</span>
+ 
+ ui.play.addEventListener(&#x27;click&#x27;, () =&gt; {
+   const action = state.clock?.playing ? clock.pause() : clock.play();
+<span class="d">-  action.catch((err) =&gt; setStatus(String(err)));</span>
+<span class="a">+  action.catch(sayError);</span>
+ });
+ 
+ ui.syncPage.addEventListener(&#x27;click&#x27;, () =&gt; {
+   const i = state.cuePages.indexOf(state.currentPage);
+   if (i &lt; 0) {
+<span class="d">-    setStatus(&#x27;No cue of the subtitles is on this page.&#x27;);</span>
+<span class="a">+    say(&#x27;No cue of the subtitles is on this page.&#x27;);</span>
+     return;
+   }
+   const ms = state.cues[i]!.start * 1000;
+<span class="d">-  clock.seek(ms).then(</span>
+<span class="d">-    () =&gt; setStatus(`Audio moved to ${clockText(ms)}.`),</span>
+<span class="d">-    (err) =&gt; setStatus(String(err)),</span>
+<span class="d">-  );</span>
+<span class="a">+  clock.seek(ms).then(() =&gt; say(`Audio moved to ${clockText(ms)}.`), sayError);</span>
+ });
+ 
+ ui.audioFile.addEventListener(&#x27;change&#x27;, () =&gt; {
+<span class="h">@@ -586,7 +567,7 @@ ui.page.addEventListener(&#x27;click&#x27;, async (e) =&gt; {</span>
+   const t = tokenAt(state.tokens, state.currentPage, x, y, TAP_TOLERANCE * size.width);
+   if (t &lt; 0) return;
+   const text = lookupText(state.tokens, t);
+<span class="d">-  setStatus(`Lookup: &quot;${text}&quot;`);</span>
+<span class="a">+  say(`Lookup: &quot;${text}&quot;`);</span>
+   const pause = ui.pauseLookup.checked &amp;&amp; state.clock?.playing === true &amp;&amp; !state.lookupPaused;
+   try {
+     if (pause) {
+<span class="h">@@ -596,7 +577,7 @@ ui.page.addEventListener(&#x27;click&#x27;, async (e) =&gt; {</span>
+     const { closed } = await SubRead.lookup({ text });
+     if (closed &amp;&amp; state.lookupPaused) await clock.play();
+   } catch (err) {
+<span class="d">-    setStatus(`Lookup failed: ${String(err)}`);</span>
+<span class="a">+    say(`Lookup failed: ${String(err)}`);</span>
+   } finally {
+     if (pause) state.lookupPaused = false;
+   }
+<span class="h">@@ -616,7 +597,7 @@ async function loadDictionaries(): Promise&lt;void&gt; {</span>
+ }
+ 
+ ui.dict.addEventListener(&#x27;change&#x27;, () =&gt; {
+<span class="d">-  SubRead.setDictionary({ component: ui.dict.value }).catch((err) =&gt; setStatus(String(err)));</span>
+<span class="a">+  SubRead.setDictionary({ component: ui.dict.value }).catch(sayError);</span>
+ });
+ 
+ // --- Start ---
+<span class="h">@@ -624,4 +605,4 @@ ui.dict.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+ loadSettings();
+ ui.make.hidden = !isAndroid;
+ ui.audioRow.hidden = isAndroid;
+<span class="d">-if (isAndroid) void loadDictionaries().catch((err) =&gt; setStatus(String(err)));</span>
+<span class="a">+if (isAndroid) void loadDictionaries().catch(sayError);</span>
+diff --git a/src/messages.ts b/src/messages.ts
+new file mode 100644
+index 0000000..3b68c07
+--- /dev/null
++++ b/src/messages.ts
+<span class="h">@@ -0,0 +1,86 @@</span>
+<span class="a">+// The texts of the status strip. Pure: no DOM.</span>
+<span class="a">+</span>
+<span class="a">+import { PlayerError, type ClockState } from &#x27;./clock-source&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** A text, and a link after it. */</span>
+<span class="a">+export interface Message {</span>
+<span class="a">+  text: string;</span>
+<span class="a">+  link?: { href: string; text: string };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export const OVERLAY_RELEASES = &#x27;https://github.com/equwal/subread-overlay/releases/latest&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** &quot;1 page&quot;, &quot;2 pages&quot;. */</span>
+<span class="a">+function count(n: number, noun: string): string {</span>
+<span class="a">+  return `${n} ${noun}${n === 1 ? &#x27;&#x27; : &#x27;s&#x27;}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A position as mm:ss, or h:mm:ss from one hour. */</span>
+<span class="a">+export function clockText(ms: number): string {</span>
+<span class="a">+  const s = Math.floor(Math.max(0, ms) / 1000);</span>
+<span class="a">+  const pad = (n: number): string =&gt; String(n).padStart(2, &#x27;0&#x27;);</span>
+<span class="a">+  const h = Math.floor(s / 3600);</span>
+<span class="a">+  return `${h &gt; 0 ? `${h}:` : &#x27;&#x27;}${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * What is wrong with the player, and what to do, for a reason of</span>
+<span class="a">+ * `PlayerError` or `ClockState.error`. Null for another reason.</span>
+<span class="a">+ */</span>
+<span class="a">+export function playerProblem(reason: string, android: boolean): Message | null {</span>
+<span class="a">+  switch (reason) {</span>
+<span class="a">+    case &#x27;no_player&#x27;:</span>
+<span class="a">+      return {</span>
+<span class="a">+        text: android</span>
+<span class="a">+          ? &#x27;No audiobook is playing. Start it in your player app.&#x27;</span>
+<span class="a">+          : &#x27;Load the audio file first.&#x27;,</span>
+<span class="a">+      };</span>
+<span class="a">+    case &#x27;no_overlay&#x27;:</span>
+<span class="a">+      return {</span>
+<span class="a">+        text: &#x27;SubRead Overlay is not installed.&#x27;,</span>
+<span class="a">+        link: { href: OVERLAY_RELEASES, text: &#x27;Get it&#x27; },</span>
+<span class="a">+      };</span>
+<span class="a">+    case &#x27;no_notification_access&#x27;:</span>
+<span class="a">+      return { text: &#x27;Allow notification access in SubRead Overlay.&#x27; };</span>
+<span class="a">+    default:</span>
+<span class="a">+      return null;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The text for a command that failed. A PlayerError gets the text of its reason. */</span>
+<span class="a">+export function errorMessage(err: unknown, android: boolean): Message {</span>
+<span class="a">+  if (err instanceof PlayerError) {</span>
+<span class="a">+    return playerProblem(err.reason, android) ?? { text: `The player failed: ${err.reason}.` };</span>
+<span class="a">+  }</span>
+<span class="a">+  return { text: String(err) };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The player part of the strip: the time and the play state, or the problem. */</span>
+<span class="a">+export function playerMessage(s: ClockState | null, android: boolean): Message {</span>
+<span class="a">+  const name = android ? &#x27;Player&#x27; : &#x27;Audio&#x27;;</span>
+<span class="a">+  if (!s) return { text: `${name}: not read yet.` };</span>
+<span class="a">+  if (s.error !== null) {</span>
+<span class="a">+    return playerProblem(s.error, android) ?? { text: `${name}: cannot read it (${s.error}).` };</span>
+<span class="a">+  }</span>
+<span class="a">+  if (s.positionMs === null) return { text: `${name}: no position.` };</span>
+<span class="a">+  return { text: `${name} ${clockText(s.positionMs)}, ${s.playing ? &#x27;playing&#x27; : &#x27;paused&#x27;}` };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function pdfLoadedText(pages: number): string {</span>
+<span class="a">+  return `PDF loaded: ${count(pages, &#x27;page&#x27;)}.`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The reading part of the strip while the pages are read. `note` tells about one page. */</span>
+<span class="a">+export function readingText(read: number, total: number, note: string): string {</span>
+<span class="a">+  return `Reading ${read}/${total}${note ? ` · ${note}` : &#x27;&#x27;}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The message after the last page is read. */</span>
+<span class="a">+export function pagesReadText(counts: { text: number; ocr: number }): string {</span>
+<span class="a">+  return `${count(counts.text + counts.ocr, &#x27;page&#x27;)} read: ${counts.text} text layer, ${counts.ocr} OCR.`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The message for a tap on a page that is not read yet. */</span>
+<span class="a">+export function notReadText(read: number, total: number): string {</span>
+<span class="a">+  return `This page is not read yet (${read}/${total} read).`;</span>
+<span class="a">+}</span>
+diff --git a/src/status.ts b/src/status.ts
+new file mode 100644
+index 0000000..45d9b46
+--- /dev/null
++++ b/src/status.ts
+<span class="h">@@ -0,0 +1,68 @@</span>
+<span class="a">+// The status strip under the top bar. It has three parts: the player,</span>
+<span class="a">+// the reading of the pages, and the last event. Only the event part is a</span>
+<span class="a">+// live region, because the other parts change often.</span>
+<span class="a">+</span>
+<span class="a">+import type { Message } from &#x27;./messages&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Milliseconds that an event message stays before it fades. */</span>
+<span class="a">+export const EVENT_MS = 6000;</span>
+<span class="a">+</span>
+<span class="a">+/** Milliseconds of the fade. The same as the transition of #status in style.css. */</span>
+<span class="a">+const FADE_MS = 600;</span>
+<span class="a">+</span>
+<span class="a">+function el(id: string): HTMLElement {</span>
+<span class="a">+  const e = document.getElementById(id);</span>
+<span class="a">+  if (!e) throw new Error(`Missing element #${id}`);</span>
+<span class="a">+  return e;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const player = el(&#x27;player-status&#x27;);</span>
+<span class="a">+const reading = el(&#x27;pages-status&#x27;);</span>
+<span class="a">+const event = el(&#x27;status&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+let fadeTimer: ReturnType&lt;typeof setTimeout&gt; | undefined;</span>
+<span class="a">+</span>
+<span class="a">+/** Writes a message into `target`: the text, then the link. */</span>
+<span class="a">+function fill(target: HTMLElement, m: Message): void {</span>
+<span class="a">+  target.textContent = m.text;</span>
+<span class="a">+  if (m.link) {</span>
+<span class="a">+    const a = document.createElement(&#x27;a&#x27;);</span>
+<span class="a">+    a.href = m.link.href;</span>
+<span class="a">+    a.target = &#x27;_blank&#x27;;</span>
+<span class="a">+    a.rel = &#x27;noopener&#x27;;</span>
+<span class="a">+    a.textContent = m.link.text;</span>
+<span class="a">+    target.append(&#x27; &#x27;, a);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+let lastPlayer = &#x27;&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Shows the state of the player. */</span>
+<span class="a">+export function showPlayer(m: Message): void {</span>
+<span class="a">+  // The clock sends a state four times a second. A new link under the</span>
+<span class="a">+  // finger can lose a tap, so the part changes only when the text changes.</span>
+<span class="a">+  const key = `${m.text}|${m.link?.href ?? &#x27;&#x27;}`;</span>
+<span class="a">+  if (key === lastPlayer) return;</span>
+<span class="a">+  lastPlayer = key;</span>
+<span class="a">+  fill(player, m);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Shows how far the reading of the pages is. Null hides this part. */</span>
+<span class="a">+export function showReading(text: string | null): void {</span>
+<span class="a">+  reading.hidden = text === null;</span>
+<span class="a">+  reading.textContent = text ?? &#x27;&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Shows an event, for example a lookup or an error. It fades after EVENT_MS. */</span>
+<span class="a">+export function say(m: Message | string): void {</span>
+<span class="a">+  fill(event, typeof m === &#x27;string&#x27; ? { text: m } : m);</span>
+<span class="a">+  event.classList.remove(&#x27;faded&#x27;);</span>
+<span class="a">+  clearTimeout(fadeTimer);</span>
+<span class="a">+  fadeTimer = setTimeout(() =&gt; {</span>
+<span class="a">+    event.classList.add(&#x27;faded&#x27;);</span>
+<span class="a">+    fadeTimer = setTimeout(() =&gt; {</span>
+<span class="a">+      event.replaceChildren();</span>
+<span class="a">+      event.classList.remove(&#x27;faded&#x27;);</span>
+<span class="a">+    }, FADE_MS);</span>
+<span class="a">+  }, EVENT_MS);</span>
+<span class="a">+}</span>
+diff --git a/src/style.css b/src/style.css
+index 65824ac..de7840a 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -40,6 +40,42 @@ body {</span>
+   white-space: nowrap;
+ }
+ 
+<span class="a">+/* The status strip: the player, the reading of the pages, the last event. */</span>
+<span class="a">+#strip {</span>
+<span class="a">+  flex: none;</span>
+<span class="a">+  box-sizing: border-box;</span>
+<span class="a">+  min-height: 1.5rem;</span>
+<span class="a">+  display: flex;</span>
+<span class="a">+  flex-wrap: wrap;</span>
+<span class="a">+  align-items: baseline;</span>
+<span class="a">+  column-gap: 0.75rem;</span>
+<span class="a">+  padding: 0.15rem 0.5rem;</span>
+<span class="a">+  font-size: 0.8rem;</span>
+<span class="a">+  line-height: 1.3;</span>
+<span class="a">+  border-bottom: 1px solid #8884;</span>
+<span class="a">+  overflow-wrap: anywhere;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#strip &gt; * {</span>
+<span class="a">+  min-width: 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#strip a {</span>
+<span class="a">+  color: inherit;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#pages-status {</span>
+<span class="a">+  opacity: 0.8;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#status {</span>
+<span class="a">+  transition: opacity 600ms ease-out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+#status.faded {</span>
+<span class="a">+  opacity: 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ #panel {
+   position: fixed;
+   top: var(--topbar);
+<span class="h">@@ -86,11 +122,6 @@ body.menu-open #panel {</span>
+   max-width: 100%;
+ }
+ 
+<span class="d">-#status {</span>
+<span class="d">-  font-size: 0.85rem;</span>
+<span class="d">-  min-height: 1.2em;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+ #topbar button {
+   white-space: nowrap;
+   font-size: 0.85rem;
+<span class="h">@@ -139,16 +170,11 @@ body.menu-open #panel {</span>
+   font-size: 0.85rem;
+ }
+ 
+<span class="d">-#make-status,</span>
+<span class="d">-#player-status,</span>
+<span class="d">-#pages-status,</span>
+<span class="d">-#status {</span>
+<span class="a">+#make-status {</span>
+   word-break: break-word;
+ }
+ 
+<span class="d">-#status a,</span>
+<span class="d">-#make-status a,</span>
+<span class="d">-#player-status a {</span>
+<span class="a">+#make-status a {</span>
+   color: inherit;
+ }
+ 
+<span class="h">@@ -239,7 +265,7 @@ body.menu-open #panel {</span>
+   body {
+     display: grid;
+     grid-template-columns: var(--panel-width) 1fr;
+<span class="d">-    grid-template-rows: var(--topbar) 1fr;</span>
+<span class="a">+    grid-template-rows: var(--topbar) auto 1fr;</span>
+   }
+ 
+   #menu {
+<span class="h">@@ -251,9 +277,15 @@ body.menu-open #panel {</span>
+     grid-row: 1;
+   }
+ 
+<span class="a">+  #strip {</span>
+<span class="a">+    grid-column: 2;</span>
+<span class="a">+    grid-row: 2;</span>
+<span class="a">+    min-width: 0;</span>
+<span class="a">+  }</span>
+<span class="a">+</span>
+   #panel {
+     grid-column: 1;
+<span class="d">-    grid-row: 1 / 3;</span>
+<span class="a">+    grid-row: 1 / 4;</span>
+     position: static;
+     width: auto;
+     transform: none;
+<span class="h">@@ -262,7 +294,7 @@ body.menu-open #panel {</span>
+ 
+   #main {
+     grid-column: 2;
+<span class="d">-    grid-row: 2;</span>
+<span class="a">+    grid-row: 3;</span>
+     min-width: 0;
+   }
+ 
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+new file mode 100644
+index 0000000..c0138ef
+--- /dev/null
++++ b/test/messages.test.ts
+<span class="h">@@ -0,0 +1,100 @@</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { PlayerError, type ClockState } from &#x27;../src/clock-source&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  clockText,</span>
+<span class="a">+  errorMessage,</span>
+<span class="a">+  notReadText,</span>
+<span class="a">+  OVERLAY_RELEASES,</span>
+<span class="a">+  pagesReadText,</span>
+<span class="a">+  pdfLoadedText,</span>
+<span class="a">+  playerMessage,</span>
+<span class="a">+  playerProblem,</span>
+<span class="a">+  readingText,</span>
+<span class="a">+} from &#x27;../src/messages&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+function state(over: Partial&lt;ClockState&gt;): ClockState {</span>
+<span class="a">+  return { positionMs: 0, playing: false, seeked: false, error: null, ...over };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;clockText&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;gives minutes and seconds, and hours from one hour&#x27;, () =&gt; {</span>
+<span class="a">+    expect(clockText(0)).toBe(&#x27;00:00&#x27;);</span>
+<span class="a">+    expect(clockText(20_500)).toBe(&#x27;00:20&#x27;);</span>
+<span class="a">+    expect(clockText(3_599_999)).toBe(&#x27;59:59&#x27;);</span>
+<span class="a">+    expect(clockText(3_600_000 + 61_000)).toBe(&#x27;1:01:01&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;playerProblem&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;tells what to do for each reason, on Android and on the web&#x27;, () =&gt; {</span>
+<span class="a">+    expect(playerProblem(&#x27;no_player&#x27;, true)).toEqual({</span>
+<span class="a">+      text: &#x27;No audiobook is playing. Start it in your player app.&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(playerProblem(&#x27;no_player&#x27;, false)).toEqual({ text: &#x27;Load the audio file first.&#x27; });</span>
+<span class="a">+    expect(playerProblem(&#x27;no_overlay&#x27;, true)).toEqual({</span>
+<span class="a">+      text: &#x27;SubRead Overlay is not installed.&#x27;,</span>
+<span class="a">+      link: { href: OVERLAY_RELEASES, text: &#x27;Get it&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(playerProblem(&#x27;no_notification_access&#x27;, true)).toEqual({</span>
+<span class="a">+      text: &#x27;Allow notification access in SubRead Overlay.&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null for another reason&#x27;, () =&gt; {</span>
+<span class="a">+    expect(playerProblem(&#x27;malformed&#x27;, true)).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;errorMessage&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;gives the text of the reason for a PlayerError&#x27;, () =&gt; {</span>
+<span class="a">+    expect(errorMessage(new PlayerError(&#x27;no_player&#x27;), false)).toEqual({</span>
+<span class="a">+      text: &#x27;Load the audio file first.&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(errorMessage(new PlayerError(&#x27;empty&#x27;), true)).toEqual({</span>
+<span class="a">+      text: &#x27;The player failed: empty.&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the error as text for another error&#x27;, () =&gt; {</span>
+<span class="a">+    expect(errorMessage(new Error(&#x27;boom&#x27;), true)).toEqual({ text: &#x27;Error: boom&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;playerMessage&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;gives the time and the play state&#x27;, () =&gt; {</span>
+<span class="a">+    expect(playerMessage(state({ positionMs: 75_000, playing: true }), true)).toEqual({</span>
+<span class="a">+      text: &#x27;Player 01:15, playing&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(playerMessage(state({ positionMs: 5_000 }), false)).toEqual({</span>
+<span class="a">+      text: &#x27;Audio 00:05, paused&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the problem and what to do&#x27;, () =&gt; {</span>
+<span class="a">+    expect(playerMessage(state({ positionMs: null, error: &#x27;no_player&#x27; }), false)).toEqual({</span>
+<span class="a">+      text: &#x27;Load the audio file first.&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(playerMessage(state({ error: &#x27;malformed&#x27; }), true)).toEqual({</span>
+<span class="a">+      text: &#x27;Player: cannot read it (malformed).&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(playerMessage(state({ positionMs: null }), true)).toEqual({</span>
+<span class="a">+      text: &#x27;Player: no position.&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(playerMessage(null, true)).toEqual({ text: &#x27;Player: not read yet.&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;page texts&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;uses the singular for one page&#x27;, () =&gt; {</span>
+<span class="a">+    expect(pdfLoadedText(1)).toBe(&#x27;PDF loaded: 1 page.&#x27;);</span>
+<span class="a">+    expect(pdfLoadedText(40)).toBe(&#x27;PDF loaded: 40 pages.&#x27;);</span>
+<span class="a">+    expect(pagesReadText({ text: 0, ocr: 1 })).toBe(&#x27;1 page read: 0 text layer, 1 OCR.&#x27;);</span>
+<span class="a">+    expect(pagesReadText({ text: 38, ocr: 2 })).toBe(&#x27;40 pages read: 38 text layer, 2 OCR.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells the reading progress and the page that is not read yet&#x27;, () =&gt; {</span>
+<span class="a">+    expect(readingText(3, 40, &#x27;&#x27;)).toBe(&#x27;Reading 3/40&#x27;);</span>
+<span class="a">+    expect(readingText(3, 40, &#x27;page 5: OCR 45%&#x27;)).toBe(&#x27;Reading 3/40 · page 5: OCR 45%&#x27;);</span>
+<span class="a">+    expect(notReadText(3, 40)).toBe(&#x27;This page is not read yet (3/40 read).&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/infra/burst/state/setup-web-server.sh - Recently Written</title>
+<link rel="stylesheet" href="../../../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../../../index.html">Recently Written</a> &middot; <a href="../../../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../../../subplz-web/index.html">Log</a> | <a href="../../../../../subplz-web/files.html">Files</a> | <a href="../../../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>infra/burst/state/setup-web-server.sh (3012 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> #!/bin/bash
+<a id="l2" href="#l2">2</a> # Set up the shared state of burst mode on the web server (Debian 12):
+<a id="l3" href="#l3">3</a> #
+<a id="l4" href="#l4">4</a> #   - Postgres on 127.0.0.1: role and database &quot;subplz&quot;.
+<a id="l5" href="#l5">5</a> #   - Redis on 127.0.0.1, with a password, and a journal on disk.
+<a id="l6" href="#l6">6</a> #   - The user &quot;subplz-tunnel&quot;: burst workers log in as this user only to
+<a id="l7" href="#l7">7</a> #     forward two ports (Postgres and Redis). No shell, no other port.
+<a id="l8" href="#l8">8</a> #   - A nightly Postgres backup to the bucket (enabled by the runbook).
+<a id="l9" href="#l9">9</a> #
+<a id="l10" href="#l10">10</a> # Terraform (main.tf) runs this script on the web server itself. It is
+<a id="l11" href="#l11">11</a> # idempotent: a second run changes nothing. Input: POSTGRES_PASSWORD,
+<a id="l12" href="#l12">12</a> # REDIS_PASSWORD, TUNNEL_PUBLIC_KEY in the environment.
+<a id="l13" href="#l13">13</a> set -euo pipefail
+<a id="l14" href="#l14">14</a> : &quot;${POSTGRES_PASSWORD:?}&quot; &quot;${REDIS_PASSWORD:?}&quot; &quot;${TUNNEL_PUBLIC_KEY:?}&quot;
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> export DEBIAN_FRONTEND=noninteractive
+<a id="l17" href="#l17">17</a> apt-get update -q
+<a id="l18" href="#l18">18</a> apt-get install -y -q postgresql redis-server rclone
+<a id="l19" href="#l19">19</a> 
+<a id="l20" href="#l20">20</a> # --- Postgres: the Debian package listens on localhost only. -----------------
+<a id="l21" href="#l21">21</a> runuser -u postgres -- psql -q -v ON_ERROR_STOP=1 -v pw=&quot;$POSTGRES_PASSWORD&quot; &lt;&lt;&#x27;SQL&#x27;
+<a id="l22" href="#l22">22</a> SELECT &#x27;CREATE ROLE subplz LOGIN&#x27; WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = &#x27;subplz&#x27;)\gexec
+<a id="l23" href="#l23">23</a> ALTER ROLE subplz PASSWORD :&#x27;pw&#x27;;
+<a id="l24" href="#l24">24</a> SELECT &#x27;CREATE DATABASE subplz OWNER subplz&#x27; WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = &#x27;subplz&#x27;)\gexec
+<a id="l25" href="#l25">25</a> SQL
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> # --- Redis: localhost only, a password, and a journal (the queue survives a restart).
+<a id="l28" href="#l28">28</a> conf=/etc/redis/redis.conf
+<a id="l29" href="#l29">29</a> set_conf() {
+<a id="l30" href="#l30">30</a>   if grep -q &quot;^$1 &quot; &quot;$conf&quot;; then
+<a id="l31" href="#l31">31</a>     sed -i &quot;s|^$1 .*|$1 $2|&quot; &quot;$conf&quot;
+<a id="l32" href="#l32">32</a>   else
+<a id="l33" href="#l33">33</a>     echo &quot;$1 $2&quot; &gt;&gt; &quot;$conf&quot;
+<a id="l34" href="#l34">34</a>   fi
+<a id="l35" href="#l35">35</a> }
+<a id="l36" href="#l36">36</a> set_conf bind &quot;127.0.0.1 -::1&quot;
+<a id="l37" href="#l37">37</a> set_conf requirepass &quot;$REDIS_PASSWORD&quot;
+<a id="l38" href="#l38">38</a> set_conf appendonly yes
+<a id="l39" href="#l39">39</a> systemctl restart redis-server
+<a id="l40" href="#l40">40</a> 
+<a id="l41" href="#l41">41</a> # --- The tunnel user. ---------------------------------------------------------
+<a id="l42" href="#l42">42</a> if ! id subplz-tunnel &gt;/dev/null 2&gt;&amp;1; then
+<a id="l43" href="#l43">43</a>   useradd --system --create-home --shell /usr/sbin/nologin subplz-tunnel
+<a id="l44" href="#l44">44</a> fi
+<a id="l45" href="#l45">45</a> home=$(getent passwd subplz-tunnel | cut -d: -f6)
+<a id="l46" href="#l46">46</a> install -d -m 700 -o subplz-tunnel -g subplz-tunnel &quot;$home/.ssh&quot;
+<a id="l47" href="#l47">47</a> printf &#x27;restrict,port-forwarding,permitopen=&quot;127.0.0.1:5432&quot;,permitopen=&quot;127.0.0.1:6379&quot; %s\n&#x27; \
+<a id="l48" href="#l48">48</a>   &quot;$TUNNEL_PUBLIC_KEY&quot; &gt; &quot;$home/.ssh/authorized_keys&quot;
+<a id="l49" href="#l49">49</a> chown subplz-tunnel:subplz-tunnel &quot;$home/.ssh/authorized_keys&quot;
+<a id="l50" href="#l50">50</a> chmod 600 &quot;$home/.ssh/authorized_keys&quot;
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> # --- Nightly backup of Postgres to the bucket. The runbook writes
+<a id="l53" href="#l53">53</a> # /etc/subplz-rclone.env and /etc/subplz-backup.env, then enables the timer.
+<a id="l54" href="#l54">54</a> cat &gt; /etc/systemd/system/subplz-pgdump.service &lt;&lt;&#x27;UNIT&#x27;
+<a id="l55" href="#l55">55</a> [Unit]
+<a id="l56" href="#l56">56</a> Description=Back up the subplz Postgres database to the bucket
+<a id="l57" href="#l57">57</a> 
+<a id="l58" href="#l58">58</a> [Service]
+<a id="l59" href="#l59">59</a> Type=oneshot
+<a id="l60" href="#l60">60</a> EnvironmentFile=/etc/subplz-rclone.env
+<a id="l61" href="#l61">61</a> EnvironmentFile=/etc/subplz-backup.env
+<a id="l62" href="#l62">62</a> ExecStart=/bin/bash -c &#x27;set -o pipefail; runuser -u postgres -- pg_dump -Fc subplz | rclone rcat &quot;r2:$BUCKET/backups/subplz-$(date -u +%%Y%%m%%d).dump&quot;&#x27;
+<a id="l63" href="#l63">63</a> UNIT
+<a id="l64" href="#l64">64</a> cat &gt; /etc/systemd/system/subplz-pgdump.timer &lt;&lt;&#x27;UNIT&#x27;
+<a id="l65" href="#l65">65</a> [Unit]
+<a id="l66" href="#l66">66</a> Description=Back up the subplz Postgres database each night
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> [Timer]
+<a id="l69" href="#l69">69</a> OnCalendar=*-*-* 04:30:00
+<a id="l70" href="#l70">70</a> Persistent=true
+<a id="l71" href="#l71">71</a> 
+<a id="l72" href="#l72">72</a> [Install]
+<a id="l73" href="#l73">73</a> WantedBy=timers.target
+<a id="l74" href="#l74">74</a> UNIT
+<a id="l75" href="#l75">75</a> systemctl daemon-reload
+<a id="l76" href="#l76">76</a> echo &quot;web server ready: Postgres, Redis, tunnel user&quot;</pre>
+</div></body></html>

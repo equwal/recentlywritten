@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 562ed86d - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 562ed86dea04d28c41b0428216f582dd30179263
+truex &lt;truex@equwal.com&gt;
+2026-09-25 01:54:03 -0700
+
+Add the player state parser, the play clock and the follower
+
+Ports of player_state.lua (subread.koplugin) and PlayClock.kt (SubRead Overlay), and a pure reducer that turns a change of the cue into a highlight and a page turn. Three follow modes: highlight and turn pages, turn pages only, off.
+
+</pre><pre> src/follower.ts           |  64 +++++++++++++++++++++
+ src/play-clock.ts         |  30 ++++++++++
+ src/player-state.ts       |  58 +++++++++++++++++++
+ test/follower.test.ts     | 138 ++++++++++++++++++++++++++++++++++++++++++++++
+ test/play-clock.test.ts   |  78 ++++++++++++++++++++++++++
+ test/player-state.test.ts |  76 +++++++++++++++++++++++++
+ 6 files changed, 444 insertions(+)
+</pre><pre>diff --git a/src/follower.ts b/src/follower.ts
+new file mode 100644
+index 0000000..42e7e03
+--- /dev/null
++++ b/src/follower.ts
+<span class="h">@@ -0,0 +1,64 @@</span>
+<span class="a">+// The reader follows the audio: which cue to mark, which page to show. Pure.</span>
+<span class="a">+//</span>
+<span class="a">+// The alignment gives each matched cue a page. This reducer turns a change</span>
+<span class="a">+// of the cue into at most one highlight and one page turn.</span>
+<span class="a">+</span>
+<span class="a">+export type FollowMode = &#x27;highlight&#x27; | &#x27;pages&#x27; | &#x27;off&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+export interface FollowInput {</span>
+<span class="a">+  /** The page of each cue, from the alignment. Null for an unmatched cue. */</span>
+<span class="a">+  cuePages: readonly (number | null)[];</span>
+<span class="a">+  mode: FollowMode;</span>
+<span class="a">+  currentPage: number;</span>
+<span class="a">+  /** The cue of the last call, or -1. */</span>
+<span class="a">+  previousCue: number;</span>
+<span class="a">+  /** The cue of now, or -1 between cues. */</span>
+<span class="a">+  cue: number;</span>
+<span class="a">+  /** True when the audio jumped: a seek, not the normal run forward. */</span>
+<span class="a">+  seeked: boolean;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface FollowOutput {</span>
+<span class="a">+  /** The cue to mark on the page, or null for no mark. */</span>
+<span class="a">+  highlightCue: number | null;</span>
+<span class="a">+  /** The page to show, or null to stay. */</span>
+<span class="a">+  turnToPage: number | null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** How many cues back an unmatched cue borrows the page of a matched one. */</span>
+<span class="a">+export const LOOKBACK = 5;</span>
+<span class="a">+</span>
+<span class="a">+const NOTHING: FollowOutput = { highlightCue: null, turnToPage: null };</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The page that stands for `cue`: its own page when the cue is matched,</span>
+<span class="a">+ * else the page of the nearest matched cue before it, within LOOKBACK.</span>
+<span class="a">+ * Null when there is none.</span>
+<span class="a">+ */</span>
+<span class="a">+export function pageForCue(cuePages: readonly (number | null)[], cue: number): number | null {</span>
+<span class="a">+  for (let i = cue; i &gt;= 0 &amp;&amp; i &gt;= cue - LOOKBACK; i--) {</span>
+<span class="a">+    const page = cuePages[i];</span>
+<span class="a">+    if (page !== null &amp;&amp; page !== undefined) return page;</span>
+<span class="a">+  }</span>
+<span class="a">+  return null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * One step of the follow.</span>
+<span class="a">+ *</span>
+<span class="a">+ * `off` does nothing. The same cue as before, without a seek, does nothing</span>
+<span class="a">+ * either: the user can turn pages by hand while a long cue plays. A page</span>
+<span class="a">+ * turn happens when the page of the cue is not the current page. In</span>
+<span class="a">+ * `highlight` mode a matched cue is marked; in `pages` mode nothing is.</span>
+<span class="a">+ */</span>
+<span class="a">+export function follow(input: FollowInput): FollowOutput {</span>
+<span class="a">+  const { cuePages, mode, currentPage, previousCue, cue, seeked } = input;</span>
+<span class="a">+  if (mode === &#x27;off&#x27; || cue &lt; 0 || cue &gt;= cuePages.length) return NOTHING;</span>
+<span class="a">+  if (cue === previousCue &amp;&amp; !seeked) return NOTHING;</span>
+<span class="a">+  const own = cuePages[cue] ?? null;</span>
+<span class="a">+  const page = pageForCue(cuePages, cue);</span>
+<span class="a">+  return {</span>
+<span class="a">+    highlightCue: mode === &#x27;highlight&#x27; &amp;&amp; own !== null ? cue : null,</span>
+<span class="a">+    turnToPage: page !== null &amp;&amp; page !== currentPage ? page : null,</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+diff --git a/src/play-clock.ts b/src/play-clock.ts
+new file mode 100644
+index 0000000..eb6cc8f
+--- /dev/null
++++ b/src/play-clock.ts
+<span class="h">@@ -0,0 +1,30 @@</span>
+<span class="a">+// What a media player said about its position, and when it said it. Pure.</span>
+<span class="a">+//</span>
+<span class="a">+// A player does not report each millisecond. It reports a position, the</span>
+<span class="a">+// time of the report, and the speed. The position now is computed from</span>
+<span class="a">+// these three. This is a port of PlayClock.kt from SubRead Overlay.</span>
+<span class="a">+</span>
+<span class="a">+export interface PlayClock {</span>
+<span class="a">+  positionMs: number;</span>
+<span class="a">+  /** The time of the report, on the same clock as the `nowMs` parameters. */</span>
+<span class="a">+  reportedAtMs: number;</span>
+<span class="a">+  speed: number;</span>
+<span class="a">+  playing: boolean;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The position in the media at `nowMs`. */</span>
+<span class="a">+export function positionAt(clock: PlayClock, nowMs: number): number {</span>
+<span class="a">+  if (!clock.playing) return clock.positionMs;</span>
+<span class="a">+  return clock.positionMs + (nowMs - clock.reportedAtMs) * clock.speed;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * How long to wait, on the clock of the device, until the media is at</span>
+<span class="a">+ * `targetMs`. Null when the media does not move forward, or is already there.</span>
+<span class="a">+ */</span>
+<span class="a">+export function waitUntil(clock: PlayClock, targetMs: number, nowMs: number): number | null {</span>
+<span class="a">+  if (!clock.playing || clock.speed &lt;= 0) return null;</span>
+<span class="a">+  const left = targetMs - positionAt(clock, nowMs);</span>
+<span class="a">+  if (left &lt;= 0) return null;</span>
+<span class="a">+  return Math.ceil(left / clock.speed);</span>
+<span class="a">+}</span>
+diff --git a/src/player-state.ts b/src/player-state.ts
+new file mode 100644
+index 0000000..e497c5c
+--- /dev/null
++++ b/src/player-state.ts
+<span class="h">@@ -0,0 +1,58 @@</span>
+<span class="a">+// The state line of the audio player, as SubRead Overlay reports it. Pure.</span>
+<span class="a">+//</span>
+<span class="a">+// SubRead Overlay is an Android app with notification access. It reads the</span>
+<span class="a">+// media session of the player and gives one line to other apps:</span>
+<span class="a">+//</span>
+<span class="a">+//     playing=1;position=96153;speed=1.0;package=de.ph1b.audiobook</span>
+<span class="a">+//</span>
+<span class="a">+// The position is in milliseconds, for the moment of the query. A problem is</span>
+<span class="a">+// one line `error=&lt;reason&gt;`. This is a port of player_state.lua from the</span>
+<span class="a">+// SubRead plugin for KOReader.</span>
+<span class="a">+</span>
+<span class="a">+export interface PlayerState {</span>
+<span class="a">+  playing: boolean;</span>
+<span class="a">+  /** Position in milliseconds. Null when the player reports none. */</span>
+<span class="a">+  positionMs: number | null;</span>
+<span class="a">+  /** Playback speed. 1 when the line has none, or a value of zero or less. */</span>
+<span class="a">+  speed: number;</span>
+<span class="a">+  /** Package name of the player app. Empty when the line has none. */</span>
+<span class="a">+  package: string;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export interface PlayerError {</span>
+<span class="a">+  /** `no_overlay`, `no_notification_access`, `no_player`, `empty` or `malformed`. */</span>
+<span class="a">+  error: string;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+export function isPlayerError(x: PlayerState | PlayerError): x is PlayerError {</span>
+<span class="a">+  return &#x27;error&#x27; in x;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const FIELD = /([\w]+)=([^;]*)/g;</span>
+<span class="a">+</span>
+<span class="a">+/** Parses a state line. */</span>
+<span class="a">+export function parseState(line: string | null | undefined): PlayerState | PlayerError {</span>
+<span class="a">+  if (typeof line !== &#x27;string&#x27; || line === &#x27;&#x27;) return { error: &#x27;empty&#x27; };</span>
+<span class="a">+  const fields = new Map&lt;string, string&gt;();</span>
+<span class="a">+  for (const m of line.matchAll(FIELD)) fields.set(m[1]!, m[2]!);</span>
+<span class="a">+  const error = fields.get(&#x27;error&#x27;);</span>
+<span class="a">+  if (error !== undefined) return { error };</span>
+<span class="a">+  const playing = fields.get(&#x27;playing&#x27;);</span>
+<span class="a">+  const position = fields.get(&#x27;position&#x27;);</span>
+<span class="a">+  if (playing === undefined || position === undefined) return { error: &#x27;malformed&#x27; };</span>
+<span class="a">+  const positionMs = Number(position);</span>
+<span class="a">+  if (position.trim() === &#x27;&#x27; || Number.isNaN(positionMs)) return { error: &#x27;malformed&#x27; };</span>
+<span class="a">+  let speed = Number(fields.get(&#x27;speed&#x27;) ?? &#x27;1&#x27;);</span>
+<span class="a">+  if (Number.isNaN(speed) || speed &lt;= 0) speed = 1;</span>
+<span class="a">+  return {</span>
+<span class="a">+    playing: playing === &#x27;1&#x27;,</span>
+<span class="a">+    positionMs: positionMs &gt;= 0 ? positionMs : null,</span>
+<span class="a">+    speed,</span>
+<span class="a">+    package: fields.get(&#x27;package&#x27;) ?? &#x27;&#x27;,</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The argument of a seek call: the position in milliseconds, as a whole number. */</span>
+<span class="a">+export function seekArgument(ms: number): string {</span>
+<span class="a">+  return String(Math.max(0, Math.round(ms)));</span>
+<span class="a">+}</span>
+diff --git a/test/follower.test.ts b/test/follower.test.ts
+new file mode 100644
+index 0000000..c236d80
+--- /dev/null
++++ b/test/follower.test.ts
+<span class="h">@@ -0,0 +1,138 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { follow, LOOKBACK, pageForCue, type FollowInput, type FollowMode } from &#x27;../src/follower&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const pages: (number | null)[] = [0, 0, null, 1, 1, null, null, 2];</span>
+<span class="a">+</span>
+<span class="a">+function input(over: Partial&lt;FollowInput&gt;): FollowInput {</span>
+<span class="a">+  return {</span>
+<span class="a">+    cuePages: pages,</span>
+<span class="a">+    mode: &#x27;highlight&#x27;,</span>
+<span class="a">+    currentPage: 0,</span>
+<span class="a">+    previousCue: -1,</span>
+<span class="a">+    cue: 0,</span>
+<span class="a">+    seeked: false,</span>
+<span class="a">+    ...over,</span>
+<span class="a">+  };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;pageForCue&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;gives the page of a matched cue&#x27;, () =&gt; {</span>
+<span class="a">+    expect(pageForCue(pages, 3)).toBe(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;borrows the page of the nearest matched cue before an unmatched one&#x27;, () =&gt; {</span>
+<span class="a">+    expect(pageForCue(pages, 2)).toBe(0);</span>
+<span class="a">+    expect(pageForCue(pages, 6)).toBe(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null when no matched cue is near enough&#x27;, () =&gt; {</span>
+<span class="a">+    const far = [0, ...new Array&lt;null&gt;(LOOKBACK + 1).fill(null)];</span>
+<span class="a">+    expect(pageForCue(far, far.length - 1)).toBeNull();</span>
+<span class="a">+    expect(pageForCue(far, LOOKBACK)).toBe(0);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;follow&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;marks a matched cue and stays on its page&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ cue: 1 }))).toEqual({ highlightCue: 1, turnToPage: null });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;turns to the page of a matched cue&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ cue: 3 }))).toEqual({ highlightCue: 3, turnToPage: 1 });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;turns for an unmatched cue with a matched cue before it, without a mark&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ cue: 5, currentPage: 0 }))).toEqual({</span>
+<span class="a">+      highlightCue: null,</span>
+<span class="a">+      turnToPage: 1,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(follow(input({ cue: 5, currentPage: 1 }))).toEqual({</span>
+<span class="a">+      highlightCue: null,</span>
+<span class="a">+      turnToPage: null,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does nothing for an unmatched cue with no matched cue near it&#x27;, () =&gt; {</span>
+<span class="a">+    const far = [0, ...new Array&lt;null&gt;(LOOKBACK + 1).fill(null)];</span>
+<span class="a">+    expect(follow(input({ cuePages: far, cue: far.length - 1, currentPage: 5 }))).toEqual({</span>
+<span class="a">+      highlightCue: null,</span>
+<span class="a">+      turnToPage: null,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;only turns pages in pages mode&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ mode: &#x27;pages&#x27;, cue: 3 }))).toEqual({</span>
+<span class="a">+      highlightCue: null,</span>
+<span class="a">+      turnToPage: 1,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does nothing when off&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ mode: &#x27;off&#x27;, cue: 3 }))).toEqual({</span>
+<span class="a">+      highlightCue: null,</span>
+<span class="a">+      turnToPage: null,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does nothing for the same cue without a seek, and acts on a seek&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ cue: 3, previousCue: 3 }))).toEqual({</span>
+<span class="a">+      highlightCue: null,</span>
+<span class="a">+      turnToPage: null,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(follow(input({ cue: 3, previousCue: 3, seeked: true }))).toEqual({</span>
+<span class="a">+      highlightCue: 3,</span>
+<span class="a">+      turnToPage: 1,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does nothing between cues&#x27;, () =&gt; {</span>
+<span class="a">+    expect(follow(input({ cue: -1 }))).toEqual({ highlightCue: null, turnToPage: null });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  const cuePages = fc.array(fc.option(fc.nat({ max: 9 }), { nil: null }), { maxLength: 30 });</span>
+<span class="a">+  const mode = fc.constantFrom&lt;FollowMode&gt;(&#x27;highlight&#x27;, &#x27;pages&#x27;, &#x27;off&#x27;);</span>
+<span class="a">+  const any = fc.record({</span>
+<span class="a">+    cuePages,</span>
+<span class="a">+    mode,</span>
+<span class="a">+    currentPage: fc.nat({ max: 9 }),</span>
+<span class="a">+    previousCue: fc.integer({ min: -1, max: 30 }),</span>
+<span class="a">+    cue: fc.integer({ min: -1, max: 30 }),</span>
+<span class="a">+    seeked: fc.boolean(),</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;never turns to a page that no cue maps to&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(any, (i) =&gt; {</span>
+<span class="a">+        const out = follow(i);</span>
+<span class="a">+        if (out.turnToPage !== null) {</span>
+<span class="a">+          expect(i.cuePages).toContain(out.turnToPage);</span>
+<span class="a">+          expect(out.turnToPage).not.toBe(i.currentPage);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;marks only the cue of now, and only when it is matched&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(any, (i) =&gt; {</span>
+<span class="a">+        const out = follow(i);</span>
+<span class="a">+        if (out.highlightCue !== null) {</span>
+<span class="a">+          expect(out.highlightCue).toBe(i.cue);</span>
+<span class="a">+          expect(i.mode).toBe(&#x27;highlight&#x27;);</span>
+<span class="a">+          expect(i.cuePages[i.cue]).not.toBeNull();</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;never acts when off, and never marks in pages mode&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(any, (i) =&gt; {</span>
+<span class="a">+        const out = follow({ ...i, mode: &#x27;off&#x27; });</span>
+<span class="a">+        expect(out).toEqual({ highlightCue: null, turnToPage: null });</span>
+<span class="a">+        expect(follow({ ...i, mode: &#x27;pages&#x27; }).highlightCue).toBeNull();</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/play-clock.test.ts b/test/play-clock.test.ts
+new file mode 100644
+index 0000000..fdc8fd7
+--- /dev/null
++++ b/test/play-clock.test.ts
+<span class="h">@@ -0,0 +1,78 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { positionAt, waitUntil, type PlayClock } from &#x27;../src/play-clock&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const ms = fc.nat({ max: 10 ** 8 });</span>
+<span class="a">+const speed = fc.double({ min: 0.25, max: 4, noNaN: true, noDefaultInfinity: true });</span>
+<span class="a">+const clock = fc.record({ positionMs: ms, reportedAtMs: ms, speed, playing: fc.boolean() });</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;positionAt&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;moves with the clock of the device at the speed&#x27;, () =&gt; {</span>
+<span class="a">+    const c: PlayClock = { positionMs: 1000, reportedAtMs: 500, speed: 2, playing: true };</span>
+<span class="a">+    expect(positionAt(c, 500)).toBe(1000);</span>
+<span class="a">+    expect(positionAt(c, 600)).toBe(1200);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;holds the position while paused&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(clock, ms, (c, now) =&gt; {</span>
+<span class="a">+        const paused = { ...c, playing: false };</span>
+<span class="a">+        expect(positionAt(paused, now)).toBe(c.positionMs);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;never goes back while playing&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(clock, ms, ms, (c, t1, t2) =&gt; {</span>
+<span class="a">+        const playing = { ...c, playing: true };</span>
+<span class="a">+        const [a, b] = t1 &lt;= t2 ? [t1, t2] : [t2, t1];</span>
+<span class="a">+        expect(positionAt(playing, b)).toBeGreaterThanOrEqual(positionAt(playing, a));</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;scales the distance with the speed&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(clock, ms, fc.double({ min: 1, max: 4, noNaN: true }), (c, dt, k) =&gt; {</span>
+<span class="a">+        const playing = { ...c, playing: true };</span>
+<span class="a">+        const faster = { ...playing, speed: playing.speed * k };</span>
+<span class="a">+        const now = c.reportedAtMs + dt;</span>
+<span class="a">+        const d1 = positionAt(playing, now) - c.positionMs;</span>
+<span class="a">+        const d2 = positionAt(faster, now) - c.positionMs;</span>
+<span class="a">+        expect(d2).toBeCloseTo(d1 * k, 3);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;waitUntil&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;gives the real time until the target&#x27;, () =&gt; {</span>
+<span class="a">+    const c: PlayClock = { positionMs: 1000, reportedAtMs: 0, speed: 2, playing: true };</span>
+<span class="a">+    expect(waitUntil(c, 3000, 0)).toBe(1000);</span>
+<span class="a">+    expect(waitUntil(c, 3000, 500)).toBe(500);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null when paused or already past the target&#x27;, () =&gt; {</span>
+<span class="a">+    const paused: PlayClock = { positionMs: 0, reportedAtMs: 0, speed: 1, playing: false };</span>
+<span class="a">+    expect(waitUntil(paused, 100, 0)).toBeNull();</span>
+<span class="a">+    const playing = { ...paused, playing: true };</span>
+<span class="a">+    expect(waitUntil(playing, 0, 0)).toBeNull();</span>
+<span class="a">+    expect(waitUntil(playing, -5, 0)).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;lands on the target after the wait&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(clock, ms, ms, (c, now, target) =&gt; {</span>
+<span class="a">+        const playing = { ...c, playing: true };</span>
+<span class="a">+        const wait = waitUntil(playing, target, now);</span>
+<span class="a">+        if (wait === null) {</span>
+<span class="a">+          expect(positionAt(playing, now)).toBeGreaterThanOrEqual(target);</span>
+<span class="a">+        } else {</span>
+<span class="a">+          expect(wait).toBeGreaterThan(0);</span>
+<span class="a">+          expect(positionAt(playing, now + wait)).toBeGreaterThanOrEqual(target);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/player-state.test.ts b/test/player-state.test.ts
+new file mode 100644
+index 0000000..666cc26
+--- /dev/null
++++ b/test/player-state.test.ts
+<span class="h">@@ -0,0 +1,76 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { isPlayerError, parseState, seekArgument, type PlayerState } from &#x27;../src/player-state&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+function state(line: string): PlayerState {</span>
+<span class="a">+  const parsed = parseState(line);</span>
+<span class="a">+  if (isPlayerError(parsed)) throw new Error(`error ${parsed.error} for ${line}`);</span>
+<span class="a">+  return parsed;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;parseState&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;reads a playing report&#x27;, () =&gt; {</span>
+<span class="a">+    expect(state(&#x27;playing=1;position=96153;speed=1.5;package=de.ph1b.audiobook&#x27;)).toEqual({</span>
+<span class="a">+      playing: true,</span>
+<span class="a">+      positionMs: 96153,</span>
+<span class="a">+      speed: 1.5,</span>
+<span class="a">+      package: &#x27;de.ph1b.audiobook&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;reads a paused report&#x27;, () =&gt; {</span>
+<span class="a">+    const s = state(&#x27;playing=0;position=0;speed=1.0;package=p&#x27;);</span>
+<span class="a">+    expect(s.playing).toBe(false);</span>
+<span class="a">+    expect(s.positionMs).toBe(0);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives no position for a player without one&#x27;, () =&gt; {</span>
+<span class="a">+    const s = state(&#x27;playing=1;position=-1;speed=1.0;package=p&#x27;);</span>
+<span class="a">+    expect(s.playing).toBe(true);</span>
+<span class="a">+    expect(s.positionMs).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;returns the error name of a problem line&#x27;, () =&gt; {</span>
+<span class="a">+    expect(parseState(&#x27;error=no_player&#x27;)).toEqual({ error: &#x27;no_player&#x27; });</span>
+<span class="a">+    expect(parseState(&#x27;error=no_notification_access&#x27;)).toEqual({</span>
+<span class="a">+      error: &#x27;no_notification_access&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(parseState(&#x27;error=no_overlay&#x27;)).toEqual({ error: &#x27;no_overlay&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;rejects an empty or broken line&#x27;, () =&gt; {</span>
+<span class="a">+    expect(parseState(null)).toEqual({ error: &#x27;empty&#x27; });</span>
+<span class="a">+    expect(parseState(undefined)).toEqual({ error: &#x27;empty&#x27; });</span>
+<span class="a">+    expect(parseState(&#x27;&#x27;)).toEqual({ error: &#x27;empty&#x27; });</span>
+<span class="a">+    expect(parseState(&#x27;hello&#x27;)).toEqual({ error: &#x27;malformed&#x27; });</span>
+<span class="a">+    expect(parseState(&#x27;playing=1;position=abc&#x27;)).toEqual({ error: &#x27;malformed&#x27; });</span>
+<span class="a">+    expect(parseState(&#x27;playing=1;position=&#x27;)).toEqual({ error: &#x27;malformed&#x27; });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;falls back to speed 1 for a missing or zero speed&#x27;, () =&gt; {</span>
+<span class="a">+    expect(state(&#x27;playing=1;position=5&#x27;).speed).toBe(1);</span>
+<span class="a">+    expect(state(&#x27;playing=1;position=5;speed=0&#x27;).speed).toBe(1);</span>
+<span class="a">+    expect(state(&#x27;playing=1;position=5;speed=-2&#x27;).speed).toBe(1);</span>
+<span class="a">+    expect(state(&#x27;playing=1;position=5&#x27;).package).toBe(&#x27;&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;round trips a position through the seek argument&#x27;, () =&gt; {</span>
+<span class="a">+    for (const ms of [0, 1, 1000, 96153, 3600500, 12345678.9]) {</span>
+<span class="a">+      const argument = seekArgument(ms);</span>
+<span class="a">+      expect(argument).toMatch(/^\d+$/);</span>
+<span class="a">+      expect(state(`playing=0;position=${argument}`).positionMs).toBeCloseTo(ms, -1);</span>
+<span class="a">+    }</span>
+<span class="a">+    expect(seekArgument(-3)).toBe(&#x27;0&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;round trips any state line&#x27;, () =&gt; {</span>
+<span class="a">+    const pkg = fc.stringMatching(/^[a-z][a-z0-9_.]{0,30}$/);</span>
+<span class="a">+    const speed = fc.double({ min: 0.25, max: 4, noNaN: true, noDefaultInfinity: true });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(fc.boolean(), fc.nat({ max: 10 ** 9 }), speed, pkg, (playing, ms, sp, p) =&gt; {</span>
+<span class="a">+        const line = `playing=${playing ? 1 : 0};position=${ms};speed=${sp};package=${p}`;</span>
+<span class="a">+        expect(state(line)).toEqual({ playing, positionMs: ms, speed: sp, package: p });</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

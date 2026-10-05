@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread c9412f77 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit c9412f77aa0fd7a1091a31a5347ae33483593065
+truex &lt;truex@equwal.com&gt;
+2026-09-26 23:21:05 -0700
+
+Do not show old status texts over the new book
+
+- The user picks a large file A that is no PDF, then B. B shows first.
+  Then A failed, and the strip said &quot;This file is not a PDF, or it is
+  damaged.&quot; over the good book B.
+- A restore of the last book that failed after an open of the user
+  said its error over the book of the user.
+- The SubRead result text of book A (&quot;15 cues, language en, ...&quot;)
+  stayed in the menu when book B opened.
+
+openBook now ends each failed attempt in one place, and says its error
+only when failureShows (book-open.ts) allows it: no later attempt shows
+a book, and for the restore, the user started no open after it. An
+empty file is now an attempt too, so its error follows the same rule.
+When a book opens, the make status goes unless a SubRead job runs or
+waits for this book (keepMakeStatus, book-subtitles.ts). The status of
+a job that runs stays, because it tells why the button is off.
+
+</pre><pre> src/book-open.ts            | 12 ++++++++
+ src/book-subtitles.ts       | 18 ++++++++++++
+ src/main.ts                 | 70 ++++++++++++++++++++++++++++-----------------
+ test/book-open.test.ts      | 45 +++++++++++++++++++++++++++++
+ test/book-subtitles.test.ts | 29 ++++++++++++++++++-
+ 5 files changed, 147 insertions(+), 27 deletions(-)
+</pre><pre>diff --git a/src/book-open.ts b/src/book-open.ts
+index fab6fa7..a16297e 100644
+--- a/src/book-open.ts
++++ b/src/book-open.ts
+<span class="h">@@ -70,3 +70,15 @@ export function subtitlesOwner(o: Opens, book: string | null): string | null {</span>
+ export function userOpened(o: Opens, since: number): boolean {
+   return o.byUser !== since;
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * True when the strip may tell why the attempt `attempt` failed: no later</span>
+<span class="a">+ * attempt shows a book. For the restore of the last book, `since` is</span>
+<span class="a">+ * o.byUser when the restore started, and the error shows only when the user</span>
+<span class="a">+ * started no open after that: the user&#x27;s book tells its own state. Before,</span>
+<span class="a">+ * &quot;This file is not a PDF, or it is damaged.&quot; of an older pick showed over</span>
+<span class="a">+ * the good book that the user picked after it.</span>
+<span class="a">+ */</span>
+<span class="a">+export function failureShows(o: Opens, attempt: number, since?: number): boolean {</span>
+<span class="a">+  return attempt &gt; o.shown &amp;&amp; (since === undefined || !userOpened(o, since));</span>
+<span class="a">+}</span>
+diff --git a/src/book-subtitles.ts b/src/book-subtitles.ts
+index 5db1729..c290670 100644
+--- a/src/book-subtitles.ts
++++ b/src/book-subtitles.ts
+<span class="h">@@ -100,3 +100,21 @@ export function subreadConcerns(c: SubreadCheck): string[] {</span>
+   }
+   return out;
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * True when the make status, the SubRead part of the menu, stays when the</span>
+<span class="a">+ * book `book` opens. `making` is the book of the SubRead job that runs, and</span>
+<span class="a">+ * `waitBook` the book of the job that waits for its pages, before the open.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The status of a job that runs stays: one job runs at a time, so it tells</span>
+<span class="a">+ * why the button is off. The status of a wait for this book stays. Else the</span>
+<span class="a">+ * status of the book before goes: the SubRead result of book A stayed in</span>
+<span class="a">+ * the menu of book B.</span>
+<span class="a">+ */</span>
+<span class="a">+export function keepMakeStatus(</span>
+<span class="a">+  book: string,</span>
+<span class="a">+  making: string | null,</span>
+<span class="a">+  waitBook: string | null,</span>
+<span class="a">+): boolean {</span>
+<span class="a">+  return making !== null || waitBook === book;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index c74f97a..8817e2d 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -9,8 +9,21 @@ import { App } from &#x27;@capacitor/app&#x27;;</span>
+ import { createAligner, shiftSpans, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+ import { ankiCard, cardSource } from &#x27;./anki-card&#x27;;
+ import { backStep, keepScreenOn } from &#x27;./app-state&#x27;;
+<span class="d">-import { beginOpen, createOpens, endOpen, subtitlesOwner, userOpened } from &#x27;./book-open&#x27;;</span>
+<span class="d">-import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  beginOpen,</span>
+<span class="a">+  createOpens,</span>
+<span class="a">+  endOpen,</span>
+<span class="a">+  failureShows,</span>
+<span class="a">+  subtitlesOwner,</span>
+<span class="a">+  userOpened,</span>
+<span class="a">+} from &#x27;./book-open&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  keepMakeStatus,</span>
+<span class="a">+  resultName,</span>
+<span class="a">+  srtName,</span>
+<span class="a">+  subreadConcerns,</span>
+<span class="a">+  subtitlesOnOpen,</span>
+<span class="a">+} from &#x27;./book-subtitles&#x27;;</span>
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+ import { audioPage, cueParts, cueProgress, pageStartTime, type CueParts } from &#x27;./cue-pages&#x27;;
+<span class="h">@@ -308,33 +321,40 @@ ui.pdfFile.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+ /** The attempts to open a book, and the attempt of the book that is open. */
+ const opens = createOpens();
+ 
+<span class="a">+/** The restore of the last book: its meta data, and opens.byUser when the restore started. */</span>
+<span class="a">+interface Restore {</span>
+<span class="a">+  meta: BookMeta;</span>
+<span class="a">+  since: number;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /**
+  * Opens `file` as the book. The book that is open stays until the new
+  * file loads: a file that is not a PDF, or is damaged, changes nothing.
+  *
+<span class="d">- * `meta` is what the reader keeps for the book, when the caller has it:</span>
+<span class="d">- * the book opens at its page. Only the restore of the last book gives it,</span>
+<span class="d">- * so an open without it is a file that the user picked. Else the meta data</span>
+<span class="d">- * comes from IndexedDB after the open. The page shows and the reading</span>
+<span class="d">- * starts at once, and the meta data applies when it comes: an upgrade of</span>
+<span class="d">- * the database can hold IndexedDB for many seconds. Gives true when the new</span>
+<span class="d">- * book is open.</span>
+<span class="a">+ * `restore` comes from the restore of the last book: the book opens at the</span>
+<span class="a">+ * page of its meta data. An open without it is a file that the user</span>
+<span class="a">+ * picked, and its meta data comes from IndexedDB after the open. The page</span>
+<span class="a">+ * shows and the reading starts at once, and the meta data applies when it</span>
+<span class="a">+ * comes: an upgrade of the database can hold IndexedDB for many seconds.</span>
+<span class="a">+ * Gives true when the new book is open.</span>
+  */
+<span class="d">-async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {</span>
+<span class="d">-  if (file.size === 0) {</span>
+<span class="d">-    say(EMPTY_FILE_TEXT);</span>
+<span class="a">+async function openBook(file: File, restore?: Restore): Promise&lt;boolean&gt; {</span>
+<span class="a">+  const meta = restore?.meta;</span>
+<span class="a">+  const attempt = beginOpen(opens, restore === undefined);</span>
+<span class="a">+  /** Ends the attempt that failed. The strip shows `text` only when failureShows allows it. */</span>
+<span class="a">+  const fail = (text: string): false =&gt; {</span>
+<span class="a">+    endOpen(opens, attempt, false);</span>
+<span class="a">+    claimSubtitles();</span>
+<span class="a">+    if (failureShows(opens, attempt, restore?.since)) say(text);</span>
+     return false;
+<span class="d">-  }</span>
+<span class="d">-  const attempt = beginOpen(opens, meta === undefined);</span>
+<span class="a">+  };</span>
+<span class="a">+  if (file.size === 0) return fail(EMPTY_FILE_TEXT);</span>
+   let bytes: ArrayBuffer;
+   try {
+     bytes = await file.arrayBuffer();
+   } catch (err) {
+<span class="d">-    endOpen(opens, attempt, false);</span>
+<span class="d">-    claimSubtitles();</span>
+     // The copy of the last book is gone, for example after the storage was cleared.
+<span class="d">-    say(meta ? LAST_BOOK_GONE_TEXT : `Cannot read ${file.name}: ${String(err)}`);</span>
+<span class="d">-    return false;</span>
+<span class="a">+    return fail(restore ? LAST_BOOK_GONE_TEXT : `Cannot read ${file.name}: ${String(err)}`);</span>
+   }
+   let pdf: PdfDoc;
+   try {
+<span class="h">@@ -342,10 +362,7 @@ async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {</span>
+     const { loadPdf } = await import(&#x27;./pdf&#x27;);
+     pdf = await loadPdf(bytes);
+   } catch (err) {
+<span class="d">-    endOpen(opens, attempt, false);</span>
+<span class="d">-    claimSubtitles();</span>
+<span class="d">-    say(pdfOpenText(err));</span>
+<span class="d">-    return false;</span>
+<span class="a">+    return fail(pdfOpenText(err));</span>
+   }
+   // A file that the user picked later is open already.
+   if (!endOpen(opens, attempt, true)) {
+<span class="h">@@ -374,11 +391,12 @@ async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {</span>
+   }
+   claimSubtitles();
+   const subtitlesSeq = state.subtitlesSeq;
+<span class="d">-  // A SubRead job that waits for the pages of another book does not start.</span>
+<span class="d">-  if (state.makeWait &amp;&amp; state.makeWait.book !== key) {</span>
+<span class="d">-    state.makeWait = null;</span>
+<span class="a">+  // The SubRead status of the book before goes, unless a job runs.</span>
+<span class="a">+  if (!keepMakeStatus(key, state.making, state.makeWait?.book ?? null)) {</span>
+     ui.makeStatus.textContent = &#x27;&#x27;;
+   }
+<span class="a">+  // A SubRead job that waits for the pages of another book does not start.</span>
+<span class="a">+  if (state.makeWait &amp;&amp; state.makeWait.book !== key) state.makeWait = null;</span>
+   setForceOcr(meta?.forceOcr ?? false);
+   ui.forceOcr.disabled = false;
+   ui.clearBook.disabled = false;
+<span class="h">@@ -503,7 +521,7 @@ async function restoreLastBook(): Promise&lt;void&gt; {</span>
+     showStart();
+     return;
+   }
+<span class="d">-  if (await openBook(file, meta)) return;</span>
+<span class="a">+  if (await openBook(file, { meta, since })) return;</span>
+   // The copy cannot be read, or it is no PDF now: forget it. After an open
+   // by the user, the copy can be of the user&#x27;s book, so it stays.
+   if (!userOpened(opens, since)) await clearLastBook(bookKey(file));
+diff --git a/test/book-open.test.ts b/test/book-open.test.ts
+index 5d9e51b..83e161b 100644
+--- a/test/book-open.test.ts
++++ b/test/book-open.test.ts
+<span class="h">@@ -4,12 +4,57 @@ import {</span>
+   beginOpen,
+   createOpens,
+   endOpen,
+<span class="a">+  failureShows,</span>
+   opening,
+   subtitlesOwner,
+   userOpened,
+   type Opens,
+ } from &#x27;../src/book-open&#x27;;
+ 
+<span class="a">+describe(&#x27;failureShows&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;does not say the error of an older pick over the book that shows&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: the user picks a large file A that is no PDF, then B. B</span>
+<span class="a">+    // shows first. Then A fails, and the strip said &quot;This file is not a</span>
+<span class="a">+    // PDF, or it is damaged.&quot; over the good book B.</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const a = beginOpen(o, true);</span>
+<span class="a">+    const b = beginOpen(o, true);</span>
+<span class="a">+    expect(endOpen(o, b, true)).toBe(true);</span>
+<span class="a">+    expect(endOpen(o, a, false)).toBe(false);</span>
+<span class="a">+    expect(failureShows(o, a)).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;says the error of a pick when no later pick shows&#x27;, () =&gt; {</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const a = beginOpen(o, true);</span>
+<span class="a">+    endOpen(o, a, false);</span>
+<span class="a">+    expect(failureShows(o, a)).toBe(true);</span>
+<span class="a">+    // B still loads when A fails. When B shows, its message replaces the error.</span>
+<span class="a">+    const c = beginOpen(o, true);</span>
+<span class="a">+    beginOpen(o, true);</span>
+<span class="a">+    endOpen(o, c, false);</span>
+<span class="a">+    expect(failureShows(o, c)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not say the error of the restore after an open of the user&#x27;, () =&gt; {</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const since = o.byUser;</span>
+<span class="a">+    const l = beginOpen(o, false);</span>
+<span class="a">+    beginOpen(o, true);</span>
+<span class="a">+    endOpen(o, l, false);</span>
+<span class="a">+    // The book of the user still loads, and it shows its own message.</span>
+<span class="a">+    expect(failureShows(o, l, since)).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;says the error of the restore when the user opened nothing&#x27;, () =&gt; {</span>
+<span class="a">+    const o = createOpens();</span>
+<span class="a">+    const since = o.byUser;</span>
+<span class="a">+    const l = beginOpen(o, false);</span>
+<span class="a">+    endOpen(o, l, false);</span>
+<span class="a">+    expect(failureShows(o, l, since)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ /** One step of a script of opens: start the next attempt, or end one that loads. */
+ interface Step {
+   begin: boolean;
+diff --git a/test/book-subtitles.test.ts b/test/book-subtitles.test.ts
+index 394b446..7f89cb9 100644
+--- a/test/book-subtitles.test.ts
++++ b/test/book-subtitles.test.ts
+<span class="h">@@ -1,6 +1,33 @@</span>
+ import fc from &#x27;fast-check&#x27;;
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import { resultName, srtName, subreadConcerns, subtitlesOnOpen } from &#x27;../src/book-subtitles&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  keepMakeStatus,</span>
+<span class="a">+  resultName,</span>
+<span class="a">+  srtName,</span>
+<span class="a">+  subreadConcerns,</span>
+<span class="a">+  subtitlesOnOpen,</span>
+<span class="a">+} from &#x27;../src/book-subtitles&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;keepMakeStatus&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;removes the SubRead result of the book before&#x27;, () =&gt; {</span>
+<span class="a">+    // The finding: &quot;15 cues, language en, 97% ...&quot; of book A stayed in the</span>
+<span class="a">+    // menu when book B opened.</span>
+<span class="a">+    expect(keepMakeStatus(&#x27;B&#x27;, null, null)).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;removes the wait of the book before: its job does not start&#x27;, () =&gt; {</span>
+<span class="a">+    expect(keepMakeStatus(&#x27;B&#x27;, null, &#x27;A&#x27;)).toBe(false);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the status of the job that runs: it tells why the button is off&#x27;, () =&gt; {</span>
+<span class="a">+    expect(keepMakeStatus(&#x27;B&#x27;, &#x27;A&#x27;, null)).toBe(true);</span>
+<span class="a">+    expect(keepMakeStatus(&#x27;A&#x27;, &#x27;A&#x27;, null)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the wait of the book that opens again&#x27;, () =&gt; {</span>
+<span class="a">+    expect(keepMakeStatus(&#x27;A&#x27;, null, &#x27;A&#x27;)).toBe(true);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+ 
+ describe(&#x27;srtName&#x27;, () =&gt; {
+   it(&#x27;puts .srt in place of .pdf&#x27;, () =&gt; {</pre>
+</div></body></html>

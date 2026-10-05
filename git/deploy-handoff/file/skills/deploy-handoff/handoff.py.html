@@ -7,373 +7,683 @@
 <div id="top"><a href="../../../../../index.html">Recently Written</a> &middot; <a href="../../../../index.html">git</a></div>
 <h1>deploy-handoff</h1><span class="desc">Claude Code plugin: the agent drives the browser to the last deploy, billing, or pull request step. You make the final click.</span><p class="url">git clone https://github.com/equwal/deploy-handoff</p><p><a href="../../../../deploy-handoff/index.html">Log</a> | <a href="../../../../deploy-handoff/files.html">Files</a> | <a href="../../../../deploy-handoff/refs.html">Refs</a></p><hr/>
 <div id="content">
-<p>skills/deploy-handoff/handoff.py (16416 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Open a web page and wait while the user does a step that only a human may do.
+<p>skills/deploy-handoff/handoff.py (30194 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Open a web page and wait while the user does a step that only a human may do.
 <a id="l2" href="#l2">2</a> 
 <a id="l3" href="#l3">3</a> A tool calls this script when it reaches a step that an AI agent must not do:
 <a id="l4" href="#l4">4</a> the final deploy, publish, or billing click, a sign-in, an OAuth consent, or
-<a id="l5" href="#l5">5</a> the creation of a GitHub pull request. The script opens the page in the
-<a id="l6" href="#l6">6</a> default browser and shows a small dialog with the steps. It never clicks for
-<a id="l7" href="#l7">7</a> the user. It prints the answer of the user as one JSON object on stdout.
-<a id="l8" href="#l8">8</a> 
-<a id="l9" href="#l9">9</a> Exit codes: 0 done, 1 error, 2 bad arguments, 3 not done, 4 timeout.
-<a id="l10" href="#l10">10</a> &quot;&quot;&quot;
-<a id="l11" href="#l11">11</a> 
-<a id="l12" href="#l12">12</a> import argparse
-<a id="l13" href="#l13">13</a> import contextlib
-<a id="l14" href="#l14">14</a> import ctypes
-<a id="l15" href="#l15">15</a> import json
-<a id="l16" href="#l16">16</a> import os
-<a id="l17" href="#l17">17</a> import re
-<a id="l18" href="#l18">18</a> import subprocess
-<a id="l19" href="#l19">19</a> import sys
-<a id="l20" href="#l20">20</a> import tkinter as tk
-<a id="l21" href="#l21">21</a> import tomllib
-<a id="l22" href="#l22">22</a> import webbrowser
-<a id="l23" href="#l23">23</a> from collections.abc import Callable, Iterable
-<a id="l24" href="#l24">24</a> from dataclasses import dataclass
-<a id="l25" href="#l25">25</a> from pathlib import Path
-<a id="l26" href="#l26">26</a> from tkinter import font as tkfont
-<a id="l27" href="#l27">27</a> from tkinter import ttk
-<a id="l28" href="#l28">28</a> from urllib.parse import quote, urlencode, urlsplit
-<a id="l29" href="#l29">29</a> 
-<a id="l30" href="#l30">30</a> SHIPPED_CONFIG = Path(__file__).with_name(&quot;config.toml&quot;)
-<a id="l31" href="#l31">31</a> USER_CONFIG = (
-<a id="l32" href="#l32">32</a>     Path(os.environ.get(&quot;XDG_CONFIG_HOME&quot;) or Path.home() / &quot;.config&quot;)
-<a id="l33" href="#l33">33</a>     / &quot;deploy-handoff&quot;
-<a id="l34" href="#l34">34</a>     / &quot;config.toml&quot;
-<a id="l35" href="#l35">35</a> )
-<a id="l36" href="#l36">36</a> # GitHub refuses very long request lines. This limit keeps a margin.
-<a id="l37" href="#l37">37</a> MAX_PR_URL_LENGTH = 8000
-<a id="l38" href="#l38">38</a> EXIT_CODES = {&quot;done&quot;: 0, &quot;error&quot;: 1, &quot;not_done&quot;: 3, &quot;timeout&quot;: 4}
-<a id="l39" href="#l39">39</a> # ASD-STE100 Simplified Technical English allows 20 words in one instruction.
-<a id="l40" href="#l40">40</a> MAX_STEP_WORDS = 20
-<a id="l41" href="#l41">41</a> PR_STEPS = (
-<a id="l42" href="#l42">42</a>     &quot;Make sure that the branches, the title, and the description are correct.&quot;,
-<a id="l43" href="#l43">43</a>     &#x27;Click &quot;Create pull request&quot;.&#x27;,
-<a id="l44" href="#l44">44</a> )
-<a id="l45" href="#l45">45</a> HEADING = &quot;Do these steps in your browser:&quot;
-<a id="l46" href="#l46">46</a> FINISH = (
-<a id="l47" href="#l47">47</a>     &#x27;When you finish, click &quot;Done&quot;.\n&#x27;
-<a id="l48" href="#l48">48</a>     &#x27;If you cannot finish, write the reason in the note. Then click &quot;Not done&quot;.&#x27;
-<a id="l49" href="#l49">49</a> )
-<a id="l50" href="#l50">50</a> WARNING = (
-<a id="l51" href="#l51">51</a>     &quot;Claude does not click for you. Before you sign in, make sure that the address bar &quot;
-<a id="l52" href="#l52">52</a>     &quot;shows the site above. Do not type a password, key, or card number in this window.&quot;
-<a id="l53" href="#l53">53</a> )
-<a id="l54" href="#l54">54</a> 
-<a id="l55" href="#l55">55</a> # A plain DNS name in lowercase ASCII. The script refuses all other host forms,
-<a id="l56" href="#l56">56</a> # so the browser and this script always read the same host from a URL.
-<a id="l57" href="#l57">57</a> HOST_RE = re.compile(r&quot;[a-z0-9-]+(?:\.[a-z0-9-]+)+&quot;)
-<a id="l58" href="#l58">58</a> # Printable ASCII without a space. Callers percent-encode all other characters.
-<a id="l59" href="#l59">59</a> URL_CHARS_RE = re.compile(r&quot;[!-~]+&quot;)
-<a id="l60" href="#l60">60</a> REPO_RE = re.compile(r&quot;[A-Za-z0-9-]+/[A-Za-z0-9._-]+&quot;)
-<a id="l61" href="#l61">61</a> GITHUB_REMOTE_RE = re.compile(
-<a id="l62" href="#l62">62</a>     r&quot;(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)&quot;
-<a id="l63" href="#l63">63</a>     r&quot;(?P&lt;repo&gt;[A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?&quot;
-<a id="l64" href="#l64">64</a> )
-<a id="l65" href="#l65">65</a> 
-<a id="l66" href="#l66">66</a> 
-<a id="l67" href="#l67">67</a> class HandoffError(Exception):
-<a id="l68" href="#l68">68</a>     &quot;&quot;&quot;The script cannot start the handoff. The message tells the caller why.&quot;&quot;&quot;
-<a id="l69" href="#l69">69</a> 
-<a id="l70" href="#l70">70</a> 
-<a id="l71" href="#l71">71</a> @dataclass(frozen=True)
-<a id="l72" href="#l72">72</a> class Request:
-<a id="l73" href="#l73">73</a>     &quot;&quot;&quot;A page to open, and the steps that the user must do on it.&quot;&quot;&quot;
-<a id="l74" href="#l74">74</a> 
-<a id="l75" href="#l75">75</a>     title: str
-<a id="l76" href="#l76">76</a>     url: str
-<a id="l77" href="#l77">77</a>     steps: tuple[str, ...]
-<a id="l78" href="#l78">78</a>     # For a pull request: the repository as &quot;owner/name&quot;, and the head branch.
-<a id="l79" href="#l79">79</a>     pr: tuple[str, str] | None = None
-<a id="l80" href="#l80">80</a> 
-<a id="l81" href="#l81">81</a> 
-<a id="l82" href="#l82">82</a> def match_domain(host: str, domains: Iterable[str]) -&gt; str | None:
-<a id="l83" href="#l83">83</a>     &quot;&quot;&quot;Return the most specific domain that is host or a parent domain of host.&quot;&quot;&quot;
-<a id="l84" href="#l84">84</a>     matches = [domain for domain in domains if host == domain or host.endswith(&quot;.&quot; + domain)]
-<a id="l85" href="#l85">85</a>     return max(matches, key=len, default=None)
-<a id="l86" href="#l86">86</a> 
-<a id="l87" href="#l87">87</a> 
-<a id="l88" href="#l88">88</a> def check_url(url: str, domains: Iterable[str]) -&gt; str:
-<a id="l89" href="#l89">89</a>     &quot;&quot;&quot;Return the domain that allows url. Raise HandoffError if the script must not open url.&quot;&quot;&quot;
-<a id="l90" href="#l90">90</a>     if &quot;\\&quot; in url or not URL_CHARS_RE.fullmatch(url):
-<a id="l91" href="#l91">91</a>         raise HandoffError(
-<a id="l92" href="#l92">92</a>             f&quot;The URL must be printable ASCII with no spaces or backslashes: {url!r}&quot;
-<a id="l93" href="#l93">93</a>         )
-<a id="l94" href="#l94">94</a>     try:
-<a id="l95" href="#l95">95</a>         parts = urlsplit(url)
-<a id="l96" href="#l96">96</a>     except ValueError as exc:
-<a id="l97" href="#l97">97</a>         raise HandoffError(f&quot;The URL is not valid: {url}&quot;) from exc
-<a id="l98" href="#l98">98</a>     host = parts.hostname or &quot;&quot;
-<a id="l99" href="#l99">99</a>     # The netloc must be the host only: no user name, no password, and no port.
-<a id="l100" href="#l100">100</a>     if parts.scheme != &quot;https&quot; or parts.netloc.lower() != host or not HOST_RE.fullmatch(host):
-<a id="l101" href="#l101">101</a>         raise HandoffError(f&quot;The URL must use https and a plain host name: {url}&quot;)
-<a id="l102" href="#l102">102</a>     domain = match_domain(host, domains)
-<a id="l103" href="#l103">103</a>     if domain is None:
-<a id="l104" href="#l104">104</a>         raise HandoffError(
-<a id="l105" href="#l105">105</a>             f&quot;{host} is not an allowed host. Ask the user to add it to allowed_hosts in &quot;
-<a id="l106" href="#l106">106</a>             f&quot;{USER_CONFIG}. Do not add it yourself.&quot;
-<a id="l107" href="#l107">107</a>         )
-<a id="l108" href="#l108">108</a>     return domain
+<a id="l5" href="#l5">5</a> the creation of a GitHub pull request. The script opens the page in the Brave
+<a id="l6" href="#l6">6</a> profile that brave_profile names in the user config file, or else in the default
+<a id="l7" href="#l7">7</a> browser. It shows a small dialog with the steps. It never clicks for the user.
+<a id="l8" href="#l8">8</a> It prints the answer of the user as one JSON object on stdout.
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> The command &quot;terminal&quot; shows the same dialog for a step at a prompt in a terminal,
+<a id="l11" href="#l11">11</a> for example the install question of a tool or a sign-in of a command line program.
+<a id="l12" href="#l12">12</a> It opens no page. The caller starts the program in a terminal that the user sees,
+<a id="l13" href="#l13">13</a> and stops at the prompt. The script never types the answer for the user.
+<a id="l14" href="#l14">14</a> 
+<a id="l15" href="#l15">15</a> The command &quot;browser --fresh&quot; starts a separate browser with a fresh profile for
+<a id="l16" href="#l16">16</a> the browser-driver agent of this plugin. Use it only if the user asks for it.
+<a id="l17" href="#l17">17</a> Playwright MCP controls that browser through a local port.
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> Exit codes: 0 done, started, or running, 1 error, 2 bad arguments, 3 not done,
+<a id="l20" href="#l20">20</a> 4 timeout.
+<a id="l21" href="#l21">21</a> &quot;&quot;&quot;
+<a id="l22" href="#l22">22</a> 
+<a id="l23" href="#l23">23</a> import argparse
+<a id="l24" href="#l24">24</a> import contextlib
+<a id="l25" href="#l25">25</a> import ctypes
+<a id="l26" href="#l26">26</a> import http.client
+<a id="l27" href="#l27">27</a> import json
+<a id="l28" href="#l28">28</a> import os
+<a id="l29" href="#l29">29</a> import re
+<a id="l30" href="#l30">30</a> import shutil
+<a id="l31" href="#l31">31</a> import subprocess
+<a id="l32" href="#l32">32</a> import sys
+<a id="l33" href="#l33">33</a> import time
+<a id="l34" href="#l34">34</a> import tomllib
+<a id="l35" href="#l35">35</a> import urllib.request
+<a id="l36" href="#l36">36</a> import webbrowser
+<a id="l37" href="#l37">37</a> from collections.abc import Callable, Iterable
+<a id="l38" href="#l38">38</a> from dataclasses import dataclass
+<a id="l39" href="#l39">39</a> from pathlib import Path
+<a id="l40" href="#l40">40</a> from urllib.parse import quote, urlencode, urlsplit
+<a id="l41" href="#l41">41</a> 
+<a id="l42" href="#l42">42</a> # A Wayland desktop without X11 has no Tk. Then MenuDialog shows the steps in bemenu.
+<a id="l43" href="#l43">43</a> try:
+<a id="l44" href="#l44">44</a>     import tkinter as tk
+<a id="l45" href="#l45">45</a>     from tkinter import font as tkfont
+<a id="l46" href="#l46">46</a>     from tkinter import ttk
+<a id="l47" href="#l47">47</a> 
+<a id="l48" href="#l48">48</a>     HAVE_TK = True
+<a id="l49" href="#l49">49</a> except ImportError:
+<a id="l50" href="#l50">50</a>     HAVE_TK = False
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> USER_CONFIG = (
+<a id="l53" href="#l53">53</a>     Path(os.environ.get(&quot;XDG_CONFIG_HOME&quot;) or Path.home() / &quot;.config&quot;)
+<a id="l54" href="#l54">54</a>     / &quot;deploy-handoff&quot;
+<a id="l55" href="#l55">55</a>     / &quot;config.toml&quot;
+<a id="l56" href="#l56">56</a> )
+<a id="l57" href="#l57">57</a> # The browser-driver agent uses a browser with a fresh profile of its own. Playwright MCP
+<a id="l58" href="#l58">58</a> # controls it through this remote debugging port. .mcp.json at the root of the plugin uses the
+<a id="l59" href="#l59">59</a> # same port.
+<a id="l60" href="#l60">60</a> DEBUG_PORT = 9333
+<a id="l61" href="#l61">61</a> BROWSER_PROFILE = USER_CONFIG.with_name(&quot;browser&quot;)
+<a id="l62" href="#l62">62</a> # The time in seconds that a new browser gets to open DEBUG_PORT.
+<a id="l63" href="#l63">63</a> BROWSER_START_SECONDS = 30
+<a id="l64" href="#l64">64</a> # The browser listens on 127.0.0.1. A proxy must not get these requests.
+<a id="l65" href="#l65">65</a> LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+<a id="l66" href="#l66">66</a> # GitHub refuses very long request lines. This limit keeps a margin.
+<a id="l67" href="#l67">67</a> MAX_PR_URL_LENGTH = 8000
+<a id="l68" href="#l68">68</a> EXIT_CODES = {&quot;done&quot;: 0, &quot;started&quot;: 0, &quot;running&quot;: 0, &quot;error&quot;: 1, &quot;not_done&quot;: 3, &quot;timeout&quot;: 4}
+<a id="l69" href="#l69">69</a> # ASD-STE100 Simplified Technical English allows 20 words in one instruction.
+<a id="l70" href="#l70">70</a> MAX_STEP_WORDS = 20
+<a id="l71" href="#l71">71</a> PR_STEPS = (
+<a id="l72" href="#l72">72</a>     &quot;Make sure that the branches, the title, and the description are correct.&quot;,
+<a id="l73" href="#l73">73</a>     &#x27;Click &quot;Create pull request&quot;.&#x27;,
+<a id="l74" href="#l74">74</a> )
+<a id="l75" href="#l75">75</a> HEADING = &quot;Do these steps in your browser:&quot;
+<a id="l76" href="#l76">76</a> TERMINAL_HEADING = &quot;Do these steps in the terminal:&quot;
+<a id="l77" href="#l77">77</a> FINISH = (
+<a id="l78" href="#l78">78</a>     &#x27;When you finish, click &quot;Done&quot;.\n&#x27;
+<a id="l79" href="#l79">79</a>     &#x27;If you cannot finish, write the reason in the note. Then click &quot;Not done&quot;.&#x27;
+<a id="l80" href="#l80">80</a> )
+<a id="l81" href="#l81">81</a> WARNING = (
+<a id="l82" href="#l82">82</a>     &quot;Claude does not click for you. Before you sign in, make sure that the address bar &quot;
+<a id="l83" href="#l83">83</a>     &quot;shows the site above. Do not type a password, key, or card number in this window.&quot;
+<a id="l84" href="#l84">84</a> )
+<a id="l85" href="#l85">85</a> TERMINAL_WARNING = (
+<a id="l86" href="#l86">86</a>     &quot;Claude does not type the answer for you. Do not type a password, key, or card number &quot;
+<a id="l87" href="#l87">87</a>     &quot;in this window.&quot;
+<a id="l88" href="#l88">88</a> )
+<a id="l89" href="#l89">89</a> 
+<a id="l90" href="#l90">90</a> # A plain DNS name in lowercase ASCII. The script refuses all other host forms,
+<a id="l91" href="#l91">91</a> # so the browser and this script always read the same host from a URL.
+<a id="l92" href="#l92">92</a> HOST_RE = re.compile(r&quot;[a-z0-9-]+(?:\.[a-z0-9-]+)+&quot;)
+<a id="l93" href="#l93">93</a> # Printable ASCII without a space. Callers percent-encode all other characters.
+<a id="l94" href="#l94">94</a> URL_CHARS_RE = re.compile(r&quot;[!-~]+&quot;)
+<a id="l95" href="#l95">95</a> REPO_RE = re.compile(r&quot;[A-Za-z0-9-]+/[A-Za-z0-9._-]+&quot;)
+<a id="l96" href="#l96">96</a> GITHUB_REMOTE_RE = re.compile(
+<a id="l97" href="#l97">97</a>     r&quot;(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)&quot;
+<a id="l98" href="#l98">98</a>     r&quot;(?P&lt;repo&gt;[A-Za-z0-9-]+/[A-Za-z0-9._-]+?)(?:\.git)?/?&quot;
+<a id="l99" href="#l99">99</a> )
+<a id="l100" href="#l100">100</a> 
+<a id="l101" href="#l101">101</a> 
+<a id="l102" href="#l102">102</a> class HandoffError(Exception):
+<a id="l103" href="#l103">103</a>     &quot;&quot;&quot;The script cannot start the handoff. The message tells the caller why.&quot;&quot;&quot;
+<a id="l104" href="#l104">104</a> 
+<a id="l105" href="#l105">105</a> 
+<a id="l106" href="#l106">106</a> @dataclass(frozen=True)
+<a id="l107" href="#l107">107</a> class Request:
+<a id="l108" href="#l108">108</a>     &quot;&quot;&quot;A page to open, or a terminal, and the steps that the user must do there.&quot;&quot;&quot;
 <a id="l109" href="#l109">109</a> 
-<a id="l110" href="#l110">110</a> 
-<a id="l111" href="#l111">111</a> def check_text(title: str, steps: Iterable[str]) -&gt; None:
-<a id="l112" href="#l112">112</a>     &quot;&quot;&quot;Raise HandoffError if the title or a step is not short Simplified Technical English.&quot;&quot;&quot;
-<a id="l113" href="#l113">113</a>     named = [(&quot;The title&quot;, title), *((f&quot;Step {n}&quot;, step) for n, step in enumerate(steps, 1))]
-<a id="l114" href="#l114">114</a>     for name, text in named:
-<a id="l115" href="#l115">115</a>         words = len(text.split())
-<a id="l116" href="#l116">116</a>         if not 0 &lt; words &lt;= MAX_STEP_WORDS or &quot;;&quot; in text:
-<a id="l117" href="#l117">117</a>             raise HandoffError(
-<a id="l118" href="#l118">118</a>                 f&quot;{name} is not short Simplified Technical English ({words} words). &quot;
-<a id="l119" href="#l119">119</a>                 f&quot;Give one action in 1 to {MAX_STEP_WORDS} words, with no semicolons.&quot;
-<a id="l120" href="#l120">120</a>             )
-<a id="l121" href="#l121">121</a> 
-<a id="l122" href="#l122">122</a> 
-<a id="l123" href="#l123">123</a> def read_hosts(path: Path) -&gt; list[str]:
-<a id="l124" href="#l124">124</a>     &quot;&quot;&quot;Return the allowed_hosts list of the TOML file at path.&quot;&quot;&quot;
-<a id="l125" href="#l125">125</a>     try:
-<a id="l126" href="#l126">126</a>         data = tomllib.loads(path.read_text(encoding=&quot;utf-8&quot;))
-<a id="l127" href="#l127">127</a>     except (OSError, tomllib.TOMLDecodeError) as exc:
-<a id="l128" href="#l128">128</a>         raise HandoffError(f&quot;Cannot read {path}: {exc}&quot;) from exc
-<a id="l129" href="#l129">129</a>     hosts = data.get(&quot;allowed_hosts&quot;, [])
-<a id="l130" href="#l130">130</a>     if not isinstance(hosts, list) or not all(
-<a id="l131" href="#l131">131</a>         isinstance(host, str) and HOST_RE.fullmatch(host) for host in hosts
-<a id="l132" href="#l132">132</a>     ):
-<a id="l133" href="#l133">133</a>         raise HandoffError(f&quot;{path}: allowed_hosts must be a list of lowercase host names.&quot;)
-<a id="l134" href="#l134">134</a>     return hosts
-<a id="l135" href="#l135">135</a> 
-<a id="l136" href="#l136">136</a> 
-<a id="l137" href="#l137">137</a> def allowed_hosts() -&gt; list[str]:
-<a id="l138" href="#l138">138</a>     &quot;&quot;&quot;Return the hosts in the shipped file, and in the user file if it exists.&quot;&quot;&quot;
-<a id="l139" href="#l139">139</a>     paths = [SHIPPED_CONFIG, USER_CONFIG] if USER_CONFIG.is_file() else [SHIPPED_CONFIG]
-<a id="l140" href="#l140">140</a>     return [host for path in paths for host in read_hosts(path)]
-<a id="l141" href="#l141">141</a> 
-<a id="l142" href="#l142">142</a> 
-<a id="l143" href="#l143">143</a> def open_page(url: str) -&gt; None:
-<a id="l144" href="#l144">144</a>     &quot;&quot;&quot;Open url in a new tab of the default browser. BROWSER can name a different browser.&quot;&quot;&quot;
-<a id="l145" href="#l145">145</a>     if not webbrowser.open(url, new=2):
-<a id="l146" href="#l146">146</a>         raise HandoffError(&quot;No browser opened the page. Set the BROWSER environment variable.&quot;)
-<a id="l147" href="#l147">147</a> 
-<a id="l148" href="#l148">148</a> 
-<a id="l149" href="#l149">149</a> def github_repo(remote_url: str) -&gt; str:
-<a id="l150" href="#l150">150</a>     &quot;&quot;&quot;Return &quot;owner/name&quot; for the URL of a github.com remote.&quot;&quot;&quot;
-<a id="l151" href="#l151">151</a>     match = GITHUB_REMOTE_RE.fullmatch(remote_url.strip())
-<a id="l152" href="#l152">152</a>     if match is None:
-<a id="l153" href="#l153">153</a>         raise HandoffError(f&quot;{remote_url} is not a github.com remote. Give --repo OWNER/NAME.&quot;)
-<a id="l154" href="#l154">154</a>     return match[&quot;repo&quot;]
-<a id="l155" href="#l155">155</a> 
+<a id="l110" href="#l110">110</a>     title: str
+<a id="l111" href="#l111">111</a>     # None for a step in a terminal. Then place names the terminal.
+<a id="l112" href="#l112">112</a>     url: str | None
+<a id="l113" href="#l113">113</a>     steps: tuple[str, ...]
+<a id="l114" href="#l114">114</a>     # For a pull request: the repository as &quot;owner/name&quot;, and the head branch.
+<a id="l115" href="#l115">115</a>     pr: tuple[str, str] | None = None
+<a id="l116" href="#l116">116</a>     # For a step in a terminal: where the prompt is, for example the name of a terminal tab.
+<a id="l117" href="#l117">117</a>     place: str | None = None
+<a id="l118" href="#l118">118</a> 
+<a id="l119" href="#l119">119</a>     def where(self) -&gt; str:
+<a id="l120" href="#l120">120</a>         &quot;&quot;&quot;Return the line that tells the user where to do the steps.&quot;&quot;&quot;
+<a id="l121" href="#l121">121</a>         if self.url is None:
+<a id="l122" href="#l122">122</a>             return f&quot;Where: {self.place}&quot;
+<a id="l123" href="#l123">123</a>         return f&quot;Site: {urlsplit(self.url).hostname}&quot;
+<a id="l124" href="#l124">124</a> 
+<a id="l125" href="#l125">125</a> 
+<a id="l126" href="#l126">126</a> def check_url(url: str) -&gt; None:
+<a id="l127" href="#l127">127</a>     &quot;&quot;&quot;Raise HandoffError if url is not an https URL with a plain host name.
+<a id="l128" href="#l128">128</a> 
+<a id="l129" href="#l129">129</a>     There is no list of allowed hosts: the user asks Claude to use only sites he trusts.
+<a id="l130" href="#l130">130</a>     The dialog shows the host, so the user can compare it with the address bar.
+<a id="l131" href="#l131">131</a>     &quot;&quot;&quot;
+<a id="l132" href="#l132">132</a>     if &quot;\\&quot; in url or not URL_CHARS_RE.fullmatch(url):
+<a id="l133" href="#l133">133</a>         raise HandoffError(
+<a id="l134" href="#l134">134</a>             f&quot;The URL must be printable ASCII with no spaces or backslashes: {url!r}&quot;
+<a id="l135" href="#l135">135</a>         )
+<a id="l136" href="#l136">136</a>     try:
+<a id="l137" href="#l137">137</a>         parts = urlsplit(url)
+<a id="l138" href="#l138">138</a>     except ValueError as exc:
+<a id="l139" href="#l139">139</a>         raise HandoffError(f&quot;The URL is not valid: {url}&quot;) from exc
+<a id="l140" href="#l140">140</a>     host = parts.hostname or &quot;&quot;
+<a id="l141" href="#l141">141</a>     # The netloc must be the host only: no user name, no password, and no port.
+<a id="l142" href="#l142">142</a>     if parts.scheme != &quot;https&quot; or parts.netloc.lower() != host or not HOST_RE.fullmatch(host):
+<a id="l143" href="#l143">143</a>         raise HandoffError(f&quot;The URL must use https and a plain host name: {url}&quot;)
+<a id="l144" href="#l144">144</a> 
+<a id="l145" href="#l145">145</a> 
+<a id="l146" href="#l146">146</a> def check_text(title: str, steps: Iterable[str]) -&gt; None:
+<a id="l147" href="#l147">147</a>     &quot;&quot;&quot;Raise HandoffError if the title or a step is not short Simplified Technical English.&quot;&quot;&quot;
+<a id="l148" href="#l148">148</a>     named = [(&quot;The title&quot;, title), *((f&quot;Step {n}&quot;, step) for n, step in enumerate(steps, 1))]
+<a id="l149" href="#l149">149</a>     for name, text in named:
+<a id="l150" href="#l150">150</a>         words = len(text.split())
+<a id="l151" href="#l151">151</a>         if not 0 &lt; words &lt;= MAX_STEP_WORDS or &quot;;&quot; in text:
+<a id="l152" href="#l152">152</a>             raise HandoffError(
+<a id="l153" href="#l153">153</a>                 f&quot;{name} is not short Simplified Technical English ({words} words). &quot;
+<a id="l154" href="#l154">154</a>                 f&quot;Give one action in 1 to {MAX_STEP_WORDS} words, with no semicolons.&quot;
+<a id="l155" href="#l155">155</a>             )
 <a id="l156" href="#l156">156</a> 
-<a id="l157" href="#l157">157</a> def compare_url(repo: str, base: str | None, head: str, title: str, body: str) -&gt; str:
-<a id="l158" href="#l158">158</a>     &quot;&quot;&quot;Return the GitHub page that shows a new pull request form with title and body filled in.&quot;&quot;&quot;
-<a id="l159" href="#l159">159</a>     # Without a base, GitHub compares head with the default branch.
-<a id="l160" href="#l160">160</a>     refs = quote(head) if base is None else f&quot;{quote(base)}...{quote(head)}&quot;
-<a id="l161" href="#l161">161</a>     query = urlencode({&quot;expand&quot;: &quot;1&quot;, &quot;title&quot;: title, &quot;body&quot;: body}, quote_via=quote)
-<a id="l162" href="#l162">162</a>     url = f&quot;https://github.com/{repo}/compare/{refs}?{query}&quot;
-<a id="l163" href="#l163">163</a>     if len(url) &gt; MAX_PR_URL_LENGTH:
-<a id="l164" href="#l164">164</a>         raise HandoffError(
-<a id="l165" href="#l165">165</a>             f&quot;The pull request URL has {len(url)} characters. The limit is {MAX_PR_URL_LENGTH}. &quot;
-<a id="l166" href="#l166">166</a>             &quot;Make the body shorter.&quot;
-<a id="l167" href="#l167">167</a>         )
-<a id="l168" href="#l168">168</a>     return url
-<a id="l169" href="#l169">169</a> 
-<a id="l170" href="#l170">170</a> 
-<a id="l171" href="#l171">171</a> def git(repo_dir: Path, *args: str) -&gt; str:
-<a id="l172" href="#l172">172</a>     &quot;&quot;&quot;Run git in repo_dir and return its output. Raise HandoffError if git fails.&quot;&quot;&quot;
-<a id="l173" href="#l173">173</a>     command = [&quot;git&quot;, &quot;-C&quot;, str(repo_dir), *args]
-<a id="l174" href="#l174">174</a>     try:
-<a id="l175" href="#l175">175</a>         result = subprocess.run(
-<a id="l176" href="#l176">176</a>             command, capture_output=True, encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;, timeout=60
-<a id="l177" href="#l177">177</a>         )
-<a id="l178" href="#l178">178</a>     except (OSError, subprocess.TimeoutExpired) as exc:
-<a id="l179" href="#l179">179</a>         raise HandoffError(f&quot;{&#x27; &#x27;.join(command)} failed: {exc}&quot;) from exc
-<a id="l180" href="#l180">180</a>     if result.returncode != 0:
-<a id="l181" href="#l181">181</a>         raise HandoffError(f&quot;{&#x27; &#x27;.join(command)} failed: {result.stderr.strip()}&quot;)
-<a id="l182" href="#l182">182</a>     return result.stdout.strip()
-<a id="l183" href="#l183">183</a> 
-<a id="l184" href="#l184">184</a> 
-<a id="l185" href="#l185">185</a> def current_branch(repo_dir: Path) -&gt; str:
-<a id="l186" href="#l186">186</a>     &quot;&quot;&quot;Return the branch that HEAD is on.&quot;&quot;&quot;
-<a id="l187" href="#l187">187</a>     branch = git(repo_dir, &quot;branch&quot;, &quot;--show-current&quot;)
-<a id="l188" href="#l188">188</a>     if not branch:
-<a id="l189" href="#l189">189</a>         raise HandoffError(&quot;HEAD is not on a branch. Give --head BRANCH.&quot;)
-<a id="l190" href="#l190">190</a>     return branch
-<a id="l191" href="#l191">191</a> 
-<a id="l192" href="#l192">192</a> 
-<a id="l193" href="#l193">193</a> def check_pushed(repo_dir: Path, remote: str, branch: str) -&gt; None:
-<a id="l194" href="#l194">194</a>     &quot;&quot;&quot;Raise HandoffError if remote does not have the commit of the local branch.&quot;&quot;&quot;
-<a id="l195" href="#l195">195</a>     ref = f&quot;refs/heads/{branch}&quot;
-<a id="l196" href="#l196">196</a>     local = git(repo_dir, &quot;rev-parse&quot;, &quot;--verify&quot;, ref)
-<a id="l197" href="#l197">197</a>     lines = git(repo_dir, &quot;ls-remote&quot;, remote, ref).splitlines()
-<a id="l198" href="#l198">198</a>     remote_commits = [line.split()[0] for line in lines if line.split()[1:] == [ref]]
-<a id="l199" href="#l199">199</a>     if remote_commits != [local]:
-<a id="l200" href="#l200">200</a>         raise HandoffError(
-<a id="l201" href="#l201">201</a>             f&quot;{remote} does not have the local commit of {branch}. Push {branch} first.&quot;
-<a id="l202" href="#l202">202</a>         )
-<a id="l203" href="#l203">203</a> 
-<a id="l204" href="#l204">204</a> 
-<a id="l205" href="#l205">205</a> def find_open_pr(repo: str, head: str) -&gt; str | None:
-<a id="l206" href="#l206">206</a>     &quot;&quot;&quot;Return the URL of the open pull request from head, or None if gh cannot find one.&quot;&quot;&quot;
-<a id="l207" href="#l207">207</a>     command = [&quot;gh&quot;, &quot;pr&quot;, &quot;list&quot;, &quot;--repo&quot;, repo, &quot;--head&quot;, head, &quot;--state&quot;, &quot;open&quot;]
-<a id="l208" href="#l208">208</a>     command += [&quot;--json&quot;, &quot;url&quot;, &quot;--jq&quot;, &quot;.[0].url // empty&quot;]
-<a id="l209" href="#l209">209</a>     try:
-<a id="l210" href="#l210">210</a>         result = subprocess.run(command, capture_output=True, encoding=&quot;utf-8&quot;, timeout=60)
-<a id="l211" href="#l211">211</a>     except (OSError, subprocess.TimeoutExpired):
-<a id="l212" href="#l212">212</a>         return None
-<a id="l213" href="#l213">213</a>     url = result.stdout.strip()
-<a id="l214" href="#l214">214</a>     return url if result.returncode == 0 and url else None
-<a id="l215" href="#l215">215</a> 
+<a id="l157" href="#l157">157</a> 
+<a id="l158" href="#l158">158</a> def check_place(place: str) -&gt; None:
+<a id="l159" href="#l159">159</a>     &quot;&quot;&quot;Raise HandoffError if place does not name a terminal in a few printable words.&quot;&quot;&quot;
+<a id="l160" href="#l160">160</a>     words = len(place.split())
+<a id="l161" href="#l161">161</a>     if not 0 &lt; words &lt;= MAX_STEP_WORDS or not place.isprintable():
+<a id="l162" href="#l162">162</a>         raise HandoffError(
+<a id="l163" href="#l163">163</a>             f&quot;The place is not a short name of a terminal ({words} words). &quot;
+<a id="l164" href="#l164">164</a>             f&quot;Give 1 to {MAX_STEP_WORDS} printable words, for example the name of the tab.&quot;
+<a id="l165" href="#l165">165</a>         )
+<a id="l166" href="#l166">166</a> 
+<a id="l167" href="#l167">167</a> 
+<a id="l168" href="#l168">168</a> def read_config(path: Path) -&gt; dict[str, object]:
+<a id="l169" href="#l169">169</a>     &quot;&quot;&quot;Return the data of the TOML file at path.&quot;&quot;&quot;
+<a id="l170" href="#l170">170</a>     try:
+<a id="l171" href="#l171">171</a>         return tomllib.loads(path.read_text(encoding=&quot;utf-8&quot;))
+<a id="l172" href="#l172">172</a>     except (OSError, tomllib.TOMLDecodeError) as exc:
+<a id="l173" href="#l173">173</a>         raise HandoffError(f&quot;Cannot read {path}: {exc}&quot;) from exc
+<a id="l174" href="#l174">174</a> 
+<a id="l175" href="#l175">175</a> 
+<a id="l176" href="#l176">176</a> def brave_profile() -&gt; str | None:
+<a id="l177" href="#l177">177</a>     &quot;&quot;&quot;Return the name of the Brave profile in the user file, or None if the file names none.&quot;&quot;&quot;
+<a id="l178" href="#l178">178</a>     if not USER_CONFIG.is_file():
+<a id="l179" href="#l179">179</a>         return None
+<a id="l180" href="#l180">180</a>     name = read_config(USER_CONFIG).get(&quot;brave_profile&quot;)
+<a id="l181" href="#l181">181</a>     if name is None:
+<a id="l182" href="#l182">182</a>         return None
+<a id="l183" href="#l183">183</a>     if not isinstance(name, str) or not name.strip():
+<a id="l184" href="#l184">184</a>         raise HandoffError(f&quot;{USER_CONFIG}: brave_profile must be the name of a Brave profile.&quot;)
+<a id="l185" href="#l185">185</a>     return name.strip()
+<a id="l186" href="#l186">186</a> 
+<a id="l187" href="#l187">187</a> 
+<a id="l188" href="#l188">188</a> def brave_data_dir() -&gt; Path:
+<a id="l189" href="#l189">189</a>     &quot;&quot;&quot;Return the folder in which Brave keeps its profiles.&quot;&quot;&quot;
+<a id="l190" href="#l190">190</a>     if sys.platform == &quot;win32&quot;:
+<a id="l191" href="#l191">191</a>         local = Path(os.environ.get(&quot;LOCALAPPDATA&quot;) or Path.home() / &quot;AppData&quot; / &quot;Local&quot;)
+<a id="l192" href="#l192">192</a>         return local / &quot;BraveSoftware&quot; / &quot;Brave-Browser&quot; / &quot;User Data&quot;
+<a id="l193" href="#l193">193</a>     if sys.platform == &quot;darwin&quot;:
+<a id="l194" href="#l194">194</a>         return Path.home() / &quot;Library&quot; / &quot;Application Support&quot; / &quot;BraveSoftware&quot; / &quot;Brave-Browser&quot;
+<a id="l195" href="#l195">195</a>     config = Path(os.environ.get(&quot;XDG_CONFIG_HOME&quot;) or Path.home() / &quot;.config&quot;)
+<a id="l196" href="#l196">196</a>     return config / &quot;BraveSoftware&quot; / &quot;Brave-Browser&quot;
+<a id="l197" href="#l197">197</a> 
+<a id="l198" href="#l198">198</a> 
+<a id="l199" href="#l199">199</a> def find_profile(local_state: Path, name: str) -&gt; str:
+<a id="l200" href="#l200">200</a>     &quot;&quot;&quot;Return the folder of the Brave profile with the display name name. Ignore the case.&quot;&quot;&quot;
+<a id="l201" href="#l201">201</a>     try:
+<a id="l202" href="#l202">202</a>         cache = json.loads(local_state.read_text(encoding=&quot;utf-8&quot;))[&quot;profile&quot;][&quot;info_cache&quot;]
+<a id="l203" href="#l203">203</a>         folders = [
+<a id="l204" href="#l204">204</a>             str(folder)
+<a id="l205" href="#l205">205</a>             for folder, info in cache.items()
+<a id="l206" href="#l206">206</a>             if str(info.get(&quot;name&quot;, &quot;&quot;)).casefold() == name.casefold()
+<a id="l207" href="#l207">207</a>         ]
+<a id="l208" href="#l208">208</a>     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+<a id="l209" href="#l209">209</a>         raise HandoffError(f&quot;Cannot read the Brave profiles in {local_state}: {exc!r}&quot;) from exc
+<a id="l210" href="#l210">210</a>     if len(folders) != 1:
+<a id="l211" href="#l211">211</a>         raise HandoffError(
+<a id="l212" href="#l212">212</a>             f&quot;Found {len(folders)} Brave profiles with the name {name!r} in {local_state}. &quot;
+<a id="l213" href="#l213">213</a>             f&quot;Set brave_profile in {USER_CONFIG} to the name of one profile.&quot;
+<a id="l214" href="#l214">214</a>         )
+<a id="l215" href="#l215">215</a>     return folders[0]
 <a id="l216" href="#l216">216</a> 
-<a id="l217" href="#l217">217</a> def pr_request(args: argparse.Namespace) -&gt; Request:
-<a id="l218" href="#l218">218</a>     &quot;&quot;&quot;Make the request that opens the GitHub form for a new pull request.&quot;&quot;&quot;
-<a id="l219" href="#l219">219</a>     repo_dir: Path = args.repo_dir
-<a id="l220" href="#l220">220</a>     repo: str = args.repo or github_repo(git(repo_dir, &quot;remote&quot;, &quot;get-url&quot;, args.remote))
-<a id="l221" href="#l221">221</a>     if not REPO_RE.fullmatch(repo):
-<a id="l222" href="#l222">222</a>         raise HandoffError(f&quot;{repo!r} is not a repository name of the form OWNER/NAME.&quot;)
-<a id="l223" href="#l223">223</a>     head: str = args.head or current_branch(repo_dir)
-<a id="l224" href="#l224">224</a>     check_pushed(repo_dir, args.remote, head)
-<a id="l225" href="#l225">225</a>     try:
-<a id="l226" href="#l226">226</a>         body: str = args.body_file.read_text(encoding=&quot;utf-8&quot;) if args.body_file else args.body
-<a id="l227" href="#l227">227</a>     except OSError as exc:
-<a id="l228" href="#l228">228</a>         raise HandoffError(f&quot;Cannot read {args.body_file}: {exc}&quot;) from exc
-<a id="l229" href="#l229">229</a>     url = compare_url(repo, args.base, head, args.title, body)
-<a id="l230" href="#l230">230</a>     return Request(f&quot;Create pull request: {args.title}&quot;, url, PR_STEPS, pr=(repo, head))
-<a id="l231" href="#l231">231</a> 
-<a id="l232" href="#l232">232</a> 
-<a id="l233" href="#l233">233</a> class Dialog:
-<a id="l234" href="#l234">234</a>     &quot;&quot;&quot;A small window on top of the browser. It shows the steps and records the answer.&quot;&quot;&quot;
-<a id="l235" href="#l235">235</a> 
-<a id="l236" href="#l236">236</a>     def __init__(self, request: Request, timeout_minutes: float, reopen: Callable[[], None]):
-<a id="l237" href="#l237">237</a>         self.status = &quot;not_done&quot;
-<a id="l238" href="#l238">238</a>         self.note_text = &quot;&quot;
-<a id="l239" href="#l239">239</a>         if sys.platform == &quot;win32&quot;:
-<a id="l240" href="#l240">240</a>             # Draw sharp text on high-DPI screens, as IDLE does. The call fails if the
-<a id="l241" href="#l241">241</a>             # process has already set the DPI awareness. That is not a problem.
-<a id="l242" href="#l242">242</a>             with contextlib.suppress(OSError):
-<a id="l243" href="#l243">243</a>                 ctypes.OleDLL(&quot;shcore&quot;).SetProcessDpiAwareness(1)
-<a id="l244" href="#l244">244</a>         self.root = tk.Tk()
-<a id="l245" href="#l245">245</a>         scale = self.root.winfo_fpixels(&quot;1i&quot;) / 96
-<a id="l246" href="#l246">246</a>         wrap = round(420 * scale)
-<a id="l247" href="#l247">247</a>         self.root.title(f&quot;Claude handoff: {request.title}&quot;)
-<a id="l248" href="#l248">248</a>         self.root.attributes(&quot;-topmost&quot;, True)
-<a id="l249" href="#l249">249</a>         self.root.resizable(False, False)
-<a id="l250" href="#l250">250</a>         # Put the window in the bottom-left corner, above the taskbar. Deploy pages
-<a id="l251" href="#l251">251</a>         # usually put the final button on the right side.
-<a id="l252" href="#l252">252</a>         self.root.geometry(f&quot;+{round(24 * scale)}-{round(80 * scale)}&quot;)
-<a id="l253" href="#l253">253</a>         self.root.protocol(&quot;WM_DELETE_WINDOW&quot;, lambda: self.finish(&quot;not_done&quot;))
-<a id="l254" href="#l254">254</a> 
-<a id="l255" href="#l255">255</a>         parts = urlsplit(request.url)
-<a id="l256" href="#l256">256</a>         shown = f&quot;https://{parts.netloc}{parts.path}&quot;
-<a id="l257" href="#l257">257</a>         if len(shown) &gt; 80:
-<a id="l258" href="#l258">258</a>             shown = shown[:77] + &quot;...&quot;
-<a id="l259" href="#l259">259</a>         steps = &quot;\n&quot;.join(f&quot;{number}. {step}&quot; for number, step in enumerate(request.steps, 1))
-<a id="l260" href="#l260">260</a>         # Tk deletes a font when its Python object goes away, so the dialog keeps it.
-<a id="l261" href="#l261">261</a>         self.bold = tkfont.nametofont(&quot;TkDefaultFont&quot;).copy()
-<a id="l262" href="#l262">262</a>         self.bold.configure(weight=&quot;bold&quot;)
-<a id="l263" href="#l263">263</a>         frame = ttk.Frame(self.root, padding=round(12 * scale))
-<a id="l264" href="#l264">264</a>         frame.grid()
-<a id="l265" href="#l265">265</a>         # The user must see first what to do, and then where to do it.
-<a id="l266" href="#l266">266</a>         ttk.Label(frame, text=request.title, font=self.bold, wraplength=wrap).grid(sticky=&quot;w&quot;)
-<a id="l267" href="#l267">267</a>         ttk.Label(frame, text=HEADING, font=self.bold).grid(sticky=&quot;w&quot;, pady=(8, 0))
-<a id="l268" href="#l268">268</a>         ttk.Label(frame, text=steps, wraplength=wrap, justify=&quot;left&quot;).grid(sticky=&quot;w&quot;)
-<a id="l269" href="#l269">269</a>         site = ttk.Label(frame, text=f&quot;Site: {parts.hostname}&quot;, font=self.bold)
-<a id="l270" href="#l270">270</a>         site.grid(sticky=&quot;w&quot;, pady=(8, 0))
-<a id="l271" href="#l271">271</a>         link = ttk.Label(frame, text=shown, foreground=&quot;blue&quot;, cursor=&quot;hand2&quot;, wraplength=wrap)
-<a id="l272" href="#l272">272</a>         link.grid(sticky=&quot;w&quot;)
-<a id="l273" href="#l273">273</a>         link.bind(&quot;&lt;Button-1&gt;&quot;, lambda _event: reopen())
-<a id="l274" href="#l274">274</a>         for text, color in ((FINISH, &quot;&quot;), (WARNING, &quot;#b00020&quot;)):
-<a id="l275" href="#l275">275</a>             label = ttk.Label(frame, text=text, foreground=color, wraplength=wrap, justify=&quot;left&quot;)
-<a id="l276" href="#l276">276</a>             label.grid(sticky=&quot;w&quot;, pady=(8, 0))
-<a id="l277" href="#l277">277</a>         ttk.Label(frame, text=&quot;Note for Claude (optional):&quot;).grid(sticky=&quot;w&quot;, pady=(8, 0))
-<a id="l278" href="#l278">278</a>         self.note = ttk.Entry(frame)
-<a id="l279" href="#l279">279</a>         self.note.grid(sticky=&quot;ew&quot;)
-<a id="l280" href="#l280">280</a>         buttons = ttk.Frame(frame)
-<a id="l281" href="#l281">281</a>         buttons.grid(sticky=&quot;e&quot;, pady=(12, 0))
-<a id="l282" href="#l282">282</a>         self.done_button = ttk.Button(buttons, text=&quot;Done&quot;, command=lambda: self.finish(&quot;done&quot;))
-<a id="l283" href="#l283">283</a>         self.done_button.grid(row=0, column=0, padx=(0, 8))
-<a id="l284" href="#l284">284</a>         self.not_done_button = ttk.Button(
-<a id="l285" href="#l285">285</a>             buttons, text=&quot;Not done&quot;, command=lambda: self.finish(&quot;not_done&quot;)
-<a id="l286" href="#l286">286</a>         )
-<a id="l287" href="#l287">287</a>         self.not_done_button.grid(row=0, column=1)
-<a id="l288" href="#l288">288</a>         self.timer = self.root.after(round(timeout_minutes * 60_000), self.finish, &quot;timeout&quot;)
-<a id="l289" href="#l289">289</a> 
-<a id="l290" href="#l290">290</a>     def finish(self, status: str) -&gt; None:
-<a id="l291" href="#l291">291</a>         &quot;&quot;&quot;Record the answer and close the window.&quot;&quot;&quot;
-<a id="l292" href="#l292">292</a>         self.root.after_cancel(self.timer)
-<a id="l293" href="#l293">293</a>         self.status = status
-<a id="l294" href="#l294">294</a>         self.note_text = self.note.get().strip()
-<a id="l295" href="#l295">295</a>         self.root.destroy()
-<a id="l296" href="#l296">296</a> 
-<a id="l297" href="#l297">297</a>     def run(self) -&gt; tuple[str, str]:
-<a id="l298" href="#l298">298</a>         &quot;&quot;&quot;Show the window until the user answers or the time ends.&quot;&quot;&quot;
-<a id="l299" href="#l299">299</a>         self.root.mainloop()
-<a id="l300" href="#l300">300</a>         return self.status, self.note_text
+<a id="l217" href="#l217">217</a> 
+<a id="l218" href="#l218">218</a> def open_in_profile(url: str, profile: str) -&gt; None:
+<a id="l219" href="#l219">219</a>     &quot;&quot;&quot;Open url in a new tab of the Brave profile with the display name profile.&quot;&quot;&quot;
+<a id="l220" href="#l220">220</a>     exe = next((path for path in brave_candidates() if path.is_file()), None)
+<a id="l221" href="#l221">221</a>     if exe is None:
+<a id="l222" href="#l222">222</a>         raise HandoffError(f&quot;Found no Brave. {USER_CONFIG} sets brave_profile to {profile!r}.&quot;)
+<a id="l223" href="#l223">223</a>     folder = find_profile(brave_data_dir() / &quot;Local State&quot;, profile)
+<a id="l224" href="#l224">224</a>     # If Brave runs already, this command gives the URL to that Brave and ends.
+<a id="l225" href="#l225">225</a>     start_browser([str(exe), f&quot;--profile-directory={folder}&quot;, url])
+<a id="l226" href="#l226">226</a> 
+<a id="l227" href="#l227">227</a> 
+<a id="l228" href="#l228">228</a> def open_page(url: str) -&gt; None:
+<a id="l229" href="#l229">229</a>     &quot;&quot;&quot;Open url in a new tab. BROWSER can name a different default browser.
+<a id="l230" href="#l230">230</a> 
+<a id="l231" href="#l231">231</a>     Use the Brave profile of the user file if it names one. Then BROWSER has no effect.
+<a id="l232" href="#l232">232</a>     &quot;&quot;&quot;
+<a id="l233" href="#l233">233</a>     profile = brave_profile()
+<a id="l234" href="#l234">234</a>     if profile is not None:
+<a id="l235" href="#l235">235</a>         open_in_profile(url, profile)
+<a id="l236" href="#l236">236</a>     elif not webbrowser.open(url, new=2):
+<a id="l237" href="#l237">237</a>         raise HandoffError(&quot;No browser opened the page. Set the BROWSER environment variable.&quot;)
+<a id="l238" href="#l238">238</a> 
+<a id="l239" href="#l239">239</a> 
+<a id="l240" href="#l240">240</a> def browser_candidates() -&gt; list[Path]:
+<a id="l241" href="#l241">241</a>     &quot;&quot;&quot;Return the usual paths of Brave and Chrome on this system. Brave comes first.&quot;&quot;&quot;
+<a id="l242" href="#l242">242</a>     if sys.platform == &quot;win32&quot;:
+<a id="l243" href="#l243">243</a>         roots = [
+<a id="l244" href="#l244">244</a>             os.environ.get(name) for name in (&quot;PROGRAMFILES&quot;, &quot;PROGRAMFILES(X86)&quot;, &quot;LOCALAPPDATA&quot;)
+<a id="l245" href="#l245">245</a>         ]
+<a id="l246" href="#l246">246</a>         programs = (
+<a id="l247" href="#l247">247</a>             r&quot;BraveSoftware\Brave-Browser\Application\brave.exe&quot;,
+<a id="l248" href="#l248">248</a>             r&quot;Google\Chrome\Application\chrome.exe&quot;,
+<a id="l249" href="#l249">249</a>         )
+<a id="l250" href="#l250">250</a>         return [Path(root, program) for program in programs for root in roots if root]
+<a id="l251" href="#l251">251</a>     if sys.platform == &quot;darwin&quot;:
+<a id="l252" href="#l252">252</a>         return [
+<a id="l253" href="#l253">253</a>             Path(&quot;/Applications/Brave Browser.app/Contents/MacOS/Brave Browser&quot;),
+<a id="l254" href="#l254">254</a>             Path(&quot;/Applications/Google Chrome.app/Contents/MacOS/Google Chrome&quot;),
+<a id="l255" href="#l255">255</a>         ]
+<a id="l256" href="#l256">256</a>     names = (&quot;brave-browser&quot;, &quot;brave&quot;, &quot;google-chrome&quot;, &quot;chromium&quot;, &quot;chromium-browser&quot;)
+<a id="l257" href="#l257">257</a>     return [Path(path) for name in names if (path := shutil.which(name))]
+<a id="l258" href="#l258">258</a> 
+<a id="l259" href="#l259">259</a> 
+<a id="l260" href="#l260">260</a> def brave_candidates() -&gt; list[Path]:
+<a id="l261" href="#l261">261</a>     &quot;&quot;&quot;Return the usual paths of Brave on this system.&quot;&quot;&quot;
+<a id="l262" href="#l262">262</a>     return [path for path in browser_candidates() if &quot;brave&quot; in path.name.lower()]
+<a id="l263" href="#l263">263</a> 
+<a id="l264" href="#l264">264</a> 
+<a id="l265" href="#l265">265</a> def find_browser(candidates: Iterable[Path]) -&gt; Path:
+<a id="l266" href="#l266">266</a>     &quot;&quot;&quot;Return the first candidate that is a file.&quot;&quot;&quot;
+<a id="l267" href="#l267">267</a>     for path in candidates:
+<a id="l268" href="#l268">268</a>         if path.is_file():
+<a id="l269" href="#l269">269</a>             return path
+<a id="l270" href="#l270">270</a>     raise HandoffError(&quot;Found no Brave or Chrome. Give --exe PATH.&quot;)
+<a id="l271" href="#l271">271</a> 
+<a id="l272" href="#l272">272</a> 
+<a id="l273" href="#l273">273</a> def browser_command(exe: Path, profile: Path, port: int) -&gt; list[str]:
+<a id="l274" href="#l274">274</a>     &quot;&quot;&quot;Return the command that starts the browser of the browser-driver agent.&quot;&quot;&quot;
+<a id="l275" href="#l275">275</a>     return [
+<a id="l276" href="#l276">276</a>         str(exe),
+<a id="l277" href="#l277">277</a>         f&quot;--user-data-dir={profile}&quot;,
+<a id="l278" href="#l278">278</a>         f&quot;--remote-debugging-port={port}&quot;,
+<a id="l279" href="#l279">279</a>         # Start with no window. With this flag and a remote debugging port, Chromium keeps
+<a id="l280" href="#l280">280</a>         # running after its last window closes. Without it, the browser stops when a person or
+<a id="l281" href="#l281">281</a>         # a program closes its window, and the agent cannot connect to the port.
+<a id="l282" href="#l282">282</a>         &quot;--no-startup-window&quot;,
+<a id="l283" href="#l283">283</a>         &quot;--no-first-run&quot;,
+<a id="l284" href="#l284">284</a>         &quot;--no-default-browser-check&quot;,
+<a id="l285" href="#l285">285</a>         # Keep the pages active when other windows cover the window of this browser.
+<a id="l286" href="#l286">286</a>         &quot;--disable-backgrounding-occluded-windows&quot;,
+<a id="l287" href="#l287">287</a>         &quot;--disable-renderer-backgrounding&quot;,
+<a id="l288" href="#l288">288</a>         &quot;--disable-background-timer-throttling&quot;,
+<a id="l289" href="#l289">289</a>     ]
+<a id="l290" href="#l290">290</a> 
+<a id="l291" href="#l291">291</a> 
+<a id="l292" href="#l292">292</a> def debug_version(port: int) -&gt; dict[str, object] | None:
+<a id="l293" href="#l293">293</a>     &quot;&quot;&quot;Return the version data of the browser that listens on port, or None if none answers.&quot;&quot;&quot;
+<a id="l294" href="#l294">294</a>     try:
+<a id="l295" href="#l295">295</a>         with LOCAL_OPENER.open(f&quot;http://127.0.0.1:{port}/json/version&quot;, timeout=2) as response:
+<a id="l296" href="#l296">296</a>             data = json.load(response)
+<a id="l297" href="#l297">297</a>     except (OSError, ValueError, http.client.HTTPException):
+<a id="l298" href="#l298">298</a>         return None
+<a id="l299" href="#l299">299</a>     return data if isinstance(data, dict) else None
+<a id="l300" href="#l300">300</a> 
 <a id="l301" href="#l301">301</a> 
-<a id="l302" href="#l302">302</a> 
-<a id="l303" href="#l303">303</a> def parse_args(argv: list[str] | None) -&gt; argparse.Namespace:
-<a id="l304" href="#l304">304</a>     &quot;&quot;&quot;Read the command line.&quot;&quot;&quot;
-<a id="l305" href="#l305">305</a>     common = argparse.ArgumentParser(add_help=False)
-<a id="l306" href="#l306">306</a>     common.add_argument(
-<a id="l307" href="#l307">307</a>         &quot;--timeout&quot;,
-<a id="l308" href="#l308">308</a>         type=float,
-<a id="l309" href="#l309">309</a>         default=30,
-<a id="l310" href="#l310">310</a>         metavar=&quot;MINUTES&quot;,
-<a id="l311" href="#l311">311</a>         help=&quot;the time to wait for the user (default: 30)&quot;,
-<a id="l312" href="#l312">312</a>     )
-<a id="l313" href="#l313">313</a>     parser = argparse.ArgumentParser(
-<a id="l314" href="#l314">314</a>         description=&quot;Open a web page and wait while the user does the final step.&quot;
-<a id="l315" href="#l315">315</a>     )
-<a id="l316" href="#l316">316</a>     commands = parser.add_subparsers(dest=&quot;command&quot;, required=True)
-<a id="l317" href="#l317">317</a>     page = commands.add_parser(&quot;open&quot;, parents=[common], help=&quot;open a page and show the steps&quot;)
-<a id="l318" href="#l318">318</a>     page.add_argument(&quot;--url&quot;, required=True, help=&quot;the https URL of the page&quot;)
-<a id="l319" href="#l319">319</a>     page.add_argument(&quot;--title&quot;, required=True, help=&quot;the action, for example: Publish 1.2&quot;)
-<a id="l320" href="#l320">320</a>     page.add_argument(
-<a id="l321" href="#l321">321</a>         &quot;--step&quot;, action=&quot;append&quot;, required=True, help=&quot;one step for the user (give it again)&quot;
-<a id="l322" href="#l322">322</a>     )
-<a id="l323" href="#l323">323</a>     page.add_argument(
-<a id="l324" href="#l324">324</a>         &quot;--no-open&quot;, action=&quot;store_true&quot;, help=&quot;show only the dialog: the page is already open&quot;
-<a id="l325" href="#l325">325</a>     )
-<a id="l326" href="#l326">326</a>     pr = commands.add_parser(&quot;pr&quot;, parents=[common], help=&quot;open the GitHub pull request form&quot;)
-<a id="l327" href="#l327">327</a>     pr.add_argument(&quot;--title&quot;, required=True, help=&quot;the title of the pull request&quot;)
-<a id="l328" href="#l328">328</a>     body = pr.add_mutually_exclusive_group()
-<a id="l329" href="#l329">329</a>     body.add_argument(&quot;--body&quot;, default=&quot;&quot;, help=&quot;the description of the pull request&quot;)
-<a id="l330" href="#l330">330</a>     body.add_argument(&quot;--body-file&quot;, type=Path, help=&quot;a file with the description&quot;)
-<a id="l331" href="#l331">331</a>     pr.add_argument(&quot;--base&quot;, help=&quot;the branch to merge into (default: the default branch)&quot;)
-<a id="l332" href="#l332">332</a>     pr.add_argument(&quot;--head&quot;, help=&quot;the branch to merge (default: the current branch)&quot;)
-<a id="l333" href="#l333">333</a>     pr.add_argument(&quot;--repo&quot;, help=&quot;OWNER/NAME on GitHub (default: from the remote URL)&quot;)
-<a id="l334" href="#l334">334</a>     pr.add_argument(&quot;--remote&quot;, default=&quot;origin&quot;, help=&quot;the remote with the branch&quot;)
-<a id="l335" href="#l335">335</a>     pr.add_argument(&quot;--repo-dir&quot;, type=Path, default=Path(), help=&quot;the local repository&quot;)
-<a id="l336" href="#l336">336</a>     return parser.parse_args(argv)
-<a id="l337" href="#l337">337</a> 
-<a id="l338" href="#l338">338</a> 
-<a id="l339" href="#l339">339</a> def report(result: dict[str, str | None]) -&gt; int:
-<a id="l340" href="#l340">340</a>     &quot;&quot;&quot;Print result as JSON. Return the exit code for its status.&quot;&quot;&quot;
-<a id="l341" href="#l341">341</a>     print(json.dumps(result))
-<a id="l342" href="#l342">342</a>     return EXIT_CODES[str(result[&quot;status&quot;])]
-<a id="l343" href="#l343">343</a> 
+<a id="l302" href="#l302">302</a> def start_browser(command: list[str]) -&gt; None:
+<a id="l303" href="#l303">303</a>     &quot;&quot;&quot;Start the browser in a new process group, so that it runs after this script ends.&quot;&quot;&quot;
+<a id="l304" href="#l304">304</a>     devnull = subprocess.DEVNULL
+<a id="l305" href="#l305">305</a>     try:
+<a id="l306" href="#l306">306</a>         if sys.platform == &quot;win32&quot;:
+<a id="l307" href="#l307">307</a>             flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+<a id="l308" href="#l308">308</a>             subprocess.Popen(
+<a id="l309" href="#l309">309</a>                 command, stdin=devnull, stdout=devnull, stderr=devnull, creationflags=flags
+<a id="l310" href="#l310">310</a>             )
+<a id="l311" href="#l311">311</a>         else:
+<a id="l312" href="#l312">312</a>             subprocess.Popen(
+<a id="l313" href="#l313">313</a>                 command, stdin=devnull, stdout=devnull, stderr=devnull, start_new_session=True
+<a id="l314" href="#l314">314</a>             )
+<a id="l315" href="#l315">315</a>     except OSError as exc:
+<a id="l316" href="#l316">316</a>         raise HandoffError(f&quot;Cannot start {command[0]}: {exc}&quot;) from exc
+<a id="l317" href="#l317">317</a> 
+<a id="l318" href="#l318">318</a> 
+<a id="l319" href="#l319">319</a> def wait_for_browser(port: int, seconds: float) -&gt; dict[str, object]:
+<a id="l320" href="#l320">320</a>     &quot;&quot;&quot;Wait until a browser answers on port. Return its version data.&quot;&quot;&quot;
+<a id="l321" href="#l321">321</a>     deadline = time.monotonic() + seconds
+<a id="l322" href="#l322">322</a>     while (version := debug_version(port)) is None:
+<a id="l323" href="#l323">323</a>         if time.monotonic() &gt; deadline:
+<a id="l324" href="#l324">324</a>             raise HandoffError(
+<a id="l325" href="#l325">325</a>                 f&quot;The browser did not open port {port} in {seconds:g} seconds. If the browser &quot;
+<a id="l326" href="#l326">326</a>                 &quot;of the agent runs without this port, close it. Then run this command again.&quot;
+<a id="l327" href="#l327">327</a>             )
+<a id="l328" href="#l328">328</a>         time.sleep(0.5)
+<a id="l329" href="#l329">329</a>     return version
+<a id="l330" href="#l330">330</a> 
+<a id="l331" href="#l331">331</a> 
+<a id="l332" href="#l332">332</a> def run_browser(exe: Path | None) -&gt; dict[str, str | None]:
+<a id="l333" href="#l333">333</a>     &quot;&quot;&quot;Start the browser of the browser-driver agent, or find it running.&quot;&quot;&quot;
+<a id="l334" href="#l334">334</a>     status = &quot;running&quot;
+<a id="l335" href="#l335">335</a>     version = debug_version(DEBUG_PORT)
+<a id="l336" href="#l336">336</a>     if version is None:
+<a id="l337" href="#l337">337</a>         status = &quot;started&quot;
+<a id="l338" href="#l338">338</a>         BROWSER_PROFILE.mkdir(parents=True, exist_ok=True)
+<a id="l339" href="#l339">339</a>         exe = exe or find_browser(browser_candidates())
+<a id="l340" href="#l340">340</a>         start_browser(browser_command(exe, BROWSER_PROFILE, DEBUG_PORT))
+<a id="l341" href="#l341">341</a>         version = wait_for_browser(DEBUG_PORT, BROWSER_START_SECONDS)
+<a id="l342" href="#l342">342</a>     endpoint = f&quot;http://127.0.0.1:{DEBUG_PORT}&quot;
+<a id="l343" href="#l343">343</a>     return {&quot;status&quot;: status, &quot;browser&quot;: str(version.get(&quot;Browser&quot;)), &quot;endpoint&quot;: endpoint}
 <a id="l344" href="#l344">344</a> 
-<a id="l345" href="#l345">345</a> def main(argv: list[str] | None = None) -&gt; int:
-<a id="l346" href="#l346">346</a>     &quot;&quot;&quot;Do the handoff. Return the exit code.&quot;&quot;&quot;
-<a id="l347" href="#l347">347</a>     args = parse_args(argv)
-<a id="l348" href="#l348">348</a>     try:
-<a id="l349" href="#l349">349</a>         hosts = allowed_hosts()
-<a id="l350" href="#l350">350</a>         if args.command == &quot;pr&quot;:
-<a id="l351" href="#l351">351</a>             request = pr_request(args)
-<a id="l352" href="#l352">352</a>         else:
-<a id="l353" href="#l353">353</a>             check_text(args.title, args.step)
-<a id="l354" href="#l354">354</a>             request = Request(args.title, args.url, tuple(args.step))
-<a id="l355" href="#l355">355</a>         check_url(request.url, hosts)
-<a id="l356" href="#l356">356</a>         # With --no-open, the caller drove a browser to the page already.
-<a id="l357" href="#l357">357</a>         if args.command == &quot;pr&quot; or not args.no_open:
-<a id="l358" href="#l358">358</a>             open_page(request.url)
-<a id="l359" href="#l359">359</a>     except HandoffError as exc:
-<a id="l360" href="#l360">360</a>         return report({&quot;status&quot;: &quot;error&quot;, &quot;error&quot;: str(exc)})
-<a id="l361" href="#l361">361</a>     status, note = Dialog(request, args.timeout, lambda: open_page(request.url)).run()
-<a id="l362" href="#l362">362</a>     result: dict[str, str | None] = {&quot;status&quot;: status, &quot;note&quot;: note}
-<a id="l363" href="#l363">363</a>     if request.pr is not None and status == &quot;done&quot;:
-<a id="l364" href="#l364">364</a>         result[&quot;pr_url&quot;] = find_open_pr(*request.pr)
-<a id="l365" href="#l365">365</a>     return report(result)
-<a id="l366" href="#l366">366</a> 
-<a id="l367" href="#l367">367</a> 
-<a id="l368" href="#l368">368</a> if __name__ == &quot;__main__&quot;:
-<a id="l369" href="#l369">369</a>     sys.exit(main())</pre>
+<a id="l345" href="#l345">345</a> 
+<a id="l346" href="#l346">346</a> def github_repo(remote_url: str) -&gt; str:
+<a id="l347" href="#l347">347</a>     &quot;&quot;&quot;Return &quot;owner/name&quot; for the URL of a github.com remote.&quot;&quot;&quot;
+<a id="l348" href="#l348">348</a>     match = GITHUB_REMOTE_RE.fullmatch(remote_url.strip())
+<a id="l349" href="#l349">349</a>     if match is None:
+<a id="l350" href="#l350">350</a>         raise HandoffError(f&quot;{remote_url} is not a github.com remote. Give --repo OWNER/NAME.&quot;)
+<a id="l351" href="#l351">351</a>     return match[&quot;repo&quot;]
+<a id="l352" href="#l352">352</a> 
+<a id="l353" href="#l353">353</a> 
+<a id="l354" href="#l354">354</a> def fork_owner(remote_url: str, repo: str) -&gt; str | None:
+<a id="l355" href="#l355">355</a>     &quot;&quot;&quot;Return the owner of a GitHub remote that is not repo, for example a fork of repo, or None.&quot;&quot;&quot;
+<a id="l356" href="#l356">356</a>     match = GITHUB_REMOTE_RE.fullmatch(remote_url.strip())
+<a id="l357" href="#l357">357</a>     if match is None or match[&quot;repo&quot;].lower() == repo.lower():
+<a id="l358" href="#l358">358</a>         return None
+<a id="l359" href="#l359">359</a>     return match[&quot;repo&quot;].split(&quot;/&quot;)[0]
+<a id="l360" href="#l360">360</a> 
+<a id="l361" href="#l361">361</a> 
+<a id="l362" href="#l362">362</a> def compare_url(repo: str, base: str | None, head: str, title: str, body: str) -&gt; str:
+<a id="l363" href="#l363">363</a>     &quot;&quot;&quot;Return the GitHub page that shows a new pull request form with title and body filled in.
+<a id="l364" href="#l364">364</a> 
+<a id="l365" href="#l365">365</a>     head is BRANCH, or OWNER:BRANCH for a branch in a fork of repo.
+<a id="l366" href="#l366">366</a>     &quot;&quot;&quot;
+<a id="l367" href="#l367">367</a>     # Without a base, GitHub compares head with the default branch. A branch name has no &quot;:&quot;.
+<a id="l368" href="#l368">368</a>     head_ref = quote(head, safe=&quot;/:&quot;)
+<a id="l369" href="#l369">369</a>     refs = head_ref if base is None else f&quot;{quote(base)}...{head_ref}&quot;
+<a id="l370" href="#l370">370</a>     query = urlencode({&quot;expand&quot;: &quot;1&quot;, &quot;title&quot;: title, &quot;body&quot;: body}, quote_via=quote)
+<a id="l371" href="#l371">371</a>     url = f&quot;https://github.com/{repo}/compare/{refs}?{query}&quot;
+<a id="l372" href="#l372">372</a>     if len(url) &gt; MAX_PR_URL_LENGTH:
+<a id="l373" href="#l373">373</a>         raise HandoffError(
+<a id="l374" href="#l374">374</a>             f&quot;The pull request URL has {len(url)} characters. The limit is {MAX_PR_URL_LENGTH}. &quot;
+<a id="l375" href="#l375">375</a>             &quot;Make the body shorter.&quot;
+<a id="l376" href="#l376">376</a>         )
+<a id="l377" href="#l377">377</a>     return url
+<a id="l378" href="#l378">378</a> 
+<a id="l379" href="#l379">379</a> 
+<a id="l380" href="#l380">380</a> def git(repo_dir: Path, *args: str) -&gt; str:
+<a id="l381" href="#l381">381</a>     &quot;&quot;&quot;Run git in repo_dir and return its output. Raise HandoffError if git fails.&quot;&quot;&quot;
+<a id="l382" href="#l382">382</a>     command = [&quot;git&quot;, &quot;-C&quot;, str(repo_dir), *args]
+<a id="l383" href="#l383">383</a>     try:
+<a id="l384" href="#l384">384</a>         result = subprocess.run(
+<a id="l385" href="#l385">385</a>             command, capture_output=True, encoding=&quot;utf-8&quot;, errors=&quot;replace&quot;, timeout=60
+<a id="l386" href="#l386">386</a>         )
+<a id="l387" href="#l387">387</a>     except (OSError, subprocess.TimeoutExpired) as exc:
+<a id="l388" href="#l388">388</a>         raise HandoffError(f&quot;{&#x27; &#x27;.join(command)} failed: {exc}&quot;) from exc
+<a id="l389" href="#l389">389</a>     if result.returncode != 0:
+<a id="l390" href="#l390">390</a>         raise HandoffError(f&quot;{&#x27; &#x27;.join(command)} failed: {result.stderr.strip()}&quot;)
+<a id="l391" href="#l391">391</a>     return result.stdout.strip()
+<a id="l392" href="#l392">392</a> 
+<a id="l393" href="#l393">393</a> 
+<a id="l394" href="#l394">394</a> def current_branch(repo_dir: Path) -&gt; str:
+<a id="l395" href="#l395">395</a>     &quot;&quot;&quot;Return the branch that HEAD is on.&quot;&quot;&quot;
+<a id="l396" href="#l396">396</a>     branch = git(repo_dir, &quot;branch&quot;, &quot;--show-current&quot;)
+<a id="l397" href="#l397">397</a>     if not branch:
+<a id="l398" href="#l398">398</a>         raise HandoffError(&quot;HEAD is not on a branch. Give --head BRANCH.&quot;)
+<a id="l399" href="#l399">399</a>     return branch
+<a id="l400" href="#l400">400</a> 
+<a id="l401" href="#l401">401</a> 
+<a id="l402" href="#l402">402</a> def check_pushed(repo_dir: Path, remote: str, branch: str) -&gt; None:
+<a id="l403" href="#l403">403</a>     &quot;&quot;&quot;Raise HandoffError if remote does not have the commit of the local branch.&quot;&quot;&quot;
+<a id="l404" href="#l404">404</a>     ref = f&quot;refs/heads/{branch}&quot;
+<a id="l405" href="#l405">405</a>     local = git(repo_dir, &quot;rev-parse&quot;, &quot;--verify&quot;, ref)
+<a id="l406" href="#l406">406</a>     lines = git(repo_dir, &quot;ls-remote&quot;, remote, ref).splitlines()
+<a id="l407" href="#l407">407</a>     remote_commits = [line.split()[0] for line in lines if line.split()[1:] == [ref]]
+<a id="l408" href="#l408">408</a>     if remote_commits != [local]:
+<a id="l409" href="#l409">409</a>         raise HandoffError(
+<a id="l410" href="#l410">410</a>             f&quot;{remote} does not have the local commit of {branch}. Push {branch} first.&quot;
+<a id="l411" href="#l411">411</a>         )
+<a id="l412" href="#l412">412</a> 
+<a id="l413" href="#l413">413</a> 
+<a id="l414" href="#l414">414</a> def find_open_pr(repo: str, head: str) -&gt; str | None:
+<a id="l415" href="#l415">415</a>     &quot;&quot;&quot;Return the URL of the open pull request from head, or None if gh cannot find one.
+<a id="l416" href="#l416">416</a> 
+<a id="l417" href="#l417">417</a>     head is BRANCH, or OWNER:BRANCH for a branch in a fork of repo.
+<a id="l418" href="#l418">418</a>     &quot;&quot;&quot;
+<a id="l419" href="#l419">419</a>     owner, _, branch = head.rpartition(&quot;:&quot;)
+<a id="l420" href="#l420">420</a>     command = [&quot;gh&quot;, &quot;pr&quot;, &quot;list&quot;, &quot;--repo&quot;, repo, &quot;--head&quot;, branch, &quot;--state&quot;, &quot;open&quot;]
+<a id="l421" href="#l421">421</a>     if owner:
+<a id="l422" href="#l422">422</a>         # gh filters by the branch name only. The jq filter also checks the owner of the branch.
+<a id="l423" href="#l423">423</a>         login = f&#x27;select(.headRepositoryOwner.login | ascii_downcase == &quot;{owner.lower()}&quot;)&#x27;
+<a id="l424" href="#l424">424</a>         command += [&quot;--json&quot;, &quot;url,headRepositoryOwner&quot;, &quot;--jq&quot;, f&quot;[.[] | {login}][0].url // empty&quot;]
+<a id="l425" href="#l425">425</a>     else:
+<a id="l426" href="#l426">426</a>         command += [&quot;--json&quot;, &quot;url&quot;, &quot;--jq&quot;, &quot;.[0].url // empty&quot;]
+<a id="l427" href="#l427">427</a>     try:
+<a id="l428" href="#l428">428</a>         result = subprocess.run(command, capture_output=True, encoding=&quot;utf-8&quot;, timeout=60)
+<a id="l429" href="#l429">429</a>     except (OSError, subprocess.TimeoutExpired):
+<a id="l430" href="#l430">430</a>         return None
+<a id="l431" href="#l431">431</a>     url = result.stdout.strip()
+<a id="l432" href="#l432">432</a>     return url if result.returncode == 0 and url else None
+<a id="l433" href="#l433">433</a> 
+<a id="l434" href="#l434">434</a> 
+<a id="l435" href="#l435">435</a> def pr_request(args: argparse.Namespace) -&gt; Request:
+<a id="l436" href="#l436">436</a>     &quot;&quot;&quot;Make the request that opens the GitHub form for a new pull request.&quot;&quot;&quot;
+<a id="l437" href="#l437">437</a>     repo_dir: Path = args.repo_dir
+<a id="l438" href="#l438">438</a>     remote_url = git(repo_dir, &quot;remote&quot;, &quot;get-url&quot;, args.remote)
+<a id="l439" href="#l439">439</a>     repo: str = args.repo or github_repo(remote_url)
+<a id="l440" href="#l440">440</a>     if not REPO_RE.fullmatch(repo):
+<a id="l441" href="#l441">441</a>         raise HandoffError(f&quot;{repo!r} is not a repository name of the form OWNER/NAME.&quot;)
+<a id="l442" href="#l442">442</a>     head: str = args.head or current_branch(repo_dir)
+<a id="l443" href="#l443">443</a>     check_pushed(repo_dir, args.remote, head)
+<a id="l444" href="#l444">444</a>     # A pull request to another repository, for example from a fork to its upstream
+<a id="l445" href="#l445">445</a>     # repository, names the branch as OWNER:BRANCH.
+<a id="l446" href="#l446">446</a>     owner = fork_owner(remote_url, repo)
+<a id="l447" href="#l447">447</a>     head_ref = head if owner is None else f&quot;{owner}:{head}&quot;
+<a id="l448" href="#l448">448</a>     try:
+<a id="l449" href="#l449">449</a>         body: str = args.body_file.read_text(encoding=&quot;utf-8&quot;) if args.body_file else args.body
+<a id="l450" href="#l450">450</a>     except OSError as exc:
+<a id="l451" href="#l451">451</a>         raise HandoffError(f&quot;Cannot read {args.body_file}: {exc}&quot;) from exc
+<a id="l452" href="#l452">452</a>     url = compare_url(repo, args.base, head_ref, args.title, body)
+<a id="l453" href="#l453">453</a>     return Request(f&quot;Create pull request: {args.title}&quot;, url, PR_STEPS, pr=(repo, head_ref))
+<a id="l454" href="#l454">454</a> 
+<a id="l455" href="#l455">455</a> 
+<a id="l456" href="#l456">456</a> class Dialog:
+<a id="l457" href="#l457">457</a>     &quot;&quot;&quot;A small window on top of the browser. It shows the steps and records the answer.&quot;&quot;&quot;
+<a id="l458" href="#l458">458</a> 
+<a id="l459" href="#l459">459</a>     def __init__(self, request: Request, timeout_minutes: float, reopen: Callable[[], None]):
+<a id="l460" href="#l460">460</a>         self.status = &quot;not_done&quot;
+<a id="l461" href="#l461">461</a>         self.note_text = &quot;&quot;
+<a id="l462" href="#l462">462</a>         if sys.platform == &quot;win32&quot;:
+<a id="l463" href="#l463">463</a>             # Draw sharp text on high-DPI screens, as IDLE does. The call fails if the
+<a id="l464" href="#l464">464</a>             # process has already set the DPI awareness. That is not a problem.
+<a id="l465" href="#l465">465</a>             with contextlib.suppress(OSError):
+<a id="l466" href="#l466">466</a>                 ctypes.OleDLL(&quot;shcore&quot;).SetProcessDpiAwareness(1)
+<a id="l467" href="#l467">467</a>         self.root = tk.Tk()
+<a id="l468" href="#l468">468</a>         scale = self.root.winfo_fpixels(&quot;1i&quot;) / 96
+<a id="l469" href="#l469">469</a>         wrap = round(420 * scale)
+<a id="l470" href="#l470">470</a>         self.root.title(f&quot;Claude handoff: {request.title}&quot;)
+<a id="l471" href="#l471">471</a>         self.root.attributes(&quot;-topmost&quot;, True)
+<a id="l472" href="#l472">472</a>         self.root.resizable(False, False)
+<a id="l473" href="#l473">473</a>         # Put the window in the bottom-left corner, above the taskbar. Deploy pages
+<a id="l474" href="#l474">474</a>         # usually put the final button on the right side.
+<a id="l475" href="#l475">475</a>         self.root.geometry(f&quot;+{round(24 * scale)}-{round(80 * scale)}&quot;)
+<a id="l476" href="#l476">476</a>         self.root.protocol(&quot;WM_DELETE_WINDOW&quot;, lambda: self.finish(&quot;not_done&quot;))
+<a id="l477" href="#l477">477</a> 
+<a id="l478" href="#l478">478</a>         steps = &quot;\n&quot;.join(f&quot;{number}. {step}&quot; for number, step in enumerate(request.steps, 1))
+<a id="l479" href="#l479">479</a>         # Tk deletes a font when its Python object goes away, so the dialog keeps it.
+<a id="l480" href="#l480">480</a>         self.bold = tkfont.nametofont(&quot;TkDefaultFont&quot;).copy()
+<a id="l481" href="#l481">481</a>         self.bold.configure(weight=&quot;bold&quot;)
+<a id="l482" href="#l482">482</a>         frame = ttk.Frame(self.root, padding=round(12 * scale))
+<a id="l483" href="#l483">483</a>         frame.grid()
+<a id="l484" href="#l484">484</a>         # The user must see first what to do, and then where to do it.
+<a id="l485" href="#l485">485</a>         ttk.Label(frame, text=request.title, font=self.bold, wraplength=wrap).grid(sticky=&quot;w&quot;)
+<a id="l486" href="#l486">486</a>         heading = HEADING if request.url is not None else TERMINAL_HEADING
+<a id="l487" href="#l487">487</a>         ttk.Label(frame, text=heading, font=self.bold).grid(sticky=&quot;w&quot;, pady=(8, 0))
+<a id="l488" href="#l488">488</a>         ttk.Label(frame, text=steps, wraplength=wrap, justify=&quot;left&quot;).grid(sticky=&quot;w&quot;)
+<a id="l489" href="#l489">489</a>         where = ttk.Label(frame, text=request.where(), font=self.bold, wraplength=wrap)
+<a id="l490" href="#l490">490</a>         where.grid(sticky=&quot;w&quot;, pady=(8, 0))
+<a id="l491" href="#l491">491</a>         warning = TERMINAL_WARNING
+<a id="l492" href="#l492">492</a>         if request.url is not None:
+<a id="l493" href="#l493">493</a>             # A step on a page: show the address, and open the page again on a click.
+<a id="l494" href="#l494">494</a>             parts = urlsplit(request.url)
+<a id="l495" href="#l495">495</a>             shown = f&quot;https://{parts.netloc}{parts.path}&quot;
+<a id="l496" href="#l496">496</a>             if len(shown) &gt; 80:
+<a id="l497" href="#l497">497</a>                 shown = shown[:77] + &quot;...&quot;
+<a id="l498" href="#l498">498</a>             link = ttk.Label(frame, text=shown, foreground=&quot;blue&quot;, cursor=&quot;hand2&quot;, wraplength=wrap)
+<a id="l499" href="#l499">499</a>             link.grid(sticky=&quot;w&quot;)
+<a id="l500" href="#l500">500</a>             link.bind(&quot;&lt;Button-1&gt;&quot;, lambda _event: reopen())
+<a id="l501" href="#l501">501</a>             warning = WARNING
+<a id="l502" href="#l502">502</a>         for text, color in ((FINISH, &quot;&quot;), (warning, &quot;#b00020&quot;)):
+<a id="l503" href="#l503">503</a>             label = ttk.Label(frame, text=text, foreground=color, wraplength=wrap, justify=&quot;left&quot;)
+<a id="l504" href="#l504">504</a>             label.grid(sticky=&quot;w&quot;, pady=(8, 0))
+<a id="l505" href="#l505">505</a>         ttk.Label(frame, text=&quot;Note for Claude (optional):&quot;).grid(sticky=&quot;w&quot;, pady=(8, 0))
+<a id="l506" href="#l506">506</a>         self.note = ttk.Entry(frame)
+<a id="l507" href="#l507">507</a>         self.note.grid(sticky=&quot;ew&quot;)
+<a id="l508" href="#l508">508</a>         buttons = ttk.Frame(frame)
+<a id="l509" href="#l509">509</a>         buttons.grid(sticky=&quot;e&quot;, pady=(12, 0))
+<a id="l510" href="#l510">510</a>         self.done_button = ttk.Button(buttons, text=&quot;Done&quot;, command=lambda: self.finish(&quot;done&quot;))
+<a id="l511" href="#l511">511</a>         self.done_button.grid(row=0, column=0, padx=(0, 8))
+<a id="l512" href="#l512">512</a>         self.not_done_button = ttk.Button(
+<a id="l513" href="#l513">513</a>             buttons, text=&quot;Not done&quot;, command=lambda: self.finish(&quot;not_done&quot;)
+<a id="l514" href="#l514">514</a>         )
+<a id="l515" href="#l515">515</a>         self.not_done_button.grid(row=0, column=1)
+<a id="l516" href="#l516">516</a>         self.timer = self.root.after(round(timeout_minutes * 60_000), self.finish, &quot;timeout&quot;)
+<a id="l517" href="#l517">517</a> 
+<a id="l518" href="#l518">518</a>     def finish(self, status: str) -&gt; None:
+<a id="l519" href="#l519">519</a>         &quot;&quot;&quot;Record the answer and close the window.&quot;&quot;&quot;
+<a id="l520" href="#l520">520</a>         self.root.after_cancel(self.timer)
+<a id="l521" href="#l521">521</a>         self.status = status
+<a id="l522" href="#l522">522</a>         self.note_text = self.note.get().strip()
+<a id="l523" href="#l523">523</a>         self.root.destroy()
+<a id="l524" href="#l524">524</a> 
+<a id="l525" href="#l525">525</a>     def run(self) -&gt; tuple[str, str]:
+<a id="l526" href="#l526">526</a>         &quot;&quot;&quot;Show the window until the user answers or the time ends.&quot;&quot;&quot;
+<a id="l527" href="#l527">527</a>         self.root.mainloop()
+<a id="l528" href="#l528">528</a>         return self.status, self.note_text
+<a id="l529" href="#l529">529</a> 
+<a id="l530" href="#l530">530</a> 
+<a id="l531" href="#l531">531</a> class MenuDialog:
+<a id="l532" href="#l532">532</a>     &quot;&quot;&quot;The steps in a bemenu list, for a Wayland desktop that has no Tk.&quot;&quot;&quot;
+<a id="l533" href="#l533">533</a> 
+<a id="l534" href="#l534">534</a>     DONE = &quot;Done&quot;
+<a id="l535" href="#l535">535</a>     NOT_DONE = &quot;Not done&quot;
+<a id="l536" href="#l536">536</a> 
+<a id="l537" href="#l537">537</a>     def __init__(self, request: Request, timeout_minutes: float, reopen: Callable[[], None]):
+<a id="l538" href="#l538">538</a>         if shutil.which(&quot;bemenu&quot;) is None:
+<a id="l539" href="#l539">539</a>             raise HandoffError(&quot;Cannot show the steps: install Python Tk or bemenu.&quot;)
+<a id="l540" href="#l540">540</a>         # Without a session, bemenu exits as if the user pressed Escape.
+<a id="l541" href="#l541">541</a>         if not os.environ.get(&quot;WAYLAND_DISPLAY&quot;):
+<a id="l542" href="#l542">542</a>             raise HandoffError(&quot;Cannot show the steps: WAYLAND_DISPLAY is not set.&quot;)
+<a id="l543" href="#l543">543</a>         self.title = request.title
+<a id="l544" href="#l544">544</a>         self.deadline = time.monotonic() + timeout_minutes * 60
+<a id="l545" href="#l545">545</a>         steps = [f&quot;{number}. {step}&quot; for number, step in enumerate(request.steps, 1)]
+<a id="l546" href="#l546">546</a>         self.items = [
+<a id="l547" href="#l547">547</a>             *steps,
+<a id="l548" href="#l548">548</a>             request.where(),
+<a id="l549" href="#l549">549</a>             &quot;If you cannot finish, type the reason and press Enter.&quot;,
+<a id="l550" href="#l550">550</a>             self.DONE,
+<a id="l551" href="#l551">551</a>             self.NOT_DONE,
+<a id="l552" href="#l552">552</a>         ]
+<a id="l553" href="#l553">553</a> 
+<a id="l554" href="#l554">554</a>     def run(self) -&gt; tuple[str, str]:
+<a id="l555" href="#l555">555</a>         &quot;&quot;&quot;Show the list until the user selects an answer or the time ends.&quot;&quot;&quot;
+<a id="l556" href="#l556">556</a>         while (remaining := self.deadline - time.monotonic()) &gt; 0:
+<a id="l557" href="#l557">557</a>             command = [&quot;bemenu&quot;, &quot;--list&quot;, str(len(self.items)), &quot;--prompt&quot;, self.title]
+<a id="l558" href="#l558">558</a>             try:
+<a id="l559" href="#l559">559</a>                 answer = subprocess.run(
+<a id="l560" href="#l560">560</a>                     command,
+<a id="l561" href="#l561">561</a>                     input=&quot;\n&quot;.join(self.items),
+<a id="l562" href="#l562">562</a>                     capture_output=True,
+<a id="l563" href="#l563">563</a>                     text=True,
+<a id="l564" href="#l564">564</a>                     timeout=remaining,
+<a id="l565" href="#l565">565</a>                 )
+<a id="l566" href="#l566">566</a>             except subprocess.TimeoutExpired:
+<a id="l567" href="#l567">567</a>                 break
+<a id="l568" href="#l568">568</a>             choice = answer.stdout.strip()
+<a id="l569" href="#l569">569</a>             # Escape makes bemenu exit with code 1.
+<a id="l570" href="#l570">570</a>             if answer.returncode != 0 or choice == self.NOT_DONE:
+<a id="l571" href="#l571">571</a>                 return &quot;not_done&quot;, &quot;&quot;
+<a id="l572" href="#l572">572</a>             if choice == self.DONE:
+<a id="l573" href="#l573">573</a>                 return &quot;done&quot;, &quot;&quot;
+<a id="l574" href="#l574">574</a>             if choice not in self.items:
+<a id="l575" href="#l575">575</a>                 return &quot;not_done&quot;, choice
+<a id="l576" href="#l576">576</a>             # The user selected a step or the site. Show the list again.
+<a id="l577" href="#l577">577</a>         return &quot;timeout&quot;, &quot;&quot;
+<a id="l578" href="#l578">578</a> 
+<a id="l579" href="#l579">579</a> 
+<a id="l580" href="#l580">580</a> def parse_args(argv: list[str] | None) -&gt; argparse.Namespace:
+<a id="l581" href="#l581">581</a>     &quot;&quot;&quot;Read the command line.&quot;&quot;&quot;
+<a id="l582" href="#l582">582</a>     common = argparse.ArgumentParser(add_help=False)
+<a id="l583" href="#l583">583</a>     common.add_argument(
+<a id="l584" href="#l584">584</a>         &quot;--timeout&quot;,
+<a id="l585" href="#l585">585</a>         type=float,
+<a id="l586" href="#l586">586</a>         default=30,
+<a id="l587" href="#l587">587</a>         metavar=&quot;MINUTES&quot;,
+<a id="l588" href="#l588">588</a>         help=&quot;the time to wait for the user (default: 30)&quot;,
+<a id="l589" href="#l589">589</a>     )
+<a id="l590" href="#l590">590</a>     parser = argparse.ArgumentParser(
+<a id="l591" href="#l591">591</a>         description=&quot;Open a web page and wait while the user does the final step.&quot;
+<a id="l592" href="#l592">592</a>     )
+<a id="l593" href="#l593">593</a>     commands = parser.add_subparsers(dest=&quot;command&quot;, required=True)
+<a id="l594" href="#l594">594</a>     page = commands.add_parser(&quot;open&quot;, parents=[common], help=&quot;open a page and show the steps&quot;)
+<a id="l595" href="#l595">595</a>     page.add_argument(&quot;--url&quot;, required=True, help=&quot;the https URL of the page&quot;)
+<a id="l596" href="#l596">596</a>     page.add_argument(&quot;--title&quot;, required=True, help=&quot;the action, for example: Publish 1.2&quot;)
+<a id="l597" href="#l597">597</a>     page.add_argument(
+<a id="l598" href="#l598">598</a>         &quot;--step&quot;, action=&quot;append&quot;, required=True, help=&quot;one step for the user (give it again)&quot;
+<a id="l599" href="#l599">599</a>     )
+<a id="l600" href="#l600">600</a>     page.add_argument(
+<a id="l601" href="#l601">601</a>         &quot;--no-open&quot;, action=&quot;store_true&quot;, help=&quot;show only the dialog: the page is already open&quot;
+<a id="l602" href="#l602">602</a>     )
+<a id="l603" href="#l603">603</a>     terminal = commands.add_parser(
+<a id="l604" href="#l604">604</a>         &quot;terminal&quot;, parents=[common], help=&quot;show the steps for a prompt in a terminal&quot;
+<a id="l605" href="#l605">605</a>     )
+<a id="l606" href="#l606">606</a>     terminal.add_argument(&quot;--title&quot;, required=True, help=&quot;the action, for example: Install 1.2&quot;)
+<a id="l607" href="#l607">607</a>     terminal.add_argument(
+<a id="l608" href="#l608">608</a>         &quot;--where&quot;, required=True, help=&quot;where the prompt is, for example the name of the tab&quot;
+<a id="l609" href="#l609">609</a>     )
+<a id="l610" href="#l610">610</a>     terminal.add_argument(
+<a id="l611" href="#l611">611</a>         &quot;--step&quot;, action=&quot;append&quot;, required=True, help=&quot;one step for the user (give it again)&quot;
+<a id="l612" href="#l612">612</a>     )
+<a id="l613" href="#l613">613</a>     pr = commands.add_parser(&quot;pr&quot;, parents=[common], help=&quot;open the GitHub pull request form&quot;)
+<a id="l614" href="#l614">614</a>     pr.add_argument(&quot;--title&quot;, required=True, help=&quot;the title of the pull request&quot;)
+<a id="l615" href="#l615">615</a>     body = pr.add_mutually_exclusive_group()
+<a id="l616" href="#l616">616</a>     body.add_argument(&quot;--body&quot;, default=&quot;&quot;, help=&quot;the description of the pull request&quot;)
+<a id="l617" href="#l617">617</a>     body.add_argument(&quot;--body-file&quot;, type=Path, help=&quot;a file with the description&quot;)
+<a id="l618" href="#l618">618</a>     pr.add_argument(&quot;--base&quot;, help=&quot;the branch to merge into (default: the default branch)&quot;)
+<a id="l619" href="#l619">619</a>     pr.add_argument(&quot;--head&quot;, help=&quot;the branch to merge (default: the current branch)&quot;)
+<a id="l620" href="#l620">620</a>     pr.add_argument(&quot;--repo&quot;, help=&quot;OWNER/NAME on GitHub (default: from the remote URL)&quot;)
+<a id="l621" href="#l621">621</a>     pr.add_argument(&quot;--remote&quot;, default=&quot;origin&quot;, help=&quot;the remote with the branch&quot;)
+<a id="l622" href="#l622">622</a>     pr.add_argument(&quot;--repo-dir&quot;, type=Path, default=Path(), help=&quot;the local repository&quot;)
+<a id="l623" href="#l623">623</a>     browser = commands.add_parser(
+<a id="l624" href="#l624">624</a>         &quot;browser&quot;, help=&quot;start a browser with a fresh profile for the browser-driver agent&quot;
+<a id="l625" href="#l625">625</a>     )
+<a id="l626" href="#l626">626</a>     browser.add_argument(
+<a id="l627" href="#l627">627</a>         &quot;--fresh&quot;, action=&quot;store_true&quot;, help=&quot;confirm that the user asked for a fresh profile&quot;
+<a id="l628" href="#l628">628</a>     )
+<a id="l629" href="#l629">629</a>     browser.add_argument(&quot;--exe&quot;, type=Path, help=&quot;the browser program (default: Brave or Chrome)&quot;)
+<a id="l630" href="#l630">630</a>     return parser.parse_args(argv)
+<a id="l631" href="#l631">631</a> 
+<a id="l632" href="#l632">632</a> 
+<a id="l633" href="#l633">633</a> def report(result: dict[str, str | None]) -&gt; int:
+<a id="l634" href="#l634">634</a>     &quot;&quot;&quot;Print result as JSON. Return the exit code for its status.&quot;&quot;&quot;
+<a id="l635" href="#l635">635</a>     print(json.dumps(result))
+<a id="l636" href="#l636">636</a>     return EXIT_CODES[str(result[&quot;status&quot;])]
+<a id="l637" href="#l637">637</a> 
+<a id="l638" href="#l638">638</a> 
+<a id="l639" href="#l639">639</a> def main(argv: list[str] | None = None) -&gt; int:
+<a id="l640" href="#l640">640</a>     &quot;&quot;&quot;Do the handoff. Return the exit code.&quot;&quot;&quot;
+<a id="l641" href="#l641">641</a>     args = parse_args(argv)
+<a id="l642" href="#l642">642</a>     try:
+<a id="l643" href="#l643">643</a>         if args.command == &quot;browser&quot;:
+<a id="l644" href="#l644">644</a>             if not args.fresh:
+<a id="l645" href="#l645">645</a>                 raise HandoffError(
+<a id="l646" href="#l646">646</a>                     &quot;This command starts a browser with a fresh profile and no sign-in. Start it &quot;
+<a id="l647" href="#l647">647</a>                     &quot;only if the user asked for a fresh browser. Then give --fresh. Otherwise &quot;
+<a id="l648" href="#l648">648</a>                     &quot;use the Brave profile of the user.&quot;
+<a id="l649" href="#l649">649</a>                 )
+<a id="l650" href="#l650">650</a>             return report(run_browser(args.exe))
+<a id="l651" href="#l651">651</a>         if args.command == &quot;terminal&quot;:
+<a id="l652" href="#l652">652</a>             # A step at a prompt in a terminal has no page: no host to check, nothing to open.
+<a id="l653" href="#l653">653</a>             check_text(args.title, args.step)
+<a id="l654" href="#l654">654</a>             check_place(args.where)
+<a id="l655" href="#l655">655</a>             request = Request(args.title, None, tuple(args.step), place=args.where)
+<a id="l656" href="#l656">656</a>         else:
+<a id="l657" href="#l657">657</a>             if args.command == &quot;pr&quot;:
+<a id="l658" href="#l658">658</a>                 request = pr_request(args)
+<a id="l659" href="#l659">659</a>             else:
+<a id="l660" href="#l660">660</a>                 check_text(args.title, args.step)
+<a id="l661" href="#l661">661</a>                 request = Request(args.title, args.url, tuple(args.step))
+<a id="l662" href="#l662">662</a>             check_url(str(request.url))
+<a id="l663" href="#l663">663</a>             # With --no-open, the caller drove a browser to the page already.
+<a id="l664" href="#l664">664</a>             if args.command == &quot;pr&quot; or not args.no_open:
+<a id="l665" href="#l665">665</a>                 open_page(str(request.url))
+<a id="l666" href="#l666">666</a>         url = request.url
+<a id="l667" href="#l667">667</a>         show = Dialog if HAVE_TK else MenuDialog
+<a id="l668" href="#l668">668</a>         dialog = show(request, args.timeout, lambda: open_page(url) if url else None)
+<a id="l669" href="#l669">669</a>     except HandoffError as exc:
+<a id="l670" href="#l670">670</a>         return report({&quot;status&quot;: &quot;error&quot;, &quot;error&quot;: str(exc)})
+<a id="l671" href="#l671">671</a>     status, note = dialog.run()
+<a id="l672" href="#l672">672</a>     result: dict[str, str | None] = {&quot;status&quot;: status, &quot;note&quot;: note}
+<a id="l673" href="#l673">673</a>     if request.pr is not None and status == &quot;done&quot;:
+<a id="l674" href="#l674">674</a>         result[&quot;pr_url&quot;] = find_open_pr(*request.pr)
+<a id="l675" href="#l675">675</a>     return report(result)
+<a id="l676" href="#l676">676</a> 
+<a id="l677" href="#l677">677</a> 
+<a id="l678" href="#l678">678</a> if __name__ == &quot;__main__&quot;:
+<a id="l679" href="#l679">679</a>     sys.exit(main())</pre>
 </div></body></html>

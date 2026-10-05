@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sad 70dc06dc - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sad</h1><span class="desc">sad (2f30.org simple audio daemon) with a Cygwin/OSS port on branch cygwin</span><p class="url">git clone https://github.com/equwal/sad</p><p><a href="../../sad/index.html">Log</a> | <a href="../../sad/files.html">Files</a> | <a href="../../sad/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 70dc06dc013ce4da8ab30f835bc81fefbbe6d78d
+sin &lt;sin@2f30.org&gt;
+2014-12-30 17:00:57 +0000
+
+Add initial implementation of resampler
+
+</pre><pre> Makefile     |   2 +-
+ config.def.h |   8 +--
+ library.c    |   4 ++
+ mp3.c        |   2 +
+ output.c     | 178 ++++++++++++++++++++++++++++++++++++++++-------------------
+ sad.h        |   3 +-
+ vorbis.c     |   2 +
+ wav.c        |   2 +
+ 8 files changed, 137 insertions(+), 64 deletions(-)
+</pre><pre>diff --git a/Makefile b/Makefile
+index b778bfd..c261f37 100644
+--- a/Makefile
++++ b/Makefile
+<span class="h">@@ -5,7 +5,7 @@ MANPREFIX = $(PREFIX)/man</span>
+ 
+ CFLAGS = -I/usr/local/include
+ LDFLAGS = -L /usr/local/lib
+<span class="d">-LDLIBS = -lsndfile -lmpg123 -lsndio -lasound -lvorbisfile</span>
+<span class="a">+LDLIBS = -lsndfile -lmpg123 -lsndio -lasound -lvorbisfile -lsoxr</span>
+ 
+ OBJ =\
+ 	alsa.o\
+diff --git a/config.def.h b/config.def.h
+index 268e70f..116eee9 100644
+--- a/config.def.h
++++ b/config.def.h
+<span class="h">@@ -1,5 +1,5 @@</span>
+<span class="d">-Outputdesc Outputdescs[] = {</span>
+<span class="d">-	{ &quot;sndio&quot;, 16, 44100, 2, 1, 0, &amp;sndiooutput },</span>
+<span class="d">-	{ &quot;alsa&quot; , 16, 44100, 2, 1, 0, &amp;alsaoutput  },</span>
+<span class="d">-	{ &quot;fifo&quot;,  16, 44100, 2, 1, 0, &amp;fifooutput  },</span>
+<span class="a">+Outputdesc outputdescs[] = {</span>
+<span class="a">+	{ &quot;sndio&quot;, 16, 44100, 2, 0, 0, &amp;sndiooutput, NULL, -1 },</span>
+<span class="a">+	{ &quot;alsa&quot; , 16, 44100, 2, 1, 0, &amp;alsaoutput,  NULL, -1 },</span>
+<span class="a">+	{ &quot;fifo&quot;,  16, 44100, 2, 0, 0, &amp;fifooutput,  NULL, -1 },</span>
+ };
+diff --git a/library.c b/library.c
+index e200b89..a857b5e 100644
+--- a/library.c
++++ b/library.c
+<span class="h">@@ -7,6 +7,7 @@</span>
+ #include &lt;stdio.h&gt;
+ #include &lt;stdlib.h&gt;
+ #include &lt;string.h&gt;
+<span class="a">+#include &lt;unistd.h&gt;</span>
+ 
+ #include &quot;sad.h&quot;
+ 
+<span class="h">@@ -19,6 +20,9 @@ addlibrary(const char *path)</span>
+ 	Decoder *d;
+ 	Song    *s;
+ 
+<span class="a">+	if (access(path, F_OK) &lt; 0)</span>
+<span class="a">+		return NULL;</span>
+<span class="a">+</span>
+ 	s = findsong(path);
+ 	if (s)
+ 		return s;
+diff --git a/mp3.c b/mp3.c
+index d7ebd30..d2c20b8 100644
+--- a/mp3.c
++++ b/mp3.c
+<span class="h">@@ -44,6 +44,8 @@ mp3open(const char *name)</span>
+ 		goto err0;
+ 	}
+ 
+<span class="a">+	initresamplers(rate);</span>
+<span class="a">+</span>
+ 	return 0;
+ err0:
+ 	mpg123_close(hdl);
+diff --git a/output.c b/output.c
+index c40db2d..444e900 100644
+--- a/output.c
++++ b/output.c
+<span class="h">@@ -3,8 +3,10 @@</span>
+ #include &lt;err.h&gt;
+ #include &lt;limits.h&gt;
+ #include &lt;stdio.h&gt;
+<span class="a">+#include &lt;stdlib.h&gt;</span>
+ #include &lt;string.h&gt;
+ #include &lt;strings.h&gt;
+<span class="a">+#include &lt;soxr.h&gt;</span>
+ 
+ #include &quot;sad.h&quot;
+ 
+<span class="h">@@ -16,34 +18,74 @@ typedef struct {</span>
+ 	int     enabled;
+ 	int     active;
+ 	Output *output;
+<span class="a">+	soxr_t  resampler;</span>
+<span class="a">+	int     inrate;</span>
+ } Outputdesc;
+ 
+ #include &quot;config.h&quot;
+ 
+<span class="a">+static int</span>
+<span class="a">+initresampler(Outputdesc *desc, int inrate)</span>
+<span class="a">+{</span>
+<span class="a">+	soxr_quality_spec_t quality;</span>
+<span class="a">+	soxr_io_spec_t      iospec;</span>
+<span class="a">+	int i;</span>
+<span class="a">+</span>
+<span class="a">+	/* TODO: resampling quality should be configurable in config.h */</span>
+<span class="a">+	quality = soxr_quality_spec(SOXR_VHQ, 0);</span>
+<span class="a">+	iospec = soxr_io_spec(SOXR_INT16_I, SOXR_INT16_I);</span>
+<span class="a">+	if (desc-&gt;resampler)</span>
+<span class="a">+		soxr_delete(desc-&gt;resampler);</span>
+<span class="a">+</span>
+<span class="a">+	desc-&gt;resampler = soxr_create(inrate, desc-&gt;rate,</span>
+<span class="a">+	                              desc-&gt;channels,</span>
+<span class="a">+	                              NULL,</span>
+<span class="a">+	                              &amp;iospec,</span>
+<span class="a">+	                              &amp;quality,</span>
+<span class="a">+	                              NULL);</span>
+<span class="a">+	if (!desc-&gt;resampler) {</span>
+<span class="a">+		warnx(&quot;soxr_create: failed to initialize resampler&quot;);</span>
+<span class="a">+		return -1;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	desc-&gt;inrate = inrate;</span>
+<span class="a">+	return 0;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ int
+<span class="d">-openoutput(const char *name)</span>
+<span class="a">+initresamplers(int inrate)</span>
+ {
+ 	Outputdesc *desc;
+<span class="d">-	int i;</span>
+<span class="a">+	int i, r = 0;</span>
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="d">-		if (strcmp(desc-&gt;name, name))</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+<span class="a">+		if (!desc-&gt;enabled)</span>
+ 			continue;
+<span class="d">-		if (desc-&gt;active)</span>
+<span class="d">-			return 0;</span>
+<span class="d">-		if (desc-&gt;output-&gt;open(desc-&gt;bits,</span>
+<span class="d">-		                       desc-&gt;rate,</span>
+<span class="d">-		                       desc-&gt;channels) &lt; 0) {</span>
+<span class="d">-			desc-&gt;active = 0;</span>
+<span class="d">-			return -1;</span>
+<span class="d">-		} else {</span>
+<span class="d">-			printf(&quot;Opened %s output\n&quot;, desc-&gt;name);</span>
+<span class="d">-			desc-&gt;active = 1;</span>
+<span class="d">-			return 0;</span>
+<span class="d">-		}</span>
+<span class="a">+		if (initresampler(desc, inrate) &lt; 0)</span>
+<span class="a">+			r = -1;</span>
+ 	}
+<span class="d">-	return -1;</span>
+<span class="a">+	return r;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+static int</span>
+<span class="a">+openoutput(Outputdesc *desc)</span>
+<span class="a">+{</span>
+<span class="a">+	int i;</span>
+<span class="a">+</span>
+<span class="a">+	if (desc-&gt;active)</span>
+<span class="a">+		return 0;</span>
+<span class="a">+</span>
+<span class="a">+	if (desc-&gt;output-&gt;open(desc-&gt;bits,</span>
+<span class="a">+	                       desc-&gt;rate,</span>
+<span class="a">+	                       desc-&gt;channels) &lt; 0) {</span>
+<span class="a">+		desc-&gt;active = 0;</span>
+<span class="a">+		return -1;</span>
+<span class="a">+	}</span>
+<span class="a">+</span>
+<span class="a">+	printf(&quot;Opened %s output\n&quot;, desc-&gt;name);</span>
+<span class="a">+	desc-&gt;active = 1;</span>
+<span class="a">+	return 0;</span>
+ }
+ 
+ int
+<span class="h">@@ -52,38 +94,32 @@ openoutputs(void)</span>
+ 	Outputdesc *desc;
+ 	int i, r = 0;
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+ 		if (!desc-&gt;enabled)
+ 			continue;
+<span class="d">-		if (openoutput(desc-&gt;name) &lt; 0)</span>
+<span class="a">+		if (openoutput(desc) &lt; 0)</span>
+ 			r = -1;
+ 	}
+ 	return r;
+ }
+ 
+<span class="d">-int</span>
+<span class="d">-closeoutput(const char *name)</span>
+<span class="a">+static int</span>
+<span class="a">+closeoutput(Outputdesc *desc)</span>
+ {
+<span class="d">-	Outputdesc *desc;</span>
+ 	int i;
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="d">-		if (strcmp(desc-&gt;name, name))</span>
+<span class="d">-			continue;</span>
+<span class="d">-		if (!desc-&gt;active)</span>
+<span class="d">-			return 0;</span>
+<span class="d">-		if (desc-&gt;output-&gt;close() &lt; 0) {</span>
+<span class="d">-			desc-&gt;active = 1;</span>
+<span class="d">-			return -1;</span>
+<span class="d">-		} else {</span>
+<span class="d">-			printf(&quot;Closed %s output\n&quot;, desc-&gt;name);</span>
+<span class="d">-			desc-&gt;active = 0;</span>
+<span class="d">-			return 0;</span>
+<span class="d">-		}</span>
+<span class="a">+	if (!desc-&gt;active)</span>
+<span class="a">+		return 0;</span>
+<span class="a">+</span>
+<span class="a">+	if (desc-&gt;output-&gt;close() &lt; 0) {</span>
+<span class="a">+		desc-&gt;active = 1;</span>
+<span class="a">+		return -1;</span>
+ 	}
+<span class="d">-	return -1;</span>
+<span class="a">+</span>
+<span class="a">+	printf(&quot;Closed %s output\n&quot;, desc-&gt;name);</span>
+<span class="a">+	desc-&gt;active = 0;</span>
+<span class="a">+	return 0;</span>
+ }
+ 
+ int
+<span class="h">@@ -92,28 +128,56 @@ closeoutputs(void)</span>
+ 	Outputdesc *desc;
+ 	int i, r = 0;
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+ 		if (!desc-&gt;enabled)
+ 			continue;
+<span class="d">-		if (closeoutput(desc-&gt;name) &lt; 0)</span>
+<span class="a">+		if (closeoutput(desc) &lt; 0)</span>
+ 			r = -1;
+ 	}
+ 	return r;
+ }
+ 
+ int
+<span class="d">-playoutput(void *buf, size_t nbytes)</span>
+<span class="a">+playoutput(void *inbuf, size_t nbytes)</span>
+ {
+ 	Outputdesc *desc;
+<span class="d">-	int i, r = 0;</span>
+<span class="d">-</span>
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="a">+	soxr_error_t e;</span>
+<span class="a">+	size_t inframes, outframes;</span>
+<span class="a">+	size_t framesize;</span>
+<span class="a">+	size_t idone, odone;</span>
+<span class="a">+	void  *outbuf;</span>
+<span class="a">+	float  ratio;</span>
+<span class="a">+	int    i, r = 0;</span>
+<span class="a">+</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+ 		if (!desc-&gt;active)
+ 			continue;
+<span class="d">-		if (desc-&gt;output-&gt;play(buf, nbytes) &lt; 0)</span>
+<span class="d">-			r = -1;</span>
+<span class="a">+		if (desc-&gt;inrate == desc-&gt;rate) {</span>
+<span class="a">+			if (desc-&gt;output-&gt;play(inbuf, nbytes) &lt;0)</span>
+<span class="a">+				r = -1;</span>
+<span class="a">+		} else {</span>
+<span class="a">+			framesize = (desc-&gt;bits + 7) / 8 * desc-&gt;channels;</span>
+<span class="a">+			inframes = nbytes / framesize;</span>
+<span class="a">+			ratio = (float)desc-&gt;rate / desc-&gt;inrate;</span>
+<span class="a">+			outframes = inframes * ratio + 1;</span>
+<span class="a">+			outbuf = malloc(outframes * framesize);</span>
+<span class="a">+			if (!outbuf)</span>
+<span class="a">+				err(1, &quot;malloc&quot;);</span>
+<span class="a">+</span>
+<span class="a">+			e = soxr_process(desc-&gt;resampler, inbuf, inframes,</span>
+<span class="a">+			                 &amp;idone, outbuf, outframes,</span>
+<span class="a">+			                 &amp;odone);</span>
+<span class="a">+			if (e) {</span>
+<span class="a">+				warnx(&quot;soxr_process: failed&quot;);</span>
+<span class="a">+				free(outbuf);</span>
+<span class="a">+				continue;</span>
+<span class="a">+			}</span>
+<span class="a">+			if (desc-&gt;output-&gt;play(outbuf, odone * framesize) &lt; 0)</span>
+<span class="a">+				r = -1;</span>
+<span class="a">+			free(outbuf);</span>
+<span class="a">+		}</span>
+ 	}
+ 	return r;
+ }
+<span class="h">@@ -124,8 +188,8 @@ setvol(int vol)</span>
+ 	Outputdesc *desc;
+ 	int i, r = 0;
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+ 		if (!desc-&gt;active)
+ 			continue;
+ 		if (desc-&gt;output-&gt;vol(vol) &lt; 0)
+<span class="h">@@ -140,13 +204,13 @@ enableoutput(const char *name)</span>
+ 	Outputdesc *desc;
+ 	int i, r;
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+ 		if (strcmp(desc-&gt;name, name))
+ 			continue;
+ 		if (desc-&gt;active)
+ 			return -1;
+<span class="d">-		if (openoutput(desc-&gt;name) &lt; 0) {</span>
+<span class="a">+		if (openoutput(desc) &lt; 0) {</span>
+ 			desc-&gt;enabled = 0;
+ 			return -1;
+ 		} else {
+<span class="h">@@ -163,13 +227,13 @@ disableoutput(const char *name)</span>
+ 	Outputdesc *desc;
+ 	int i;
+ 
+<span class="d">-	for (i = 0; i &lt; LEN(Outputdescs); i++) {</span>
+<span class="d">-		desc = &amp;Outputdescs[i];</span>
+<span class="a">+	for (i = 0; i &lt; LEN(outputdescs); i++) {</span>
+<span class="a">+		desc = &amp;outputdescs[i];</span>
+ 		if (strcmp(desc-&gt;name, name))
+ 			continue;
+ 		if (!desc-&gt;active)
+ 			return -1;
+<span class="d">-		if (closeoutput(desc-&gt;name) &lt; 0) {</span>
+<span class="a">+		if (closeoutput(desc) &lt; 0) {</span>
+ 			desc-&gt;enabled = 1;
+ 			return -1;
+ 		} else {
+diff --git a/sad.h b/sad.h
+index 43cc38b..eddbc44 100644
+--- a/sad.h
++++ b/sad.h
+<span class="h">@@ -123,9 +123,8 @@ int initdecoders(void);</span>
+ Decoder *matchdecoder(const char *);
+ 
+ /* output.c */
+<span class="d">-int openoutput(const char *);</span>
+<span class="a">+int initresamplers(int);</span>
+ int openoutputs(void);
+<span class="d">-int closeoutput(const char *);</span>
+ int closeoutputs(void);
+ int enableoutput(const char *);
+ int disableoutput(const char *);
+diff --git a/vorbis.c b/vorbis.c
+index 51d4cd6..7e46220 100644
+--- a/vorbis.c
++++ b/vorbis.c
+<span class="h">@@ -34,6 +34,8 @@ vorbisopen(const char *name)</span>
+ 		goto err0;
+ 	}
+ 
+<span class="a">+	initresamplers(vi-&gt;rate);</span>
+<span class="a">+</span>
+ 	return 0;
+ 
+ err0:
+diff --git a/wav.c b/wav.c
+index 34a25d5..3669cbb 100644
+--- a/wav.c
++++ b/wav.c
+<span class="h">@@ -51,6 +51,8 @@ wavopen(const char *name)</span>
+ 		goto err0;
+ 	}
+ 
+<span class="a">+	initresamplers(sfinfo.samplerate);</span>
+<span class="a">+</span>
+ 	return 0;
+ err0:
+ 	sf_close(sf);</pre>
+</div></body></html>

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 6a212b7f - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 6a212b7f65ed4410dec86ec4fe11c0e898dc87ee
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:15:03 -0700
+
+Make a tap on the page work like a finger
+
+The tap tolerance was 1.5% of the page width, about 6 CSS pixels on a
+phone. It is now 24 CSS pixels, converted to page pixels with the
+displayed size of the page and the pinch zoom.
+
+A tap on punctuation only sends nothing. A tap on a page that is not
+read yet tells how many pages are read. When the pause before a lookup
+fails, the lookup still runs, and the player plays again only when this
+app paused it.
+
+The web has no dictionary app, so the web copies the text to the
+clipboard itself and shows &quot;Copied&quot; or &quot;Copy failed&quot; in the strip. It
+does not pause. The Dictionary and &quot;Pause on lookup&quot; settings show only
+on Android.
+
+</pre><pre> index.html            |  4 +--
+ src/hit-test.ts       | 12 +++++++++
+ src/main.ts           | 74 ++++++++++++++++++++++++++++++++++++++++++---------
+ test/hit-test.test.ts | 31 ++++++++++++++++++++-
+ 4 files changed, 105 insertions(+), 16 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index a60f7f1..7fcc9df 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -81,13 +81,13 @@</span>
+         &gt;&lt;input id=&quot;force-ocr&quot; type=&quot;checkbox&quot; /&gt; Force OCR (the text layer of the PDF is
+         wrong)&lt;/label
+       &gt;
+<span class="d">-      &lt;label</span>
+<span class="a">+      &lt;label id=&quot;dict-row&quot;</span>
+         &gt;Dictionary
+         &lt;select id=&quot;dict&quot;&gt;
+           &lt;option value=&quot;&quot;&gt;Ask each time&lt;/option&gt;
+         &lt;/select&gt;
+       &lt;/label&gt;
+<span class="d">-      &lt;label class=&quot;check&quot;</span>
+<span class="a">+      &lt;label id=&quot;pause-row&quot; class=&quot;check&quot;</span>
+         &gt;&lt;input id=&quot;pause-lookup&quot; type=&quot;checkbox&quot; checked /&gt; Pause on lookup&lt;/label
+       &gt;
+       &lt;div class=&quot;row&quot;&gt;
+diff --git a/src/hit-test.ts b/src/hit-test.ts
+index ea37133..d528593 100644
+--- a/src/hit-test.ts
++++ b/src/hit-test.ts
+<span class="h">@@ -25,6 +25,18 @@ const PUNCTUATION = /^[\p{P}\p{S}]+$/u;</span>
+ /** Text that ends a sentence. No next line follows it in a lookup. */
+ const SENTENCE_END = /[。．！？.!?」』]$/u;
+ 
+<span class="a">+/** How far from a character a tap may land, in CSS pixels: about the size of a finger. */</span>
+<span class="a">+export const TAP_CSS = 24;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The tap tolerance in page pixels. The page is `pageWidth` pixels wide</span>
+<span class="a">+ * and shows `shownWidth` CSS pixels wide. A pinch zoom of `zoom` makes a</span>
+<span class="a">+ * CSS pixel bigger on the screen, so the finger covers fewer of them.</span>
+<span class="a">+ */</span>
+<span class="a">+export function tapTolerance(pageWidth: number, shownWidth: number, zoom = 1): number {</span>
+<span class="a">+  return (TAP_CSS * pageWidth) / (shownWidth * Math.max(1, zoom));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** Distance from a point to a box. Zero inside the box. */
+ function boxDistance(box: OcrToken[&#x27;bbox&#x27;], x: number, y: number): number {
+   const dx = Math.max(box.x0 - x, 0, x - box.x1);
+diff --git a/src/main.ts b/src/main.ts
+index a0b27df..1bdd9e3 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -6,11 +6,12 @@ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./al</span>
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+ import { cueMoved, follow, type FollowMode } from &#x27;./follower&#x27;;
+<span class="d">-import { lookupText, tokenAt } from &#x27;./hit-test&#x27;;</span>
+<span class="a">+import { lookupText, tapTolerance, tokenAt } from &#x27;./hit-test&#x27;;</span>
+ import { lineBoxes } from &#x27;./line-boxes&#x27;;
+ import {
+   clockText,
+   errorMessage,
+<span class="a">+  notReadText,</span>
+   pagesReadText,
+   pdfLoadedText,
+   playerMessage,
+<span class="h">@@ -36,9 +37,6 @@ import {</span>
+ /** Page width in pixels for OCR and the text layer. Boxes are stored in this scale. */
+ const OCR_WIDTH = 1600;
+ 
+<span class="d">-/** How far from a character a tap may land, as a share of the page width. */</span>
+<span class="d">-const TAP_TOLERANCE = 0.015;</span>
+<span class="d">-</span>
+ /** The space around a box of the mark, in CSS pixels. */
+ const BOX_PAD = 2;
+ 
+<span class="h">@@ -71,7 +69,9 @@ const ui = {</span>
+   follow: el&lt;HTMLFieldSetElement&gt;(&#x27;follow&#x27;),
+   lang: el&lt;HTMLSelectElement&gt;(&#x27;lang&#x27;),
+   forceOcr: el&lt;HTMLInputElement&gt;(&#x27;force-ocr&#x27;),
+<span class="a">+  dictRow: el&lt;HTMLLabelElement&gt;(&#x27;dict-row&#x27;),</span>
+   dict: el&lt;HTMLSelectElement&gt;(&#x27;dict&#x27;),
+<span class="a">+  pauseRow: el&lt;HTMLLabelElement&gt;(&#x27;pause-row&#x27;),</span>
+   pauseLookup: el&lt;HTMLInputElement&gt;(&#x27;pause-lookup&#x27;),
+   clearCache: el&lt;HTMLButtonElement&gt;(&#x27;clear-cache&#x27;),
+   cues: el&lt;HTMLOListElement&gt;(&#x27;cues&#x27;),
+<span class="h">@@ -557,31 +557,76 @@ ui.next.addEventListener(&#x27;click&#x27;, () =&gt; void showPage(state.currentPage + 1));</span>
+ // --- Tap on a word ---
+ 
+ /** Tap on the page: send the text under the tap to the dictionary. */
+<span class="d">-ui.page.addEventListener(&#x27;click&#x27;, async (e) =&gt; {</span>
+<span class="a">+ui.page.addEventListener(&#x27;click&#x27;, (e) =&gt; {</span>
+   const canvas = ui.page.querySelector(&#x27;canvas&#x27;);
+<span class="a">+  const pdf = state.pdf;</span>
+<span class="a">+  if (!canvas || !pdf) return;</span>
+   const size = state.pages[state.currentPage];
+<span class="d">-  if (!canvas || !size) return;</span>
+<span class="a">+  if (!size) {</span>
+<span class="a">+    say(notReadText(state.pages.filter((p) =&gt; p).length, pdf.numPages));</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+   const rect = canvas.getBoundingClientRect();
+   const x = ((e.clientX - rect.left) / rect.width) * size.width;
+   const y = ((e.clientY - rect.top) / rect.height) * size.height;
+<span class="d">-  const t = tokenAt(state.tokens, state.currentPage, x, y, TAP_TOLERANCE * size.width);</span>
+<span class="a">+  const zoom = window.visualViewport?.scale ?? 1;</span>
+<span class="a">+  const t = tokenAt(</span>
+<span class="a">+    state.tokens,</span>
+<span class="a">+    state.currentPage,</span>
+<span class="a">+    x,</span>
+<span class="a">+    y,</span>
+<span class="a">+    tapTolerance(size.width, rect.width, zoom),</span>
+<span class="a">+  );</span>
+   if (t &lt; 0) return;
+   const text = lookupText(state.tokens, t);
+<span class="a">+  // A tap on punctuation only gives no text.</span>
+<span class="a">+  if (text === &#x27;&#x27;) return;</span>
+<span class="a">+  void (isAndroid ? lookUp(text) : copy(text));</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+/** The web has no dictionary app: the text goes to the clipboard. */</span>
+<span class="a">+async function copy(text: string): Promise&lt;void&gt; {</span>
+<span class="a">+  try {</span>
+<span class="a">+    await navigator.clipboard.writeText(text);</span>
+<span class="a">+    say(`Copied: &quot;${text}&quot;`);</span>
+<span class="a">+  } catch {</span>
+<span class="a">+    say(`Copy failed: &quot;${text}&quot;`);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Sends the text to the dictionary app. With &quot;Pause on lookup&quot;, the</span>
+<span class="a">+ * player pauses first and plays again when the dictionary closes. When</span>
+<span class="a">+ * the pause fails, the lookup still runs.</span>
+<span class="a">+ */</span>
+<span class="a">+async function lookUp(text: string): Promise&lt;void&gt; {</span>
+   say(`Lookup: &quot;${text}&quot;`);
+   const pause = ui.pauseLookup.checked &amp;&amp; state.clock?.playing === true &amp;&amp; !state.lookupPaused;
+<span class="d">-  try {</span>
+<span class="d">-    if (pause) {</span>
+<span class="d">-      state.lookupPaused = true;</span>
+<span class="a">+  let paused = false;</span>
+<span class="a">+  if (pause) {</span>
+<span class="a">+    state.lookupPaused = true;</span>
+<span class="a">+    try {</span>
+       await clock.pause();
+<span class="a">+      paused = true;</span>
+<span class="a">+    } catch (err) {</span>
+<span class="a">+      sayError(err);</span>
+     }
+<span class="d">-    const { closed } = await SubRead.lookup({ text });</span>
+<span class="d">-    if (closed &amp;&amp; state.lookupPaused) await clock.play();</span>
+<span class="a">+  }</span>
+<span class="a">+  // Play again when the dictionary closed, or when it did not open.</span>
+<span class="a">+  let resume = true;</span>
+<span class="a">+  try {</span>
+<span class="a">+    ({ closed: resume } = await SubRead.lookup({ text }));</span>
+   } catch (err) {
+     say(`Lookup failed: ${String(err)}`);
+<span class="a">+  }</span>
+<span class="a">+  try {</span>
+<span class="a">+    if (paused &amp;&amp; resume) await clock.play();</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    sayError(err);</span>
+   } finally {
+     if (pause) state.lookupPaused = false;
+   }
+<span class="d">-});</span>
+<span class="a">+}</span>
+ 
+ // --- Dictionaries (Android) ---
+ 
+<span class="h">@@ -605,4 +650,7 @@ ui.dict.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+ loadSettings();
+ ui.make.hidden = !isAndroid;
+ ui.audioRow.hidden = isAndroid;
+<span class="a">+// The web copies a lookup at once: there is no dictionary app to choose or to wait for.</span>
+<span class="a">+ui.dictRow.hidden = !isAndroid;</span>
+<span class="a">+ui.pauseRow.hidden = !isAndroid;</span>
+ if (isAndroid) void loadDictionaries().catch(sayError);
+diff --git a/test/hit-test.test.ts b/test/hit-test.test.ts
+index 5651a86..b629753 100644
+--- a/test/hit-test.test.ts
++++ b/test/hit-test.test.ts
+<span class="h">@@ -2,7 +2,14 @@ import fc from &#x27;fast-check&#x27;;</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+ import type { OcrToken } from &#x27;../src/align&#x27;;
+ import { isCjk } from &#x27;../src/book-text&#x27;;
+<span class="d">-import { LOOKUP_LENGTH, lookupText, scanText, tokenAt } from &#x27;../src/hit-test&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  LOOKUP_LENGTH,</span>
+<span class="a">+  lookupText,</span>
+<span class="a">+  scanText,</span>
+<span class="a">+  TAP_CSS,</span>
+<span class="a">+  tapTolerance,</span>
+<span class="a">+  tokenAt,</span>
+<span class="a">+} from &#x27;../src/hit-test&#x27;;</span>
+ 
+ /** Tokens for one page: `lines` laid out left to right, 10 px per character. */
+ function tokensOf(lines: string[], page = 0): OcrToken[] {
+<span class="h">@@ -51,6 +58,28 @@ describe(&#x27;tokenAt&#x27;, () =&gt; {</span>
+   });
+ });
+ 
+<span class="a">+describe(&#x27;tapTolerance&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;converts the CSS pixels of a finger to page pixels&#x27;, () =&gt; {</span>
+<span class="a">+    expect(tapTolerance(1600, 400)).toBe(TAP_CSS * 4);</span>
+<span class="a">+    expect(tapTolerance(1600, 800)).toBe(TAP_CSS * 2);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gets smaller when the page is zoomed in&#x27;, () =&gt; {</span>
+<span class="a">+    expect(tapTolerance(1600, 400, 2)).toBe(TAP_CSS * 2);</span>
+<span class="a">+    expect(tapTolerance(1600, 400, 0.5)).toBe(TAP_CSS * 4);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;finds a character 20 CSS pixels from a tap on a phone&#x27;, () =&gt; {</span>
+<span class="a">+    // A 1600-pixel page on a phone, 344 CSS pixels wide. The old tolerance,</span>
+<span class="a">+    // 1.5% of the page width, was 24 page pixels: about 5 CSS pixels.</span>
+<span class="a">+    const page = tokensOf([&#x27;abc&#x27;]);</span>
+<span class="a">+    const scale = 1600 / 344;</span>
+<span class="a">+    const x = page[2]!.bbox.x1 + 20 * scale;</span>
+<span class="a">+    expect(tokenAt(page, 0, x, 10, 0.015 * 1600)).toBe(-1);</span>
+<span class="a">+    expect(tokenAt(page, 0, x, 10, tapTolerance(1600, 344))).toBe(2);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+ /** Tokens of one line of words, with a word id per word. Spaces are not tokens. */
+ function wordTokens(words: string[], page = 0, line = 0): OcrToken[] {
+   const tokens: OcrToken[] = [];</pre>
+</div></body></html>

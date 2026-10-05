@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 56a9a470 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 56a9a470a72916d2357f21ff8d4a9b9d754878da
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:41:41 -0700
+
+Turn the page inside a cue that crosses a page break
+
+A cue with text on two pages had the page of its first token. So the
+page turned only at the next cue, and &quot;Audio to this page&quot; on the
+second page went to that next cue. The new pure module cue-pages.ts
+gives each cue its parts on the pages, with the share of its
+normalized characters on each page. The page of the audio follows the
+time: the first page until the start of the cue plus its length times
+the share on the first page, then the second page. An unmatched cue
+borrows the last page of the matched cue before it, not the first.
+
+&quot;Move the audio to this page&quot; now goes to the time where the text of
+the page starts: in the first cue with text on the page, and inside
+that cue when it starts on the page before. The time is up to 50 ms
+later, so a clock that rounds to milliseconds shows the same page. A
+property test finds the page again at that time. The button is off
+while the player has no position or has an error.
+
+</pre><pre> src/cue-pages.ts       | 131 +++++++++++++++++++++++++++++
+ src/follower.ts        |  25 +-----
+ src/main.ts            |  47 +++++++----
+ test/cue-pages.test.ts | 219 +++++++++++++++++++++++++++++++++++++++++++++++++
+ test/follower.test.ts  |  33 ++------
+ 5 files changed, 390 insertions(+), 65 deletions(-)
+</pre><pre>diff --git a/src/cue-pages.ts b/src/cue-pages.ts
+new file mode 100644
+index 0000000..d5992df
+--- /dev/null
++++ b/src/cue-pages.ts
+<span class="h">@@ -0,0 +1,131 @@</span>
+<span class="a">+// Where each cue is on the pages, and the page of the audio at a time. Pure.</span>
+<span class="a">+//</span>
+<span class="a">+// Most cues are on one page. A cue at a page break has text on two pages.</span>
+<span class="a">+// The narrator reads the text in order, so the page follows the time: the</span>
+<span class="a">+// first page for the share of the text of the cue on it, then the next page.</span>
+<span class="a">+</span>
+<span class="a">+import { normalizeText, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The part of a cue on one page. */</span>
+<span class="a">+export interface PagePart {</span>
+<span class="a">+  page: number;</span>
+<span class="a">+  /** The share of the text of the cue on this page: more than 0, at most 1. The shares of a cue add up to 1. */</span>
+<span class="a">+  share: number;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The parts of a cue in page order. Empty for an unmatched cue. */</span>
+<span class="a">+export type CueParts = readonly PagePart[];</span>
+<span class="a">+</span>
+<span class="a">+/** A cue in time, in seconds. */</span>
+<span class="a">+export interface CueTime {</span>
+<span class="a">+  start: number;</span>
+<span class="a">+  end: number;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** How many cues back an unmatched cue borrows the page of a matched one. */</span>
+<span class="a">+export const LOOKBACK = 5;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * A seek to the start of a page lands this many seconds into its text, at</span>
+<span class="a">+ * most. A clock that rounds the time then does not show the page before.</span>
+<span class="a">+ */</span>
+<span class="a">+export const SEEK_INTO = 0.05;</span>
+<span class="a">+</span>
+<span class="a">+/** The count of normalized characters of each token text that was seen. */</span>
+<span class="a">+const weights = new Map&lt;string, number&gt;();</span>
+<span class="a">+</span>
+<span class="a">+/** The count of normalized characters of a token: 0 for punctuation, as in the alignment. */</span>
+<span class="a">+function weight(text: string): number {</span>
+<span class="a">+  let n = weights.get(text);</span>
+<span class="a">+  if (n === undefined) {</span>
+<span class="a">+    n = normalizeText(text).length;</span>
+<span class="a">+    weights.set(text, n);</span>
+<span class="a">+  }</span>
+<span class="a">+  return n;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The parts of each cue on the pages, from the spans of the alignment.</span>
+<span class="a">+ * The share of a page is the share of the normalized characters of the</span>
+<span class="a">+ * span on that page. The tokens must be in page order.</span>
+<span class="a">+ */</span>
+<span class="a">+export function cueParts(tokens: readonly OcrToken[], spans: readonly TokenSpan[]): CueParts[] {</span>
+<span class="a">+  return spans.map((span) =&gt; {</span>
+<span class="a">+    if (!span.matched) return [];</span>
+<span class="a">+    const counts: { page: number; chars: number }[] = [];</span>
+<span class="a">+    let total = 0;</span>
+<span class="a">+    for (let t = span.start; t &lt; span.end; t++) {</span>
+<span class="a">+      const token = tokens[t];</span>
+<span class="a">+      if (!token) continue;</span>
+<span class="a">+      const n = weight(token.text);</span>
+<span class="a">+      if (n === 0) continue;</span>
+<span class="a">+      const last = counts[counts.length - 1];</span>
+<span class="a">+      if (last &amp;&amp; last.page === token.page) last.chars += n;</span>
+<span class="a">+      else counts.push({ page: token.page, chars: n });</span>
+<span class="a">+      total += n;</span>
+<span class="a">+    }</span>
+<span class="a">+    return counts.map((c) =&gt; ({ page: c.page, share: c.chars / total }));</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** How far time `t` is into `cue`: 0 at its start, 1 at its end and after it. */</span>
+<span class="a">+export function cueProgress(cue: CueTime, t: number): number {</span>
+<span class="a">+  const length = cue.end - cue.start;</span>
+<span class="a">+  if (length &lt;= 0) return 1;</span>
+<span class="a">+  return Math.min(1, Math.max(0, (t - cue.start) / length));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The page of the audio at `progress` into cue `cue`. For a matched cue it</span>
+<span class="a">+ * is the page of the part that holds the progress: the first page until</span>
+<span class="a">+ * the share of the text on it is read, then the next page. An unmatched</span>
+<span class="a">+ * cue borrows the last page of the nearest matched cue before it, within</span>
+<span class="a">+ * LOOKBACK cues. Null when there is none.</span>
+<span class="a">+ */</span>
+<span class="a">+export function audioPage(</span>
+<span class="a">+  parts: readonly CueParts[],</span>
+<span class="a">+  cue: number,</span>
+<span class="a">+  progress: number,</span>
+<span class="a">+): number | null {</span>
+<span class="a">+  const own = parts[cue];</span>
+<span class="a">+  if (own &amp;&amp; own.length &gt; 0) {</span>
+<span class="a">+    let end = 0;</span>
+<span class="a">+    for (const part of own) {</span>
+<span class="a">+      end += part.share;</span>
+<span class="a">+      if (progress &lt; end) return part.page;</span>
+<span class="a">+    }</span>
+<span class="a">+    return own[own.length - 1]!.page;</span>
+<span class="a">+  }</span>
+<span class="a">+  for (let i = cue - 1; i &gt;= 0 &amp;&amp; i &gt;= cue - LOOKBACK; i--) {</span>
+<span class="a">+    const before = parts[i];</span>
+<span class="a">+    if (before &amp;&amp; before.length &gt; 0) return before[before.length - 1]!.page;</span>
+<span class="a">+  }</span>
+<span class="a">+  return null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The time where the text of `page` starts, in seconds: in the first cue</span>
+<span class="a">+ * with text on the page. When that cue starts on a page before, the time</span>
+<span class="a">+ * is inside the cue, after the share of its text on the pages before. The</span>
+<span class="a">+ * time is up to SEEK_INTO later, but inside the part of the page. Null</span>
+<span class="a">+ * when no cue has text on the page.</span>
+<span class="a">+ */</span>
+<span class="a">+export function pageStartTime(</span>
+<span class="a">+  parts: readonly CueParts[],</span>
+<span class="a">+  cues: readonly CueTime[],</span>
+<span class="a">+  page: number,</span>
+<span class="a">+): number | null {</span>
+<span class="a">+  for (let i = 0; i &lt; parts.length; i++) {</span>
+<span class="a">+    const cue = cues[i];</span>
+<span class="a">+    if (!cue) continue;</span>
+<span class="a">+    let before = 0;</span>
+<span class="a">+    for (const part of parts[i]!) {</span>
+<span class="a">+      if (part.page === page) {</span>
+<span class="a">+        const length = Math.max(0, cue.end - cue.start);</span>
+<span class="a">+        return cue.start + length * before + Math.min(SEEK_INTO, (length * part.share) / 2);</span>
+<span class="a">+      }</span>
+<span class="a">+      before += part.share;</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+  return null;</span>
+<span class="a">+}</span>
+diff --git a/src/follower.ts b/src/follower.ts
+index ec2dd85..8e525ae 100644
+--- a/src/follower.ts
++++ b/src/follower.ts
+<span class="h">@@ -1,10 +1,9 @@</span>
+ // The reader follows the audio: which cue to mark, which page to show. Pure.
+ //
+<span class="d">-// The alignment gives each matched cue a page. At each step the follow</span>
+<span class="d">-// compares the page of the audio with the page shown, and turns the page</span>
+<span class="d">-// when they differ. A page turn by the user holds the follow: the page</span>
+<span class="d">-// stays until the audio reaches it, the audio jumps, or the user asks to</span>
+<span class="d">-// follow again.</span>
+<span class="a">+// At each step the follow compares the page of the audio (see audioPage</span>
+<span class="a">+// in cue-pages.ts) with the page shown, and turns the page when they</span>
+<span class="a">+// differ. A page turn by the user holds the follow: the page stays until</span>
+<span class="a">+// the audio reaches it, the audio jumps, or the user asks to follow again.</span>
+ 
+ export type FollowMode = &#x27;highlight&#x27; | &#x27;pages&#x27; | &#x27;off&#x27;;
+ 
+<span class="h">@@ -43,22 +42,6 @@ export interface FollowOutput {</span>
+   held: boolean;
+ }
+ 
+<span class="d">-/** How many cues back an unmatched cue borrows the page of a matched one. */</span>
+<span class="d">-export const LOOKBACK = 5;</span>
+<span class="d">-</span>
+<span class="d">-/**</span>
+<span class="d">- * The page that stands for `cue`: its own page when the cue is matched,</span>
+<span class="d">- * else the page of the nearest matched cue before it, within LOOKBACK.</span>
+<span class="d">- * Null when there is none.</span>
+<span class="d">- */</span>
+<span class="d">-export function pageForCue(cuePages: readonly (number | null)[], cue: number): number | null {</span>
+<span class="d">-  for (let i = cue; i &gt;= 0 &amp;&amp; i &gt;= cue - LOOKBACK; i--) {</span>
+<span class="d">-    const page = cuePages[i];</span>
+<span class="d">-    if (page !== null &amp;&amp; page !== undefined) return page;</span>
+<span class="d">-  }</span>
+<span class="d">-  return null;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+ /**
+  * One step of the follow.
+  *
+diff --git a/src/main.ts b/src/main.ts
+index c501a6d..e850d4d 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -5,7 +5,8 @@</span>
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+<span class="d">-import { follow, pageForCue, type FollowEvent, type FollowMode } from &#x27;./follower&#x27;;</span>
+<span class="a">+import { audioPage, cueParts, cueProgress, pageStartTime, type CueParts } from &#x27;./cue-pages&#x27;;</span>
+<span class="a">+import { follow, type FollowEvent, type FollowMode } from &#x27;./follower&#x27;;</span>
+ import { lookupText, tapTolerance, tokenAt } from &#x27;./hit-test&#x27;;
+ import { lineBoxes } from &#x27;./line-boxes&#x27;;
+ import {
+<span class="h">@@ -102,8 +103,8 @@ const state = {</span>
+   /** The aligner of the loaded subtitles. It keeps the result of each page. */
+   aligner: null as Aligner | null,
+   spans: [] as TokenSpan[],
+<span class="d">-  /** The page of each cue, or null for an unmatched cue. */</span>
+<span class="d">-  cuePages: [] as (number | null)[],</span>
+<span class="a">+  /** The parts of each cue on the pages. Empty for an unmatched cue. */</span>
+<span class="a">+  cueParts: [] as CueParts[],</span>
+   currentPage: -1,
+   /** The cue of the last clock state, or -1. */
+   activeCue: -1,
+<span class="h">@@ -237,7 +238,7 @@ ui.pdfFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+     state.pages = [];
+     state.tokens = [];
+     state.spans = [];
+<span class="d">-    state.cuePages = [];</span>
+<span class="a">+    state.cueParts = [];</span>
+     state.activeCue = -1;
+     state.markedCue = -1;
+     state.held = false;
+<span class="h">@@ -298,7 +299,7 @@ async function readBook(): Promise&lt;void&gt; {</span>
+   state.tokens = [];
+   // The spans index the old tokens, so they go too.
+   state.spans = [];
+<span class="d">-  state.cuePages = [];</span>
+<span class="a">+  state.cueParts = [];</span>
+   state.markedCue = -1;
+   const total = pdf.numPages;
+   const pending = new Set(Array.from({ length: total }, (_, i) =&gt; i));
+<span class="h">@@ -365,10 +366,10 @@ function loadSubtitles(text: string, source: string): void {</span>
+   state.aligner = createAligner(state.cues.map((c) =&gt; c.text));
+   state.srt = text;
+   state.spans = [];
+<span class="d">-  state.cuePages = [];</span>
+<span class="a">+  state.cueParts = [];</span>
+   state.activeCue = -1;
+   state.markedCue = -1;
+<span class="d">-  ui.syncPage.disabled = state.cues.length === 0;</span>
+<span class="a">+  updateSyncPage();</span>
+   renderCueList();
+   const matched = align();
+   say(
+<span class="h">@@ -458,13 +459,13 @@ function align(): number | null {</span>
+   state.alignTimer = null;
+   if (!state.aligner || state.cues.length === 0 || state.tokens.length === 0) return null;
+   state.spans = state.aligner.spans(state.pages.map((p) =&gt; p?.tokens));
+<span class="d">-  state.cuePages = state.spans.map((s) =&gt; (s.matched ? state.tokens[s.start]!.page : null));</span>
+<span class="a">+  state.cueParts = cueParts(state.tokens, state.spans);</span>
+   renderCueList();
+   view.mark();
+   // The cue of now can have a new page. A new alignment is no seek, so a
+   // page that the user turned to stays.
+   runFollow(&#x27;realign&#x27;);
+<span class="d">-  return state.cuePages.filter((p) =&gt; p !== null).length;</span>
+<span class="a">+  return state.cueParts.filter((parts) =&gt; parts.length &gt; 0).length;</span>
+ }
+ 
+ // --- Cue list ---
+<span class="h">@@ -506,27 +507,37 @@ function showPlayerStatus(s: ClockState): void {</span>
+   }
+   // Before a PDF is open, the start card tells what to do first.
+   showPlayer(state.pdf ? playerMessage(s, isAndroid) : null);
+<span class="a">+  updateSyncPage();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** &quot;Move the audio to this page&quot; needs cues and a player with a position. */</span>
+<span class="a">+function updateSyncPage(): void {</span>
+<span class="a">+  const s = state.clock;</span>
+<span class="a">+  ui.syncPage.disabled = state.cues.length === 0 || !s || s.positionMs === null || s.error !== null;</span>
+ }
+ 
+ /**
+  * The follow for the last state of the clock: mark the cue of now, and
+<span class="d">- * turn to its page unless the follow is held. In the silence between two</span>
+<span class="d">- * cues, the cue before stays the cue of now.</span>
+<span class="a">+ * turn to the page of the audio unless the follow is held. In the silence</span>
+<span class="a">+ * between two cues, the cue before stays the cue of now. In a cue on two</span>
+<span class="a">+ * pages, the page follows the time.</span>
+  */
+ function runFollow(event: FollowEvent): void {
+   const s = state.clock;
+<span class="d">-  const cue = s?.positionMs == null ? -1 : lastCueAt(state.cues, s.positionMs / 1000);</span>
+<span class="a">+  const t = s?.positionMs == null ? null : s.positionMs / 1000;</span>
+<span class="a">+  const cue = t === null ? -1 : lastCueAt(state.cues, t);</span>
+   if (cue !== state.activeCue) {
+     markCueInList(cue);
+     state.activeCue = cue;
+   }
+   const mode = followMode();
+<span class="d">-  const page = cue &lt; 0 ? null : pageForCue(state.cuePages, cue);</span>
+<span class="a">+  const page =</span>
+<span class="a">+    t === null || cue &lt; 0 ? null : audioPage(state.cueParts, cue, cueProgress(state.cues[cue]!, t));</span>
+   const out = follow({
+     mode,
+     currentPage: state.currentPage,
+     cue,
+<span class="d">-    matched: cue &gt;= 0 &amp;&amp; state.cuePages[cue] != null,</span>
+<span class="a">+    matched: (state.cueParts[cue]?.length ?? 0) &gt; 0,</span>
+     page,
+     held: state.held,
+     event,
+<span class="h">@@ -575,13 +586,15 @@ ui.play.addEventListener(&#x27;click&#x27;, () =&gt; {</span>
+ 
+ ui.followNow.addEventListener(&#x27;click&#x27;, () =&gt; runFollow(&#x27;follow&#x27;));
+ 
+<span class="a">+// The audio goes to where the text of the page starts, also inside a cue</span>
+<span class="a">+// that starts on the page before.</span>
+ ui.syncPage.addEventListener(&#x27;click&#x27;, () =&gt; {
+<span class="d">-  const i = state.cuePages.indexOf(state.currentPage);</span>
+<span class="d">-  if (i &lt; 0) {</span>
+<span class="a">+  const t = pageStartTime(state.cueParts, state.cues, state.currentPage);</span>
+<span class="a">+  if (t === null) {</span>
+     say(&#x27;No cue of the subtitles is on this page.&#x27;);
+     return;
+   }
+<span class="d">-  seek(state.cues[i]!.start * 1000);</span>
+<span class="a">+  seek(t * 1000);</span>
+ });
+ 
+ ui.audioFile.addEventListener(&#x27;change&#x27;, () =&gt; {
+diff --git a/test/cue-pages.test.ts b/test/cue-pages.test.ts
+new file mode 100644
+index 0000000..01a8557
+--- /dev/null
++++ b/test/cue-pages.test.ts
+<span class="h">@@ -0,0 +1,219 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { normalizeText, type OcrToken } from &#x27;../src/align&#x27;;</span>
+<span class="a">+import {</span>
+<span class="a">+  audioPage,</span>
+<span class="a">+  cueParts,</span>
+<span class="a">+  cueProgress,</span>
+<span class="a">+  LOOKBACK,</span>
+<span class="a">+  pageStartTime,</span>
+<span class="a">+  SEEK_INTO,</span>
+<span class="a">+  type CueParts,</span>
+<span class="a">+} from &#x27;../src/cue-pages&#x27;;</span>
+<span class="a">+import { lastCueAt } from &#x27;../src/subtitles&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** Tokens of one text line, one per character; a space gets no token. */</span>
+<span class="a">+function lineTokens(text: string, page: number): OcrToken[] {</span>
+<span class="a">+  return [...text]</span>
+<span class="a">+    .filter((ch) =&gt; ch !== &#x27; &#x27;)</span>
+<span class="a">+    .map((ch, i) =&gt; ({ text: ch, page, line: page, bbox: { x0: i, y0: 0, x1: i + 1, y1: 1 } }));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// Cue 8 of sample-eng-2p.srt, 17.5 s to 20 s: the last line of page 1 and</span>
+<span class="a">+// the first line of page 2.</span>
+<span class="a">+const PAGE_1_END = &#x27;with nothing more than light and sound.&#x27;;</span>
+<span class="a">+const PAGE_2_START = &#x27;It rolled across the fields and woke the geese,&#x27;;</span>
+<span class="a">+const crossing = [...lineTokens(PAGE_1_END, 0), ...lineTokens(PAGE_2_START, 1)];</span>
+<span class="a">+/** The alignment drops the comma at the end, so the span ends before it. */</span>
+<span class="a">+const crossingSpan = { start: 0, end: crossing.length - 1, matched: true };</span>
+<span class="a">+const CUE_8 = { start: 17.5, end: 20 };</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;cueParts&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;splits a cue at the page break by its normalized characters&#x27;, () =&gt; {</span>
+<span class="a">+    const [parts] = cueParts(crossing, [crossingSpan]);</span>
+<span class="a">+    expect(parts).toEqual([</span>
+<span class="a">+      { page: 0, share: 32 / 70 },</span>
+<span class="a">+      { page: 1, share: 38 / 70 },</span>
+<span class="a">+    ]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives no parts for an unmatched cue&#x27;, () =&gt; {</span>
+<span class="a">+    expect(cueParts(crossing, [{ start: 0, end: 0, matched: false }])).toEqual([[]]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives shares that add up to 1, one part per page in page order&#x27;, () =&gt; {</span>
+<span class="a">+    const token = fc.record({</span>
+<span class="a">+      text: fc.constantFrom(&#x27;a&#x27;, &#x27;B&#x27;, &#x27;猫&#x27;, &#x27;,&#x27;, &#x27;。&#x27;, &#x27; &#x27;),</span>
+<span class="a">+      page: fc.nat({ max: 3 }),</span>
+<span class="a">+    });</span>
+<span class="a">+    const input = fc</span>
+<span class="a">+      .array(token, { minLength: 1, maxLength: 60 })</span>
+<span class="a">+      .map((ts) =&gt; ts.sort((x, y) =&gt; x.page - y.page))</span>
+<span class="a">+      .chain((ts) =&gt;</span>
+<span class="a">+        fc.tuple(fc.constant(ts), fc.nat({ max: ts.length - 1 }), fc.nat({ max: ts.length - 1 })),</span>
+<span class="a">+      );</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ([ts, a, b]) =&gt; {</span>
+<span class="a">+        const tokens: OcrToken[] = ts.map((t, i) =&gt; ({</span>
+<span class="a">+          ...t,</span>
+<span class="a">+          line: t.page,</span>
+<span class="a">+          bbox: { x0: i, y0: 0, x1: i + 1, y1: 1 },</span>
+<span class="a">+        }));</span>
+<span class="a">+        const span = { start: Math.min(a, b), end: Math.max(a, b) + 1, matched: true };</span>
+<span class="a">+        const [parts] = cueParts(tokens, [span]);</span>
+<span class="a">+        // A slow reference: count the normalized characters of each page.</span>
+<span class="a">+        const counts = new Map&lt;number, number&gt;();</span>
+<span class="a">+        for (const t of tokens.slice(span.start, span.end)) {</span>
+<span class="a">+          const n = normalizeText(t.text).length;</span>
+<span class="a">+          if (n &gt; 0) counts.set(t.page, (counts.get(t.page) ?? 0) + n);</span>
+<span class="a">+        }</span>
+<span class="a">+        const total = [...counts.values()].reduce((x, y) =&gt; x + y, 0);</span>
+<span class="a">+        expect(parts!.map((p) =&gt; p.page)).toEqual([...counts.keys()]);</span>
+<span class="a">+        parts!.forEach((p) =&gt; expect(p.share).toBeCloseTo(counts.get(p.page)! / total, 12));</span>
+<span class="a">+        if (parts!.length &gt; 0) {</span>
+<span class="a">+          expect(parts!.reduce((x, p) =&gt; x + p.share, 0)).toBeCloseTo(1, 12);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;cueProgress&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;goes from 0 at the start of the cue to 1 at its end&#x27;, () =&gt; {</span>
+<span class="a">+    expect(cueProgress(CUE_8, 17)).toBe(0);</span>
+<span class="a">+    expect(cueProgress(CUE_8, 17.5)).toBe(0);</span>
+<span class="a">+    expect(cueProgress(CUE_8, 18.75)).toBe(0.5);</span>
+<span class="a">+    expect(cueProgress(CUE_8, 20)).toBe(1);</span>
+<span class="a">+    expect(cueProgress(CUE_8, 21)).toBe(1);</span>
+<span class="a">+    expect(cueProgress({ start: 3, end: 3 }, 3)).toBe(1);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;audioPage&#x27;, () =&gt; {</span>
+<span class="a">+  const [parts] = cueParts(crossing, [crossingSpan]);</span>
+<span class="a">+  const split = CUE_8.start + (CUE_8.end - CUE_8.start) * (32 / 70);</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;turns inside a crossing cue at the share of its text on the first page&#x27;, () =&gt; {</span>
+<span class="a">+    expect(split).toBeCloseTo(18.643, 3);</span>
+<span class="a">+    expect(audioPage([parts!], 0, cueProgress(CUE_8, 18.5))).toBe(0);</span>
+<span class="a">+    expect(audioPage([parts!], 0, cueProgress(CUE_8, split - 0.01))).toBe(0);</span>
+<span class="a">+    expect(audioPage([parts!], 0, cueProgress(CUE_8, split + 0.01))).toBe(1);</span>
+<span class="a">+    expect(audioPage([parts!], 0, 1)).toBe(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;lets an unmatched cue borrow the last page of the cue before it&#x27;, () =&gt; {</span>
+<span class="a">+    // After the crossing cue the audio is on page 2, not back on page 1.</span>
+<span class="a">+    expect(audioPage([parts!, []], 1, 0)).toBe(1);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives null when no matched cue is near enough&#x27;, () =&gt; {</span>
+<span class="a">+    const far: CueParts[] = [</span>
+<span class="a">+      [{ page: 0, share: 1 }],</span>
+<span class="a">+      ...new Array&lt;CueParts&gt;(LOOKBACK + 1).fill([]),</span>
+<span class="a">+    ];</span>
+<span class="a">+    expect(audioPage(far, far.length - 1, 0)).toBeNull();</span>
+<span class="a">+    expect(audioPage(far, LOOKBACK, 0)).toBe(0);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  /** Parts of cues: each cue is unmatched, or on one to three pages that rise. */</span>
+<span class="a">+  const cueList = fc.array(</span>
+<span class="a">+    fc.oneof(</span>
+<span class="a">+      fc.constant&lt;CueParts&gt;([]),</span>
+<span class="a">+      fc</span>
+<span class="a">+        .array(fc.integer({ min: 1, max: 20 }), { minLength: 1, maxLength: 3 })</span>
+<span class="a">+        .chain((counts) =&gt;</span>
+<span class="a">+          fc.tuple(</span>
+<span class="a">+            fc.constant(counts),</span>
+<span class="a">+            fc.array(fc.integer({ min: 1, max: 2 }), {</span>
+<span class="a">+              minLength: counts.length,</span>
+<span class="a">+              maxLength: counts.length,</span>
+<span class="a">+            }),</span>
+<span class="a">+            fc.nat({ max: 5 }),</span>
+<span class="a">+          ),</span>
+<span class="a">+        )</span>
+<span class="a">+        .map(([counts, gaps, first]) =&gt; {</span>
+<span class="a">+          const total = counts.reduce((x, y) =&gt; x + y, 0);</span>
+<span class="a">+          let page = first;</span>
+<span class="a">+          return counts.map((c, k) =&gt; {</span>
+<span class="a">+            if (k &gt; 0) page += gaps[k]!;</span>
+<span class="a">+            return { page, share: c / total };</span>
+<span class="a">+          });</span>
+<span class="a">+        }),</span>
+<span class="a">+    ),</span>
+<span class="a">+    { minLength: 1, maxLength: 12 },</span>
+<span class="a">+  );</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;moves forward through the pages of a cue as the audio goes on&#x27;, () =&gt; {</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(</span>
+<span class="a">+        cueList,</span>
+<span class="a">+        fc.nat(),</span>
+<span class="a">+        fc.double({ min: 0, max: 1, noNaN: true }),</span>
+<span class="a">+        (list, pick, p) =&gt; {</span>
+<span class="a">+          const cue = pick % list.length;</span>
+<span class="a">+          const own = list[cue]!;</span>
+<span class="a">+          if (own.length === 0) return;</span>
+<span class="a">+          const page = audioPage(list, cue, p);</span>
+<span class="a">+          expect(own.map((x) =&gt; x.page)).toContain(page);</span>
+<span class="a">+          expect(audioPage(list, cue, 0)).toBe(own[0]!.page);</span>
+<span class="a">+          expect(audioPage(list, cue, 1)).toBe(own[own.length - 1]!.page);</span>
+<span class="a">+          expect(audioPage(list, cue, Math.min(1, p + 0.1))!).toBeGreaterThanOrEqual(page!);</span>
+<span class="a">+        },</span>
+<span class="a">+      ),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;finds the page again at the time where the page starts&#x27;, () =&gt; {</span>
+<span class="a">+    // Cues one after the other, 0.5 s to 5 s long, with gaps.</span>
+<span class="a">+    const input = cueList.chain((list) =&gt;</span>
+<span class="a">+      fc.tuple(</span>
+<span class="a">+        fc.constant(list),</span>
+<span class="a">+        fc.array(fc.tuple(fc.integer({ min: 0, max: 30 }), fc.integer({ min: 50, max: 500 })), {</span>
+<span class="a">+          minLength: list.length,</span>
+<span class="a">+          maxLength: list.length,</span>
+<span class="a">+        }),</span>
+<span class="a">+      ),</span>
+<span class="a">+    );</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ([list, times]) =&gt; {</span>
+<span class="a">+        let clock = 0;</span>
+<span class="a">+        const cues = times.map(([gap, length]) =&gt; {</span>
+<span class="a">+          const start = clock + gap / 10;</span>
+<span class="a">+          clock = start + length / 100;</span>
+<span class="a">+          return { start, end: clock };</span>
+<span class="a">+        });</span>
+<span class="a">+        const pages = new Set(list.flatMap((parts) =&gt; parts.map((p) =&gt; p.page)));</span>
+<span class="a">+        for (const page of pages) {</span>
+<span class="a">+          const t = pageStartTime(list, cues, page);</span>
+<span class="a">+          expect(t).not.toBeNull();</span>
+<span class="a">+          // The clock counts whole milliseconds.</span>
+<span class="a">+          const ms = Math.round(t! * 1000) / 1000;</span>
+<span class="a">+          const cue = lastCueAt(cues, ms);</span>
+<span class="a">+          expect(audioPage(list, cue, cueProgress(cues[cue]!, ms))).toBe(page);</span>
+<span class="a">+          // No cue before has text on the page.</span>
+<span class="a">+          for (let i = 0; i &lt; cue; i++) expect(list[i]!.some((p) =&gt; p.page === page)).toBe(false);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;pageStartTime&#x27;, () =&gt; {</span>
+<span class="a">+  const [parts] = cueParts(crossing, [crossingSpan]);</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the time where the text of page 2 starts inside the crossing cue&#x27;, () =&gt; {</span>
+<span class="a">+    const t = pageStartTime([parts!], [CUE_8], 1);</span>
+<span class="a">+    expect(t).toBeCloseTo(17.5 + 2.5 * (32 / 70) + SEEK_INTO, 6);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the start of the first cue on a page, and null for a page with no cue&#x27;, () =&gt; {</span>
+<span class="a">+    const list: CueParts[] = [[], [{ page: 0, share: 1 }], [{ page: 0, share: 1 }]];</span>
+<span class="a">+    const cues = [</span>
+<span class="a">+      { start: 0, end: 2 },</span>
+<span class="a">+      { start: 2, end: 4 },</span>
+<span class="a">+      { start: 4, end: 6 },</span>
+<span class="a">+    ];</span>
+<span class="a">+    expect(pageStartTime(list, cues, 0)).toBeCloseTo(2 + SEEK_INTO, 9);</span>
+<span class="a">+    expect(pageStartTime(list, cues, 1)).toBeNull();</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/follower.test.ts b/test/follower.test.ts
+index 44d3216..a2e8011 100644
+--- a/test/follower.test.ts
++++ b/test/follower.test.ts
+<span class="h">@@ -1,15 +1,11 @@</span>
+ import fc from &#x27;fast-check&#x27;;
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import {</span>
+<span class="d">-  follow,</span>
+<span class="d">-  LOOKBACK,</span>
+<span class="d">-  pageForCue,</span>
+<span class="d">-  type FollowEvent,</span>
+<span class="d">-  type FollowInput,</span>
+<span class="d">-  type FollowMode,</span>
+<span class="d">-} from &#x27;../src/follower&#x27;;</span>
+<span class="a">+import { audioPage, type CueParts } from &#x27;../src/cue-pages&#x27;;</span>
+<span class="a">+import { follow, type FollowEvent, type FollowInput, type FollowMode } from &#x27;../src/follower&#x27;;</span>
+ 
+<span class="a">+/** The page of each cue. Null for an unmatched cue. */</span>
+ const pages: (number | null)[] = [0, 0, null, 1, 1, null, null, 2];
+<span class="a">+const parts: CueParts[] = pages.map((p) =&gt; (p === null ? [] : [{ page: p, share: 1 }]));</span>
+ 
+ function input(over: Partial&lt;FollowInput&gt;): FollowInput {
+   return {
+<span class="h">@@ -24,33 +20,16 @@ function input(over: Partial&lt;FollowInput&gt;): FollowInput {</span>
+   };
+ }
+ 
+<span class="d">-/** The input of the follow for cue `cue` of `cuePages`. */</span>
+<span class="a">+/** The input of the follow at the start of cue `cue` of `pages`. */</span>
+ function at(cue: number, over: Partial&lt;FollowInput&gt; = {}): FollowInput {
+   return input({
+     cue,
+     matched: pages[cue] !== null &amp;&amp; pages[cue] !== undefined,
+<span class="d">-    page: pageForCue(pages, cue),</span>
+<span class="a">+    page: audioPage(parts, cue, 0),</span>
+     ...over,
+   });
+ }
+ 
+<span class="d">-describe(&#x27;pageForCue&#x27;, () =&gt; {</span>
+<span class="d">-  it(&#x27;gives the page of a matched cue&#x27;, () =&gt; {</span>
+<span class="d">-    expect(pageForCue(pages, 3)).toBe(1);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;borrows the page of the nearest matched cue before an unmatched one&#x27;, () =&gt; {</span>
+<span class="d">-    expect(pageForCue(pages, 2)).toBe(0);</span>
+<span class="d">-    expect(pageForCue(pages, 6)).toBe(1);</span>
+<span class="d">-  });</span>
+<span class="d">-</span>
+<span class="d">-  it(&#x27;gives null when no matched cue is near enough&#x27;, () =&gt; {</span>
+<span class="d">-    const far = [0, ...new Array&lt;null&gt;(LOOKBACK + 1).fill(null)];</span>
+<span class="d">-    expect(pageForCue(far, far.length - 1)).toBeNull();</span>
+<span class="d">-    expect(pageForCue(far, LOOKBACK)).toBe(0);</span>
+<span class="d">-  });</span>
+<span class="d">-});</span>
+<span class="d">-</span>
+ describe(&#x27;follow&#x27;, () =&gt; {
+   it(&#x27;marks a matched cue and stays on its page&#x27;, () =&gt; {
+     expect(follow(at(1))).toEqual({ highlightCue: 1, turnToPage: null, held: false });</pre>
+</div></body></html>

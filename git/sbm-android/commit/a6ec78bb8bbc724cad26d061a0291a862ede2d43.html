@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-android a6ec78bb - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-android</h1><span class="desc">sbm bookmarks for Android: fuzzy search, share to add, sync with bm and the browser add-on</span><p class="url">git clone https://github.com/equwal/sbm-android</p><p><a href="../../sbm-android/index.html">Log</a> | <a href="../../sbm-android/files.html">Files</a> | <a href="../../sbm-android/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit a6ec78bb8bbc724cad26d061a0291a862ede2d43
+equwal &lt;truex@equwal.com&gt;
+2026-09-22 20:17:56 -0700
+
+A live preview of the first match above the list
+
+While the user searches, the page of the first match shows in a web
+view above the list. Press and hold a bookmark, then Preview, to show
+another one. A tap on the address above the preview opens the page. The
+page loads 400 ms after the first match stops changing, so fast typing
+loads one page only. An http page loads with https, because the app
+allows no cleartext traffic. Page preview in the menu turns the preview
+off.
+
+The page in the preview runs its scripts, as in a browser, but it
+cannot take the focus from the search, open other apps or read the
+files of the app. Its links stay in the preview. The web view is made
+only when the preview first shows, so the app still starts fast. A page
+that stops the renderer does not stop the app: the next preview uses a
+new web view.
+
+README and the store description tell that the preview uses the
+network.
+
+</pre><pre> README.md                                          |  12 +-
+ app/src/main/java/com/equwal/sbm/MainActivity.kt   | 141 +++++++++++++++++++--
+ app/src/main/java/com/equwal/sbm/Preview.kt        |  19 +++
+ app/src/main/res/layout/activity_main.xml          |  25 ++++
+ app/src/main/res/menu/main.xml                     |   5 +
+ app/src/main/res/values/strings.xml                |   3 +
+ app/src/test/java/com/equwal/sbm/PreviewTest.kt    |  41 ++++++
+ .../metadata/android/en-US/full_description.txt    |   4 +-
+ 8 files changed, 235 insertions(+), 15 deletions(-)
+</pre><pre>diff --git a/README.md b/README.md
+index 61d1b12..57e0a4c 100644
+--- a/README.md
++++ b/README.md
+<span class="h">@@ -10,6 +10,10 @@ How sync looks between bm and the browser add-on:</span>
+ - **Search as you type**, with the fuzzy match of fzf. Go opens the first
+   match. Text that is no bookmark opens as an address, or as a web search,
+   as in bm.
+<span class="a">+- **Live preview:** while you search, the page of the first match shows</span>
+<span class="a">+  above the list. Press and hold a bookmark, then Preview, to see another</span>
+<span class="a">+  one. Tap the address above the preview to open the page. An http page</span>
+<span class="a">+  shows with https. Turn the preview off with Page preview in the menu.</span>
+ - **Tap to open**, press and hold to copy or share.
+ - **Share to sbm** from any browser to add the page.
+ - **Sync** with bm on your computers and the sbm add-on for Firefox and
+<span class="h">@@ -32,9 +36,11 @@ storage.</span>
+ 
+ ## Privacy
+ 
+<span class="d">-The app has no ads, no analytics and no trackers. It uses the network only</span>
+<span class="d">-for sync, after you sign in, and only with the server that you choose. See</span>
+<span class="d">-the [privacy policy](https://sbm.subread.space/privacy).</span>
+<span class="a">+The app has no ads, no analytics and no trackers. It uses the network for</span>
+<span class="a">+two things only. Sync, after you sign in, and only with the server that you</span>
+<span class="a">+choose. And the live preview, which loads the page of a bookmark from its</span>
+<span class="a">+site while you search, as a browser does; Page preview in the menu turns it</span>
+<span class="a">+off. See the [privacy policy](https://sbm.subread.space/privacy).</span>
+ 
+ ## Build
+ 
+diff --git a/app/src/main/java/com/equwal/sbm/MainActivity.kt b/app/src/main/java/com/equwal/sbm/MainActivity.kt
+index 1b4bf24..7b76588 100644
+--- a/app/src/main/java/com/equwal/sbm/MainActivity.kt
++++ b/app/src/main/java/com/equwal/sbm/MainActivity.kt
+<span class="h">@@ -1,5 +1,6 @@</span>
+ package com.equwal.sbm
+ 
+<span class="a">+import android.annotation.SuppressLint</span>
+ import android.app.Activity
+ import android.app.AlertDialog
+ import android.content.ActivityNotFoundException
+<span class="h">@@ -9,6 +10,8 @@ import android.content.Intent</span>
+ import android.net.Uri
+ import android.os.Build
+ import android.os.Bundle
+<span class="a">+import android.os.Handler</span>
+<span class="a">+import android.os.Looper</span>
+ import android.text.Editable
+ import android.text.TextWatcher
+ import android.view.Menu
+<span class="h">@@ -17,19 +20,34 @@ import android.view.View</span>
+ import android.view.ViewGroup
+ import android.view.WindowInsets
+ import android.view.inputmethod.EditorInfo
+<span class="a">+import android.webkit.RenderProcessGoneDetail</span>
+<span class="a">+import android.webkit.WebResourceRequest</span>
+<span class="a">+import android.webkit.WebView</span>
+<span class="a">+import android.webkit.WebViewClient</span>
+ import android.widget.BaseAdapter
+ import android.widget.EditText
+<span class="a">+import android.widget.LinearLayout</span>
+ import android.widget.ListView
+ import android.widget.TextView
+ import android.widget.Toast
+ import android.widget.Toolbar
+ 
+<span class="d">-/** The list: search as you type, tap to open, press and hold for more. */</span>
+<span class="a">+/**</span>
+<span class="a">+ * The list: search as you type, tap to open, press and hold for more. During</span>
+<span class="a">+ * a search, the page of the first match shows live above the list.</span>
+<span class="a">+ */</span>
+ class MainActivity : Activity() {
+     private lateinit var search: EditText
+     private lateinit var empty: TextView
+<span class="a">+    private lateinit var preview: LinearLayout</span>
+<span class="a">+    private lateinit var caption: TextView</span>
+     private val rows = Rows()
+     private var all: List&lt;Bookmark&gt; = emptyList()
+<span class="a">+    private var page: WebView? = null // made when the preview first shows</span>
+<span class="a">+    private var previewed: Bookmark? = null // the bookmark in the preview</span>
+<span class="a">+    private var picked: Bookmark? = null // the bookmark that the user picked with Preview</span>
+<span class="a">+    private var framed: String? = null // the address in the web view</span>
+<span class="a">+    private val later = Handler(Looper.getMainLooper())</span>
+ 
+     override fun onCreate(state: Bundle?) {
+         super.onCreate(state)
+<span class="h">@@ -38,6 +56,9 @@ class MainActivity : Activity() {</span>
+         setActionBar(toolbar)
+         search = findViewById(R.id.search)
+         empty = findViewById(R.id.empty)
+<span class="a">+        preview = findViewById(R.id.preview)</span>
+<span class="a">+        caption = findViewById(R.id.caption)</span>
+<span class="a">+        caption.setOnClickListener { previewed?.let { open(it.url) } }</span>
+         val list = findViewById&lt;ListView&gt;(R.id.list)
+         list.adapter = rows
+         list.emptyView = empty
+<span class="h">@@ -57,7 +78,10 @@ class MainActivity : Activity() {</span>
+         search.addTextChangedListener(object : TextWatcher {
+             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+<span class="d">-            override fun afterTextChanged(s: Editable?) = show()</span>
+<span class="a">+            override fun afterTextChanged(s: Editable?) {</span>
+<span class="a">+                picked = null</span>
+<span class="a">+                show()</span>
+<span class="a">+            }</span>
+         })
+         search.setOnEditorActionListener { _, action, _ -&gt;
+             if (action == EditorInfo.IME_ACTION_GO) {
+<span class="h">@@ -76,10 +100,22 @@ class MainActivity : Activity() {</span>
+ 
+     override fun onResume() {
+         super.onResume()
+<span class="a">+        page?.onResume()</span>
+         load()
+         if (Sync.signedIn(this)) sync(quiet = true)
+     }
+ 
+<span class="a">+    override fun onPause() {</span>
+<span class="a">+        page?.onPause()</span>
+<span class="a">+        super.onPause()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    override fun onDestroy() {</span>
+<span class="a">+        later.removeCallbacksAndMessages(null)</span>
+<span class="a">+        page?.destroy()</span>
+<span class="a">+        super.onDestroy()</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+     /** Sync, then show the file again. A quiet sync reports only what the user must act on. */
+     private fun sync(quiet: Boolean) {
+         Sync.run(this) { result -&gt;
+<span class="h">@@ -134,6 +170,77 @@ class MainActivity : Activity() {</span>
+     private fun show() {
+         rows.items = Fuzzy.filter(all, search.text.toString()) { &quot;${it.desc} ${it.tags.joinToString(&quot; &quot;)} ${it.url}&quot; }
+         rows.notifyDataSetChanged()
+<span class="a">+        showPage(picked ?: if (search.text.isBlank()) null else rows.items.firstOrNull())</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    private val settings get() = getSharedPreferences(&quot;settings&quot;, MODE_PRIVATE)</span>
+<span class="a">+    private val previewOn get() = settings.getBoolean(&quot;preview&quot;, true)</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * Show the page of [b] in the preview, or close the preview for null. The</span>
+<span class="a">+     * page loads only when [b] stays in the preview for a moment, so that</span>
+<span class="a">+     * fast typing does not load a page for each letter.</span>
+<span class="a">+     */</span>
+<span class="a">+    private fun showPage(b: Bookmark?) {</span>
+<span class="a">+        later.removeCallbacksAndMessages(null)</span>
+<span class="a">+        previewed = if (previewOn) b else null</span>
+<span class="a">+        val shown = previewed</span>
+<span class="a">+        if (shown == null) {</span>
+<span class="a">+            preview.visibility = View.GONE</span>
+<span class="a">+            loadPage(null)</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        preview.visibility = View.VISIBLE</span>
+<span class="a">+        val to = Preview.address(shown.url)</span>
+<span class="a">+        caption.text = to ?: getString(R.string.no_preview, shown.url)</span>
+<span class="a">+        if (to == null) loadPage(null) else later.postDelayed({ loadPage(to) }, PREVIEW_WAIT)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /** Load the page at [to] in the preview, or an empty page for null. */</span>
+<span class="a">+    private fun loadPage(to: String?) {</span>
+<span class="a">+        if (to == framed) return</span>
+<span class="a">+        framed = to</span>
+<span class="a">+        val view = page ?: if (to == null) return else newPage()</span>
+<span class="a">+        view.loadUrl(to ?: &quot;about:blank&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * A web view for the preview, under the caption. The page in it is only</span>
+<span class="a">+     * to look at: it runs its scripts, as in a browser, but it cannot take</span>
+<span class="a">+     * the focus from the search, open other apps or read the files of the</span>
+<span class="a">+     * app. Its links stay in the preview, and an http link loads with https.</span>
+<span class="a">+     */</span>
+<span class="a">+    @SuppressLint(&quot;SetJavaScriptEnabled&quot;) // Most pages need scripts to show, and the page gets no interface to the app.</span>
+<span class="a">+    private fun newPage(): WebView {</span>
+<span class="a">+        val view = WebView(this)</span>
+<span class="a">+        view.isFocusable = false</span>
+<span class="a">+        view.isFocusableInTouchMode = false</span>
+<span class="a">+        view.settings.javaScriptEnabled = true</span>
+<span class="a">+        view.settings.domStorageEnabled = true</span>
+<span class="a">+        view.settings.allowFileAccess = false</span>
+<span class="a">+        view.settings.allowContentAccess = false</span>
+<span class="a">+        view.webViewClient = object : WebViewClient() {</span>
+<span class="a">+            override fun shouldOverrideUrlLoading(v: WebView, request: WebResourceRequest): Boolean {</span>
+<span class="a">+                val url = request.url.toString()</span>
+<span class="a">+                val to = Preview.address(url) ?: return true</span>
+<span class="a">+                if (to == url) return false</span>
+<span class="a">+                v.loadUrl(to)</span>
+<span class="a">+                return true</span>
+<span class="a">+            }</span>
+<span class="a">+</span>
+<span class="a">+            // A page that stops the renderer must not stop the app: a new</span>
+<span class="a">+            // web view takes the place of the old one.</span>
+<span class="a">+            override fun onRenderProcessGone(v: WebView, detail: RenderProcessGoneDetail): Boolean {</span>
+<span class="a">+                preview.removeView(v)</span>
+<span class="a">+                v.destroy()</span>
+<span class="a">+                if (page === v) page = null</span>
+<span class="a">+                framed = null</span>
+<span class="a">+                return true</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        preview.addView(view, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))</span>
+<span class="a">+        page = view</span>
+<span class="a">+        return view</span>
+     }
+ 
+     /** Go opens the first bookmark. Without one, the text is an address or a web search, as in bm. */
+<span class="h">@@ -154,16 +261,22 @@ class MainActivity : Activity() {</span>
+     }
+ 
+     private fun more(b: Bookmark) {
+<span class="d">-        val actions = arrayOf(getString(R.string.open), getString(R.string.copy), getString(R.string.share))</span>
+<span class="a">+        val actions = listOfNotNull(</span>
+<span class="a">+            getString(R.string.open) to { open(b.url) },</span>
+<span class="a">+            if (previewOn) {</span>
+<span class="a">+                getString(R.string.preview) to {</span>
+<span class="a">+                    picked = b</span>
+<span class="a">+                    show()</span>
+<span class="a">+                }</span>
+<span class="a">+            } else {</span>
+<span class="a">+                null</span>
+<span class="a">+            },</span>
+<span class="a">+            getString(R.string.copy) to { copy(b.url) },</span>
+<span class="a">+            getString(R.string.share) to { share(b) },</span>
+<span class="a">+        )</span>
+         AlertDialog.Builder(this)
+             .setTitle(b.desc.ifEmpty { b.url })
+<span class="d">-            .setItems(actions) { _, which -&gt;</span>
+<span class="d">-                when (which) {</span>
+<span class="d">-                    0 -&gt; open(b.url)</span>
+<span class="d">-                    1 -&gt; copy(b.url)</span>
+<span class="d">-                    else -&gt; share(b)</span>
+<span class="d">-                }</span>
+<span class="d">-            }</span>
+<span class="a">+            .setItems(actions.map { it.first }.toTypedArray()) { _, which -&gt; actions[which].second() }</span>
+             .show()
+     }
+ 
+<span class="h">@@ -190,6 +303,7 @@ class MainActivity : Activity() {</span>
+         menu.findItem(R.id.sync_now).isVisible = on
+         menu.findItem(R.id.sign_out).isVisible = on
+         menu.findItem(R.id.sign_in).isVisible = !on
+<span class="a">+        menu.findItem(R.id.preview_on).isChecked = previewOn</span>
+         // Google Play does not allow links to payments outside Google Play.
+         menu.findItem(R.id.donate).isVisible = BuildConfig.DONATE
+         return true
+<span class="h">@@ -214,6 +328,12 @@ class MainActivity : Activity() {</span>
+             load()
+             true
+         }
+<span class="a">+        R.id.preview_on -&gt; {</span>
+<span class="a">+            settings.edit().putBoolean(&quot;preview&quot;, !previewOn).apply()</span>
+<span class="a">+            invalidateOptionsMenu()</span>
+<span class="a">+            show()</span>
+<span class="a">+            true</span>
+<span class="a">+        }</span>
+         R.id.donate -&gt; {
+             open(KOFI)
+             true
+<span class="h">@@ -261,6 +381,7 @@ class MainActivity : Activity() {</span>
+ 
+     private companion object {
+         const val CHOOSE = 1
+<span class="a">+        const val PREVIEW_WAIT = 400L // ms</span>
+         const val KOFI = &quot;https://ko-fi.com/truex&quot;
+     }
+ }
+diff --git a/app/src/main/java/com/equwal/sbm/Preview.kt b/app/src/main/java/com/equwal/sbm/Preview.kt
+new file mode 100644
+index 0000000..945a96f
+--- /dev/null
++++ b/app/src/main/java/com/equwal/sbm/Preview.kt
+<span class="h">@@ -0,0 +1,19 @@</span>
+<span class="a">+package com.equwal.sbm</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The live preview: the page of a bookmark, shown under the search. This</span>
+<span class="a">+ * file has no Android code, so the tests run on any JVM.</span>
+<span class="a">+ */</span>
+<span class="a">+object Preview {</span>
+<span class="a">+    private val web = Regex(&quot;^(?i)https?://([^/?#\\s]+)(.*)$&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    /**</span>
+<span class="a">+     * The address that the preview loads for the URL of a bookmark, or null</span>
+<span class="a">+     * when the page cannot show. Only web pages show. An http page loads with</span>
+<span class="a">+     * https, because the app allows no cleartext traffic.</span>
+<span class="a">+     */</span>
+<span class="a">+    fun address(url: String): String? {</span>
+<span class="a">+        val m = web.matchEntire(url.trim()) ?: return null</span>
+<span class="a">+        return &quot;https://&quot; + m.groupValues[1] + m.groupValues[2]</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/app/src/main/res/layout/activity_main.xml b/app/src/main/res/layout/activity_main.xml
+index 804ed4d..60a7fbd 100644
+--- a/app/src/main/res/layout/activity_main.xml
++++ b/app/src/main/res/layout/activity_main.xml
+<span class="h">@@ -25,6 +25,31 @@</span>
+         android:inputType=&quot;text|textNoSuggestions&quot;
+         android:singleLine=&quot;true&quot; /&gt;
+ 
+<span class="a">+    &lt;!-- The live preview: the page of the first match, or of the bookmark</span>
+<span class="a">+         that the user picks with Preview. It shows only during a search.</span>
+<span class="a">+         MainActivity adds the web view under the caption when it is first</span>
+<span class="a">+         necessary, so that the app starts fast. --&gt;</span>
+<span class="a">+    &lt;LinearLayout</span>
+<span class="a">+        android:id=&quot;@+id/preview&quot;</span>
+<span class="a">+        android:layout_width=&quot;match_parent&quot;</span>
+<span class="a">+        android:layout_height=&quot;0dp&quot;</span>
+<span class="a">+        android:layout_weight=&quot;1&quot;</span>
+<span class="a">+        android:orientation=&quot;vertical&quot;</span>
+<span class="a">+        android:visibility=&quot;gone&quot;&gt;</span>
+<span class="a">+</span>
+<span class="a">+        &lt;TextView</span>
+<span class="a">+            android:id=&quot;@+id/caption&quot;</span>
+<span class="a">+            android:layout_width=&quot;match_parent&quot;</span>
+<span class="a">+            android:layout_height=&quot;wrap_content&quot;</span>
+<span class="a">+            android:background=&quot;?android:attr/selectableItemBackground&quot;</span>
+<span class="a">+            android:ellipsize=&quot;middle&quot;</span>
+<span class="a">+            android:paddingHorizontal=&quot;16dp&quot;</span>
+<span class="a">+            android:paddingVertical=&quot;6dp&quot;</span>
+<span class="a">+            android:singleLine=&quot;true&quot;</span>
+<span class="a">+            android:textAppearance=&quot;?android:attr/textAppearanceSmall&quot;</span>
+<span class="a">+            android:textColor=&quot;?android:attr/textColorSecondary&quot; /&gt;</span>
+<span class="a">+    &lt;/LinearLayout&gt;</span>
+<span class="a">+</span>
+     &lt;FrameLayout
+         android:layout_width=&quot;match_parent&quot;
+         android:layout_height=&quot;0dp&quot;
+diff --git a/app/src/main/res/menu/main.xml b/app/src/main/res/menu/main.xml
+index ae31135..e8e11cc 100644
+--- a/app/src/main/res/menu/main.xml
++++ b/app/src/main/res/menu/main.xml
+<span class="h">@@ -13,6 +13,11 @@</span>
+         android:id=&quot;@+id/sign_in&quot;
+         android:showAsAction=&quot;never&quot;
+         android:title=&quot;@string/sign_in&quot; /&gt;
+<span class="a">+    &lt;item</span>
+<span class="a">+        android:id=&quot;@+id/preview_on&quot;</span>
+<span class="a">+        android:checkable=&quot;true&quot;</span>
+<span class="a">+        android:showAsAction=&quot;never&quot;</span>
+<span class="a">+        android:title=&quot;@string/preview_on&quot; /&gt;</span>
+     &lt;item
+         android:id=&quot;@+id/open_file&quot;
+         android:showAsAction=&quot;never&quot;
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 946e080..6db0a41 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+<span class="h">@@ -6,6 +6,9 @@</span>
+     &lt;string name=&quot;no_file&quot;&gt;Sign in to sync with the menu. Or open your sbm bookmark file: Open file. To start a new file, use New file.&lt;/string&gt;
+     &lt;string name=&quot;no_match&quot;&gt;No bookmark matches. Press Go to search the web.&lt;/string&gt;
+     &lt;string name=&quot;open&quot;&gt;Open&lt;/string&gt;
+<span class="a">+    &lt;string name=&quot;preview&quot;&gt;Preview&lt;/string&gt;</span>
+<span class="a">+    &lt;string name=&quot;preview_on&quot;&gt;Page preview&lt;/string&gt;</span>
+<span class="a">+    &lt;string name=&quot;no_preview&quot;&gt;No preview: %1$s is not a web page&lt;/string&gt;</span>
+     &lt;string name=&quot;copy&quot;&gt;Copy the URL&lt;/string&gt;
+     &lt;string name=&quot;share&quot;&gt;Share&lt;/string&gt;
+     &lt;string name=&quot;copied&quot;&gt;The URL is copied&lt;/string&gt;
+diff --git a/app/src/test/java/com/equwal/sbm/PreviewTest.kt b/app/src/test/java/com/equwal/sbm/PreviewTest.kt
+new file mode 100644
+index 0000000..15cc0b4
+--- /dev/null
++++ b/app/src/test/java/com/equwal/sbm/PreviewTest.kt
+<span class="h">@@ -0,0 +1,41 @@</span>
+<span class="a">+package com.equwal.sbm</span>
+<span class="a">+</span>
+<span class="a">+import net.jqwik.api.Arbitraries</span>
+<span class="a">+import net.jqwik.api.Arbitrary</span>
+<span class="a">+import net.jqwik.api.Combinators</span>
+<span class="a">+import net.jqwik.api.Example</span>
+<span class="a">+import net.jqwik.api.ForAll</span>
+<span class="a">+import net.jqwik.api.Property</span>
+<span class="a">+import net.jqwik.api.Provide</span>
+<span class="a">+</span>
+<span class="a">+class PreviewTest {</span>
+<span class="a">+    // The part of a web address after the scheme: a host, then a path.</span>
+<span class="a">+    @Provide</span>
+<span class="a">+    fun rests(): Arbitrary&lt;String&gt; {</span>
+<span class="a">+        val host = Arbitraries.strings().withCharRange(&#x27;a&#x27;, &#x27;z&#x27;).withChars(&#x27;.&#x27;, &#x27;-&#x27;, &#x27;0&#x27;, &#x27;9&#x27;).ofMinLength(1).ofMaxLength(20)</span>
+<span class="a">+        val path = Arbitraries.strings().withCharRange(&#x27;!&#x27;, &#x27;~&#x27;).ofMaxLength(40)</span>
+<span class="a">+            .map { if (it.isEmpty() || it[0] in &quot;/?#&quot;) it else &quot;/$it&quot; }</span>
+<span class="a">+        return Combinators.combine(host, path).`as` { h, p -&gt; h + p }</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Provide</span>
+<span class="a">+    fun schemes(): Arbitrary&lt;String&gt; = Arbitraries.of(&quot;http://&quot;, &quot;https://&quot;, &quot;HTTP://&quot;, &quot;Https://&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    @Property</span>
+<span class="a">+    fun `a web page shows at its address with https`(@ForAll(&quot;schemes&quot;) scheme: String, @ForAll(&quot;rests&quot;) rest: String): Boolean =</span>
+<span class="a">+        Preview.address(scheme + rest) == &quot;https://$rest&quot;</span>
+<span class="a">+</span>
+<span class="a">+    @Property</span>
+<span class="a">+    fun `the preview only ever loads https addresses, and loads them as they are`(@ForAll text: String): Boolean {</span>
+<span class="a">+        val a = Preview.address(text) ?: return true</span>
+<span class="a">+        return a.startsWith(&quot;https://&quot;) &amp;&amp; Preview.address(a) == a</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+    @Example</span>
+<span class="a">+    fun `addresses that are no web page have no preview`() {</span>
+<span class="a">+        for (u in listOf(&quot;javascript:alert(1)&quot;, &quot;data:text/html,x&quot;, &quot;file:///etc/passwd&quot;, &quot;intent://x#Intent;end&quot;,</span>
+<span class="a">+            &quot;market://details?id=x&quot;, &quot;ftp://example.org/&quot;, &quot;about:blank&quot;, &quot;example.org&quot;, &quot;&quot;, &quot;https://&quot;, &quot;http:///x&quot;)) {</span>
+<span class="a">+            check(Preview.address(u) == null) { u }</span>
+<span class="a">+        }</span>
+<span class="a">+    }</span>
+<span class="a">+}</span>
+diff --git a/fastlane/metadata/android/en-US/full_description.txt b/fastlane/metadata/android/en-US/full_description.txt
+index 93ef36c..be754eb 100644
+--- a/fastlane/metadata/android/en-US/full_description.txt
++++ b/fastlane/metadata/android/en-US/full_description.txt
+<span class="h">@@ -1,7 +1,7 @@</span>
+ sbm keeps your bookmarks in one plain text file, one bookmark per line: the address, a description and tags. This app brings that file to your phone.
+ 
+ &lt;b&gt;Find a bookmark fast&lt;/b&gt;
+<span class="d">-Type a few letters. The search is fuzzy, as in fzf: the letters of each word must come in order, but not always together. Tap a bookmark to open it; press and hold to copy the address or share it. Text that is no bookmark opens as an address, or as a web search.</span>
+<span class="a">+Type a few letters. The search is fuzzy, as in fzf: the letters of each word must come in order, but not always together. The page of the first match shows live above the list. Tap a bookmark to open it; press and hold to preview it, copy the address or share it. Text that is no bookmark opens as an address, or as a web search.</span>
+ 
+ &lt;b&gt;Add from any app&lt;/b&gt;
+ Share a page from your browser to sbm, add a description and tags, and save.
+<span class="h">@@ -12,6 +12,6 @@ The server is free software, so you can run your own. Sync on the default server</span>
+ Or do not sign in: open a bookmark file that Syncthing, git or a file app keeps on your phone.
+ 
+ &lt;b&gt;Small and private&lt;/b&gt;
+<span class="d">-No ads, no analytics, no trackers, no Google libraries. The app uses the network only for sync, and only after you sign in.</span>
+<span class="a">+No ads, no analytics, no trackers, no Google libraries. The app uses the network only for sync, after you sign in, and for the live preview, which loads the page of a bookmark from its site. Page preview in the menu turns the preview off.</span>
+ 
+ sbm is free software under the AGPL-3.0.</pre>
+</div></body></html>

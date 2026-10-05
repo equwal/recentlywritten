@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 7279e6a7 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 7279e6a78a56be19697104dac3bc951d712f6cb1
+truex &lt;truex@equwal.com&gt;
+2026-09-26 18:25:04 -0700
+
+Keep the open book when a file does not load
+
+A damaged file in the PDF field broke the open book: the handler closed
+the old document before the new one loaded. After the error, Next
+changed the page label but not the page, and pdf.js logged &quot;Cannot read
+properties of null (reading &#x27;sendWithPromise&#x27;)&quot;. openBook now loads the
+new document first. The old book goes only after the load succeeds.
+
+- A file that pdf.js cannot open gives &quot;This file is not a PDF, or it
+  is damaged.&quot; in place of the InvalidPDFException text.
+- A picked file of 0 bytes, for example a file that another app still
+  writes, gives &quot;The file is empty or not ready. Try again in a
+  moment.&quot; for the PDF and for the subtitles.
+- decodeSubtitles reads the subtitle file (UTF-8, UTF-16 or Shift_JIS)
+  in place of file.text().
+- A subtitle file with no cues keeps the cues that are loaded. On the
+  phone a PDF in the subtitles field replaced 15 cues with 0.
+- The subtitles field has no type filter. A browser download of an .srt
+  often has the type application/octet-stream, and the filter made it
+  grey in the Android picker.
+- Both fields forget the picked file, so the same file can be picked
+  again.
+- The .srt row shows only for subtitles that SubRead made.
+- When all pages are read and less than 30% of the cues match, the
+  strip says &quot;These subtitles do not match this book or the OCR
+  language.&quot; after the count.
+- A render of a closed document no longer gives an unhandled
+  rejection.
+
+</pre><pre> index.html                  |   4 +-
+ src/book-subtitles.ts       |   6 ++
+ src/main.ts                 | 166 +++++++++++++++++++++++++++++++++-----------
+ src/messages.ts             |  34 +++++++++
+ src/view.ts                 |   3 +-
+ test/book-subtitles.test.ts |  15 ++++
+ test/messages.test.ts       |  61 ++++++++++++++++
+ 7 files changed, 245 insertions(+), 44 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index df31fd5..45c4eaf 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -80,9 +80,7 @@</span>
+       &lt;/p&gt;
+ 
+       &lt;label&gt;PDF (scan or text) &lt;input id=&quot;pdf-file&quot; type=&quot;file&quot; accept=&quot;application/pdf&quot; /&gt;&lt;/label&gt;
+<span class="d">-      &lt;label</span>
+<span class="d">-        &gt;Subtitles (.srt or .vtt) &lt;input id=&quot;sub-file&quot; type=&quot;file&quot; accept=&quot;.srt,.vtt,text/*&quot;</span>
+<span class="d">-      /&gt;&lt;/label&gt;</span>
+<span class="a">+      &lt;label&gt;Subtitles (.srt or .vtt) &lt;input id=&quot;sub-file&quot; type=&quot;file&quot; /&gt;&lt;/label&gt;</span>
+ 
+       &lt;section id=&quot;make&quot; hidden&gt;
+         &lt;div class=&quot;row&quot;&gt;
+diff --git a/src/book-subtitles.ts b/src/book-subtitles.ts
+new file mode 100644
+index 0000000..899bfff
+--- /dev/null
++++ b/src/book-subtitles.ts
+<span class="h">@@ -0,0 +1,6 @@</span>
+<span class="a">+// The subtitles of a book. Pure: no DOM.</span>
+<span class="a">+</span>
+<span class="a">+/** The name of the .srt of a book: &quot;Neko.pdf&quot; gives &quot;Neko.srt&quot;. */</span>
+<span class="a">+export function srtName(bookName: string): string {</span>
+<span class="a">+  return `${bookName.replace(/\.pdf$/i, &#x27;&#x27;)}.srt`;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index 0775630..5809dfe 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -6,6 +6,7 @@</span>
+ // (the strip) and view.ts (the page).
+ 
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+<span class="a">+import { srtName } from &#x27;./book-subtitles&#x27;;</span>
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+ import { audioPage, cueParts, cueProgress, pageStartTime, type CueParts } from &#x27;./cue-pages&#x27;;
+<span class="h">@@ -15,10 +16,14 @@ import { lookupText, tapTolerance, tokenAt } from &#x27;./hit-test&#x27;;</span>
+ import { lineBoxes, padBox } from &#x27;./line-boxes&#x27;;
+ import {
+   clockText,
+<span class="a">+  EMPTY_FILE_TEXT,</span>
+   errorMessage,
+<span class="a">+  matchedText,</span>
+<span class="a">+  noCuesText,</span>
+   notReadText,
+   pagesReadText,
+   pdfLoadedText,
+<span class="a">+  pdfOpenText,</span>
+   playerMessage,
+   readingText,
+ } from &#x27;./messages&#x27;;
+<span class="h">@@ -30,7 +35,7 @@ import { nextPage } from &#x27;./read-order&#x27;;</span>
+ import { scrollTarget } from &#x27;./scroll&#x27;;
+ import { say, showPlayer, showReading } from &#x27;./status&#x27;;
+ import { isAndroid, SubRead } from &#x27;./subread&#x27;;
+<span class="d">-import { lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;</span>
+<span class="a">+import { decodeSubtitles, lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;</span>
+ import {
+   bookKey,
+   clearPages,
+<span class="h">@@ -39,6 +44,7 @@ import {</span>
+   pageKey,
+   putPage,
+   putSrt,
+<span class="a">+  type BookSubtitles,</span>
+   type PageEntry,
+ } from &#x27;./token-cache&#x27;;
+ import { createPageView, type Marks } from &#x27;./view&#x27;;
+<span class="h">@@ -118,7 +124,8 @@ const state = {</span>
+   clock: null as ClockState | null,
+   readSeq: 0,
+   alignTimer: null as ReturnType&lt;typeof setTimeout&gt; | null,
+<span class="d">-  srt: null as string | null,</span>
+<span class="a">+  /** The subtitles that are loaded, or null. */</span>
+<span class="a">+  subtitles: null as BookSubtitles | null,</span>
+   /** True while the player waits for a dictionary lookup that this app paused. */
+   lookupPaused: false,
+   /** True while a page turn by the user holds the follow. */
+<span class="h">@@ -212,37 +219,74 @@ function sayError(err: unknown): void {</span>
+ 
+ ui.openPdf.addEventListener(&#x27;click&#x27;, () =&gt; ui.pdfFile.click());
+ 
+<span class="d">-ui.pdfFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+<span class="a">+ui.pdfFile.addEventListener(&#x27;change&#x27;, () =&gt; {</span>
+   const file = ui.pdfFile.files?.[0];
+<span class="a">+  // The same file can be picked again.</span>
+<span class="a">+  ui.pdfFile.value = &#x27;&#x27;;</span>
+   if (!file) return;
+   drawer.closeOnPhone();
+<span class="a">+  void openBook(file);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+/** The count of attempts to open a book, and the attempt of the book that is open. */</span>
+<span class="a">+const opens = { tried: 0, shown: 0 };</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Opens `file` as the book. The book that is open stays until the new</span>
+<span class="a">+ * file loads: a file that is not a PDF, or is damaged, changes nothing.</span>
+<span class="a">+ * Gives true when the new book is open.</span>
+<span class="a">+ */</span>
+<span class="a">+async function openBook(file: File): Promise&lt;boolean&gt; {</span>
+<span class="a">+  if (file.size === 0) {</span>
+<span class="a">+    say(EMPTY_FILE_TEXT);</span>
+<span class="a">+    return false;</span>
+<span class="a">+  }</span>
+<span class="a">+  const attempt = ++opens.tried;</span>
+<span class="a">+  let pdf: PdfDoc;</span>
+   try {
+<span class="d">-    state.readSeq++;</span>
+<span class="d">-    await state.pdf?.destroy();</span>
+     // pdf.js loads with the first PDF, so the start card shows sooner.
+     const { loadPdf } = await import(&#x27;./pdf&#x27;);
+<span class="d">-    state.pdf = await loadPdf(await file.arrayBuffer());</span>
+<span class="d">-    state.file = file;</span>
+<span class="d">-    state.pages = [];</span>
+<span class="d">-    state.tokens = [];</span>
+<span class="d">-    state.spans = [];</span>
+<span class="d">-    state.cueParts = [];</span>
+<span class="d">-    state.activeCue = -1;</span>
+<span class="d">-    state.markedCue = -1;</span>
+<span class="d">-    state.held = false;</span>
+<span class="d">-    ui.makeSubs.disabled = false;</span>
+<span class="d">-    ui.empty.hidden = true;</span>
+<span class="d">-    ui.page.hidden = false;</span>
+<span class="d">-    if (state.clock) showPlayerStatus(state.clock);</span>
+<span class="d">-    say(pdfLoadedText(state.pdf.numPages));</span>
+<span class="d">-    await showPage(0);</span>
+<span class="d">-    const saved = await getSrt(bookKey(file));</span>
+<span class="d">-    if (saved) loadSubtitles(saved, &#x27;the last SubRead run&#x27;);</span>
+<span class="d">-    void readBook();</span>
+<span class="a">+    pdf = await loadPdf(await file.arrayBuffer());</span>
+   } catch (err) {
+<span class="d">-    say(`Cannot open PDF: ${String(err)}`);</span>
+<span class="a">+    say(pdfOpenText(err));</span>
+<span class="a">+    return false;</span>
+   }
+<span class="d">-});</span>
+<span class="a">+  // A file that the user picked later is open already.</span>
+<span class="a">+  if (attempt &lt; opens.shown) {</span>
+<span class="a">+    void pdf.destroy();</span>
+<span class="a">+    return false;</span>
+<span class="a">+  }</span>
+<span class="a">+  opens.shown = attempt;</span>
+<span class="a">+  const old = state.pdf;</span>
+<span class="a">+  state.pdf = pdf;</span>
+<span class="a">+  state.file = file;</span>
+<span class="a">+  state.pages = [];</span>
+<span class="a">+  state.tokens = [];</span>
+<span class="a">+  state.spans = [];</span>
+<span class="a">+  state.cueParts = [];</span>
+<span class="a">+  state.activeCue = -1;</span>
+<span class="a">+  state.markedCue = -1;</span>
+<span class="a">+  state.held = false;</span>
+<span class="a">+  ui.makeSubs.disabled = false;</span>
+<span class="a">+  ui.empty.hidden = true;</span>
+<span class="a">+  ui.page.hidden = false;</span>
+<span class="a">+  if (state.clock) showPlayerStatus(state.clock);</span>
+<span class="a">+  say(pdfLoadedText(pdf.numPages));</span>
+<span class="a">+  // showPage sets the current page at once, so the reading starts there.</span>
+<span class="a">+  void showPage(0);</span>
+<span class="a">+  // readBook stops the reading of the old book before its document closes.</span>
+<span class="a">+  void readBook();</span>
+<span class="a">+  void old?.destroy();</span>
+<span class="a">+  showSrtRow();</span>
+<span class="a">+  const saved = await getSrt(bookKey(file));</span>
+<span class="a">+  if (saved &amp;&amp; state.file === file) {</span>
+<span class="a">+    loadSubtitles(</span>
+<span class="a">+      { name: srtName(file.name), text: saved, source: &#x27;subread&#x27; },</span>
+<span class="a">+      &#x27;the last SubRead run&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  }</span>
+<span class="a">+  return true;</span>
+<span class="a">+}</span>
+ 
+ /** The tokens of one page: from the cache, else the text layer, else OCR. */
+ async function readPage(
+<span class="h">@@ -327,7 +371,7 @@ async function readBook(): Promise&lt;void&gt; {</span>
+     const matched = align();
+     say(
+       pagesReadText(counts) +
+<span class="d">-        (matched === null ? &#x27;&#x27; : ` ${matched}/${state.cues.length} cues matched.`),</span>
+<span class="a">+        (matched === null ? &#x27;&#x27; : ` ${matchedText(matched, state.cues.length, true)}`),</span>
+     );
+   } catch (err) {
+     if (seq === state.readSeq) say(`Cannot read the pages: ${String(err)}`);
+<span class="h">@@ -350,11 +394,19 @@ ui.clearCache.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+ 
+ // --- Subtitles ---
+ 
+<span class="d">-/** Load subtitles from a file or from SubRead. `source` names where they came from. */</span>
+<span class="d">-function loadSubtitles(text: string, source: string): void {</span>
+<span class="d">-  state.cues = parseSubtitles(text);</span>
+<span class="d">-  state.aligner = createAligner(state.cues.map((c) =&gt; c.text));</span>
+<span class="d">-  state.srt = text;</span>
+<span class="a">+/**</span>
+<span class="a">+ * Loads subtitles from a file or from SubRead. `from` names where they</span>
+<span class="a">+ * came from in the message. `cues` are the cues of the text, when the</span>
+<span class="a">+ * caller parsed them already.</span>
+<span class="a">+ */</span>
+<span class="a">+function loadSubtitles(</span>
+<span class="a">+  subtitles: BookSubtitles,</span>
+<span class="a">+  from = subtitles.name,</span>
+<span class="a">+  cues = parseSubtitles(subtitles.text),</span>
+<span class="a">+): void {</span>
+<span class="a">+  state.cues = cues;</span>
+<span class="a">+  state.aligner = createAligner(cues.map((c) =&gt; c.text));</span>
+<span class="a">+  state.subtitles = subtitles;</span>
+   state.spans = [];
+   state.cueParts = [];
+   state.activeCue = -1;
+<span class="h">@@ -363,22 +415,51 @@ function loadSubtitles(text: string, source: string): void {</span>
+   renderCueList();
+   const matched = align();
+   say(
+<span class="d">-    `${state.cues.length} cues loaded from ${source}.` +</span>
+<span class="d">-      (matched === null ? &#x27;&#x27; : ` ${matched} matched to the pages read so far.`),</span>
+<span class="a">+    `${cues.length} cues loaded from ${from}.` +</span>
+<span class="a">+      (matched === null ? &#x27;&#x27; : ` ${matchedText(matched, cues.length, allPagesRead())}`),</span>
+   );
+<span class="d">-  offerSrt(text);</span>
+<span class="a">+  showSrtRow();</span>
+ }
+ 
+<span class="a">+// A browser download of an .srt often has the type application/octet-stream,</span>
+<span class="a">+// and a type filter makes such a file grey in the Android picker. So the</span>
+<span class="a">+// field takes each file, and the parser decides.</span>
+ ui.subFile.addEventListener(&#x27;change&#x27;, async () =&gt; {
+   const file = ui.subFile.files?.[0];
+<span class="a">+  // The same file can be picked again.</span>
+<span class="a">+  ui.subFile.value = &#x27;&#x27;;</span>
+   if (!file) return;
+   drawer.closeOnPhone();
+<span class="d">-  loadSubtitles(await file.text(), file.name);</span>
+<span class="a">+  if (file.size === 0) {</span>
+<span class="a">+    say(EMPTY_FILE_TEXT);</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  let text: string;</span>
+<span class="a">+  try {</span>
+<span class="a">+    text = decodeSubtitles(await file.arrayBuffer());</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    say(`Cannot read ${file.name}: ${String(err)}`);</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  // A file with no cues, for example a PDF, keeps the cues that are loaded.</span>
+<span class="a">+  const cues = parseSubtitles(text);</span>
+<span class="a">+  if (cues.length === 0) {</span>
+<span class="a">+    say(noCuesText(file.name));</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  loadSubtitles({ name: file.name, text, source: &#x27;file&#x27; }, file.name, cues);</span>
+ });
+ 
+<span class="d">-function offerSrt(text: string): void {</span>
+<span class="d">-  const name = `${(state.file?.name ?? &#x27;book&#x27;).replace(/\.pdf$/i, &#x27;&#x27;)}.srt`;</span>
+<span class="d">-  ui.srtRow.hidden = false;</span>
+<span class="a">+/**</span>
+<span class="a">+ * The .srt row shows for subtitles that SubRead made: a download on the</span>
+<span class="a">+ * web, the share sheet on Android. A file that the user loaded is on the</span>
+<span class="a">+ * device already.</span>
+<span class="a">+ */</span>
+<span class="a">+function showSrtRow(): void {</span>
+<span class="a">+  const subtitles = state.subtitles;</span>
+<span class="a">+  ui.srtRow.hidden = subtitles?.source !== &#x27;subread&#x27;;</span>
+<span class="a">+  if (!subtitles || ui.srtRow.hidden) return;</span>
+<span class="a">+  const { name, text } = subtitles;</span>
+   ui.srtDownload.hidden = isAndroid;
+   ui.srtShare.hidden = !isAndroid;
+   if (!isAndroid) {
+<span class="h">@@ -431,7 +512,7 @@ ui.makeSubs.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+       ? &#x27; Under 80% usually means another edition or the wrong language.&#x27;
+       : &#x27;&#x27;);
+   await putSrt(bookKey(file), result.srt);
+<span class="d">-  loadSubtitles(result.srt, &#x27;SubRead&#x27;);</span>
+<span class="a">+  loadSubtitles({ name: srtName(file.name), text: result.srt, source: &#x27;subread&#x27; }, &#x27;SubRead&#x27;);</span>
+ });
+ 
+ // --- Alignment ---
+<span class="h">@@ -628,7 +709,12 @@ async function showPage(index: number): Promise&lt;void&gt; {</span>
+   if (!pdf || index &lt; 0 || index &gt;= pdf.numPages) return;
+   state.currentPage = index;
+   nav.update();
+<span class="d">-  await view.show(pdf, index);</span>
+<span class="a">+  try {</span>
+<span class="a">+    await view.show(pdf, index);</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    // A render of a book that closed meanwhile fails. That is no error.</span>
+<span class="a">+    if (state.pdf === pdf) sayError(err);</span>
+<span class="a">+  }</span>
+ }
+ 
+ // --- Tap on a word ---
+diff --git a/src/messages.ts b/src/messages.ts
+index 3b68c07..7b6573b 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -84,3 +84,37 @@ export function pagesReadText(counts: { text: number; ocr: number }): string {</span>
+ export function notReadText(read: number, total: number): string {
+   return `This page is not read yet (${read}/${total} read).`;
+ }
+<span class="a">+</span>
+<span class="a">+/** A picked file of 0 bytes, for example a file that another app still writes. */</span>
+<span class="a">+export const EMPTY_FILE_TEXT = &#x27;The file is empty or not ready. Try again in a moment.&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The message when pdf.js cannot open a file. */</span>
+<span class="a">+export function pdfOpenText(err: unknown): string {</span>
+<span class="a">+  if (err instanceof Error &amp;&amp; err.name === &#x27;InvalidPDFException&#x27;) {</span>
+<span class="a">+    return &#x27;This file is not a PDF, or it is damaged.&#x27;;</span>
+<span class="a">+  }</span>
+<span class="a">+  return `Cannot open the PDF: ${String(err)}`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The message for a subtitle file with no cues, for example a PDF. */</span>
+<span class="a">+export function noCuesText(name: string): string {</span>
+<span class="a">+  return `No subtitle lines in ${name}. Choose an .srt or .vtt file.`;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * When all pages are read and less than this share of the cues is</span>
+<span class="a">+ * matched, the subtitles are for another text or another language.</span>
+<span class="a">+ */</span>
+<span class="a">+export const MISMATCH_SHARE = 0.3;</span>
+<span class="a">+</span>
+<span class="a">+export const MISMATCH_TEXT = &#x27;These subtitles do not match this book or the OCR language.&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The count of matched cues. When all pages are read and less than</span>
+<span class="a">+ * MISMATCH_SHARE of the cues is matched, the hint follows.</span>
+<span class="a">+ */</span>
+<span class="a">+export function matchedText(matched: number, cues: number, allRead: boolean): string {</span>
+<span class="a">+  if (!allRead) return `${matched}/${cues} cues matched to the pages read so far.`;</span>
+<span class="a">+  const text = `${matched}/${cues} cues matched.`;</span>
+<span class="a">+  return cues &gt; 0 &amp;&amp; matched / cues &lt; MISMATCH_SHARE ? `${text} ${MISMATCH_TEXT}` : text;</span>
+<span class="a">+}</span>
+diff --git a/src/view.ts b/src/view.ts
+index 57e342b..f2ca041 100644
+--- a/src/view.ts
++++ b/src/view.ts
+<span class="h">@@ -168,7 +168,8 @@ export function createPageView(</span>
+       const dpr = window.devicePixelRatio || 1;
+       const width = ui.page.clientWidth;
+       if (width &gt; 0 &amp;&amp; (Math.abs(width - shown.cssWidth) &gt;= 1 || dpr !== shown.dpr)) {
+<span class="d">-        void render();</span>
+<span class="a">+        // A render of a closed document fails. The stretched canvas stays.</span>
+<span class="a">+        render().catch(() =&gt; undefined);</span>
+       }
+     }, RESIZE_MS);
+   }).observe(ui.viewer);
+diff --git a/test/book-subtitles.test.ts b/test/book-subtitles.test.ts
+new file mode 100644
+index 0000000..962a237
+--- /dev/null
++++ b/test/book-subtitles.test.ts
+<span class="h">@@ -0,0 +1,15 @@</span>
+<span class="a">+import { describe, expect, it } from &#x27;vitest&#x27;;</span>
+<span class="a">+import { srtName } from &#x27;../src/book-subtitles&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;srtName&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;puts .srt in place of .pdf&#x27;, () =&gt; {</span>
+<span class="a">+    expect(srtName(&#x27;sample-eng-2p.pdf&#x27;)).toBe(&#x27;sample-eng-2p.srt&#x27;);</span>
+<span class="a">+    expect(srtName(&#x27;Neko.PDF&#x27;)).toBe(&#x27;Neko.srt&#x27;);</span>
+<span class="a">+    expect(srtName(&#x27;吾輩は猫である.pdf&#x27;)).toBe(&#x27;吾輩は猫である.srt&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;adds .srt to a name without .pdf at the end&#x27;, () =&gt; {</span>
+<span class="a">+    expect(srtName(&#x27;book&#x27;)).toBe(&#x27;book.srt&#x27;);</span>
+<span class="a">+    expect(srtName(&#x27;a.pdf.txt&#x27;)).toBe(&#x27;a.pdf.txt.srt&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/messages.test.ts b/test/messages.test.ts
+index c0138ef..cd8a46b 100644
+--- a/test/messages.test.ts
++++ b/test/messages.test.ts
+<span class="h">@@ -1,12 +1,18 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+ import { PlayerError, type ClockState } from &#x27;../src/clock-source&#x27;;
+ import {
+   clockText,
+   errorMessage,
+<span class="a">+  matchedText,</span>
+<span class="a">+  MISMATCH_SHARE,</span>
+<span class="a">+  MISMATCH_TEXT,</span>
+<span class="a">+  noCuesText,</span>
+   notReadText,
+   OVERLAY_RELEASES,
+   pagesReadText,
+   pdfLoadedText,
+<span class="a">+  pdfOpenText,</span>
+   playerMessage,
+   playerProblem,
+   readingText,
+<span class="h">@@ -98,3 +104,58 @@ describe(&#x27;page texts&#x27;, () =&gt; {</span>
+     expect(notReadText(3, 40)).toBe(&#x27;This page is not read yet (3/40 read).&#x27;);
+   });
+ });
+<span class="a">+</span>
+<span class="a">+/** The error of pdf.js 6 for a file that is not a PDF: a PNG, an .srt, or a cut PDF. */</span>
+<span class="a">+function invalidPdf(): Error {</span>
+<span class="a">+  const err = new Error(&#x27;Invalid PDF structure.&#x27;);</span>
+<span class="a">+  err.name = &#x27;InvalidPDFException&#x27;;</span>
+<span class="a">+  return err;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;file texts&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;says that a file is not a PDF, with no exception text&#x27;, () =&gt; {</span>
+<span class="a">+    expect(pdfOpenText(invalidPdf())).toBe(&#x27;This file is not a PDF, or it is damaged.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives another error of pdf.js as it is&#x27;, () =&gt; {</span>
+<span class="a">+    expect(pdfOpenText(new Error(&#x27;Worker was destroyed&#x27;))).toBe(</span>
+<span class="a">+      &#x27;Cannot open the PDF: Error: Worker was destroyed&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;names the subtitle file with no cues&#x27;, () =&gt; {</span>
+<span class="a">+    expect(noCuesText(&#x27;sample-eng.pdf&#x27;)).toBe(</span>
+<span class="a">+      &#x27;No subtitle lines in sample-eng.pdf. Choose an .srt or .vtt file.&#x27;,</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+describe(&#x27;matchedText&#x27;, () =&gt; {</span>
+<span class="a">+  it(&#x27;counts the matched cues of the pages read so far&#x27;, () =&gt; {</span>
+<span class="a">+    expect(matchedText(2, 15, false)).toBe(&#x27;2/15 cues matched to the pages read so far.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;adds the hint when all pages are read and less than 30% of the cues match&#x27;, () =&gt; {</span>
+<span class="a">+    // sample-jpn.srt on the English PDF.</span>
+<span class="a">+    expect(matchedText(0, 3, true)).toBe(`0/3 cues matched. ${MISMATCH_TEXT}`);</span>
+<span class="a">+    expect(matchedText(4, 15, true)).toBe(`4/15 cues matched. ${MISMATCH_TEXT}`);</span>
+<span class="a">+    expect(matchedText(5, 15, true)).toBe(&#x27;5/15 cues matched.&#x27;);</span>
+<span class="a">+    expect(matchedText(15, 15, true)).toBe(&#x27;15/15 cues matched.&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the hint exactly for all pages read and less than 30% matched&#x27;, () =&gt; {</span>
+<span class="a">+    expect(MISMATCH_SHARE).toBe(0.3);</span>
+<span class="a">+    // 3 of 10 is 30%: no hint. In floating point 0.3 * 10 is more than 3.</span>
+<span class="a">+    expect(matchedText(3, 10, true)).toBe(&#x27;3/10 cues matched.&#x27;);</span>
+<span class="a">+    const counts = fc</span>
+<span class="a">+      .tuple(fc.nat({ max: 500 }), fc.nat({ max: 500 }))</span>
+<span class="a">+      .map(([a, b]) =&gt; ({ matched: Math.min(a, b), cues: Math.max(a, b) }));</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(counts, fc.boolean(), ({ matched, cues }, allRead) =&gt; {</span>
+<span class="a">+        const hint = matchedText(matched, cues, allRead).endsWith(MISMATCH_TEXT);</span>
+<span class="a">+        // Whole numbers: 10 * matched &lt; 3 * cues is exact.</span>
+<span class="a">+        expect(hint).toBe(allRead &amp;&amp; 10 * matched &lt; 3 * cues);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+<span class="a">+});</span></pre>
+</div></body></html>

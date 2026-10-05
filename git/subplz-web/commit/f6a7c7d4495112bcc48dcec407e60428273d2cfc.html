@@ -1,0 +1,807 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web f6a7c7d4 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../subplz-web/index.html">Log</a> | <a href="../../subplz-web/files.html">Files</a> | <a href="../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit f6a7c7d4495112bcc48dcec407e60428273d2cfc
+equwal &lt;truex@equwal.com&gt;
+2026-09-26 14:55:32 -0700
+
+Add hours for Google Play purchases once for each token
+
+The Play build of Subrep sends each Google Play purchase to the new
+endpoint POST /api/captions/play-purchase, with its device cookie. The
+server asks the Google Play Developer API for the purchase
+(purchases.products.get). It adds the hours of the pack once. Then it
+consumes the purchase. The app never consumes.
+
+The table play_purchases keeps the SHA-256 of each token, with a unique
+index. The row and the hours go in one transaction. So a second send of
+the same token adds nothing and answers 200. A purchase with an account
+id must belong to the caller, or to an account that merged into the
+caller. A purchase without an account id (for example, a promo code) goes
+to the first caller. A consumed token without a row gets 409, because
+only this server consumes, and it consumes after its commit.
+
+New dependency: google-auth[requests]. It signs the service-account token
+of the Play Developer API. The standard library has no OAuth 2 signer.
+requests and cryptography are installed already.
+
+Tests: pytest 236 passed (38 new), with property tests for the credit and
+for the address of a token. The new tests failed before the change. Each
+of five changes to play.py makes a test fail: no state check, no owner
+check, no unique token, no consumed check, no consume by the server.
+test_vendor_files_may_be_kept fails before and after the change, because
+a new worktree has no frontend/vendor.
+
+</pre><pre> backend/main.py     |   3 +-
+ backend/play.py     | 236 +++++++++++++++++++++++++++
+ backend/settings.py |   3 +-
+ requirements.txt    |   5 +
+ tests/test_play.py  | 450 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 694 insertions(+), 3 deletions(-)
+</pre><pre>diff --git a/backend/main.py b/backend/main.py
+index 11d98c7..859a742 100644
+--- a/backend/main.py
++++ b/backend/main.py
+<span class="h">@@ -19,7 +19,7 @@ from fastapi import FastAPI</span>
+ from fastapi.responses import FileResponse
+ from fastapi.staticfiles import StaticFiles
+ 
+<span class="d">-from . import billing, captions, subrep</span>
+<span class="a">+from . import billing, captions, play, subrep</span>
+ from .api import router
+ from .db import Job, JobStatus, SessionLocal, init_db
+ from .languages import all_languages
+<span class="h">@@ -133,6 +133,7 @@ app = FastAPI(</span>
+ )
+ app.include_router(router)
+ app.include_router(captions.router)
+<span class="a">+app.include_router(play.router)</span>
+ app.include_router(subrep.router)
+ 
+ 
+diff --git a/backend/play.py b/backend/play.py
+new file mode 100644
+index 0000000..a439395
+--- /dev/null
++++ b/backend/play.py
+<span class="h">@@ -0,0 +1,236 @@</span>
+<span class="a">+&quot;&quot;&quot;Google Play purchases of cloud caption hours: the Play build of Subrep.</span>
+<span class="a">+</span>
+<span class="a">+Google Play requires its own billing for digital goods that an app from Google</span>
+<span class="a">+Play sells. So the Play build of Subrep buys the hour packs of captions.PACKS</span>
+<span class="a">+with Google Play Billing. The Play product ids are the pack ids.</span>
+<span class="a">+</span>
+<span class="a">+The app sends each purchase token here with its device cookie. This module asks</span>
+<span class="a">+Google for the purchase, adds the hours of the pack to the account once, and</span>
+<span class="a">+consumes the purchase, so that the user can buy the pack again. The app never</span>
+<span class="a">+consumes. If this server does not answer, the app sends the purchase again at</span>
+<span class="a">+its next start.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+from __future__ import annotations</span>
+<span class="a">+</span>
+<span class="a">+import functools</span>
+<span class="a">+import hashlib</span>
+<span class="a">+import logging</span>
+<span class="a">+from datetime import datetime</span>
+<span class="a">+from typing import Annotated</span>
+<span class="a">+from urllib.parse import quote</span>
+<span class="a">+</span>
+<span class="a">+from fastapi import APIRouter, Depends, HTTPException</span>
+<span class="a">+from pydantic import BaseModel, Field</span>
+<span class="a">+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String</span>
+<span class="a">+from sqlalchemy.exc import IntegrityError</span>
+<span class="a">+from sqlalchemy.orm import Mapped, Session, mapped_column</span>
+<span class="a">+</span>
+<span class="a">+from . import accounts, captions</span>
+<span class="a">+from .api import get_account, get_session</span>
+<span class="a">+from .db import Account, Base, new_id, utcnow</span>
+<span class="a">+from .settings import settings</span>
+<span class="a">+</span>
+<span class="a">+log = logging.getLogger(__name__)</span>
+<span class="a">+</span>
+<span class="a">+ANDROIDPUBLISHER = &quot;https://www.googleapis.com/auth/androidpublisher&quot;</span>
+<span class="a">+API = &quot;https://androidpublisher.googleapis.com/androidpublisher/v3/applications&quot;</span>
+<span class="a">+PACKAGE = &quot;com.honjimaku.subrep&quot;</span>
+<span class="a">+NOT_SET_UP = &quot;Google Play purchases are not set up on this server.&quot;</span>
+<span class="a">+NO_ANSWER = &quot;Google Play did not answer. Try again later.&quot;</span>
+<span class="a">+# purchases.products.get numbers the states of a purchase in another way than</span>
+<span class="a">+# the Android library, where PURCHASED is 1. Do not mix the two.</span>
+<span class="a">+PURCHASED = 0  # purchaseState</span>
+<span class="a">+CONSUMED = 1  # consumptionState</span>
+<span class="a">+TEST = 0  # purchaseType: a license tester bought it, and paid nothing</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class PlayError(Exception):</span>
+<span class="a">+    &quot;&quot;&quot;A purchase that gives no hours now. `status` is the HTTP answer for the app.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self, status: int, detail: str):</span>
+<span class="a">+        super().__init__(detail)</span>
+<span class="a">+        self.status = status</span>
+<span class="a">+        self.detail = detail</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class PlayPurchase(Base):</span>
+<span class="a">+    &quot;&quot;&quot;Ledger of Google Play purchases.</span>
+<span class="a">+</span>
+<span class="a">+    The unique token hash makes the credit idempotent. The app sends a purchase</span>
+<span class="a">+    again after a crash or a lost answer, and the hours must come only once.</span>
+<span class="a">+    Only the hash is kept: no code needs the token after the credit.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    __tablename__ = &quot;play_purchases&quot;</span>
+<span class="a">+</span>
+<span class="a">+    id: Mapped[str] = mapped_column(</span>
+<span class="a">+        String(64), primary_key=True, default=lambda: new_id(&quot;play&quot;)</span>
+<span class="a">+    )</span>
+<span class="a">+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)</span>
+<span class="a">+    account_id: Mapped[str] = mapped_column(ForeignKey(&quot;accounts.id&quot;), index=True)</span>
+<span class="a">+    product_id: Mapped[str] = mapped_column(String(32))</span>
+<span class="a">+    quantity: Mapped[int] = mapped_column(Integer, default=1)</span>
+<span class="a">+    seconds: Mapped[int] = mapped_column(Integer)</span>
+<span class="a">+    test: Mapped[bool] = mapped_column(Boolean, default=False)</span>
+<span class="a">+    # The Google order number on the receipt of the buyer (GPA....). Support</span>
+<span class="a">+    # finds the account with it. A purchase with a promo code has none.</span>
+<span class="a">+    order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)</span>
+<span class="a">+    created_at: Mapped[datetime] = mapped_column(</span>
+<span class="a">+        DateTime(timezone=True), default=utcnow</span>
+<span class="a">+    )</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _hash(token: str) -&gt; str:</span>
+<span class="a">+    return hashlib.sha256(token.encode()).hexdigest()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# the Google Play Developer API</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+@functools.lru_cache(maxsize=1)</span>
+<span class="a">+def _credentials(path: str):</span>
+<span class="a">+    &quot;&quot;&quot;Read the key file once. A missing or bad file is PlayError 503.&quot;&quot;&quot;</span>
+<span class="a">+    from google.auth import exceptions</span>
+<span class="a">+    from google.oauth2 import service_account</span>
+<span class="a">+</span>
+<span class="a">+    try:</span>
+<span class="a">+        return service_account.Credentials.from_service_account_file(</span>
+<span class="a">+            path, scopes=[ANDROIDPUBLISHER]</span>
+<span class="a">+        )</span>
+<span class="a">+    except (OSError, ValueError, exceptions.DefaultCredentialsError) as exc:</span>
+<span class="a">+        # Log only the type: the message can hold parts of the file.</span>
+<span class="a">+        log.error(&quot;cannot read the Google Play key file %s: %s&quot;, path, type(exc).__name__)</span>
+<span class="a">+        raise PlayError(503, NOT_SET_UP) from exc</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _session():</span>
+<span class="a">+    &quot;&quot;&quot;An HTTP session that signs each request. Tests replace this function.&quot;&quot;&quot;</span>
+<span class="a">+    from google.auth.transport.requests import AuthorizedSession</span>
+<span class="a">+</span>
+<span class="a">+    return AuthorizedSession(_credentials(settings.play_service_account_file))</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _url(product_id: str, token: str) -&gt; str:</span>
+<span class="a">+    return (f&quot;{API}/{PACKAGE}/purchases/products/{quote(product_id, safe=&#x27;&#x27;)}&quot;</span>
+<span class="a">+            f&quot;/tokens/{quote(token, safe=&#x27;&#x27;)}&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def _call(method: str, url: str):</span>
+<span class="a">+    &quot;&quot;&quot;Send one request to Google. Never log `url`: it can hold a purchase token.&quot;&quot;&quot;</span>
+<span class="a">+    import requests</span>
+<span class="a">+    from google.auth import exceptions</span>
+<span class="a">+</span>
+<span class="a">+    try:</span>
+<span class="a">+        with _session() as http:</span>
+<span class="a">+            response = http.request(method, url, timeout=15)</span>
+<span class="a">+    except exceptions.RefreshError as exc:</span>
+<span class="a">+        log.error(&quot;Google refused the Play key: %s&quot;, type(exc).__name__)</span>
+<span class="a">+        raise PlayError(503, NOT_SET_UP) from exc</span>
+<span class="a">+    except (requests.RequestException, exceptions.TransportError) as exc:</span>
+<span class="a">+        raise PlayError(502, NO_ANSWER) from exc</span>
+<span class="a">+    if response.status_code in (200, 204):</span>
+<span class="a">+        return response</span>
+<span class="a">+    if response.status_code in (400, 404, 410):</span>
+<span class="a">+        raise PlayError(400, &quot;Google Play does not know this purchase.&quot;)</span>
+<span class="a">+    if response.status_code in (401, 403):</span>
+<span class="a">+        log.error(&quot;the Play key has no access to the orders of %s (%d)&quot;,</span>
+<span class="a">+                  PACKAGE, response.status_code)</span>
+<span class="a">+        raise PlayError(503, NOT_SET_UP)</span>
+<span class="a">+    raise PlayError(502, NO_ANSWER)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def get(product_id: str, token: str) -&gt; dict:</span>
+<span class="a">+    &quot;&quot;&quot;The purchase as Google sees it (purchases.products.get).&quot;&quot;&quot;</span>
+<span class="a">+    return _call(&quot;GET&quot;, _url(product_id, token)).json()</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def consume(product_id: str, token: str) -&gt; None:</span>
+<span class="a">+    &quot;&quot;&quot;Close the purchase, so that the user can buy the pack again.&quot;&quot;&quot;</span>
+<span class="a">+    _call(&quot;POST&quot;, _url(product_id, token) + &quot;:consume&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# the credit</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def credit(session: Session, account: Account, product_id: str, token: str,</span>
+<span class="a">+           purchase: dict) -&gt; bool:</span>
+<span class="a">+    &quot;&quot;&quot;Add the hours of one purchase that Google returned, once for each token.</span>
+<span class="a">+</span>
+<span class="a">+    Return True when this call added them, and False when an earlier call did.</span>
+<span class="a">+    Raise PlayError when the purchase gives no hours.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if purchase.get(&quot;purchaseState&quot;) != PURCHASED:</span>
+<span class="a">+        raise PlayError(409, &quot;The purchase is not complete yet.&quot;)</span>
+<span class="a">+    if purchase.get(&quot;productId&quot;, product_id) != product_id:</span>
+<span class="a">+        raise PlayError(400, &quot;Google Play does not know this purchase.&quot;)</span>
+<span class="a">+    owner_id = purchase.get(&quot;obfuscatedExternalAccountId&quot;)</span>
+<span class="a">+    # A purchase made outside the app, for example with a promo code, has no</span>
+<span class="a">+    # account id. Google says that the app can give it to the user who sends it.</span>
+<span class="a">+    if owner_id:</span>
+<span class="a">+        owner = session.get(Account, owner_id)</span>
+<span class="a">+        if owner is None or accounts.resolve(session, owner).id != account.id:</span>
+<span class="a">+            raise PlayError(403, &quot;This purchase belongs to another account.&quot;)</span>
+<span class="a">+    quantity = int(purchase.get(&quot;quantity&quot;) or 1)</span>
+<span class="a">+    seconds = captions.HOURS[product_id] * 3600 * quantity</span>
+<span class="a">+    test = purchase.get(&quot;purchaseType&quot;) == TEST</span>
+<span class="a">+    session.add(PlayPurchase(</span>
+<span class="a">+        token_hash=_hash(token), account_id=account.id, product_id=product_id,</span>
+<span class="a">+        quantity=quantity, seconds=seconds, test=test, order_id=purchase.get(&quot;orderId&quot;),</span>
+<span class="a">+    ))</span>
+<span class="a">+    try:</span>
+<span class="a">+        session.flush()</span>
+<span class="a">+    except IntegrityError:</span>
+<span class="a">+        session.rollback()  # An earlier call added this token.</span>
+<span class="a">+        return False</span>
+<span class="a">+    if purchase.get(&quot;consumptionState&quot;) == CONSUMED:</span>
+<span class="a">+        # Only this server consumes, and it commits before it consumes. So a</span>
+<span class="a">+        # consumed token without a row means that the ledger lost the row.</span>
+<span class="a">+        session.rollback()</span>
+<span class="a">+        log.warning(&quot;consumed Play purchase %s has no ledger row&quot;,</span>
+<span class="a">+                    purchase.get(&quot;orderId&quot;) or &quot;(no order id)&quot;)</span>
+<span class="a">+        raise PlayError(409, &quot;This purchase was used already.&quot;)</span>
+<span class="a">+    captions.add(session, account.id, seconds)</span>
+<span class="a">+    session.commit()</span>
+<span class="a">+    log.info(&quot;play purchase %s: %s x%d for %s%s&quot;,</span>
+<span class="a">+             purchase.get(&quot;orderId&quot;) or &quot;(no order id)&quot;, product_id, quantity,</span>
+<span class="a">+             account.id, &quot; (test)&quot; if test else &quot;&quot;)</span>
+<span class="a">+    return True</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+# routes</span>
+<span class="a">+# ---------------------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+router = APIRouter(prefix=&quot;/api/captions&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class PlayIn(BaseModel):</span>
+<span class="a">+    product_id: str = Field(max_length=64)</span>
+<span class="a">+    purchase_token: str = Field(min_length=1, max_length=4096)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@router.post(&quot;/play-purchase&quot;)</span>
+<span class="a">+def play_purchase(</span>
+<span class="a">+    body: PlayIn,</span>
+<span class="a">+    account: Annotated[Account, Depends(get_account)],</span>
+<span class="a">+    session: Annotated[Session, Depends(get_session)],</span>
+<span class="a">+):</span>
+<span class="a">+    &quot;&quot;&quot;The Play build sends each purchase here, once or more. It gives hours once.&quot;&quot;&quot;</span>
+<span class="a">+    if not settings.play_configured:</span>
+<span class="a">+        raise HTTPException(503, NOT_SET_UP)</span>
+<span class="a">+    if body.product_id not in captions.HOURS:</span>
+<span class="a">+        raise HTTPException(404, &quot;No such pack.&quot;)</span>
+<span class="a">+    try:</span>
+<span class="a">+        purchase = get(body.product_id, body.purchase_token)</span>
+<span class="a">+        credit(session, account, body.product_id, body.purchase_token, purchase)</span>
+<span class="a">+    except PlayError as exc:</span>
+<span class="a">+        raise HTTPException(exc.status, exc.detail) from exc</span>
+<span class="a">+    if purchase.get(&quot;consumptionState&quot;) != CONSUMED:</span>
+<span class="a">+        try:</span>
+<span class="a">+            consume(body.product_id, body.purchase_token)</span>
+<span class="a">+        except PlayError as exc:</span>
+<span class="a">+            # The hours are in the account. The next send of the app consumes it.</span>
+<span class="a">+            log.warning(&quot;could not consume a Play purchase of %s: %s&quot;, account.id, exc.detail)</span>
+<span class="a">+    return {&quot;seconds_left&quot;: captions.seconds_left(session, account.id)}</span>
+diff --git a/backend/settings.py b/backend/settings.py
+index 201dd42..04badcf 100644
+--- a/backend/settings.py
++++ b/backend/settings.py
+<span class="h">@@ -145,7 +145,8 @@ class Settings(BaseSettings):</span>
+     # The path of the JSON key of a service account that can read and consume
+     # the orders of Subrep in Play Console. Keep the file outside the checkout,
+     # owned by the service user, with mode 600. Without the file, the server
+<span class="d">-    # tells the Play build that it cannot sell hours (play_available).</span>
+<span class="a">+    # tells the Play build that it cannot sell hours (play_available), and</span>
+<span class="a">+    # POST /api/captions/play-purchase answers 503. See play.py.</span>
+     play_service_account_file: str = &quot;&quot;
+ 
+     # --- Subrep Pro -------------------------------------------------------
+diff --git a/requirements.txt b/requirements.txt
+index 9957924..a6e1711 100644
+--- a/requirements.txt
++++ b/requirements.txt
+<span class="h">@@ -17,6 +17,11 @@ stripe&gt;=13</span>
+ # desktop app checks. The standard library has no Ed25519.
+ cryptography&gt;=42
+ 
+<span class="a">+# Google Play purchases of Subrep hours (backend/play.py). google-auth signs the</span>
+<span class="a">+# service-account token of the Play Developer API. The standard library has no</span>
+<span class="a">+# OAuth 2 signer.</span>
+<span class="a">+google-auth[requests]&gt;=2.58</span>
+<span class="a">+</span>
+ # --- public deployment extras (not needed on localhost) ---
+ # redis&gt;=5.0          # SUBPLZ_WEB_QUEUE_BACKEND=redis
+ # rq&gt;=1.16            # external worker processes
+diff --git a/tests/test_play.py b/tests/test_play.py
+index 162594b..0001c47 100644
+--- a/tests/test_play.py
++++ b/tests/test_play.py
+<span class="h">@@ -1,9 +1,119 @@</span>
+<span class="d">-&quot;&quot;&quot;Google Play purchases of cloud caption hours: the Play build of Subrep.&quot;&quot;&quot;</span>
+<span class="a">+&quot;&quot;&quot;Google Play purchases of cloud caption hours: the Play build of Subrep.</span>
+<span class="a">+</span>
+<span class="a">+No test reaches Google. FakeGooglePlay replaces play.get and play.consume, and</span>
+<span class="a">+the tests of the HTTP layer give play._session a fake session.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+ 
+ from __future__ import annotations
+ 
+<span class="a">+import itertools</span>
+<span class="a">+import json</span>
+<span class="a">+import logging</span>
+<span class="a">+import secrets</span>
+<span class="a">+from urllib.parse import unquote</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+import requests</span>
+<span class="a">+from google.auth import exceptions as google_errors</span>
+<span class="a">+from hypothesis import given</span>
+<span class="a">+from hypothesis import settings as hsettings</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+</span>
+<span class="a">+from backend import accounts, captions, play</span>
+<span class="a">+from backend.db import Account, SessionLocal</span>
+ from backend.settings import settings
+ 
+<span class="a">+from .conftest import account_id</span>
+<span class="a">+</span>
+<span class="a">+HOUR = 3600</span>
+<span class="a">+UNKNOWN = &quot;Google Play does not know this purchase.&quot;</span>
+<span class="a">+_orders = itertools.count(1)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class FakeGooglePlay:</span>
+<span class="a">+    &quot;&quot;&quot;Google Play as this server sees it: the purchases of the app, by token.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self):</span>
+<span class="a">+        self.purchases: dict[str, dict] = {}</span>
+<span class="a">+        self.consumed: list[str] = []</span>
+<span class="a">+        self.gets: list[tuple[str, str]] = []</span>
+<span class="a">+        self.down = False</span>
+<span class="a">+        self.fail_consume = 0</span>
+<span class="a">+</span>
+<span class="a">+    def buy(self, token: str, account: str | None, product: str = &quot;captions20&quot;,</span>
+<span class="a">+            state: int = 0, quantity: int | None = None, test: bool = False) -&gt; dict:</span>
+<span class="a">+        &quot;&quot;&quot;Add a purchase, as purchases.products.get returns it.</span>
+<span class="a">+</span>
+<span class="a">+        `account` None is a purchase without an account id, for example with</span>
+<span class="a">+        a promo code in the Play Store app.</span>
+<span class="a">+        &quot;&quot;&quot;</span>
+<span class="a">+        purchase = {&quot;kind&quot;: &quot;androidpublisher#productPurchase&quot;, &quot;productId&quot;: product,</span>
+<span class="a">+                    &quot;purchaseState&quot;: state, &quot;consumptionState&quot;: 0,</span>
+<span class="a">+                    &quot;orderId&quot;: f&quot;GPA.3300-{next(_orders):04d}&quot;}</span>
+<span class="a">+        if account is not None:</span>
+<span class="a">+            purchase[&quot;obfuscatedExternalAccountId&quot;] = account</span>
+<span class="a">+        if quantity is not None:</span>
+<span class="a">+            purchase[&quot;quantity&quot;] = quantity</span>
+<span class="a">+        if test:</span>
+<span class="a">+            purchase[&quot;purchaseType&quot;] = 0</span>
+<span class="a">+        self.purchases[token] = purchase</span>
+<span class="a">+        return purchase</span>
+<span class="a">+</span>
+<span class="a">+    def get(self, product_id: str, token: str) -&gt; dict:</span>
+<span class="a">+        self.gets.append((product_id, token))</span>
+<span class="a">+        if self.down:</span>
+<span class="a">+            raise play.PlayError(502, play.NO_ANSWER)</span>
+<span class="a">+        if token not in self.purchases:</span>
+<span class="a">+            raise play.PlayError(400, UNKNOWN)</span>
+<span class="a">+        return dict(self.purchases[token])</span>
+<span class="a">+</span>
+<span class="a">+    def consume(self, product_id: str, token: str) -&gt; None:</span>
+<span class="a">+        if self.fail_consume:</span>
+<span class="a">+            self.fail_consume -= 1</span>
+<span class="a">+            raise play.PlayError(502, play.NO_ANSWER)</span>
+<span class="a">+        self.consumed.append(token)</span>
+<span class="a">+        self.purchases[token][&quot;consumptionState&quot;] = 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture(autouse=True)</span>
+<span class="a">+def _no_google(monkeypatch):</span>
+<span class="a">+    &quot;&quot;&quot;No test may reach Google. A test of the HTTP layer gives its own fake session.&quot;&quot;&quot;</span>
+<span class="a">+    def refuse():</span>
+<span class="a">+        raise AssertionError(&quot;a test tried to reach Google Play&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    monkeypatch.setattr(play, &quot;_session&quot;, refuse)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def google(monkeypatch, tmp_path):</span>
+<span class="a">+    &quot;&quot;&quot;A server with a Play key file, and Google Play faked.&quot;&quot;&quot;</span>
+<span class="a">+    fake = FakeGooglePlay()</span>
+<span class="a">+    monkeypatch.setattr(play, &quot;get&quot;, fake.get)</span>
+<span class="a">+    monkeypatch.setattr(play, &quot;consume&quot;, fake.consume)</span>
+<span class="a">+    key = tmp_path / &quot;play-key.json&quot;</span>
+<span class="a">+    key.write_text(&quot;{}&quot;)  # play.get is fake, so nothing reads the key.</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, str(key))</span>
+<span class="a">+    return fake</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def new_token() -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;A purchase token that no other test uses: the test database lives for the whole run.&quot;&quot;&quot;</span>
+<span class="a">+    return f&quot;tok.{secrets.token_hex(8)}-_&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def post_play(client, token: str, product: str = &quot;captions20&quot;):</span>
+<span class="a">+    return client.post(&quot;/api/captions/play-purchase&quot;,</span>
+<span class="a">+                       json={&quot;product_id&quot;: product, &quot;purchase_token&quot;: token})</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def left(client) -&gt; int:</span>
+<span class="a">+    return client.get(&quot;/api/captions&quot;).json()[&quot;seconds_left&quot;]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def ledger(token: str) -&gt; list[play.PlayPurchase]:</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        return s.query(play.PlayPurchase).filter_by(token_hash=play._hash(token)).all()</span>
+<span class="a">+</span>
+ 
+ def test_the_play_build_can_sell_only_when_the_server_can_check_purchases(
+         client, monkeypatch, tmp_path):
+<span class="h">@@ -24,3 +134,341 @@ def test_the_play_build_can_sell_only_when_the_server_can_check_purchases(</span>
+ 
+     monkeypatch.setattr(settings, &quot;caption_api_key&quot;, &quot;&quot;)
+     assert client.get(&quot;/api/captions&quot;).json()[&quot;play_available&quot;] is False
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- POST /api/captions/play-purchase -----------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+def test_no_play_key_is_503_and_google_is_not_asked(client, google, monkeypatch, tmp_path):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, &quot;&quot;)</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 503 and r.json()[&quot;detail&quot;] == play.NOT_SET_UP</span>
+<span class="a">+    monkeypatch.setattr(settings, &quot;play_service_account_file&quot;, str(tmp_path / &quot;missing.json&quot;))</span>
+<span class="a">+    assert post_play(client, token).status_code == 503</span>
+<span class="a">+    assert google.gets == [] and left(client) == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_an_unknown_pack_is_404(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    assert post_play(client, token, product=&quot;pack10&quot;).status_code == 404</span>
+<span class="a">+    assert google.gets == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_paid_purchase_gives_its_hours_and_is_consumed(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    purchase = google.buy(token, account_id(client))</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 20 * HOUR}</span>
+<span class="a">+    assert google.consumed == [token]</span>
+<span class="a">+    assert left(client) == 20 * HOUR</span>
+<span class="a">+    [row] = ledger(token)</span>
+<span class="a">+    assert (row.account_id, row.product_id, row.quantity, row.seconds, row.order_id) == (</span>
+<span class="a">+        account_id(client), &quot;captions20&quot;, 1, 20 * HOUR, purchase[&quot;orderId&quot;])</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_same_purchase_twice_gives_its_hours_once(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    assert post_play(client, token).status_code == 200</span>
+<span class="a">+    r = post_play(client, token)  # The app sends it again after a lost answer.</span>
+<span class="a">+    assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 20 * HOUR}</span>
+<span class="a">+    assert google.consumed == [token]</span>
+<span class="a">+    assert len(ledger(token)) == 1</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_pending_purchase_gives_nothing_until_it_is_paid(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client), state=2)</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 409 and r.json()[&quot;detail&quot;] == &quot;The purchase is not complete yet.&quot;</span>
+<span class="a">+    assert left(client) == 0 and google.consumed == [] and ledger(token) == []</span>
+<span class="a">+</span>
+<span class="a">+    google.purchases[token][&quot;purchaseState&quot;] = 0</span>
+<span class="a">+    assert post_play(client, token).status_code == 200</span>
+<span class="a">+    assert left(client) == 20 * HOUR and google.consumed == [token]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_cancelled_purchase_gives_nothing(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client), state=1)</span>
+<span class="a">+    assert post_play(client, token).status_code == 409</span>
+<span class="a">+    assert left(client) == 0 and google.consumed == [] and ledger(token) == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_purchase_for_another_account_gives_nothing(client, second_client, google):</span>
+<span class="a">+    token, stranger = new_token(), new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    google.buy(stranger, &quot;acct_0000000000000000&quot;)  # No such account on this server.</span>
+<span class="a">+    for sender, sent in ((second_client, token), (client, stranger)):</span>
+<span class="a">+        r = post_play(sender, sent)</span>
+<span class="a">+        assert r.status_code == 403</span>
+<span class="a">+        assert r.json()[&quot;detail&quot;] == &quot;This purchase belongs to another account.&quot;</span>
+<span class="a">+    assert left(client) == 0 and left(second_client) == 0 and google.consumed == []</span>
+<span class="a">+</span>
+<span class="a">+    assert post_play(client, token).status_code == 200</span>
+<span class="a">+    assert left(client) == 20 * HOUR and left(second_client) == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_purchase_without_an_account_id_goes_to_the_caller_once(client, second_client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, None)</span>
+<span class="a">+    assert post_play(client, token).status_code == 200</span>
+<span class="a">+    r = post_play(second_client, token)</span>
+<span class="a">+    assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 0}</span>
+<span class="a">+    assert left(client) == 20 * HOUR and left(second_client) == 0</span>
+<span class="a">+    assert google.consumed == [token]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_purchase_from_before_a_merge_goes_to_the_merged_account(client, second_client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    old, survivor = account_id(client), account_id(second_client)</span>
+<span class="a">+    google.buy(token, old)</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        accounts.merge(s, s.get(Account, old), s.get(Account, survivor))</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+    assert post_play(second_client, token).status_code == 200</span>
+<span class="a">+    assert left(second_client) == 20 * HOUR</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_failed_consume_keeps_the_hours_and_the_next_call_consumes(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    google.fail_consume = 1</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 200 and r.json() == {&quot;seconds_left&quot;: 20 * HOUR}</span>
+<span class="a">+    assert google.consumed == []</span>
+<span class="a">+</span>
+<span class="a">+    assert post_play(client, token).status_code == 200</span>
+<span class="a">+    assert google.consumed == [token] and left(client) == 20 * HOUR</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_no_answer_from_google_gives_nothing(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    google.down = True</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 502 and r.json()[&quot;detail&quot;] == play.NO_ANSWER</span>
+<span class="a">+    assert left(client) == 0 and ledger(token) == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_token_that_google_does_not_know_is_400(client, google):</span>
+<span class="a">+    r = post_play(client, new_token())</span>
+<span class="a">+    assert r.status_code == 400 and r.json()[&quot;detail&quot;] == UNKNOWN</span>
+<span class="a">+    assert left(client) == 0</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_purchase_for_another_pack_is_400(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client), product=&quot;captions80&quot;)</span>
+<span class="a">+    r = post_play(client, token, product=&quot;captions20&quot;)</span>
+<span class="a">+    assert r.status_code == 400 and r.json()[&quot;detail&quot;] == UNKNOWN</span>
+<span class="a">+    assert left(client) == 0 and google.consumed == [] and ledger(token) == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_quantity_multiplies_the_hours(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client), quantity=3)</span>
+<span class="a">+    assert post_play(client, token).json() == {&quot;seconds_left&quot;: 60 * HOUR}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_log_never_holds_the_token(client, google, caplog):</span>
+<span class="a">+    caplog.set_level(logging.DEBUG)</span>
+<span class="a">+    token, lost = new_token(), new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    google.buy(lost, account_id(client))[&quot;consumptionState&quot;] = 1</span>
+<span class="a">+    google.fail_consume = 1</span>
+<span class="a">+    assert post_play(client, token).status_code == 200  # The hours, and a failed consume.</span>
+<span class="a">+    assert post_play(client, token).status_code == 200  # The consume.</span>
+<span class="a">+    assert post_play(client, lost).status_code == 409  # Consumed, but not in the ledger.</span>
+<span class="a">+    assert &quot;play purchase&quot; in caplog.text and &quot;could not consume&quot; in caplog.text</span>
+<span class="a">+    assert token not in caplog.text and lost not in caplog.text</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_consumed_purchase_without_a_row_gives_nothing(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))[&quot;consumptionState&quot;] = 1</span>
+<span class="a">+    r = post_play(client, token)</span>
+<span class="a">+    assert r.status_code == 409 and r.json()[&quot;detail&quot;] == &quot;This purchase was used already.&quot;</span>
+<span class="a">+    assert left(client) == 0 and google.consumed == [] and ledger(token) == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_test_purchase_is_marked_in_the_ledger(client, google):</span>
+<span class="a">+    tested, paid = new_token(), new_token()</span>
+<span class="a">+    google.buy(tested, account_id(client), test=True)</span>
+<span class="a">+    google.buy(paid, account_id(client))</span>
+<span class="a">+    assert post_play(client, tested).status_code == 200</span>
+<span class="a">+    assert post_play(client, paid).status_code == 200</span>
+<span class="a">+    assert [row.test for row in ledger(tested)] == [True]</span>
+<span class="a">+    assert [row.test for row in ledger(paid)] == [False]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_bad_body_is_422(client, google):</span>
+<span class="a">+    token = new_token()</span>
+<span class="a">+    google.buy(token, account_id(client))</span>
+<span class="a">+    assert post_play(client, &quot;&quot;).status_code == 422</span>
+<span class="a">+    assert post_play(client, &quot;x&quot; * 4097).status_code == 422</span>
+<span class="a">+    assert google.gets == []</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- the HTTP layer -----------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+class FakeResponse:</span>
+<span class="a">+    def __init__(self, status_code: int, body: dict | None = None):</span>
+<span class="a">+        self.status_code = status_code</span>
+<span class="a">+        self._body = body or {}</span>
+<span class="a">+</span>
+<span class="a">+    def json(self) -&gt; dict:</span>
+<span class="a">+        return self._body</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+class FakeHttp:</span>
+<span class="a">+    &quot;&quot;&quot;Stands in for the signed session: records each request and gives the next answer.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+    def __init__(self):</span>
+<span class="a">+        self.answers: list = []</span>
+<span class="a">+        self.seen: list[tuple[str, str]] = []</span>
+<span class="a">+</span>
+<span class="a">+    def __enter__(self):</span>
+<span class="a">+        return self</span>
+<span class="a">+</span>
+<span class="a">+    def __exit__(self, *exc):</span>
+<span class="a">+        return False</span>
+<span class="a">+</span>
+<span class="a">+    def request(self, method: str, url: str, timeout: float | None = None):</span>
+<span class="a">+        assert timeout  # A request without a timeout can hang a worker.</span>
+<span class="a">+        self.seen.append((method, url))</span>
+<span class="a">+        answer = self.answers.pop(0)</span>
+<span class="a">+        if isinstance(answer, Exception):</span>
+<span class="a">+            raise answer</span>
+<span class="a">+        return answer</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture</span>
+<span class="a">+def http(monkeypatch):</span>
+<span class="a">+    fake = FakeHttp()</span>
+<span class="a">+    monkeypatch.setattr(play, &quot;_session&quot;, lambda: fake)</span>
+<span class="a">+    return fake</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_get_asks_google_for_the_pack_and_the_token(http):</span>
+<span class="a">+    http.answers = [FakeResponse(200, {&quot;purchaseState&quot;: 0})]</span>
+<span class="a">+    assert play.get(&quot;captions20&quot;, &quot;abc.DEF-_1&quot;) == {&quot;purchaseState&quot;: 0}</span>
+<span class="a">+    url = (&quot;https://androidpublisher.googleapis.com/androidpublisher/v3/applications/&quot;</span>
+<span class="a">+           &quot;com.honjimaku.subrep/purchases/products/captions20/tokens/abc.DEF-_1&quot;)</span>
+<span class="a">+    assert http.seen == [(&quot;GET&quot;, url)]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_consume_posts_to_the_consume_address(http):</span>
+<span class="a">+    http.answers = [FakeResponse(204)]</span>
+<span class="a">+    play.consume(&quot;captions80&quot;, &quot;abc&quot;)</span>
+<span class="a">+    [(method, url)] = http.seen</span>
+<span class="a">+    assert method == &quot;POST&quot;</span>
+<span class="a">+    assert url.endswith(&quot;/com.honjimaku.subrep/purchases/products/captions80/tokens/abc:consume&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.mark.parametrize(&quot;google_status, status&quot;, [</span>
+<span class="a">+    (400, 400), (404, 400), (410, 400), (401, 503), (403, 503), (429, 502), (500, 502), (503, 502),</span>
+<span class="a">+])</span>
+<span class="a">+def test_google_errors_become_clear_answers(http, google_status, status):</span>
+<span class="a">+    http.answers = [FakeResponse(google_status)]</span>
+<span class="a">+    with pytest.raises(play.PlayError) as caught:</span>
+<span class="a">+        play.get(&quot;captions20&quot;, &quot;abc&quot;)</span>
+<span class="a">+    assert caught.value.status == status</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.mark.parametrize(&quot;error&quot;, [</span>
+<span class="a">+    requests.ConnectionError(&quot;no route to host&quot;),</span>
+<span class="a">+    requests.Timeout(&quot;read timed out&quot;),</span>
+<span class="a">+    google_errors.TransportError(&quot;no route to the token server&quot;),</span>
+<span class="a">+])</span>
+<span class="a">+def test_no_connection_to_google_is_502(http, error):</span>
+<span class="a">+    http.answers = [error]</span>
+<span class="a">+    with pytest.raises(play.PlayError) as caught:</span>
+<span class="a">+        play.get(&quot;captions20&quot;, &quot;abc&quot;)</span>
+<span class="a">+    assert caught.value.status == 502</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_a_key_that_google_refuses_is_503(http):</span>
+<span class="a">+    http.answers = [google_errors.RefreshError(&quot;invalid_grant: account not found&quot;)]</span>
+<span class="a">+    with pytest.raises(play.PlayError) as caught:</span>
+<span class="a">+        play.get(&quot;captions20&quot;, &quot;abc&quot;)</span>
+<span class="a">+    assert (caught.value.status, caught.value.detail) == (503, play.NOT_SET_UP)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_the_key_file_gives_credentials_for_the_play_api(tmp_path):</span>
+<span class="a">+    from cryptography.hazmat.primitives import serialization</span>
+<span class="a">+    from cryptography.hazmat.primitives.asymmetric import rsa</span>
+<span class="a">+</span>
+<span class="a">+    pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(</span>
+<span class="a">+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,</span>
+<span class="a">+        serialization.NoEncryption()).decode()</span>
+<span class="a">+    key = tmp_path / &quot;play-key.json&quot;</span>
+<span class="a">+    key.write_text(json.dumps({</span>
+<span class="a">+        &quot;type&quot;: &quot;service_account&quot;, &quot;project_id&quot;: &quot;subrep-test&quot;, &quot;private_key_id&quot;: &quot;k1&quot;,</span>
+<span class="a">+        &quot;private_key&quot;: pem, &quot;client_email&quot;: &quot;play@subrep-test.iam.gserviceaccount.com&quot;,</span>
+<span class="a">+        &quot;client_id&quot;: &quot;1&quot;, &quot;token_uri&quot;: &quot;https://oauth2.googleapis.com/token&quot;,</span>
+<span class="a">+    }))</span>
+<span class="a">+    credentials = play._credentials(str(key))</span>
+<span class="a">+    assert credentials.scopes == [&quot;https://www.googleapis.com/auth/androidpublisher&quot;]</span>
+<span class="a">+    assert credentials.service_account_email == &quot;play@subrep-test.iam.gserviceaccount.com&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.mark.parametrize(&quot;content&quot;, [&quot;{}&quot;, &quot;not json&quot;, None])</span>
+<span class="a">+def test_a_bad_key_file_is_503(tmp_path, content):</span>
+<span class="a">+    key = tmp_path / &quot;play-key.json&quot;</span>
+<span class="a">+    if content is not None:</span>
+<span class="a">+        key.write_text(content)</span>
+<span class="a">+    with pytest.raises(play.PlayError) as caught:</span>
+<span class="a">+        play._credentials(str(key))</span>
+<span class="a">+    assert caught.value.status == 503</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# --- properties ---------------------------------------------------------------</span>
+<span class="a">+</span>
+<span class="a">+@hsettings(max_examples=50, deadline=None)</span>
+<span class="a">+@given(buys=st.lists(st.tuples(st.sampled_from(sorted(captions.HOURS)), st.integers(1, 3),</span>
+<span class="a">+                               st.sampled_from([&quot;me&quot;, &quot;other&quot;, &quot;none&quot;])),</span>
+<span class="a">+                     min_size=1, max_size=4),</span>
+<span class="a">+       calls=st.lists(st.tuples(st.integers(0, 3), st.sampled_from([0, 1, 2]),</span>
+<span class="a">+                                st.sampled_from([0, 1])),</span>
+<span class="a">+                      max_size=25))</span>
+<span class="a">+def test_a_token_gives_its_hours_once_and_only_when_paid_for_this_account(buys, calls):</span>
+<span class="a">+    run = secrets.token_hex(6)  # The database lives across examples.</span>
+<span class="a">+    with SessionLocal() as s:</span>
+<span class="a">+        me, other = accounts.new_account(s), accounts.new_account(s)</span>
+<span class="a">+        s.commit()</span>
+<span class="a">+        ids = {&quot;me&quot;: me.id, &quot;other&quot;: other.id, &quot;none&quot;: None}</span>
+<span class="a">+        expected, added = {}, {}</span>
+<span class="a">+        for i, state, consumed in calls:</span>
+<span class="a">+            if i &gt;= len(buys):</span>
+<span class="a">+                continue</span>
+<span class="a">+            product, quantity, owner = buys[i]</span>
+<span class="a">+            token = f&quot;{run}.{i}&quot;</span>
+<span class="a">+            google = {&quot;purchaseState&quot;: state, &quot;consumptionState&quot;: consumed,</span>
+<span class="a">+                      &quot;productId&quot;: product, &quot;quantity&quot;: quantity}</span>
+<span class="a">+            if ids[owner]:</span>
+<span class="a">+                google[&quot;obfuscatedExternalAccountId&quot;] = ids[owner]</span>
+<span class="a">+            try:</span>
+<span class="a">+                if play.credit(s, me, product, token, google):</span>
+<span class="a">+                    added[token] = added.get(token, 0) + 1</span>
+<span class="a">+            except play.PlayError:</span>
+<span class="a">+                pass</span>
+<span class="a">+            # Hours come only from a call that saw the purchase paid and not consumed.</span>
+<span class="a">+            if state == 0 and consumed == 0 and owner != &quot;other&quot;:</span>
+<span class="a">+                expected[token] = captions.HOURS[product] * HOUR * quantity</span>
+<span class="a">+        assert captions.seconds_left(s, ids[&quot;me&quot;]) == sum(expected.values())</span>
+<span class="a">+        assert captions.seconds_left(s, ids[&quot;other&quot;]) == 0</span>
+<span class="a">+        assert added == {token: 1 for token in expected}</span>
+<span class="a">+        assert s.query(play.PlayPurchase).filter_by(account_id=ids[&quot;me&quot;]).count() == len(expected)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@given(st.text(min_size=1))</span>
+<span class="a">+def test_any_token_is_one_path_segment_of_the_address(token):</span>
+<span class="a">+    url = play._url(&quot;captions20&quot;, token)</span>
+<span class="a">+    assert &quot;?&quot; not in url and &quot;#&quot; not in url</span>
+<span class="a">+    head, tail = url.split(&quot;/tokens/&quot;, 1)</span>
+<span class="a">+    assert head.endswith(&quot;/com.honjimaku.subrep/purchases/products/captions20&quot;)</span>
+<span class="a">+    assert &quot;/&quot; not in tail</span>
+<span class="a">+    assert unquote(tail) == token</span></pre>
+</div></body></html>

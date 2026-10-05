@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread/src/align.ts - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../../scan-subread/index.html">Log</a> | <a href="../../../scan-subread/files.html">Files</a> | <a href="../../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>src/align.ts (14309 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> // Pure text alignment. No DOM, no OCR engine.
+<a id="l2" href="#l2">2</a> //
+<a id="l3" href="#l3">3</a> // Input: the texts of the subtitle cues, and the tokens of the pages that
+<a id="l4" href="#l4">4</a> // are read so far. Output: for each cue, the span of tokens that shows the
+<a id="l5" href="#l5">5</a> // cue.
+<a id="l6" href="#l6">6</a> //
+<a id="l7" href="#l7">7</a> // A book has some hundred thousand characters, and the reader reads its
+<a id="l8" href="#l8">8</a> // pages one by one. One diff of all cues against a few pages is slow, and
+<a id="l9" href="#l9">9</a> // it matches cues to wrong places. So each page is aligned on its own:
+<a id="l10" href="#l10">10</a> //
+<a id="l11" href="#l11">11</a> // 1. All cues, normalized and joined, make the cue stream. An index holds
+<a id="l12" href="#l12">12</a> //    each K-gram (a run of K characters) that occurs only once in it.
+<a id="l13" href="#l13">13</a> // 2. Each K-gram of a page that is in the index gives an anchor: a cue
+<a id="l14" href="#l14">14</a> //    position and a page position. The longest chain of anchors that rises
+<a id="l15" href="#l15">15</a> //    in both stays. An anchor far from the median shift of the chain is a
+<a id="l16" href="#l16">16</a> //    chance hit and goes too. A page with fewer than MIN_ANCHORS anchors is
+<a id="l17" href="#l17">17</a> //    not in the subtitles.
+<a id="l18" href="#l18">18</a> // 3. The first and the last anchor give the region of the cue stream that
+<a id="l19" href="#l19">19</a> //    the page shows. A character diff (Myers, via fast-diff) of the region
+<a id="l20" href="#l20">20</a> //    against the page maps cue characters to page tokens.
+<a id="l21" href="#l21">21</a> // 4. The pairs (cue character, token) of all read pages must rise in both.
+<a id="l22" href="#l22">22</a> //    The longest rising chain of pairs stays. The other pairs go, for
+<a id="l23" href="#l23">23</a> //    example the pairs of a page that is out of order.
+<a id="l24" href="#l24">24</a> // 5. Each cue gets the span from its first to its last mapped token.
+<a id="l25" href="#l25">25</a> //
+<a id="l26" href="#l26">26</a> // The aligner keeps the result of steps 2 and 3 for each page, so one more
+<a id="l27" href="#l27">27</a> // page costs the work of one page. A short cue stream has too few K-grams
+<a id="l28" href="#l28">28</a> // for anchors: its region is the whole stream.
+<a id="l29" href="#l29">29</a> 
+<a id="l30" href="#l30">30</a> import diff from &#x27;fast-diff&#x27;;
+<a id="l31" href="#l31">31</a> 
+<a id="l32" href="#l32">32</a> /** A recognized unit of text with a box on a page. */
+<a id="l33" href="#l33">33</a> export interface OcrToken {
+<a id="l34" href="#l34">34</a>   text: string;
+<a id="l35" href="#l35">35</a>   page: number;
+<a id="l36" href="#l36">36</a>   /** Line id. Tokens with the same line id lie on one visual line. */
+<a id="l37" href="#l37">37</a>   line: number;
+<a id="l38" href="#l38">38</a>   /** Word id. Tokens with the same word id form one OCR word. Absent for hand-made tokens. */
+<a id="l39" href="#l39">39</a>   word?: number;
+<a id="l40" href="#l40">40</a>   bbox: { x0: number; y0: number; x1: number; y1: number };
+<a id="l41" href="#l41">41</a> }
+<a id="l42" href="#l42">42</a> 
+<a id="l43" href="#l43">43</a> /** Half-open token span [start, end) in the tokens of the read pages. */
+<a id="l44" href="#l44">44</a> export interface TokenSpan {
+<a id="l45" href="#l45">45</a>   start: number;
+<a id="l46" href="#l46">46</a>   end: number;
+<a id="l47" href="#l47">47</a>   /** True when a character of the cue is mapped. An unmatched cue has the span [0, 0). */
+<a id="l48" href="#l48">48</a>   matched: boolean;
+<a id="l49" href="#l49">49</a> }
+<a id="l50" href="#l50">50</a> 
+<a id="l51" href="#l51">51</a> /** The length of the K-grams in the index. */
+<a id="l52" href="#l52">52</a> const K = 8;
+<a id="l53" href="#l53">53</a> 
+<a id="l54" href="#l54">54</a> /** A page with fewer anchors than this is not in the subtitles. */
+<a id="l55" href="#l55">55</a> const MIN_ANCHORS = 3;
+<a id="l56" href="#l56">56</a> 
+<a id="l57" href="#l57">57</a> /**
+<a id="l58" href="#l58">58</a>  * An anchor whose shift (cue position minus page position) is further than
+<a id="l59" href="#l59">59</a>  * this from the median shift of its page is a chance hit. A long page can
+<a id="l60" href="#l60">60</a>  * have a longer part that is not narrated, such as a caption, so a quarter
+<a id="l61" href="#l61">61</a>  * of the page length applies when it is more.
+<a id="l62" href="#l62">62</a>  */
+<a id="l63" href="#l63">63</a> const SHIFT_LIMIT = 50;
+<a id="l64" href="#l64">64</a> 
+<a id="l65" href="#l65">65</a> /**
+<a id="l66" href="#l66">66</a>  * A cue stream of this length or less (a few subtitle lines) is too short
+<a id="l67" href="#l67">67</a>  * for anchors. Each page is then compared with the whole stream, so text
+<a id="l68" href="#l68">68</a>  * that is not in the subtitles can match by chance.
+<a id="l69" href="#l69">69</a>  */
+<a id="l70" href="#l70">70</a> const SHORT_STREAM = 64;
+<a id="l71" href="#l71">71</a> 
+<a id="l72" href="#l72">72</a> /** The shortest equal run of the diff that counts as a match. */
+<a id="l73" href="#l73">73</a> const MIN_RUN = 2;
+<a id="l74" href="#l74">74</a> 
+<a id="l75" href="#l75">75</a> /** The longest edit next to a shorter equal run that still counts as local noise. */
+<a id="l76" href="#l76">76</a> const MAX_LOCAL_EDIT = 2;
+<a id="l77" href="#l77">77</a> 
+<a id="l78" href="#l78">78</a> const KEEP = /[\p{L}\p{N}\p{M}]/u;
+<a id="l79" href="#l79">79</a> 
+<a id="l80" href="#l80">80</a> /** A limit on the passes of normalizeText. Real text needs one or two. */
+<a id="l81" href="#l81">81</a> const MAX_NORMALIZE_PASSES = 4;
+<a id="l82" href="#l82">82</a> 
+<a id="l83" href="#l83">83</a> /** One pass: NFKC, lowercase, then only letters, numbers and marks. */
+<a id="l84" href="#l84">84</a> function normalizePass(text: string): string {
+<a id="l85" href="#l85">85</a>   let out = &#x27;&#x27;;
+<a id="l86" href="#l86">86</a>   for (const ch of text.normalize(&#x27;NFKC&#x27;).toLowerCase()) {
+<a id="l87" href="#l87">87</a>     if (KEEP.test(ch)) out += ch;
+<a id="l88" href="#l88">88</a>   }
+<a id="l89" href="#l89">89</a>   return out;
+<a id="l90" href="#l90">90</a> }
+<a id="l91" href="#l91">91</a> 
+<a id="l92" href="#l92">92</a> /**
+<a id="l93" href="#l93">93</a>  * Normalize text for comparison. NFKC folds full-width forms. Lowercase
+<a id="l94" href="#l94">94</a>  * folds case. Only letters, numbers and marks stay. Spaces and punctuation
+<a id="l95" href="#l95">95</a>  * go, so word boundaries do not matter. This works for CJK, where OCR and
+<a id="l96" href="#l96">96</a>  * subtitles rarely agree on spacing.
+<a id="l97" href="#l97">97</a>  *
+<a id="l98" href="#l98">98</a>  * The case map and the filter can leave combining marks out of canonical
+<a id="l99" href="#l99">99</a>  * order, and then one more pass changes the text. The passes repeat until
+<a id="l100" href="#l100">100</a>  * the text stays the same, so the result is stable.
+<a id="l101" href="#l101">101</a>  */
+<a id="l102" href="#l102">102</a> export function normalizeText(text: string): string {
+<a id="l103" href="#l103">103</a>   let out = normalizePass(text);
+<a id="l104" href="#l104">104</a>   for (let pass = 1; pass &lt; MAX_NORMALIZE_PASSES; pass++) {
+<a id="l105" href="#l105">105</a>     const next = normalizePass(out);
+<a id="l106" href="#l106">106</a>     if (next === out) break;
+<a id="l107" href="#l107">107</a>     out = next;
+<a id="l108" href="#l108">108</a>   }
+<a id="l109" href="#l109">109</a>   return out;
+<a id="l110" href="#l110">110</a> }
+<a id="l111" href="#l111">111</a> 
+<a id="l112" href="#l112">112</a> export interface Stream {
+<a id="l113" href="#l113">113</a>   chars: string;
+<a id="l114" href="#l114">114</a>   /** tokenOf[i] is the index of the token that holds chars[i]. */
+<a id="l115" href="#l115">115</a>   tokenOf: number[];
+<a id="l116" href="#l116">116</a> }
+<a id="l117" href="#l117">117</a> 
+<a id="l118" href="#l118">118</a> /** Join normalized token texts into one stream with a char-to-token map. */
+<a id="l119" href="#l119">119</a> export function buildStream(texts: readonly string[]): Stream {
+<a id="l120" href="#l120">120</a>   let chars = &#x27;&#x27;;
+<a id="l121" href="#l121">121</a>   const tokenOf: number[] = [];
+<a id="l122" href="#l122">122</a>   texts.forEach((text, i) =&gt; {
+<a id="l123" href="#l123">123</a>     const norm = normalizeText(text);
+<a id="l124" href="#l124">124</a>     chars += norm;
+<a id="l125" href="#l125">125</a>     for (let k = 0; k &lt; norm.length; k++) tokenOf.push(i);
+<a id="l126" href="#l126">126</a>   });
+<a id="l127" href="#l127">127</a>   return { chars, tokenOf };
+<a id="l128" href="#l128">128</a> }
+<a id="l129" href="#l129">129</a> 
+<a id="l130" href="#l130">130</a> /** The tokens of one page. The aligner uses only their text. */
+<a id="l131" href="#l131">131</a> export type PageTokens = readonly Pick&lt;OcrToken, &#x27;text&#x27;&gt;[];
+<a id="l132" href="#l132">132</a> 
+<a id="l133" href="#l133">133</a> /** Aligns the cues of one subtitle file to the pages that are read. */
+<a id="l134" href="#l134">134</a> export interface Aligner {
+<a id="l135" href="#l135">135</a>   /**
+<a id="l136" href="#l136">136</a>    * One span for each cue. `pages[p]` holds the tokens of page p, or
+<a id="l137" href="#l137">137</a>    * undefined when page p is not read. The spans index the tokens of the
+<a id="l138" href="#l138">138</a>    * read pages, joined in page order. The spans of the matched cues rise:
+<a id="l139" href="#l139">139</a>    * a later cue starts and ends at or after an earlier cue.
+<a id="l140" href="#l140">140</a>    */
+<a id="l141" href="#l141">141</a>   spans(pages: readonly (PageTokens | undefined)[]): TokenSpan[];
+<a id="l142" href="#l142">142</a> }
+<a id="l143" href="#l143">143</a> 
+<a id="l144" href="#l144">144</a> /** The pairs (cue character, page token) of one page, in page order. Both rise. */
+<a id="l145" href="#l145">145</a> interface PageMatch {
+<a id="l146" href="#l146">146</a>   /** Positions in the cue stream. */
+<a id="l147" href="#l147">147</a>   cue: Int32Array;
+<a id="l148" href="#l148">148</a>   /** For each position in `cue`, the index of its token on the page. */
+<a id="l149" href="#l149">149</a>   token: Int32Array;
+<a id="l150" href="#l150">150</a> }
+<a id="l151" href="#l151">151</a> 
+<a id="l152" href="#l152">152</a> /** A half-open range [from, to) of the cue stream. */
+<a id="l153" href="#l153">153</a> interface Region {
+<a id="l154" href="#l154">154</a>   from: number;
+<a id="l155" href="#l155">155</a>   to: number;
+<a id="l156" href="#l156">156</a> }
+<a id="l157" href="#l157">157</a> 
+<a id="l158" href="#l158">158</a> /**
+<a id="l159" href="#l159">159</a>  * Make an aligner for the cues of one subtitle file. Keep it while the
+<a id="l160" href="#l160">160</a>  * subtitles stay loaded: it keeps the result of each page that it saw.
+<a id="l161" href="#l161">161</a>  */
+<a id="l162" href="#l162">162</a> export function createAligner(cueTexts: readonly string[]): Aligner {
+<a id="l163" href="#l163">163</a>   const cues = cueTexts.map(normalizeText);
+<a id="l164" href="#l164">164</a>   const stream = cues.join(&#x27;&#x27;);
+<a id="l165" href="#l165">165</a>   /** cueOf[i] is the index of the cue that holds stream[i]. */
+<a id="l166" href="#l166">166</a>   const cueOf = new Int32Array(stream.length);
+<a id="l167" href="#l167">167</a>   let at = 0;
+<a id="l168" href="#l168">168</a>   cues.forEach((cue, i) =&gt; {
+<a id="l169" href="#l169">169</a>     cueOf.fill(i, at, at + cue.length);
+<a id="l170" href="#l170">170</a>     at += cue.length;
+<a id="l171" href="#l171">171</a>   });
+<a id="l172" href="#l172">172</a>   const grams = uniqueGrams(stream);
+<a id="l173" href="#l173">173</a>   /** The match of each page, by the identity of its token array. */
+<a id="l174" href="#l174">174</a>   const matches = new WeakMap&lt;PageTokens, PageMatch&gt;();
+<a id="l175" href="#l175">175</a> 
+<a id="l176" href="#l176">176</a>   function matchPage(tokens: PageTokens): PageMatch {
+<a id="l177" href="#l177">177</a>     const page = buildStream(tokens.map((t) =&gt; t.text));
+<a id="l178" href="#l178">178</a>     const region =
+<a id="l179" href="#l179">179</a>       stream.length &lt;= SHORT_STREAM
+<a id="l180" href="#l180">180</a>         ? { from: 0, to: stream.length }
+<a id="l181" href="#l181">181</a>         : locate(page.chars, stream, grams);
+<a id="l182" href="#l182">182</a>     return region
+<a id="l183" href="#l183">183</a>       ? mapRegion(stream, region, page)
+<a id="l184" href="#l184">184</a>       : { cue: new Int32Array(), token: new Int32Array() };
+<a id="l185" href="#l185">185</a>   }
+<a id="l186" href="#l186">186</a> 
+<a id="l187" href="#l187">187</a>   return {
+<a id="l188" href="#l188">188</a>     spans(pages) {
+<a id="l189" href="#l189">189</a>       // Join the pairs of the read pages in page order. A token index counts
+<a id="l190" href="#l190">190</a>       // the tokens of all read pages before it.
+<a id="l191" href="#l191">191</a>       const parts: { match: PageMatch; base: number }[] = [];
+<a id="l192" href="#l192">192</a>       let base = 0;
+<a id="l193" href="#l193">193</a>       let count = 0;
+<a id="l194" href="#l194">194</a>       for (const tokens of pages) {
+<a id="l195" href="#l195">195</a>         if (!tokens) continue;
+<a id="l196" href="#l196">196</a>         let match = matches.get(tokens);
+<a id="l197" href="#l197">197</a>         if (!match) {
+<a id="l198" href="#l198">198</a>           match = matchPage(tokens);
+<a id="l199" href="#l199">199</a>           matches.set(tokens, match);
+<a id="l200" href="#l200">200</a>         }
+<a id="l201" href="#l201">201</a>         parts.push({ match, base });
+<a id="l202" href="#l202">202</a>         base += tokens.length;
+<a id="l203" href="#l203">203</a>         count += match.cue.length;
+<a id="l204" href="#l204">204</a>       }
+<a id="l205" href="#l205">205</a>       const cue = new Int32Array(count);
+<a id="l206" href="#l206">206</a>       const token = new Int32Array(count);
+<a id="l207" href="#l207">207</a>       let n = 0;
+<a id="l208" href="#l208">208</a>       for (const part of parts) {
+<a id="l209" href="#l209">209</a>         cue.set(part.match.cue, n);
+<a id="l210" href="#l210">210</a>         for (let k = 0; k &lt; part.match.token.length; k++) {
+<a id="l211" href="#l211">211</a>           token[n + k] = part.base + part.match.token[k]!;
+<a id="l212" href="#l212">212</a>         }
+<a id="l213" href="#l213">213</a>         n += part.match.cue.length;
+<a id="l214" href="#l214">214</a>       }
+<a id="l215" href="#l215">215</a> 
+<a id="l216" href="#l216">216</a>       // The tokens rise already. Keep the longest chain of pairs whose cue
+<a id="l217" href="#l217">217</a>       // positions rise too. Then each cue spans its first to its last token.
+<a id="l218" href="#l218">218</a>       const spans: TokenSpan[] = cues.map(() =&gt; ({ start: 0, end: 0, matched: false }));
+<a id="l219" href="#l219">219</a>       for (const k of risingChain(cue)) {
+<a id="l220" href="#l220">220</a>         const span = spans[cueOf[cue[k]!]!]!;
+<a id="l221" href="#l221">221</a>         if (!span.matched) {
+<a id="l222" href="#l222">222</a>           span.start = token[k]!;
+<a id="l223" href="#l223">223</a>           span.matched = true;
+<a id="l224" href="#l224">224</a>         }
+<a id="l225" href="#l225">225</a>         span.end = token[k]! + 1;
+<a id="l226" href="#l226">226</a>       }
+<a id="l227" href="#l227">227</a>       return spans;
+<a id="l228" href="#l228">228</a>     },
+<a id="l229" href="#l229">229</a>   };
+<a id="l230" href="#l230">230</a> }
+<a id="l231" href="#l231">231</a> 
+<a id="l232" href="#l232">232</a> /** A hash of the K characters of `text` at `at`. Two different K-grams can have the same hash. */
+<a id="l233" href="#l233">233</a> function gramHash(text: string, at: number): number {
+<a id="l234" href="#l234">234</a>   let h = 0;
+<a id="l235" href="#l235">235</a>   for (let i = at; i &lt; at + K; i++) h = (Math.imul(h, 31) + text.charCodeAt(i)) | 0;
+<a id="l236" href="#l236">236</a>   return h;
+<a id="l237" href="#l237">237</a> }
+<a id="l238" href="#l238">238</a> 
+<a id="l239" href="#l239">239</a> /**
+<a id="l240" href="#l240">240</a>  * For each K-gram hash of the stream: the position of the K-gram when the
+<a id="l241" href="#l241">241</a>  * hash occurs once, else -1.
+<a id="l242" href="#l242">242</a>  */
+<a id="l243" href="#l243">243</a> function uniqueGrams(stream: string): Map&lt;number, number&gt; {
+<a id="l244" href="#l244">244</a>   const grams = new Map&lt;number, number&gt;();
+<a id="l245" href="#l245">245</a>   for (let i = 0; i + K &lt;= stream.length; i++) {
+<a id="l246" href="#l246">246</a>     const h = gramHash(stream, i);
+<a id="l247" href="#l247">247</a>     grams.set(h, grams.has(h) ? -1 : i);
+<a id="l248" href="#l248">248</a>   }
+<a id="l249" href="#l249">249</a>   return grams;
+<a id="l250" href="#l250">250</a> }
+<a id="l251" href="#l251">251</a> 
+<a id="l252" href="#l252">252</a> /**
+<a id="l253" href="#l253">253</a>  * The region of the cue stream that a page shows, found with anchors.
+<a id="l254" href="#l254">254</a>  * Null when the page has too few anchors: it is not in the subtitles.
+<a id="l255" href="#l255">255</a>  */
+<a id="l256" href="#l256">256</a> function locate(page: string, stream: string, grams: ReadonlyMap&lt;number, number&gt;): Region | null {
+<a id="l257" href="#l257">257</a>   // The anchors in page order. A hash hit counts only when the text agrees.
+<a id="l258" href="#l258">258</a>   const cuePos: number[] = [];
+<a id="l259" href="#l259">259</a>   const pagePos: number[] = [];
+<a id="l260" href="#l260">260</a>   for (let j = 0; j + K &lt;= page.length; j++) {
+<a id="l261" href="#l261">261</a>     const at = grams.get(gramHash(page, j));
+<a id="l262" href="#l262">262</a>     if (at !== undefined &amp;&amp; at &gt;= 0 &amp;&amp; stream.startsWith(page.slice(j, j + K), at)) {
+<a id="l263" href="#l263">263</a>       cuePos.push(at);
+<a id="l264" href="#l264">264</a>       pagePos.push(j);
+<a id="l265" href="#l265">265</a>     }
+<a id="l266" href="#l266">266</a>   }
+<a id="l267" href="#l267">267</a>   // A chance hit breaks the order, so keep the longest chain that rises in
+<a id="l268" href="#l268">268</a>   // both. A chance hit in the chain is far from the median shift.
+<a id="l269" href="#l269">269</a>   const chain = risingChain(cuePos);
+<a id="l270" href="#l270">270</a>   if (chain.length &lt; MIN_ANCHORS) return null;
+<a id="l271" href="#l271">271</a>   const shift = (k: number): number =&gt; cuePos[k]! - pagePos[k]!;
+<a id="l272" href="#l272">272</a>   const median = chain.map(shift).sort((x, y) =&gt; x - y)[chain.length &gt;&gt; 1]!;
+<a id="l273" href="#l273">273</a>   const limit = Math.max(SHIFT_LIMIT, page.length / 4);
+<a id="l274" href="#l274">274</a>   const kept = chain.filter((k) =&gt; Math.abs(shift(k) - median) &lt;= limit);
+<a id="l275" href="#l275">275</a>   if (kept.length &lt; MIN_ANCHORS) return null;
+<a id="l276" href="#l276">276</a>   // The page ends, projected along the shift of the first and the last anchor.
+<a id="l277" href="#l277">277</a>   const first = kept[0]!;
+<a id="l278" href="#l278">278</a>   const last = kept[kept.length - 1]!;
+<a id="l279" href="#l279">279</a>   return {
+<a id="l280" href="#l280">280</a>     from: Math.max(0, shift(first)),
+<a id="l281" href="#l281">281</a>     to: Math.min(stream.length, shift(last) + page.length),
+<a id="l282" href="#l282">282</a>   };
+<a id="l283" href="#l283">283</a> }
+<a id="l284" href="#l284">284</a> 
+<a id="l285" href="#l285">285</a> /** Map the cue characters of a region to the tokens of a page with a character diff. */
+<a id="l286" href="#l286">286</a> function mapRegion(stream: string, region: Region, page: Stream): PageMatch {
+<a id="l287" href="#l287">287</a>   const cue: number[] = [];
+<a id="l288" href="#l288">288</a>   const token: number[] = [];
+<a id="l289" href="#l289">289</a>   const ops = diff(stream.slice(region.from, region.to), page.chars);
+<a id="l290" href="#l290">290</a>   let a = region.from;
+<a id="l291" href="#l291">291</a>   let b = 0;
+<a id="l292" href="#l292">292</a>   ops.forEach(([op, text], i) =&gt; {
+<a id="l293" href="#l293">293</a>     if (op === diff.EQUAL) {
+<a id="l294" href="#l294">294</a>       if (text.length &gt;= MIN_RUN || isLocalNoise(ops, i)) {
+<a id="l295" href="#l295">295</a>         for (let k = 0; k &lt; text.length; k++) {
+<a id="l296" href="#l296">296</a>           cue.push(a + k);
+<a id="l297" href="#l297">297</a>           token.push(page.tokenOf[b + k]!);
+<a id="l298" href="#l298">298</a>         }
+<a id="l299" href="#l299">299</a>       }
+<a id="l300" href="#l300">300</a>       a += text.length;
+<a id="l301" href="#l301">301</a>       b += text.length;
+<a id="l302" href="#l302">302</a>     } else if (op === diff.DELETE) {
+<a id="l303" href="#l303">303</a>       a += text.length;
+<a id="l304" href="#l304">304</a>     } else {
+<a id="l305" href="#l305">305</a>       b += text.length;
+<a id="l306" href="#l306">306</a>     }
+<a id="l307" href="#l307">307</a>   });
+<a id="l308" href="#l308">308</a>   return { cue: Int32Array.from(cue), token: Int32Array.from(token) };
+<a id="l309" href="#l309">309</a> }
+<a id="l310" href="#l310">310</a> 
+<a id="l311" href="#l311">311</a> /**
+<a id="l312" href="#l312">312</a>  * True when the equal run at ops[i] sits between short edits, such as one
+<a id="l313" href="#l313">313</a>  * substituted or one dropped character. A short equal run inside a long
+<a id="l314" href="#l314">314</a>  * insert or delete is a chance match and does not count.
+<a id="l315" href="#l315">315</a>  */
+<a id="l316" href="#l316">316</a> function isLocalNoise(ops: readonly diff.Diff[], i: number): boolean {
+<a id="l317" href="#l317">317</a>   let before = 0;
+<a id="l318" href="#l318">318</a>   for (let k = i - 1; k &gt;= 0 &amp;&amp; ops[k]![0] !== diff.EQUAL; k--) before += ops[k]![1].length;
+<a id="l319" href="#l319">319</a>   let after = 0;
+<a id="l320" href="#l320">320</a>   for (let k = i + 1; k &lt; ops.length &amp;&amp; ops[k]![0] !== diff.EQUAL; k++) after += ops[k]![1].length;
+<a id="l321" href="#l321">321</a>   return before &lt;= MAX_LOCAL_EDIT &amp;&amp; after &lt;= MAX_LOCAL_EDIT;
+<a id="l322" href="#l322">322</a> }
+<a id="l323" href="#l323">323</a> 
+<a id="l324" href="#l324">324</a> /**
+<a id="l325" href="#l325">325</a>  * The indices of a longest chain of `values` that rises strictly, in index
+<a id="l326" href="#l326">326</a>  * order. Patience sorting: O(n log n).
+<a id="l327" href="#l327">327</a>  */
+<a id="l328" href="#l328">328</a> export function risingChain(values: ArrayLike&lt;number&gt;): number[] {
+<a id="l329" href="#l329">329</a>   /** ends[k] is the index of the smallest last value of a rising chain of length k + 1. */
+<a id="l330" href="#l330">330</a>   const ends = new Int32Array(values.length);
+<a id="l331" href="#l331">331</a>   /** before[i] is the index before i in the chain that ends at i, or -1. */
+<a id="l332" href="#l332">332</a>   const before = new Int32Array(values.length);
+<a id="l333" href="#l333">333</a>   let length = 0;
+<a id="l334" href="#l334">334</a>   for (let i = 0; i &lt; values.length; i++) {
+<a id="l335" href="#l335">335</a>     const value = values[i]!;
+<a id="l336" href="#l336">336</a>     // Find the shortest chain whose last value is not below `value`. Most
+<a id="l337" href="#l337">337</a>     // values extend the longest chain, so try that first.
+<a id="l338" href="#l338">338</a>     let lo = length;
+<a id="l339" href="#l339">339</a>     if (length === 0 || values[ends[length - 1]!]! &gt;= value) {
+<a id="l340" href="#l340">340</a>       lo = 0;
+<a id="l341" href="#l341">341</a>       let hi = length;
+<a id="l342" href="#l342">342</a>       while (lo &lt; hi) {
+<a id="l343" href="#l343">343</a>         const mid = (lo + hi) &gt;&gt; 1;
+<a id="l344" href="#l344">344</a>         if (values[ends[mid]!]! &lt; value) lo = mid + 1;
+<a id="l345" href="#l345">345</a>         else hi = mid;
+<a id="l346" href="#l346">346</a>       }
+<a id="l347" href="#l347">347</a>     }
+<a id="l348" href="#l348">348</a>     before[i] = lo &gt; 0 ? ends[lo - 1]! : -1;
+<a id="l349" href="#l349">349</a>     ends[lo] = i;
+<a id="l350" href="#l350">350</a>     if (lo === length) length++;
+<a id="l351" href="#l351">351</a>   }
+<a id="l352" href="#l352">352</a>   const chain = new Array&lt;number&gt;(length);
+<a id="l353" href="#l353">353</a>   for (let k = length - 1, i = length &gt; 0 ? ends[length - 1]! : -1; k &gt;= 0; k--, i = before[i]!) {
+<a id="l354" href="#l354">354</a>     chain[k] = i;
+<a id="l355" href="#l355">355</a>   }
+<a id="l356" href="#l356">356</a>   return chain;
+<a id="l357" href="#l357">357</a> }
+<a id="l358" href="#l358">358</a> 
+<a id="l359" href="#l359">359</a> /**
+<a id="l360" href="#l360">360</a>  * The spans after `count` tokens go into the tokens at index `at`: each
+<a id="l361" href="#l361">361</a>  * matched span keeps its first and its last token. The reader reads the
+<a id="l362" href="#l362">362</a>  * pages after the current page first. A page before it then puts its tokens
+<a id="l363" href="#l363">363</a>  * in front of the tokens that the spans index, and without this shift the
+<a id="l364" href="#l364">364</a>  * spans point at other tokens until the next alignment. A span across `at`
+<a id="l365" href="#l365">365</a>  * also holds the new tokens. An unmatched span stays as it is.
+<a id="l366" href="#l366">366</a>  */
+<a id="l367" href="#l367">367</a> export function shiftSpans(spans: readonly TokenSpan[], at: number, count: number): TokenSpan[] {
+<a id="l368" href="#l368">368</a>   return spans.map((span) =&gt;
+<a id="l369" href="#l369">369</a>     span.matched
+<a id="l370" href="#l370">370</a>       ? {
+<a id="l371" href="#l371">371</a>           start: span.start &lt; at ? span.start : span.start + count,
+<a id="l372" href="#l372">372</a>           end: span.end &lt;= at ? span.end : span.end + count,
+<a id="l373" href="#l373">373</a>           matched: true,
+<a id="l374" href="#l374">374</a>         }
+<a id="l375" href="#l375">375</a>       : span,
+<a id="l376" href="#l376">376</a>   );
+<a id="l377" href="#l377">377</a> }
+<a id="l378" href="#l378">378</a> 
+<a id="l379" href="#l379">379</a> /**
+<a id="l380" href="#l380">380</a>  * Align cues to tokens in one call. The tokens must be in page order, the
+<a id="l381" href="#l381">381</a>  * order that the reader keeps them in. The spans index `tokens`.
+<a id="l382" href="#l382">382</a>  */
+<a id="l383" href="#l383">383</a> export function alignCuesToTokens(
+<a id="l384" href="#l384">384</a>   cueTexts: readonly string[],
+<a id="l385" href="#l385">385</a>   tokens: readonly Pick&lt;OcrToken, &#x27;text&#x27; | &#x27;page&#x27;&gt;[],
+<a id="l386" href="#l386">386</a> ): TokenSpan[] {
+<a id="l387" href="#l387">387</a>   const pages: Pick&lt;OcrToken, &#x27;text&#x27; | &#x27;page&#x27;&gt;[][] = [];
+<a id="l388" href="#l388">388</a>   tokens.forEach((t, i) =&gt; {
+<a id="l389" href="#l389">389</a>     if (i &gt; 0 &amp;&amp; t.page &lt; tokens[i - 1]!.page) {
+<a id="l390" href="#l390">390</a>       throw new Error(&#x27;alignCuesToTokens: the tokens are not in page order.&#x27;);
+<a id="l391" href="#l391">391</a>     }
+<a id="l392" href="#l392">392</a>     (pages[t.page] ??= []).push(t);
+<a id="l393" href="#l393">393</a>   });
+<a id="l394" href="#l394">394</a>   return createAligner(cueTexts).spans(pages);
+<a id="l395" href="#l395">395</a> }</pre>
+</div></body></html>

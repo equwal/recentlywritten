@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subplz-web/tools/copy_database.py - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>subplz-web</h1><span class="desc"></span><p class="url">git clone https://github.com/equwal/subplz-web</p><p><a href="../../../subplz-web/index.html">Log</a> | <a href="../../../subplz-web/files.html">Files</a> | <a href="../../../subplz-web/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tools/copy_database.py (2723 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> &quot;&quot;&quot;Copy every row of the app database to another database.
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> The web server needs this once, when it turns on burst workers: the workers
+<a id="l4" href="#l4">4</a> share a Postgres database with it, and until then the data is in SQLite (see
+<a id="l5" href="#l5">5</a> infra/burst/README.md).
+<a id="l6" href="#l6">6</a> 
+<a id="l7" href="#l7">7</a>     python -m tools.copy_database sqlite:////opt/subplz-web/data/subplz.db \\
+<a id="l8" href="#l8">8</a>         &quot;postgresql+psycopg://user:password@host:port/db?sslmode=require&quot;
+<a id="l9" href="#l9">9</a> 
+<a id="l10" href="#l10">10</a> The target gets the tables of the app models first. The copy refuses a target
+<a id="l11" href="#l11">11</a> that has rows already, so it never mixes two databases.
+<a id="l12" href="#l12">12</a> &quot;&quot;&quot;
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> from __future__ import annotations
+<a id="l15" href="#l15">15</a> 
+<a id="l16" href="#l16">16</a> import sys
+<a id="l17" href="#l17">17</a> from datetime import datetime, timezone
+<a id="l18" href="#l18">18</a> 
+<a id="l19" href="#l19">19</a> from sqlalchemy import DateTime, create_engine, func, insert, select
+<a id="l20" href="#l20">20</a> 
+<a id="l21" href="#l21">21</a> # The runbook runs this tool in a new interpreter. There, Base.metadata holds
+<a id="l22" href="#l22">22</a> # only the tables of the modules that Python imported. backend.main imports
+<a id="l23" href="#l23">23</a> # every model module, as the app does, so the copy gets every table.
+<a id="l24" href="#l24">24</a> import backend.main  # noqa: F401
+<a id="l25" href="#l25">25</a> from backend.db import Base
+<a id="l26" href="#l26">26</a> 
+<a id="l27" href="#l27">27</a> BATCH = 1000
+<a id="l28" href="#l28">28</a> 
+<a id="l29" href="#l29">29</a> 
+<a id="l30" href="#l30">30</a> def _as_utc(table, row: dict) -&gt; dict:
+<a id="l31" href="#l31">31</a>     &quot;&quot;&quot;SQLite keeps no time zone. The app writes UTC, so say so for Postgres.&quot;&quot;&quot;
+<a id="l32" href="#l32">32</a>     for column in table.columns:
+<a id="l33" href="#l33">33</a>         value = row.get(column.name)
+<a id="l34" href="#l34">34</a>         if (isinstance(column.type, DateTime) and column.type.timezone
+<a id="l35" href="#l35">35</a>                 and isinstance(value, datetime) and value.tzinfo is None):
+<a id="l36" href="#l36">36</a>             row[column.name] = value.replace(tzinfo=timezone.utc)
+<a id="l37" href="#l37">37</a>     return row
+<a id="l38" href="#l38">38</a> 
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a> def copy_database(source_url: str, target_url: str) -&gt; dict[str, int]:
+<a id="l41" href="#l41">41</a>     &quot;&quot;&quot;Copy each table of the app from `source_url` to `target_url`.
+<a id="l42" href="#l42">42</a> 
+<a id="l43" href="#l43">43</a>     Returns the number of rows copied for each table.
+<a id="l44" href="#l44">44</a>     &quot;&quot;&quot;
+<a id="l45" href="#l45">45</a>     source = create_engine(source_url)
+<a id="l46" href="#l46">46</a>     target = create_engine(target_url)
+<a id="l47" href="#l47">47</a>     Base.metadata.create_all(target)
+<a id="l48" href="#l48">48</a>     counts: dict[str, int] = {}
+<a id="l49" href="#l49">49</a>     with source.connect() as src, target.begin() as dst:
+<a id="l50" href="#l50">50</a>         for table in Base.metadata.sorted_tables:
+<a id="l51" href="#l51">51</a>             if dst.execute(select(func.count()).select_from(table)).scalar():
+<a id="l52" href="#l52">52</a>                 raise RuntimeError(f&quot;table {table.name} has rows in the target already&quot;)
+<a id="l53" href="#l53">53</a>         # sorted_tables puts each table after the tables that it refers to.
+<a id="l54" href="#l54">54</a>         for table in Base.metadata.sorted_tables:
+<a id="l55" href="#l55">55</a>             rows = [_as_utc(table, dict(r._mapping)) for r in src.execute(select(table))]
+<a id="l56" href="#l56">56</a>             for start in range(0, len(rows), BATCH):
+<a id="l57" href="#l57">57</a>                 dst.execute(insert(table), rows[start:start + BATCH])
+<a id="l58" href="#l58">58</a>             counts[table.name] = len(rows)
+<a id="l59" href="#l59">59</a>     return counts
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> 
+<a id="l62" href="#l62">62</a> def main(argv: list[str]) -&gt; int:
+<a id="l63" href="#l63">63</a>     if len(argv) != 2:
+<a id="l64" href="#l64">64</a>         print(__doc__, file=sys.stderr)
+<a id="l65" href="#l65">65</a>         return 2
+<a id="l66" href="#l66">66</a>     for table, count in copy_database(argv[0], argv[1]).items():
+<a id="l67" href="#l67">67</a>         print(f&quot;{table}: {count}&quot;)
+<a id="l68" href="#l68">68</a>     return 0
+<a id="l69" href="#l69">69</a> 
+<a id="l70" href="#l70">70</a> 
+<a id="l71" href="#l71">71</a> if __name__ == &quot;__main__&quot;:
+<a id="l72" href="#l72">72</a>     sys.exit(main(sys.argv[1:]))</pre>
+</div></body></html>

@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dsl-agent 4922280d - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>dsl-agent</h1><span class="desc">Claude Code plugin: an agent that speaks only DSL, and the MCP server that stores and runs the DSLs</span><p class="url">git clone https://github.com/equwal/dsl-agent</p><p><a href="../../dsl-agent/index.html">Log</a> | <a href="../../dsl-agent/files.html">Files</a> | <a href="../../dsl-agent/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 4922280d897ed2859679b4db892ade7a03f6bc6b
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-10-04 03:56:52 -0700
+
+Add the dsl plugin: a DSL-only agent and its MCP server
+
+The agent reads sloppy DSL pseudocode, writes a PEG grammar and an interpreter, runs the program, and replies only in code blocks. It prefers Common Lisp as the host language.
+
+The MCP server stores each DSL in $DSL_HOME and pipes programs to its interpreter. $DSL_HOME/runtimes.json overrides the interpreter command for each machine.
+
+</pre><pre> .claude-plugin/marketplace.json |  12 ++++
+ .claude-plugin/plugin.json      |   6 ++
+ .gitignore                      |  14 ++++
+ .mcp.json                       |   8 +++
+ agents/dsl.md                   |  84 ++++++++++++++++++++++++
+ server.py                       | 139 ++++++++++++++++++++++++++++++++++++++++
+ test_server.py                  | 105 ++++++++++++++++++++++++++++++
+ 7 files changed, 368 insertions(+)
+</pre><pre>diff --git a/.claude-plugin/marketplace.json b/.claude-plugin/marketplace.json
+new file mode 100644
+index 0000000..96bfbf0
+--- /dev/null
++++ b/.claude-plugin/marketplace.json
+<span class="h">@@ -0,0 +1,12 @@</span>
+<span class="a">+{</span>
+<span class="a">+  &quot;name&quot;: &quot;dsl-agent&quot;,</span>
+<span class="a">+  &quot;description&quot;: &quot;One plugin: an agent that speaks only DSL, and the MCP server that stores and runs the DSLs.&quot;,</span>
+<span class="a">+  &quot;owner&quot;: { &quot;name&quot;: &quot;equwal&quot; },</span>
+<span class="a">+  &quot;plugins&quot;: [</span>
+<span class="a">+    {</span>
+<span class="a">+      &quot;name&quot;: &quot;dsl&quot;,</span>
+<span class="a">+      &quot;source&quot;: &quot;./&quot;,</span>
+<span class="a">+      &quot;description&quot;: &quot;Talk to Claude in DSLs. It turns your pseudocode into a grammar, writes an interpreter in the best-fit language, runs your program, and answers in code.&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+  ]</span>
+<span class="a">+}</span>
+diff --git a/.claude-plugin/plugin.json b/.claude-plugin/plugin.json
+new file mode 100644
+index 0000000..3966056
+--- /dev/null
++++ b/.claude-plugin/plugin.json
+<span class="h">@@ -0,0 +1,6 @@</span>
+<span class="a">+{</span>
+<span class="a">+  &quot;name&quot;: &quot;dsl&quot;,</span>
+<span class="a">+  &quot;version&quot;: &quot;0.1.0&quot;,</span>
+<span class="a">+  &quot;description&quot;: &quot;Talk to Claude in DSLs. It turns your pseudocode into a grammar, writes an interpreter in the best-fit language, runs your program, and answers in code.&quot;,</span>
+<span class="a">+  &quot;author&quot;: { &quot;name&quot;: &quot;equwal&quot; }</span>
+<span class="a">+}</span>
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..a33a5de
+--- /dev/null
++++ b/.gitignore
+<span class="h">@@ -0,0 +1,14 @@</span>
+<span class="a">+.env</span>
+<span class="a">+auth.json</span>
+<span class="a">+.credentials.json</span>
+<span class="a">+*.token</span>
+<span class="a">+*.db</span>
+<span class="a">+*.sqlite</span>
+<span class="a">+*.log</span>
+<span class="a">+*_history</span>
+<span class="a">+__pycache__/</span>
+<span class="a">+.venv/</span>
+<span class="a">+.hypothesis/</span>
+<span class="a">+.mypy_cache/</span>
+<span class="a">+.pytest_cache/</span>
+<span class="a">+.ruff_cache/</span>
+diff --git a/.mcp.json b/.mcp.json
+new file mode 100644
+index 0000000..a0dceb8
+--- /dev/null
++++ b/.mcp.json
+<span class="h">@@ -0,0 +1,8 @@</span>
+<span class="a">+{</span>
+<span class="a">+  &quot;mcpServers&quot;: {</span>
+<span class="a">+    &quot;dsl&quot;: {</span>
+<span class="a">+      &quot;command&quot;: &quot;uv&quot;,</span>
+<span class="a">+      &quot;args&quot;: [&quot;run&quot;, &quot;--script&quot;, &quot;${CLAUDE_PLUGIN_ROOT}/server.py&quot;]</span>
+<span class="a">+    }</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+diff --git a/agents/dsl.md b/agents/dsl.md
+new file mode 100644
+index 0000000..4c12cac
+--- /dev/null
++++ b/agents/dsl.md
+<span class="h">@@ -0,0 +1,84 @@</span>
+<span class="a">+---</span>
+<span class="a">+name: dsl</span>
+<span class="a">+description: Speaks only DSL. Reads sloppy DSL pseudocode, makes it a proper DSL with a grammar, writes the interpreter in the best-fit language, runs the program, and answers in code blocks.</span>
+<span class="a">+---</span>
+<span class="a">+</span>
+<span class="a">+```lisp</span>
+<span class="a">+(define-agent dsl</span>
+<span class="a">+</span>
+<span class="a">+  (invariant</span>
+<span class="a">+    (every user-message (is program))        ; any notation, sloppy, partial. never chat</span>
+<span class="a">+    (every reply (only fenced-code))         ; no prose: not before, between, after, or inside</span>
+<span class="a">+    (every dsl (has grammar interpreter))    ; stored with the tools below</span>
+<span class="a">+    (every output (from (run name program)))) ; show what ran, never what you expect</span>
+<span class="a">+</span>
+<span class="a">+  (tools                                     ; mcp server &quot;dsl&quot;</span>
+<span class="a">+    (runtimes)                               ; ext -&gt; interpreter installed?</span>
+<span class="a">+    (ls)                                     ; name -&gt; ext</span>
+<span class="a">+    (get name)                               ; grammar ext source</span>
+<span class="a">+    (put name grammar ext source)            ; store or replace</span>
+<span class="a">+    (run name program))                      ; stdout stderr exit</span>
+<span class="a">+</span>
+<span class="a">+  (on user-message</span>
+<span class="a">+    (let* ((known   (ls))</span>
+<span class="a">+           (dsl     (or (reuse  (same-notation message known))   ; (get name)</span>
+<span class="a">+                        (extend (near-notation message known))   ; grow grammar + source,</span>
+<span class="a">+                                                                 ; old programs stay valid</span>
+<span class="a">+                        (design message)))</span>
+<span class="a">+           (program (normalize message (grammar dsl))))</span>
+<span class="a">+      (when (or (new dsl) (changed dsl)) (put dsl))</span>
+<span class="a">+      (repeat 3 :until (= 0 (exit result))</span>
+<span class="a">+        (setf result (run (name dsl) program))</span>
+<span class="a">+        (unless (= 0 (exit result))</span>
+<span class="a">+          (repair (or (source dsl) program))</span>
+<span class="a">+          (put dsl)))</span>
+<span class="a">+      (reply dsl program result)))</span>
+<span class="a">+</span>
+<span class="a">+  (design</span>
+<span class="a">+    (name    slug by-domain short)           ; flow, calc, rules</span>
+<span class="a">+    (grammar peg complete minimal)           ; the message + its obvious siblings</span>
+<span class="a">+    (ext     (host task))</span>
+<span class="a">+    (source  (stdin program) (stdout result)</span>
+<span class="a">+             (bad-program -&gt; stderr message, exit nonzero)</span>
+<span class="a">+             (needs only the runtime)))</span>
+<span class="a">+</span>
+<span class="a">+  (host                                      ; only where (runtimes) is true</span>
+<span class="a">+    (prefer lisp)                            ; common lisp, unless another host</span>
+<span class="a">+                                             ; fits clearly better</span>
+<span class="a">+    (lisp macros symbols code-as-data evaluators trees general)</span>
+<span class="a">+    (awk  lines records fields tables reports)</span>
+<span class="a">+    (sh   files processes pipes commands)</span>
+<span class="a">+    (scm  s-expressions rewriting continuations)</span>
+<span class="a">+    (hs   typed-ast parsers invariants)</span>
+<span class="a">+    (clj  maps sequences edn json)</span>
+<span class="a">+    (_    any other ext of (runtimes) that fits clearly better))</span>
+<span class="a">+</span>
+<span class="a">+  (normalize</span>
+<span class="a">+    (keep intent order names literals)</span>
+<span class="a">+    (fix  spelling case delimiters arity defaults)</span>
+<span class="a">+    (never invent data paths effects))</span>
+<span class="a">+</span>
+<span class="a">+  (effects                                   ; steps no interpreter can do: judgment,</span>
+<span class="a">+                                             ; code edits, search</span>
+<span class="a">+    (interpreter (prints &quot;! &lt;step&gt;&quot; per step))</span>
+<span class="a">+    (agent (does each &quot;!&quot; step with its own tools)</span>
+<span class="a">+           (reports the result as dsl data in the output block)))</span>
+<span class="a">+</span>
+<span class="a">+  (reply</span>
+<span class="a">+    (when (or (new dsl) (changed dsl)) (block &quot;peg&quot; grammar))</span>
+<span class="a">+    (block (name dsl) program)               ; info string = dsl name</span>
+<span class="a">+    (block &quot;&quot; stdout)                        ; verbatim</span>
+<span class="a">+    (unless (= 0 (exit result)) (block &quot;stderr&quot; stderr)))</span>
+<span class="a">+</span>
+<span class="a">+  (ask                                       ; only when two readings give two results</span>
+<span class="a">+    (block &quot;?&quot; (numbered candidate-programs))) ; user answers with the number</span>
+<span class="a">+</span>
+<span class="a">+  (example</span>
+<span class="a">+    (user &quot;sales.csv &gt; group region &gt; sum amount &gt; top 2&quot;)</span>
+<span class="a">+    (reply</span>
+<span class="a">+      (block &quot;peg&quot;  &quot;pipeline &lt;- &#x27;read&#x27; path (&#x27;|&#x27; stage)*</span>
+<span class="a">+stage    &lt;- &#x27;group&#x27; field / &#x27;sum&#x27; field / &#x27;top&#x27; int&quot;)</span>
+<span class="a">+      (block &quot;flow&quot; &quot;read sales.csv | group region | sum amount | top 2&quot;)</span>
+<span class="a">+      (block &quot;&quot;     &quot;west 4100</span>
+<span class="a">+north 3900&quot;))))</span>
+<span class="a">+```</span>
+diff --git a/server.py b/server.py
+new file mode 100644
+index 0000000..6645b5c
+--- /dev/null
++++ b/server.py
+<span class="h">@@ -0,0 +1,139 @@</span>
+<span class="a">+# /// script</span>
+<span class="a">+# requires-python = &quot;&gt;=3.10&quot;</span>
+<span class="a">+# dependencies = [&quot;mcp&gt;=2,&lt;3&quot;]</span>
+<span class="a">+# ///</span>
+<span class="a">+&quot;&quot;&quot;MCP server: a registry of DSLs.</span>
+<span class="a">+</span>
+<span class="a">+Each DSL is a folder in $DSL_HOME (default ~/.dsl) that holds a grammar and</span>
+<span class="a">+one interpreter file, impl.&lt;ext&gt;. `run` pipes a program to that interpreter.</span>
+<span class="a">+&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+import json</span>
+<span class="a">+import os</span>
+<span class="a">+import re</span>
+<span class="a">+import shutil</span>
+<span class="a">+import subprocess</span>
+<span class="a">+import sys</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+</span>
+<span class="a">+from mcp.server.mcpserver import MCPServer</span>
+<span class="a">+</span>
+<span class="a">+mcp = MCPServer(&quot;dsl&quot;)</span>
+<span class="a">+</span>
+<span class="a">+NAME = re.compile(r&quot;[a-z0-9][a-z0-9_-]{0,63}&quot;)</span>
+<span class="a">+LIMIT = 100_000  # characters of stdout, and of stderr, that `run` returns</span>
+<span class="a">+</span>
+<span class="a">+# Interpreter argv for each impl extension. `run` appends the impl path.</span>
+<span class="a">+RUNTIMES: dict[str, list[str]] = {</span>
+<span class="a">+    &quot;awk&quot;: [&quot;awk&quot;, &quot;-f&quot;],</span>
+<span class="a">+    &quot;sh&quot;: [&quot;sh&quot;],</span>
+<span class="a">+    &quot;lisp&quot;: [&quot;sbcl&quot;, &quot;--script&quot;],</span>
+<span class="a">+    &quot;scm&quot;: [&quot;guile&quot;, &quot;--no-auto-compile&quot;, &quot;-s&quot;],</span>
+<span class="a">+    &quot;hs&quot;: [&quot;runghc&quot;],</span>
+<span class="a">+    &quot;clj&quot;: [&quot;bb&quot;],</span>
+<span class="a">+    &quot;js&quot;: [&quot;node&quot;],</span>
+<span class="a">+    &quot;py&quot;: [sys.executable],</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def home() -&gt; Path:</span>
+<span class="a">+    return Path(os.environ.get(&quot;DSL_HOME&quot;) or Path.home() / &quot;.dsl&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def table() -&gt; dict[str, list[str]]:</span>
+<span class="a">+    &quot;&quot;&quot;RUNTIMES, plus the entries of $DSL_HOME/runtimes.json when it exists.&quot;&quot;&quot;</span>
+<span class="a">+    override = home() / &quot;runtimes.json&quot;</span>
+<span class="a">+    extra: dict[str, list[str]] = (</span>
+<span class="a">+        json.loads(override.read_bytes()) if override.exists() else {}</span>
+<span class="a">+    )</span>
+<span class="a">+    return RUNTIMES | extra</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def folder(name: str) -&gt; Path:</span>
+<span class="a">+    # The name becomes a path segment, so reject anything that can leave home().</span>
+<span class="a">+    if not NAME.fullmatch(name):</span>
+<span class="a">+        raise ValueError(f&quot;name must match {NAME.pattern}&quot;)</span>
+<span class="a">+    return home() / name</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def impl(name: str) -&gt; Path:</span>
+<span class="a">+    found = sorted(folder(name).glob(&quot;impl.*&quot;))</span>
+<span class="a">+    if not found:</span>
+<span class="a">+        raise ValueError(f&quot;no DSL named {name}&quot;)</span>
+<span class="a">+    return found[0]</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@mcp.tool()</span>
+<span class="a">+def runtimes() -&gt; dict[str, bool]:</span>
+<span class="a">+    &quot;&quot;&quot;Map each impl extension to whether its interpreter is on PATH.&quot;&quot;&quot;</span>
+<span class="a">+    return {ext: shutil.which(argv[0]) is not None for ext, argv in table().items()}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@mcp.tool()</span>
+<span class="a">+def ls() -&gt; dict[str, str]:</span>
+<span class="a">+    &quot;&quot;&quot;Map each stored DSL name to the extension of its interpreter.&quot;&quot;&quot;</span>
+<span class="a">+    return {f.parent.name: f.suffix[1:] for f in sorted(home().glob(&quot;*/impl.*&quot;))}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@mcp.tool()</span>
+<span class="a">+def get(name: str) -&gt; dict[str, str]:</span>
+<span class="a">+    &quot;&quot;&quot;Return the grammar, the extension and the interpreter source of a DSL.&quot;&quot;&quot;</span>
+<span class="a">+    f = impl(name)</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;grammar&quot;: (f.parent / &quot;grammar&quot;).read_bytes().decode(),</span>
+<span class="a">+        &quot;ext&quot;: f.suffix[1:],</span>
+<span class="a">+        &quot;source&quot;: f.read_bytes().decode(),</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@mcp.tool()</span>
+<span class="a">+def put(name: str, grammar: str, ext: str, source: str) -&gt; str:</span>
+<span class="a">+    &quot;&quot;&quot;Store or replace a DSL.</span>
+<span class="a">+</span>
+<span class="a">+    `source` is the interpreter, in the language of `ext` (a key of `runtimes`).</span>
+<span class="a">+    It reads a program on stdin, writes the result to stdout, and exits non-zero</span>
+<span class="a">+    with a message on stderr for a bad program.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    if ext not in table():</span>
+<span class="a">+        raise ValueError(f&quot;ext must be one of {sorted(table())}&quot;)</span>
+<span class="a">+    d = folder(name)</span>
+<span class="a">+    d.mkdir(parents=True, exist_ok=True)</span>
+<span class="a">+    new = d / f&quot;impl.{ext}&quot;</span>
+<span class="a">+    (d / &quot;grammar&quot;).write_bytes(grammar.encode())</span>
+<span class="a">+    new.write_bytes(source.encode())</span>
+<span class="a">+    for old in d.glob(&quot;impl.*&quot;):</span>
+<span class="a">+        if old != new:</span>
+<span class="a">+            old.unlink()</span>
+<span class="a">+    return f&quot;{name}.{ext}&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@mcp.tool()</span>
+<span class="a">+def run(name: str, program: str, timeout: float = 10) -&gt; dict[str, str | int]:</span>
+<span class="a">+    &quot;&quot;&quot;Run a program through the interpreter of a DSL.</span>
+<span class="a">+</span>
+<span class="a">+    The interpreter starts in the working directory of the server.</span>
+<span class="a">+    Return stdout, stderr and the exit code.</span>
+<span class="a">+    &quot;&quot;&quot;</span>
+<span class="a">+    f = impl(name)</span>
+<span class="a">+    argv = table()[f.suffix[1:]]</span>
+<span class="a">+    exe = shutil.which(argv[0])</span>
+<span class="a">+    if exe is None:</span>
+<span class="a">+        raise ValueError(f&quot;{argv[0]} is not on PATH&quot;)</span>
+<span class="a">+    # ponytail: captures all output in memory, then cuts it to LIMIT.</span>
+<span class="a">+    # Read through a capped pipe if a DSL can flood stdout within the timeout.</span>
+<span class="a">+    done = subprocess.run(</span>
+<span class="a">+        [exe, *argv[1:], str(f)],</span>
+<span class="a">+        input=program.encode(),</span>
+<span class="a">+        capture_output=True,</span>
+<span class="a">+        timeout=timeout,</span>
+<span class="a">+        check=False,</span>
+<span class="a">+    )</span>
+<span class="a">+    return {</span>
+<span class="a">+        &quot;stdout&quot;: done.stdout.decode(errors=&quot;replace&quot;)[:LIMIT],</span>
+<span class="a">+        &quot;stderr&quot;: done.stderr.decode(errors=&quot;replace&quot;)[:LIMIT],</span>
+<span class="a">+        &quot;exit&quot;: done.returncode,</span>
+<span class="a">+    }</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &quot;__main__&quot;:</span>
+<span class="a">+    mcp.run()</span>
+diff --git a/test_server.py b/test_server.py
+new file mode 100644
+index 0000000..c4806f8
+--- /dev/null
++++ b/test_server.py
+<span class="h">@@ -0,0 +1,105 @@</span>
+<span class="a">+&quot;&quot;&quot;Checks for server.py: a round trip, name validation, and one run over stdio.&quot;&quot;&quot;</span>
+<span class="a">+</span>
+<span class="a">+import asyncio</span>
+<span class="a">+import json</span>
+<span class="a">+import os</span>
+<span class="a">+import sys</span>
+<span class="a">+from collections.abc import Iterator</span>
+<span class="a">+from pathlib import Path</span>
+<span class="a">+from typing import Any</span>
+<span class="a">+</span>
+<span class="a">+import pytest</span>
+<span class="a">+from hypothesis import example, given</span>
+<span class="a">+from hypothesis import strategies as st</span>
+<span class="a">+from mcp import ClientSession, StdioServerParameters</span>
+<span class="a">+from mcp.client.stdio import stdio_client</span>
+<span class="a">+</span>
+<span class="a">+import server</span>
+<span class="a">+</span>
+<span class="a">+SERVER = str(Path(__file__).with_name(&quot;server.py&quot;))</span>
+<span class="a">+UPPER = &quot;import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read().upper())\n&quot;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+# One interpreter per extension. Each copies its program to stdout.</span>
+<span class="a">+ECHO = {</span>
+<span class="a">+    &quot;awk&quot;: &quot;{ print }\n&quot;,</span>
+<span class="a">+    &quot;sh&quot;: &quot;cat\n&quot;,</span>
+<span class="a">+    &quot;lisp&quot;: &quot;(loop for line = (read-line nil nil) while line do (write-line line))\n&quot;,</span>
+<span class="a">+    &quot;scm&quot;: &quot;(use-modules (ice-9 rdelim))\n&quot;</span>
+<span class="a">+    &quot;(let loop ((line (read-line)))\n&quot;</span>
+<span class="a">+    &quot;  (unless (eof-object? line) (write-line line) (loop (read-line))))\n&quot;,</span>
+<span class="a">+    &quot;hs&quot;: &quot;main :: IO ()\nmain = interact id\n&quot;,</span>
+<span class="a">+    &quot;clj&quot;: &quot;(print (slurp *in*))\n(flush)\n&quot;,</span>
+<span class="a">+    &quot;js&quot;: &quot;process.stdin.pipe(process.stdout);\n&quot;,</span>
+<span class="a">+    &quot;py&quot;: &quot;import sys\nsys.stdout.write(sys.stdin.read())\n&quot;,</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.fixture(scope=&quot;module&quot;, autouse=True)</span>
+<span class="a">+def dsl_home(tmp_path_factory: pytest.TempPathFactory) -&gt; Iterator[None]:</span>
+<span class="a">+    home = tmp_path_factory.mktemp(&quot;dsl&quot;)</span>
+<span class="a">+    # Keep the overrides of this machine, so the runtime test checks them.</span>
+<span class="a">+    mine = server.home() / &quot;runtimes.json&quot;</span>
+<span class="a">+    table = json.loads(mine.read_bytes()) if mine.exists() else {}</span>
+<span class="a">+    # &quot;up&quot; exists only in this override, so a run with it proves the override loads.</span>
+<span class="a">+    (home / &quot;runtimes.json&quot;).write_text(json.dumps(table | {&quot;up&quot;: [sys.executable]}))</span>
+<span class="a">+    with pytest.MonkeyPatch.context() as patch:</span>
+<span class="a">+        patch.setenv(&quot;DSL_HOME&quot;, str(home))</span>
+<span class="a">+        yield</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@given(</span>
+<span class="a">+    grammar=st.text(),</span>
+<span class="a">+    ext=st.sampled_from(sorted(server.RUNTIMES)),</span>
+<span class="a">+    source=st.text(),</span>
+<span class="a">+)</span>
+<span class="a">+def test_put_then_get_returns_the_same_dsl(grammar: str, ext: str, source: str) -&gt; None:</span>
+<span class="a">+    server.put(&quot;t&quot;, grammar, ext, source)</span>
+<span class="a">+    assert server.get(&quot;t&quot;) == {&quot;grammar&quot;: grammar, &quot;ext&quot;: ext, &quot;source&quot;: source}</span>
+<span class="a">+    assert server.ls()[&quot;t&quot;] == ext</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@given(name=st.text().filter(lambda s: not server.NAME.fullmatch(s)))</span>
+<span class="a">+@example(&quot;../evil&quot;)</span>
+<span class="a">+@example(&quot;a/b&quot;)</span>
+<span class="a">+@example(&quot;&quot;)</span>
+<span class="a">+def test_put_rejects_a_name_that_is_not_a_slug(name: str) -&gt; None:</span>
+<span class="a">+    with pytest.raises(ValueError):</span>
+<span class="a">+        server.put(name, &quot;&quot;, &quot;py&quot;, &quot;&quot;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@pytest.mark.parametrize(&quot;ext&quot;, sorted(server.RUNTIMES))</span>
+<span class="a">+def test_each_installed_runtime_runs_an_interpreter(ext: str) -&gt; None:</span>
+<span class="a">+    if not server.runtimes()[ext]:</span>
+<span class="a">+        pytest.skip(f&quot;{server.table()[ext][0]} is not installed&quot;)</span>
+<span class="a">+    server.put(&quot;echo&quot;, &quot;program &lt;- .*&quot;, ext, ECHO[ext])</span>
+<span class="a">+    result = server.run(&quot;echo&quot;, &quot;a b\n&quot;, timeout=60)</span>
+<span class="a">+    assert (result[&quot;exit&quot;], str(result[&quot;stdout&quot;]).splitlines()) == (0, [&quot;a b&quot;]), result</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def test_put_and_run_over_stdio() -&gt; None:</span>
+<span class="a">+    async def call() -&gt; Any:</span>
+<span class="a">+        params = StdioServerParameters(</span>
+<span class="a">+            command=sys.executable, args=[SERVER], env=dict(os.environ)</span>
+<span class="a">+        )</span>
+<span class="a">+        async with (</span>
+<span class="a">+            stdio_client(params) as (read, write),</span>
+<span class="a">+            ClientSession(read, write) as session,</span>
+<span class="a">+        ):</span>
+<span class="a">+            await session.initialize()</span>
+<span class="a">+            tools = {tool.name for tool in (await session.list_tools()).tools}</span>
+<span class="a">+            assert tools == {&quot;runtimes&quot;, &quot;ls&quot;, &quot;get&quot;, &quot;put&quot;, &quot;run&quot;}</span>
+<span class="a">+            dsl = {</span>
+<span class="a">+                &quot;name&quot;: &quot;upper&quot;,</span>
+<span class="a">+                &quot;grammar&quot;: &quot;text &lt;- .*&quot;,</span>
+<span class="a">+                &quot;ext&quot;: &quot;up&quot;,</span>
+<span class="a">+                &quot;source&quot;: UPPER,</span>
+<span class="a">+            }</span>
+<span class="a">+            await session.call_tool(&quot;put&quot;, dsl)</span>
+<span class="a">+            result = await session.call_tool(</span>
+<span class="a">+                &quot;run&quot;, {&quot;name&quot;: &quot;upper&quot;, &quot;program&quot;: &quot;a b\n&quot;}</span>
+<span class="a">+            )</span>
+<span class="a">+            assert not result.is_error</span>
+<span class="a">+            return result.structured_content</span>
+<span class="a">+</span>
+<span class="a">+    assert asyncio.run(call()) == {&quot;stdout&quot;: &quot;A B\n&quot;, &quot;stderr&quot;: &quot;&quot;, &quot;exit&quot;: 0}</span></pre>
+</div></body></html>

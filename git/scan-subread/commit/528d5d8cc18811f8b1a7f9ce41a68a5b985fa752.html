@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 528d5d8c - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 528d5d8cc18811f8b1a7f9ce41a68a5b985fa752
+truex &lt;truex@equwal.com&gt;
+2026-09-26 18:33:40 -0700
+
+Open the last book at its page with its subtitles
+
+On the phone, Back, a force stop, or Android stopping the reader while
+the user was in the dictionary lost everything: after the relaunch the
+reader showed &quot;No PDF&quot; and no cues.
+
+- Each open keeps the PDF as the last book in IndexedDB. At start the
+  reader opens the last book at its page, with its subtitles, without a
+  picker. The start card shows only when there is no last book.
+- The page goes to the meta data of the book 1 s after it changes, and
+  at once when the page is hidden or another book opens.
+- Each subtitle file and each SubRead result goes to the meta data of
+  the open book.
+- Subtitles belong to a book. Another book loads its own subtitles, or
+  has none: the cue list, the mark, the .srt row and &quot;audio to page&quot;
+  clear. Subtitles that were loaded while no book was open stay, and
+  are kept for the book that opens next (subtitlesOnOpen).
+- A picked book shows its first page and starts the reading at once.
+  Its meta data applies when it comes. The first open after the upgrade
+  from the dictionary build waited about 30 s with no text. When the
+  database is not open after 2 s, the strip says &quot;Updating the page
+  cache...&quot; and the start card shows.
+- When the copy of the last book cannot be read or opened, the reader
+  forgets it and shows the start card.
+
+getSrt and putSrt are gone. clearLastBook and dbReady are new, with
+tests.
+
+</pre><pre> index.html                  |   2 +-
+ src/book-subtitles.ts       |  28 +++++
+ src/main.ts                 | 257 +++++++++++++++++++++++++++++++++++++++-----
+ src/messages.ts             |   6 ++
+ src/status.ts               |   6 +-
+ src/token-cache.ts          |  34 +++---
+ test/book-subtitles.test.ts |  28 ++++-
+ test/token-cache.test.ts    |  35 ++++--
+ 8 files changed, 337 insertions(+), 59 deletions(-)
+</pre><pre>diff --git a/index.html b/index.html
+index 45c4eaf..7aadff2 100644
+--- a/index.html
++++ b/index.html
+<span class="h">@@ -148,7 +148,7 @@</span>
+ 
+     &lt;main id=&quot;main&quot;&gt;
+       &lt;div id=&quot;viewer&quot;&gt;
+<span class="d">-        &lt;section id=&quot;empty&quot; class=&quot;card&quot;&gt;</span>
+<span class="a">+        &lt;section id=&quot;empty&quot; class=&quot;card&quot; hidden&gt;</span>
+           &lt;h2&gt;Scan Subread&lt;/h2&gt;
+           &lt;p&gt;
+             Read a PDF along with its audiobook. The page follows the narrator, and a tap on a word
+diff --git a/src/book-subtitles.ts b/src/book-subtitles.ts
+index 899bfff..906f12d 100644
+--- a/src/book-subtitles.ts
++++ b/src/book-subtitles.ts
+<span class="h">@@ -4,3 +4,31 @@</span>
+ export function srtName(bookName: string): string {
+   return `${bookName.replace(/\.pdf$/i, &#x27;&#x27;)}.srt`;
+ }
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * What happens to the loaded subtitles when a book opens:</span>
+<span class="a">+ *</span>
+<span class="a">+ * - `keep`: they stay, and they are saved for the book.</span>
+<span class="a">+ * - `load`: the saved subtitles of the book replace them.</span>
+<span class="a">+ * - `clear`: they go, and the book has no subtitles.</span>
+<span class="a">+ */</span>
+<span class="a">+export type OpenStep = &#x27;keep&#x27; | &#x27;load&#x27; | &#x27;clear&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * What happens to the loaded subtitles when the book `book` opens (see</span>
+<span class="a">+ * bookKey). `loaded` is the book of the loaded subtitles: null when they</span>
+<span class="a">+ * were loaded while no book was open, undefined when no subtitles are</span>
+<span class="a">+ * loaded. `saved` is true when the book has saved subtitles.</span>
+<span class="a">+ *</span>
+<span class="a">+ * Subtitles belong to a book. Subtitles that were loaded while no book was</span>
+<span class="a">+ * open are for the book that opens next, so they stay also when that book</span>
+<span class="a">+ * has saved subtitles.</span>
+<span class="a">+ */</span>
+<span class="a">+export function subtitlesOnOpen(</span>
+<span class="a">+  loaded: string | null | undefined,</span>
+<span class="a">+  book: string,</span>
+<span class="a">+  saved: boolean,</span>
+<span class="a">+): OpenStep {</span>
+<span class="a">+  if (loaded === null || loaded === book) return &#x27;keep&#x27;;</span>
+<span class="a">+  return saved ? &#x27;load&#x27; : &#x27;clear&#x27;;</span>
+<span class="a">+}</span>
+diff --git a/src/main.ts b/src/main.ts
+index 5809dfe..ea24bba 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -6,7 +6,7 @@</span>
+ // (the strip) and view.ts (the page).
+ 
+ import { createAligner, type Aligner, type OcrToken, type TokenSpan } from &#x27;./align&#x27;;
+<span class="d">-import { srtName } from &#x27;./book-subtitles&#x27;;</span>
+<span class="a">+import { srtName, subtitlesOnOpen } from &#x27;./book-subtitles&#x27;;</span>
+ import { bookText } from &#x27;./book-text&#x27;;
+ import { LocalAudioClock, OverlayClock, type ClockSource, type ClockState } from &#x27;./clock-source&#x27;;
+ import { audioPage, cueParts, cueProgress, pageStartTime, type CueParts } from &#x27;./cue-pages&#x27;;
+<span class="h">@@ -18,6 +18,7 @@ import {</span>
+   clockText,
+   EMPTY_FILE_TEXT,
+   errorMessage,
+<span class="a">+  LAST_BOOK_GONE_TEXT,</span>
+   matchedText,
+   noCuesText,
+   notReadText,
+<span class="h">@@ -26,6 +27,8 @@ import {</span>
+   pdfOpenText,
+   playerMessage,
+   readingText,
+<span class="a">+  UPDATING_CACHE_TEXT,</span>
+<span class="a">+  type Message,</span>
+ } from &#x27;./messages&#x27;;
+ import { setupNav } from &#x27;./nav&#x27;;
+ import type { Ocr } from &#x27;./ocr&#x27;;
+<span class="h">@@ -38,12 +41,17 @@ import { isAndroid, SubRead } from &#x27;./subread&#x27;;</span>
+ import { decodeSubtitles, lastCueAt, parseSubtitles, type Cue } from &#x27;./subtitles&#x27;;
+ import {
+   bookKey,
+<span class="a">+  clearLastBook,</span>
+   clearPages,
+<span class="a">+  dbReady,</span>
+<span class="a">+  getLastBook,</span>
+<span class="a">+  getMeta,</span>
+   getPage,
+<span class="d">-  getSrt,</span>
+   pageKey,
+<span class="a">+  putLastBook,</span>
+<span class="a">+  putMeta,</span>
+   putPage,
+<span class="d">-  putSrt,</span>
+<span class="a">+  type BookMeta,</span>
+   type BookSubtitles,
+   type PageEntry,
+ } from &#x27;./token-cache&#x27;;
+<span class="h">@@ -55,6 +63,12 @@ const OCR_WIDTH = 1600;</span>
+ /** Milliseconds to wait after a page is read before the cues are aligned again. */
+ const ALIGN_DEBOUNCE = 300;
+ 
+<span class="a">+/** Milliseconds after a page change before the page goes to the meta data of the book. */</span>
+<span class="a">+const PAGE_SAVE_MS = 1000;</span>
+<span class="a">+</span>
+<span class="a">+/** After this many milliseconds, the strip tells that the database upgrade holds the reading. */</span>
+<span class="a">+const SLOW_DB_MS = 2000;</span>
+<span class="a">+</span>
+ const SUBREAD_RELEASES = &#x27;https://github.com/equwal/subread-android/releases/latest&#x27;;
+ 
+ function el&lt;T extends HTMLElement&gt;(id: string): T {
+<span class="h">@@ -106,6 +120,8 @@ const ui = {</span>
+ const state = {
+   pdf: null as PdfDoc | null,
+   file: null as File | null,
+<span class="a">+  /** The key of the open book (see bookKey), or null. */</span>
+<span class="a">+  book: null as string | null,</span>
+   /** The tokens of each page that is read. Index = page. */
+   pages: [] as (PageEntry | undefined)[],
+   /** The tokens of the pages read so far, in page order. */
+<span class="h">@@ -126,6 +142,14 @@ const state = {</span>
+   alignTimer: null as ReturnType&lt;typeof setTimeout&gt; | null,
+   /** The subtitles that are loaded, or null. */
+   subtitles: null as BookSubtitles | null,
+<span class="a">+  /** The book of the loaded subtitles. Null when they were loaded while no book was open. */</span>
+<span class="a">+  subtitlesBook: null as string | null,</span>
+<span class="a">+  /** The count of subtitle loads. The meta data of a book does not replace later subtitles. */</span>
+<span class="a">+  subtitlesSeq: 0,</span>
+<span class="a">+  /** The last message of the reading of the pages, or null. */</span>
+<span class="a">+  reading: null as Message | string | null,</span>
+<span class="a">+  /** True while the database is not open after SLOW_DB_MS. */</span>
+<span class="a">+  dbSlow: false,</span>
+   /** True while the player waits for a dictionary lookup that this app paused. */
+   lookupPaused: false,
+   /** True while a page turn by the user holds the follow. */
+<span class="h">@@ -234,19 +258,32 @@ const opens = { tried: 0, shown: 0 };</span>
+ /**
+  * Opens `file` as the book. The book that is open stays until the new
+  * file loads: a file that is not a PDF, or is damaged, changes nothing.
+<span class="d">- * Gives true when the new book is open.</span>
+<span class="a">+ *</span>
+<span class="a">+ * `meta` is what the reader keeps for the book, when the caller has it:</span>
+<span class="a">+ * the book opens at its page. Else the meta data comes from IndexedDB</span>
+<span class="a">+ * after the open. The page shows and the reading starts at once, and the</span>
+<span class="a">+ * meta data applies when it comes: an upgrade of the database can hold</span>
+<span class="a">+ * IndexedDB for many seconds. Gives true when the new book is open.</span>
+  */
+<span class="d">-async function openBook(file: File): Promise&lt;boolean&gt; {</span>
+<span class="a">+async function openBook(file: File, meta?: BookMeta): Promise&lt;boolean&gt; {</span>
+   if (file.size === 0) {
+     say(EMPTY_FILE_TEXT);
+     return false;
+   }
+   const attempt = ++opens.tried;
+<span class="a">+  let bytes: ArrayBuffer;</span>
+<span class="a">+  try {</span>
+<span class="a">+    bytes = await file.arrayBuffer();</span>
+<span class="a">+  } catch (err) {</span>
+<span class="a">+    // The copy of the last book is gone, for example after the storage was cleared.</span>
+<span class="a">+    say(meta ? LAST_BOOK_GONE_TEXT : `Cannot read ${file.name}: ${String(err)}`);</span>
+<span class="a">+    return false;</span>
+<span class="a">+  }</span>
+   let pdf: PdfDoc;
+   try {
+     // pdf.js loads with the first PDF, so the start card shows sooner.
+     const { loadPdf } = await import(&#x27;./pdf&#x27;);
+<span class="d">-    pdf = await loadPdf(await file.arrayBuffer());</span>
+<span class="a">+    pdf = await loadPdf(bytes);</span>
+   } catch (err) {
+     say(pdfOpenText(err));
+     return false;
+<span class="h">@@ -257,9 +294,13 @@ async function openBook(file: File): Promise&lt;boolean&gt; {</span>
+     return false;
+   }
+   opens.shown = attempt;
+<span class="a">+  const key = bookKey(file);</span>
+<span class="a">+  // The page of the book before goes to its meta data now.</span>
+<span class="a">+  flushPageSave();</span>
+   const old = state.pdf;
+   state.pdf = pdf;
+   state.file = file;
+<span class="a">+  state.book = key;</span>
+   state.pages = [];
+   state.tokens = [];
+   state.spans = [];
+<span class="h">@@ -267,27 +308,149 @@ async function openBook(file: File): Promise&lt;boolean&gt; {</span>
+   state.activeCue = -1;
+   state.markedCue = -1;
+   state.held = false;
+<span class="a">+  // The subtitles of another book go at once. Subtitles that were loaded</span>
+<span class="a">+  // while no book was open wait for the meta data of this book.</span>
+<span class="a">+  if (state.subtitles &amp;&amp; state.subtitlesBook !== null &amp;&amp; state.subtitlesBook !== key) {</span>
+<span class="a">+    clearSubtitles();</span>
+<span class="a">+  }</span>
+<span class="a">+  const subtitlesSeq = state.subtitlesSeq;</span>
+   ui.makeSubs.disabled = false;
+   ui.empty.hidden = true;
+   ui.page.hidden = false;
+   if (state.clock) showPlayerStatus(state.clock);
+   say(pdfLoadedText(pdf.numPages));
+   // showPage sets the current page at once, so the reading starts there.
+<span class="d">-  void showPage(0);</span>
+<span class="a">+  void showPage(validPage(meta?.page, pdf.numPages) ?? 0);</span>
+   // readBook stops the reading of the old book before its document closes.
+   void readBook();
+   void old?.destroy();
+   showSrtRow();
+<span class="d">-  const saved = await getSrt(bookKey(file));</span>
+<span class="d">-  if (saved &amp;&amp; state.file === file) {</span>
+<span class="d">-    loadSubtitles(</span>
+<span class="d">-      { name: srtName(file.name), text: saved, source: &#x27;subread&#x27; },</span>
+<span class="d">-      &#x27;the last SubRead run&#x27;,</span>
+<span class="d">-    );</span>
+<span class="a">+  if (meta) {</span>
+<span class="a">+    applyMeta(meta, attempt, subtitlesSeq);</span>
+<span class="a">+  } else {</span>
+<span class="a">+    void putLastBook(file);</span>
+<span class="a">+    void getMeta(key).then((m) =&gt; applyMeta(m, attempt, subtitlesSeq));</span>
+   }
+   return true;
+ }
+ 
+<span class="a">+/** `page` when it is a page of a book of `pages` pages, else undefined. */</span>
+<span class="a">+function validPage(page: number | undefined, pages: number): number | undefined {</span>
+<span class="a">+  return page !== undefined &amp;&amp; Number.isInteger(page) &amp;&amp; page &gt;= 0 &amp;&amp; page &lt; pages</span>
+<span class="a">+    ? page</span>
+<span class="a">+    : undefined;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Applies the meta data of the book that open attempt `attempt` opened.</span>
+<span class="a">+ * `subtitlesSeq` is the count of subtitle loads at the open: subtitles</span>
+<span class="a">+ * that the user loaded after the open stay. The page applies only while</span>
+<span class="a">+ * the first page shows, so a page turn after the open stays.</span>
+<span class="a">+ */</span>
+<span class="a">+function applyMeta(meta: BookMeta, attempt: number, subtitlesSeq: number): void {</span>
+<span class="a">+  const key = state.book;</span>
+<span class="a">+  const pdf = state.pdf;</span>
+<span class="a">+  if (attempt !== opens.shown || key === null || !pdf) return;</span>
+<span class="a">+  const page = validPage(meta.page, pdf.numPages);</span>
+<span class="a">+  if (page !== undefined &amp;&amp; page !== state.currentPage &amp;&amp; state.currentPage === 0) {</span>
+<span class="a">+    void showPage(page);</span>
+<span class="a">+  }</span>
+<span class="a">+  if (state.subtitlesSeq !== subtitlesSeq) return;</span>
+<span class="a">+  const loaded = state.subtitles ? state.subtitlesBook : undefined;</span>
+<span class="a">+  switch (subtitlesOnOpen(loaded, key, meta.subtitles !== undefined)) {</span>
+<span class="a">+    case &#x27;keep&#x27;:</span>
+<span class="a">+      if (state.subtitles) {</span>
+<span class="a">+        state.subtitlesBook = key;</span>
+<span class="a">+        void putMeta(key, { subtitles: state.subtitles });</span>
+<span class="a">+      }</span>
+<span class="a">+      break;</span>
+<span class="a">+    case &#x27;load&#x27;:</span>
+<span class="a">+      if (meta.subtitles) loadSubtitles(meta.subtitles, { save: false });</span>
+<span class="a">+      break;</span>
+<span class="a">+    case &#x27;clear&#x27;:</span>
+<span class="a">+      clearSubtitles();</span>
+<span class="a">+      break;</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// --- The page of the book, in its meta data ---</span>
+<span class="a">+</span>
+<span class="a">+/** The page that goes to the meta data of its book after PAGE_SAVE_MS. */</span>
+<span class="a">+let pageSave: { book: string; page: number; timer: ReturnType&lt;typeof setTimeout&gt; } | null = null;</span>
+<span class="a">+</span>
+<span class="a">+/** Keeps the current page for the book, after PAGE_SAVE_MS without another page change. */</span>
+<span class="a">+function savePageSoon(): void {</span>
+<span class="a">+  const book = state.book;</span>
+<span class="a">+  if (book === null) return;</span>
+<span class="a">+  if (pageSave) clearTimeout(pageSave.timer);</span>
+<span class="a">+  pageSave = { book, page: state.currentPage, timer: setTimeout(flushPageSave, PAGE_SAVE_MS) };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Keeps the page that waits now. */</span>
+<span class="a">+function flushPageSave(): void {</span>
+<span class="a">+  const save = pageSave;</span>
+<span class="a">+  if (!save) return;</span>
+<span class="a">+  pageSave = null;</span>
+<span class="a">+  clearTimeout(save.timer);</span>
+<span class="a">+  void putMeta(save.book, { page: save.page });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+// A reload or a closed tab does not lose the last page turn.</span>
+<span class="a">+window.addEventListener(&#x27;pagehide&#x27;, flushPageSave);</span>
+<span class="a">+document.addEventListener(&#x27;visibilitychange&#x27;, () =&gt; {</span>
+<span class="a">+  if (document.hidden) flushPageSave();</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+// --- The last book ---</span>
+<span class="a">+</span>
+<span class="a">+/** Shows the start card, while no book is open. */</span>
+<span class="a">+function showStart(): void {</span>
+<span class="a">+  if (!state.pdf) ui.empty.hidden = false;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Opens the last book at its page, with its subtitles. Android stops the</span>
+<span class="a">+ * reader while the user is in the dictionary or in the player app, and a</span>
+<span class="a">+ * reload forgets the file that the user opened.</span>
+<span class="a">+ */</span>
+<span class="a">+async function restoreLastBook(): Promise&lt;void&gt; {</span>
+<span class="a">+  const file = await getLastBook();</span>
+<span class="a">+  // The user opened a book while the database was busy.</span>
+<span class="a">+  if (state.pdf) return;</span>
+<span class="a">+  if (!file) {</span>
+<span class="a">+    showStart();</span>
+<span class="a">+    return;</span>
+<span class="a">+  }</span>
+<span class="a">+  const meta = await getMeta(bookKey(file));</span>
+<span class="a">+  if (state.pdf) return;</span>
+<span class="a">+  if (await openBook(file, meta)) return;</span>
+<span class="a">+  // The copy cannot be read, or it is no PDF now: forget it.</span>
+<span class="a">+  await clearLastBook();</span>
+<span class="a">+  showStart();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The first open of the database after an upgrade can take many seconds.</span>
+<span class="a">+ * The strip tells so after SLOW_DB_MS, and the start card shows, so that</span>
+<span class="a">+ * the user can open a book.</span>
+<span class="a">+ */</span>
+<span class="a">+function watchDb(): void {</span>
+<span class="a">+  let open = false;</span>
+<span class="a">+  const timer = setTimeout(() =&gt; {</span>
+<span class="a">+    if (open) return;</span>
+<span class="a">+    state.dbSlow = true;</span>
+<span class="a">+    showReadingPart();</span>
+<span class="a">+    showStart();</span>
+<span class="a">+  }, SLOW_DB_MS);</span>
+<span class="a">+  void dbReady().then(() =&gt; {</span>
+<span class="a">+    open = true;</span>
+<span class="a">+    clearTimeout(timer);</span>
+<span class="a">+    if (!state.dbSlow) return;</span>
+<span class="a">+    state.dbSlow = false;</span>
+<span class="a">+    showReadingPart();</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** The tokens of one page: from the cache, else the text layer, else OCR. */
+ async function readPage(
+   pdf: PdfDoc,
+<span class="h">@@ -341,7 +504,7 @@ async function readBook(): Promise&lt;void&gt; {</span>
+   let page = -1;
+   const onOcrProgress = (p: number): void =&gt; {
+     if (seq === state.readSeq) {
+<span class="d">-      showReading(readingText(read(), total, `page ${page + 1}: OCR ${Math.round(p * 100)}%`));</span>
+<span class="a">+      setReading(readingText(read(), total, `page ${page + 1}: OCR ${Math.round(p * 100)}%`));</span>
+     }
+   };
+   // The OCR worker, and tesseract.js itself, load on the first page that needs them.
+<span class="h">@@ -355,7 +518,7 @@ async function readBook(): Promise&lt;void&gt; {</span>
+     while (pending.size &gt; 0) {
+       page = nextPage(pending, state.currentPage);
+       pending.delete(page);
+<span class="d">-      showReading(readingText(read(), total, `page ${page + 1}`));</span>
+<span class="a">+      setReading(readingText(read(), total, `page ${page + 1}`));</span>
+       const entry = await readPage(pdf, file, page, getOcr);
+       if (seq !== state.readSeq) return; // Another book or another setting took over.
+       counts[entry.source]++;
+<span class="h">@@ -364,7 +527,7 @@ async function readBook(): Promise&lt;void&gt; {</span>
+       const at = state.pages.slice(0, page).reduce((n, p) =&gt; n + (p?.tokens.length ?? 0), 0);
+       state.tokens.splice(at, 0, ...entry.tokens);
+       const how = entry.source === &#x27;text&#x27; ? &#x27;text layer&#x27; : &#x27;OCR&#x27;;
+<span class="d">-      showReading(readingText(read(), total, `page ${page + 1}: ${how}`));</span>
+<span class="a">+      setReading(readingText(read(), total, `page ${page + 1}: ${how}`));</span>
+       if (page === state.currentPage) view.mark();
+       scheduleAlign();
+     }
+<span class="h">@@ -377,10 +540,20 @@ async function readBook(): Promise&lt;void&gt; {</span>
+     if (seq === state.readSeq) say(`Cannot read the pages: ${String(err)}`);
+   } finally {
+     if (ocr.started) await (await ocr.started).terminate().catch(() =&gt; undefined);
+<span class="d">-    if (seq === state.readSeq) showReading(null);</span>
+<span class="a">+    if (seq === state.readSeq) setReading(null);</span>
+   }
+ }
+ 
+<span class="a">+/** Shows the reading part of the strip: the database notice, else the reading of the pages. */</span>
+<span class="a">+function showReadingPart(): void {</span>
+<span class="a">+  showReading(state.dbSlow ? UPDATING_CACHE_TEXT : state.reading);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+function setReading(m: Message | string | null): void {</span>
+<span class="a">+  state.reading = m;</span>
+<span class="a">+  showReadingPart();</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** True when every page of the book is read. */
+ function allPagesRead(): boolean {
+   const pdf = state.pdf;
+<span class="h">@@ -395,18 +568,25 @@ ui.clearCache.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+ // --- Subtitles ---
+ 
+ /**
+<span class="d">- * Loads subtitles from a file or from SubRead. `from` names where they</span>
+<span class="d">- * came from in the message. `cues` are the cues of the text, when the</span>
+<span class="d">- * caller parsed them already.</span>
+<span class="a">+ * Loads subtitles from a file, from SubRead or from the meta data of the</span>
+<span class="a">+ * book. They belong to the open book, or to the book that opens next.</span>
+<span class="a">+ *</span>
+<span class="a">+ * - `from` names where they came from in the message.</span>
+<span class="a">+ * - `cues` are the cues of the text, when the caller parsed them already.</span>
+<span class="a">+ * - `save` keeps them in the meta data of the open book. The default is</span>
+<span class="a">+ *   true: each file and each SubRead result is kept.</span>
+  */
+ function loadSubtitles(
+   subtitles: BookSubtitles,
+<span class="d">-  from = subtitles.name,</span>
+<span class="d">-  cues = parseSubtitles(subtitles.text),</span>
+<span class="a">+  opts: { from?: string; cues?: Cue[]; save?: boolean } = {},</span>
+ ): void {
+<span class="a">+  const cues = opts.cues ?? parseSubtitles(subtitles.text);</span>
+   state.cues = cues;
+   state.aligner = createAligner(cues.map((c) =&gt; c.text));
+   state.subtitles = subtitles;
+<span class="a">+  state.subtitlesBook = state.book;</span>
+<span class="a">+  state.subtitlesSeq++;</span>
+<span class="a">+  if (opts.save !== false &amp;&amp; state.book !== null) void putMeta(state.book, { subtitles });</span>
+   state.spans = [];
+   state.cueParts = [];
+   state.activeCue = -1;
+<span class="h">@@ -415,12 +595,30 @@ function loadSubtitles(</span>
+   renderCueList();
+   const matched = align();
+   say(
+<span class="d">-    `${cues.length} cues loaded from ${from}.` +</span>
+<span class="a">+    `${cues.length} cues loaded from ${opts.from ?? subtitles.name}.` +</span>
+       (matched === null ? &#x27;&#x27; : ` ${matchedText(matched, cues.length, allPagesRead())}`),
+   );
+   showSrtRow();
+ }
+ 
+<span class="a">+/** Removes the subtitles: the cues, the cue list, the mark, the .srt row. */</span>
+<span class="a">+function clearSubtitles(): void {</span>
+<span class="a">+  state.cues = [];</span>
+<span class="a">+  state.aligner = null;</span>
+<span class="a">+  state.subtitles = null;</span>
+<span class="a">+  state.subtitlesBook = null;</span>
+<span class="a">+  state.spans = [];</span>
+<span class="a">+  state.cueParts = [];</span>
+<span class="a">+  state.activeCue = -1;</span>
+<span class="a">+  state.markedCue = -1;</span>
+<span class="a">+  updateSyncPage();</span>
+<span class="a">+  renderCueList();</span>
+<span class="a">+  showSrtRow();</span>
+<span class="a">+  view.mark();</span>
+<span class="a">+  // The Follow button goes: with no cues there is no page to follow.</span>
+<span class="a">+  runFollow(&#x27;realign&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ // A browser download of an .srt often has the type application/octet-stream,
+ // and a type filter makes such a file grey in the Android picker. So the
+ // field takes each file, and the parser decides.
+<span class="h">@@ -447,7 +645,7 @@ ui.subFile.addEventListener(&#x27;change&#x27;, async () =&gt; {</span>
+     say(noCuesText(file.name));
+     return;
+   }
+<span class="d">-  loadSubtitles({ name: file.name, text, source: &#x27;file&#x27; }, file.name, cues);</span>
+<span class="a">+  loadSubtitles({ name: file.name, text, source: &#x27;file&#x27; }, { cues });</span>
+ });
+ 
+ /**
+<span class="h">@@ -490,6 +688,8 @@ ui.makeSubs.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+     bookText: bookText(state.tokens),
+     language: ui.subLang.value,
+   });
+<span class="a">+  // The subtitles are for the book of the job, not for a book that opened since.</span>
+<span class="a">+  if (state.file !== file) return;</span>
+   if (result.error === &#x27;not_installed&#x27;) {
+     ui.makeStatus.replaceChildren(&#x27;SubRead is not installed. &#x27;);
+     const a = document.createElement(&#x27;a&#x27;);
+<span class="h">@@ -511,8 +711,10 @@ ui.makeSubs.addEventListener(&#x27;click&#x27;, async () =&gt; {</span>
+     (rate !== null &amp;&amp; rate &lt; 0.8
+       ? &#x27; Under 80% usually means another edition or the wrong language.&#x27;
+       : &#x27;&#x27;);
+<span class="d">-  await putSrt(bookKey(file), result.srt);</span>
+<span class="d">-  loadSubtitles({ name: srtName(file.name), text: result.srt, source: &#x27;subread&#x27; }, &#x27;SubRead&#x27;);</span>
+<span class="a">+  loadSubtitles(</span>
+<span class="a">+    { name: srtName(file.name), text: result.srt, source: &#x27;subread&#x27; },</span>
+<span class="a">+    { from: &#x27;SubRead&#x27; },</span>
+<span class="a">+  );</span>
+ });
+ 
+ // --- Alignment ---
+<span class="h">@@ -709,6 +911,7 @@ async function showPage(index: number): Promise&lt;void&gt; {</span>
+   if (!pdf || index &lt; 0 || index &gt;= pdf.numPages) return;
+   state.currentPage = index;
+   nav.update();
+<span class="a">+  savePageSoon();</span>
+   try {
+     await view.show(pdf, index);
+   } catch (err) {
+<span class="h">@@ -817,3 +1020,5 @@ ui.audioRow.hidden = isAndroid;</span>
+ ui.dictRow.hidden = !isAndroid;
+ ui.pauseRow.hidden = !isAndroid;
+ if (isAndroid) void loadDictionaries().catch(sayError);
+<span class="a">+watchDb();</span>
+<span class="a">+void restoreLastBook();</span>
+diff --git a/src/messages.ts b/src/messages.ts
+index 7b6573b..3745483 100644
+--- a/src/messages.ts
++++ b/src/messages.ts
+<span class="h">@@ -85,6 +85,12 @@ export function notReadText(read: number, total: number): string {</span>
+   return `This page is not read yet (${read}/${total} read).`;
+ }
+ 
+<span class="a">+/** The strip says this while the database upgrade holds the reading. */</span>
+<span class="a">+export const UPDATING_CACHE_TEXT = &#x27;Updating the page cache...&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+/** The copy of the last book cannot be read, for example after the storage was cleared. */</span>
+<span class="a">+export const LAST_BOOK_GONE_TEXT = &#x27;The last book is no longer in the app storage. Open it again.&#x27;;</span>
+<span class="a">+</span>
+ /** A picked file of 0 bytes, for example a file that another app still writes. */
+ export const EMPTY_FILE_TEXT = &#x27;The file is empty or not ready. Try again in a moment.&#x27;;
+ 
+diff --git a/src/status.ts b/src/status.ts
+index cb25cfb..e4b74c9 100644
+--- a/src/status.ts
++++ b/src/status.ts
+<span class="h">@@ -49,9 +49,9 @@ export function showPlayer(m: Message | null): void {</span>
+ }
+ 
+ /** Shows how far the reading of the pages is. Null hides this part. */
+<span class="d">-export function showReading(text: string | null): void {</span>
+<span class="d">-  reading.hidden = text === null;</span>
+<span class="d">-  reading.textContent = text ?? &#x27;&#x27;;</span>
+<span class="a">+export function showReading(m: Message | string | null): void {</span>
+<span class="a">+  reading.hidden = m === null;</span>
+<span class="a">+  fill(reading, typeof m === &#x27;string&#x27; ? { text: m } : (m ?? { text: &#x27;&#x27; }));</span>
+ }
+ 
+ /** Shows an event, for example a lookup or an error. It fades after EVENT_MS. */
+diff --git a/src/token-cache.ts b/src/token-cache.ts
+index 73c528d..1b502a6 100644
+--- a/src/token-cache.ts
++++ b/src/token-cache.ts
+<span class="h">@@ -22,6 +22,7 @@ import {</span>
+   type StoreNames,
+ } from &#x27;idb&#x27;;
+ import type { OcrToken } from &#x27;./align&#x27;;
+<span class="a">+import { srtName } from &#x27;./book-subtitles&#x27;;</span>
+ 
+ export type TextSource = &#x27;text&#x27; | &#x27;ocr&#x27;;
+ 
+<span class="h">@@ -124,8 +125,7 @@ async function moveSrtToMeta(</span>
+ /** Subtitles from SubRead for the book `key`. &quot;book.pdf|123&quot; gives the name &quot;book.srt&quot;. */
+ function subreadSubtitles(key: string, text: string): BookSubtitles {
+   const bar = key.lastIndexOf(&#x27;|&#x27;);
+<span class="d">-  const file = bar &lt; 0 ? key : key.slice(0, bar);</span>
+<span class="d">-  return { name: `${file.replace(/\.pdf$/i, &#x27;&#x27;)}.srt`, text, source: &#x27;subread&#x27; };</span>
+<span class="a">+  return { name: srtName(bar &lt; 0 ? key : key.slice(0, bar)), text, source: &#x27;subread&#x27; };</span>
+ }
+ 
+ /** Runs `op` on the database. Gives undefined when IndexedDB fails, and warns once. */
+<span class="h">@@ -193,6 +193,20 @@ export function getLastBook(): Promise&lt;File | undefined&gt; {</span>
+   });
+ }
+ 
+<span class="a">+/** Removes the copy of the last book, for example when its data cannot be read. */</span>
+<span class="a">+export async function clearLastBook(): Promise&lt;void&gt; {</span>
+<span class="a">+  await tryDb((d) =&gt; d.delete(&#x27;books&#x27;, LAST));</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Resolves when the database is open, or when IndexedDB failed. The first</span>
+<span class="a">+ * open after an upgrade can take long: an earlier build kept about 86 MB of</span>
+<span class="a">+ * dictionary data, and the upgrade deletes it.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function dbReady(): Promise&lt;void&gt; {</span>
+<span class="a">+  await tryDb(() =&gt; Promise.resolve());</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** What the reader keeps for the book `key`. An empty object when there is nothing, or IndexedDB fails. */
+ export async function getMeta(key: string): Promise&lt;BookMeta&gt; {
+   return (await tryDb((d) =&gt; d.get(&#x27;meta&#x27;, key))) ?? {};
+<span class="h">@@ -217,19 +231,3 @@ export async function putMeta(key: string, patch: Partial&lt;BookMeta&gt;): Promise&lt;vo</span>
+     return Promise.all([merge(), tx.done]);
+   });
+ }
+<span class="d">-</span>
+<span class="d">-/**</span>
+<span class="d">- * The text of the subtitles of the book `key`.</span>
+<span class="d">- * @deprecated Use getMeta. The next change of main.ts removes this function.</span>
+<span class="d">- */</span>
+<span class="d">-export async function getSrt(key: string): Promise&lt;string | undefined&gt; {</span>
+<span class="d">-  return (await getMeta(key)).subtitles?.text;</span>
+<span class="d">-}</span>
+<span class="d">-</span>
+<span class="d">-/**</span>
+<span class="d">- * Keeps the subtitles that SubRead made for the book `key`.</span>
+<span class="d">- * @deprecated Use putMeta. The next change of main.ts removes this function.</span>
+<span class="d">- */</span>
+<span class="d">-export async function putSrt(key: string, srt: string): Promise&lt;void&gt; {</span>
+<span class="d">-  await putMeta(key, { subtitles: subreadSubtitles(key, srt) });</span>
+<span class="d">-}</span>
+diff --git a/test/book-subtitles.test.ts b/test/book-subtitles.test.ts
+index 962a237..452ea59 100644
+--- a/test/book-subtitles.test.ts
++++ b/test/book-subtitles.test.ts
+<span class="h">@@ -1,5 +1,5 @@</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import { srtName } from &#x27;../src/book-subtitles&#x27;;</span>
+<span class="a">+import { srtName, subtitlesOnOpen } from &#x27;../src/book-subtitles&#x27;;</span>
+ 
+ describe(&#x27;srtName&#x27;, () =&gt; {
+   it(&#x27;puts .srt in place of .pdf&#x27;, () =&gt; {
+<span class="h">@@ -13,3 +13,29 @@ describe(&#x27;srtName&#x27;, () =&gt; {</span>
+     expect(srtName(&#x27;a.pdf.txt&#x27;)).toBe(&#x27;a.pdf.txt.srt&#x27;);
+   });
+ });
+<span class="a">+</span>
+<span class="a">+describe(&#x27;subtitlesOnOpen&#x27;, () =&gt; {</span>
+<span class="a">+  const eng = &#x27;sample-eng-2p.pdf|4053&#x27;;</span>
+<span class="a">+  const jpn = &#x27;sample-jpn.pdf|20410&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;loads the saved subtitles of the book, else clears&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subtitlesOnOpen(undefined, jpn, true)).toBe(&#x27;load&#x27;);</span>
+<span class="a">+    expect(subtitlesOnOpen(undefined, jpn, false)).toBe(&#x27;clear&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not keep the subtitles of another book&#x27;, () =&gt; {</span>
+<span class="a">+    // The web finding: the cues of the English book stayed on the Japanese book.</span>
+<span class="a">+    expect(subtitlesOnOpen(eng, jpn, false)).toBe(&#x27;clear&#x27;);</span>
+<span class="a">+    expect(subtitlesOnOpen(eng, jpn, true)).toBe(&#x27;load&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps subtitles that were loaded while no book was open, for the book that opens&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subtitlesOnOpen(null, jpn, false)).toBe(&#x27;keep&#x27;);</span>
+<span class="a">+    expect(subtitlesOnOpen(null, jpn, true)).toBe(&#x27;keep&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the subtitles of the same book&#x27;, () =&gt; {</span>
+<span class="a">+    expect(subtitlesOnOpen(jpn, jpn, true)).toBe(&#x27;keep&#x27;);</span>
+<span class="a">+    expect(subtitlesOnOpen(jpn, jpn, false)).toBe(&#x27;keep&#x27;);</span>
+<span class="a">+  });</span>
+<span class="a">+});</span>
+diff --git a/test/token-cache.test.ts b/test/token-cache.test.ts
+index ff7e0b9..716cc97 100644
+--- a/test/token-cache.test.ts
++++ b/test/token-cache.test.ts
+<span class="h">@@ -137,16 +137,31 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({ page: 1, forceOcr: true });
+   });
+ 
+<span class="d">-  it(&#x27;keeps the subtitles of putSrt in the meta data&#x27;, async () =&gt; {</span>
+<span class="a">+  it(&#x27;forgets the last book, and keeps the meta data and the pages&#x27;, async () =&gt; {</span>
+     const cache = await freshCache();
+<span class="d">-    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { page: 2 });</span>
+<span class="d">-    await cache.putSrt(&#x27;neko.pdf|10&#x27;, srt);</span>
+<span class="d">-    expect(await cache.getSrt(&#x27;neko.pdf|10&#x27;)).toBe(srt);</span>
+<span class="d">-    expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({</span>
+<span class="d">-      page: 2,</span>
+<span class="d">-      subtitles: { name: &#x27;neko.srt&#x27;, text: srt, source: &#x27;subread&#x27; },</span>
+<span class="a">+    const neko = new File([&#x27;%PDF-1.7 猫&#x27;], &#x27;neko.pdf&#x27;, { type: &#x27;application/pdf&#x27; });</span>
+<span class="a">+    await cache.putLastBook(neko);</span>
+<span class="a">+    await cache.putMeta(cache.bookKey(neko), { page: 2 });</span>
+<span class="a">+    await cache.putPage(cache.pageKey(neko, 0, &#x27;jpn&#x27;, &#x27;ocr&#x27;), entry);</span>
+<span class="a">+    await cache.clearLastBook();</span>
+<span class="a">+    expect(await cache.getLastBook()).toBeUndefined();</span>
+<span class="a">+    expect(await cache.getMeta(cache.bookKey(neko))).toEqual({ page: 2 });</span>
+<span class="a">+    expect(await cache.getPage(cache.pageKey(neko, 0, &#x27;jpn&#x27;, &#x27;ocr&#x27;))).toEqual(entry);</span>
+<span class="a">+    // No last book: nothing to forget.</span>
+<span class="a">+    await expect(cache.clearLastBook()).resolves.toBeUndefined();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;tells when the database is open, after the upgrade&#x27;, async () =&gt; {</span>
+<span class="a">+    const old = await openDB(&#x27;scan-subread&#x27;, 1, {</span>
+<span class="a">+      upgrade(d) {</span>
+<span class="a">+        d.createObjectStore(&#x27;dictionaries&#x27;);</span>
+<span class="a">+        d.createObjectStore(&#x27;terms&#x27;);</span>
+<span class="a">+      },</span>
+     });
+<span class="d">-    expect(await cache.getSrt(&#x27;inu.pdf|20&#x27;)).toBeUndefined();</span>
+<span class="a">+    old.close();</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    await cache.dbReady();</span>
+<span class="a">+    expect(await schema()).toEqual({ version: 3, stores: [&#x27;books&#x27;, &#x27;meta&#x27;, &#x27;pages&#x27;] });</span>
+   });
+ 
+   it(&#x27;clears the pages of one book, or the pages of all books&#x27;, async () =&gt; {
+<span class="h">@@ -205,8 +220,8 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     await expect(cache.putMeta(&#x27;b&#x27;, { page: 1 })).resolves.toBeUndefined();
+     await expect(cache.putLastBook(new File([&#x27;x&#x27;], &#x27;b.pdf&#x27;))).resolves.toBe(false);
+     await expect(cache.getLastBook()).resolves.toBeUndefined();
+<span class="d">-    await expect(cache.getSrt(&#x27;b&#x27;)).resolves.toBeUndefined();</span>
+<span class="d">-    await expect(cache.putSrt(&#x27;b&#x27;, srt)).resolves.toBeUndefined();</span>
+<span class="a">+    await expect(cache.clearLastBook()).resolves.toBeUndefined();</span>
+<span class="a">+    await expect(cache.dbReady()).resolves.toBeUndefined();</span>
+     expect(warn).toHaveBeenCalledTimes(1);
+   });
+ </pre>
+</div></body></html>

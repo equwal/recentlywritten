@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread 2847df0c - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 2847df0cbbcae427e874b6710ec36abcfe0d8cfc
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:08:59 -0700
+
+Extend the cue box to the edges of its words
+
+The alignment drops punctuation and can drop a noisy letter at the
+edge of a cue. The box of a line then stopped in a word, and the comma
+after &quot;hills&quot; was outside. lineBoxes now grows the box of each line to
+the edges of its first and its last word. In a CJK word only punctuation
+joins, because Japanese OCR can give one word for a whole line. Each box
+also gets 2 CSS pixels of padding, and the page clips it.
+
+</pre><pre> src/line-boxes.ts       |  76 +++++++++++++++++++++++++++-----
+ src/main.ts             |   9 +++-
+ src/style.css           |   2 +
+ test/line-boxes.test.ts | 115 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 186 insertions(+), 16 deletions(-)
+</pre><pre>diff --git a/src/line-boxes.ts b/src/line-boxes.ts
+index 19b6f35..34640fa 100644
+--- a/src/line-boxes.ts
++++ b/src/line-boxes.ts
+<span class="h">@@ -1,28 +1,80 @@</span>
+ // The boxes that mark a cue on the page. Pure: no DOM.
+ 
+ import type { OcrToken, TokenSpan } from &#x27;./align&#x27;;
+<span class="a">+import { isCjk } from &#x27;./book-text&#x27;;</span>
+ 
+ export type Box = OcrToken[&#x27;bbox&#x27;];
+ 
+<span class="a">+/** A token of punctuation or symbols only. */</span>
+<span class="a">+const PUNCTUATION = /^[\p{P}\p{S}]+$/u;</span>
+<span class="a">+</span>
+<span class="a">+/** A token of opening punctuation only: a bracket or a quote that opens. */</span>
+<span class="a">+const OPENING = /^[\p{Ps}\p{Pi}]+$/u;</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * True when the box of a line can grow from the edge token of the span</span>
+<span class="a">+ * over `next`, the token before it (`back`) or after it. Both must have the</span>
+<span class="a">+ * same page, line and word id.</span>
+<span class="a">+ *</span>
+<span class="a">+ * In a word that is not CJK, all its tokens join: the spaces show where</span>
+<span class="a">+ * the word ends. Japanese OCR can give one word for a whole line, so in a</span>
+<span class="a">+ * CJK word only punctuation joins: an opening mark before the span, and</span>
+<span class="a">+ * another mark after it. A 。 before the span ends the cue before.</span>
+<span class="a">+ */</span>
+<span class="a">+function joins(edge: OcrToken, next: OcrToken | undefined, back: boolean): next is OcrToken {</span>
+<span class="a">+  if (</span>
+<span class="a">+    next === undefined ||</span>
+<span class="a">+    edge.word === undefined ||</span>
+<span class="a">+    next.page !== edge.page ||</span>
+<span class="a">+    next.line !== edge.line ||</span>
+<span class="a">+    next.word !== edge.word</span>
+<span class="a">+  ) {</span>
+<span class="a">+    return false;</span>
+<span class="a">+  }</span>
+<span class="a">+  if (!isCjk(edge.text)) return !isCjk(next.text) || PUNCTUATION.test(next.text);</span>
+<span class="a">+  if (back) return OPENING.test(next.text);</span>
+<span class="a">+  return PUNCTUATION.test(next.text) &amp;&amp; !OPENING.test(next.text);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Grows `box` so that it holds `bbox`. */</span>
+<span class="a">+function grow(box: Box, bbox: Box): void {</span>
+<span class="a">+  box.x0 = Math.min(box.x0, bbox.x0);</span>
+<span class="a">+  box.y0 = Math.min(box.y0, bbox.y0);</span>
+<span class="a">+  box.x1 = Math.max(box.x1, bbox.x1);</span>
+<span class="a">+  box.y1 = Math.max(box.y1, bbox.y1);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /**
+  * One box for each text line of `span` on `page`: the union of the boxes
+<span class="d">- * of its tokens on that line. Tokens on other pages do not count. A span</span>
+<span class="d">- * of an older alignment can go past the end of `tokens`: those indices</span>
+<span class="d">- * do not count either.</span>
+<span class="a">+ * of its tokens on that line, plus `pad` pixels on each side. Tokens on</span>
+<span class="a">+ * other pages do not count. A span of an older alignment can go past the</span>
+<span class="a">+ * end of `tokens`: those indices do not count either.</span>
+<span class="a">+ *</span>
+<span class="a">+ * The alignment drops punctuation, and it can drop a noisy letter at the</span>
+<span class="a">+ * edge of a cue. So the box of a line grows to the edges of its first and</span>
+<span class="a">+ * its last word (see `joins`).</span>
+  */
+<span class="d">-export function lineBoxes(tokens: readonly OcrToken[], span: TokenSpan, page: number): Box[] {</span>
+<span class="d">-  const lines = new Map&lt;number, Box&gt;();</span>
+<span class="a">+export function lineBoxes(</span>
+<span class="a">+  tokens: readonly OcrToken[],</span>
+<span class="a">+  span: TokenSpan,</span>
+<span class="a">+  page: number,</span>
+<span class="a">+  pad = 0,</span>
+<span class="a">+): Box[] {</span>
+<span class="a">+  /** For each line: its box, and the first and the last token of the span on it. */</span>
+<span class="a">+  const lines = new Map&lt;number, { box: Box; first: number; last: number }&gt;();</span>
+   for (let t = span.start; t &lt; span.end; t++) {
+     const token = tokens[t];
+     if (!token || token.page !== page) continue;
+<span class="d">-    const box = lines.get(token.line);</span>
+<span class="d">-    if (!box) lines.set(token.line, { ...token.bbox });</span>
+<span class="a">+    const line = lines.get(token.line);</span>
+<span class="a">+    if (!line) lines.set(token.line, { box: { ...token.bbox }, first: t, last: t });</span>
+     else {
+<span class="d">-      box.x0 = Math.min(box.x0, token.bbox.x0);</span>
+<span class="d">-      box.y0 = Math.min(box.y0, token.bbox.y0);</span>
+<span class="d">-      box.x1 = Math.max(box.x1, token.bbox.x1);</span>
+<span class="d">-      box.y1 = Math.max(box.y1, token.bbox.y1);</span>
+<span class="a">+      grow(line.box, token.bbox);</span>
+<span class="a">+      line.last = t;</span>
+     }
+   }
+<span class="d">-  return [...lines.values()];</span>
+<span class="a">+  return [...lines.values()].map(({ box, first, last }) =&gt; {</span>
+<span class="a">+    for (let t = first - 1; joins(tokens[first]!, tokens[t], true); t--) grow(box, tokens[t]!.bbox);</span>
+<span class="a">+    for (let t = last + 1; joins(tokens[last]!, tokens[t], false); t++) grow(box, tokens[t]!.bbox);</span>
+<span class="a">+    return { x0: box.x0 - pad, y0: box.y0 - pad, x1: box.x1 + pad, y1: box.y1 + pad };</span>
+<span class="a">+  });</span>
+ }
+diff --git a/src/main.ts b/src/main.ts
+index 3940b08..2bfe1d8 100644
+--- a/src/main.ts
++++ b/src/main.ts
+<span class="h">@@ -30,6 +30,9 @@ const OCR_WIDTH = 1600;</span>
+ /** How far from a character a tap may land, as a share of the page width. */
+ const TAP_TOLERANCE = 0.015;
+ 
+<span class="a">+/** The space around a box of the mark, in CSS pixels. */</span>
+<span class="a">+const BOX_PAD = 2;</span>
+<span class="a">+</span>
+ /** Milliseconds to wait after a page is read before the cues are aligned again. */
+ const ALIGN_DEBOUNCE = 300;
+ 
+<span class="h">@@ -553,8 +556,10 @@ function drawBoxes(): void {</span>
+   ui.overlay.replaceChildren();
+   const span = state.spans[state.markedCue];
+   const size = state.pages[state.currentPage];
+<span class="d">-  if (!span || !size) return;</span>
+<span class="d">-  for (const box of lineBoxes(state.tokens, span, state.currentPage)) {</span>
+<span class="a">+  const shown = ui.page.querySelector(&#x27;canvas&#x27;)?.getBoundingClientRect().width;</span>
+<span class="a">+  if (!span || !size || !shown) return;</span>
+<span class="a">+  const pad = (BOX_PAD * size.width) / shown;</span>
+<span class="a">+  for (const box of lineBoxes(state.tokens, span, state.currentPage, pad)) {</span>
+     const div = document.createElement(&#x27;div&#x27;);
+     div.className = &#x27;box&#x27;;
+     div.style.left = `${(100 * box.x0) / size.width}%`;
+diff --git a/src/style.css b/src/style.css
+index 3c0fc31..65824ac 100644
+--- a/src/style.css
++++ b/src/style.css
+<span class="h">@@ -215,10 +215,12 @@ body.menu-open #panel {</span>
+   }
+ }
+ 
+<span class="a">+/* The padding of a box can go past the edge of the page. The page clips it. */</span>
+ #overlay {
+   position: absolute;
+   inset: 0;
+   pointer-events: none;
+<span class="a">+  overflow: hidden;</span>
+ }
+ 
+ .box {
+diff --git a/test/line-boxes.test.ts b/test/line-boxes.test.ts
+index 1171dc5..03ef14e 100644
+--- a/test/line-boxes.test.ts
++++ b/test/line-boxes.test.ts
+<span class="h">@@ -1,6 +1,7 @@</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+ import { describe, expect, it } from &#x27;vitest&#x27;;
+<span class="d">-import type { OcrToken } from &#x27;../src/align&#x27;;</span>
+<span class="d">-import { lineBoxes } from &#x27;../src/line-boxes&#x27;;</span>
+<span class="a">+import type { OcrToken, TokenSpan } from &#x27;../src/align&#x27;;</span>
+<span class="a">+import { lineBoxes, type Box } from &#x27;../src/line-boxes&#x27;;</span>
+ 
+ function token(page: number, line: number, x0: number, y0: number): OcrToken {
+   return { text: &#x27;a&#x27;, page, line, bbox: { x0, y0, x1: x0 + 10, y1: y0 + 20 } };
+<span class="h">@@ -14,6 +15,33 @@ const tokens = [</span>
+   token(1, 100000, 10, 0),
+ ];
+ 
+<span class="a">+/**</span>
+<span class="a">+ * Tokens of text lines, one token per character, 10 px per character and</span>
+<span class="a">+ * 20 px per line. A space separates two words and gets no token.</span>
+<span class="a">+ */</span>
+<span class="a">+function textTokens(lines: string[], page = 0): OcrToken[] {</span>
+<span class="a">+  const out: OcrToken[] = [];</span>
+<span class="a">+  let word = 0;</span>
+<span class="a">+  lines.forEach((text, row) =&gt; {</span>
+<span class="a">+    [...text].forEach((ch, col) =&gt; {</span>
+<span class="a">+      if (ch === &#x27; &#x27;) {</span>
+<span class="a">+        word++;</span>
+<span class="a">+        return;</span>
+<span class="a">+      }</span>
+<span class="a">+      const x0 = col * 10;</span>
+<span class="a">+      const y0 = row * 20;</span>
+<span class="a">+      out.push({ text: ch, page, line: row, word, bbox: { x0, y0, x1: x0 + 10, y1: y0 + 20 } });</span>
+<span class="a">+    });</span>
+<span class="a">+    word++;</span>
+<span class="a">+  });</span>
+<span class="a">+  return out;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** A matched span of the tokens `from` to `to`, `to` not included. */</span>
+<span class="a">+function spanOf(from: number, to: number): TokenSpan {</span>
+<span class="a">+  return { start: from, end: to, matched: true };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ describe(&#x27;lineBoxes&#x27;, () =&gt; {
+   it(&#x27;gives one box for each line, the union of its token boxes&#x27;, () =&gt; {
+     expect(lineBoxes(tokens, { start: 0, end: 3, matched: true }, 0)).toEqual([
+<span class="h">@@ -35,4 +63,87 @@ describe(&#x27;lineBoxes&#x27;, () =&gt; {</span>
+       { x0: 0, y0: 0, x1: 20, y1: 22 },
+     ]);
+   });
+<span class="a">+</span>
+<span class="a">+  it(&#x27;grows to the comma and the last letter that the alignment dropped&#x27;, () =&gt; {</span>
+<span class="a">+    // &quot;quiet hills,&quot; with the span to &quot;hill&quot;: the alignment dropped &quot;s,&quot;.</span>
+<span class="a">+    const line = textTokens([&#x27;quiet hills,&#x27;]);</span>
+<span class="a">+    expect(line.map((t) =&gt; t.text).join(&#x27;&#x27;)).toBe(&#x27;quiethills,&#x27;);</span>
+<span class="a">+    const box = lineBoxes(line, spanOf(0, 9), 0);</span>
+<span class="a">+    expect(box).toEqual([{ x0: 0, y0: 0, x1: 120, y1: 20 }]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;grows to the start of the first word&#x27;, () =&gt; {</span>
+<span class="a">+    // The span starts at &quot;ills&quot;, in the middle of &quot;hills&quot;.</span>
+<span class="a">+    const line = textTokens([&#x27;the hills rose&#x27;]);</span>
+<span class="a">+    expect(lineBoxes(line, spanOf(4, 8), 0)).toEqual([{ x0: 40, y0: 0, x1: 90, y1: 20 }]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;does not grow over the next word or the next line&#x27;, () =&gt; {</span>
+<span class="a">+    const page = textTokens([&#x27;one two&#x27;, &#x27;three&#x27;]);</span>
+<span class="a">+    // The span is &quot;two&quot;: the box stays on &quot;two&quot;.</span>
+<span class="a">+    expect(lineBoxes(page, spanOf(3, 6), 0)).toEqual([{ x0: 40, y0: 0, x1: 70, y1: 20 }]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;grows over CJK punctuation, but not over a CJK letter of the same OCR word&#x27;, () =&gt; {</span>
+<span class="a">+    // Japanese OCR gave one word for the whole line.</span>
+<span class="a">+    const line = textTokens([&#x27;吾輩は猫である。名前は&#x27;]);</span>
+<span class="a">+    // The span is 猫である: 。 joins the box, 名前は does not.</span>
+<span class="a">+    expect(lineBoxes(line, spanOf(3, 7), 0)).toEqual([{ x0: 30, y0: 0, x1: 80, y1: 20 }]);</span>
+<span class="a">+    // The span is 名前: the 。 before it ends the cue before, and は is a letter.</span>
+<span class="a">+    expect(lineBoxes(line, spanOf(8, 10), 0)).toEqual([{ x0: 80, y0: 0, x1: 100, y1: 20 }]);</span>
+<span class="a">+    // The span is 猫だ: the brackets around it join.</span>
+<span class="a">+    const quote = textTokens([&#x27;彼は「猫だ」と言った&#x27;]);</span>
+<span class="a">+    expect(lineBoxes(quote, spanOf(3, 5), 0)).toEqual([{ x0: 20, y0: 0, x1: 60, y1: 20 }]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;pads each box on each side&#x27;, () =&gt; {</span>
+<span class="a">+    const line = textTokens([&#x27;quiet hills,&#x27;]);</span>
+<span class="a">+    expect(lineBoxes(line, spanOf(0, 9), 0, 3)).toEqual([{ x0: -3, y0: -3, x1: 123, y1: 23 }]);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives the box of the whole words of the span on each line&#x27;, () =&gt; {</span>
+<span class="a">+    // Latin words and punctuation: a whole word of each span token is in the</span>
+<span class="a">+    // box. A slow reference: the union of the tokens of the span and of the</span>
+<span class="a">+    // tokens that share a line and a word id with a span token.</span>
+<span class="a">+    const word = fc.stringMatching(/^[a-z,.;!?&quot;]{1,6}$/);</span>
+<span class="a">+    const text = fc.array(fc.array(word, { minLength: 1, maxLength: 5 }), {</span>
+<span class="a">+      minLength: 1,</span>
+<span class="a">+      maxLength: 4,</span>
+<span class="a">+    });</span>
+<span class="a">+    const input = text.chain((lines) =&gt; {</span>
+<span class="a">+      const page = textTokens(lines.map((words) =&gt; words.join(&#x27; &#x27;)));</span>
+<span class="a">+      return fc.tuple(</span>
+<span class="a">+        fc.constant(page),</span>
+<span class="a">+        fc.nat({ max: page.length - 1 }),</span>
+<span class="a">+        fc.nat({ max: page.length - 1 }),</span>
+<span class="a">+        fc.nat({ max: 5 }),</span>
+<span class="a">+      );</span>
+<span class="a">+    });</span>
+<span class="a">+    fc.assert(</span>
+<span class="a">+      fc.property(input, ([page, a, b, pad]) =&gt; {</span>
+<span class="a">+        const span = spanOf(Math.min(a, b), Math.max(a, b) + 1);</span>
+<span class="a">+        const inSpan = page.slice(span.start, span.end);</span>
+<span class="a">+        const expected = new Map&lt;number, Box&gt;();</span>
+<span class="a">+        for (const t of page) {</span>
+<span class="a">+          const keep = inSpan.some((s) =&gt; s === t || (s.line === t.line &amp;&amp; s.word === t.word));</span>
+<span class="a">+          if (!keep) continue;</span>
+<span class="a">+          const box = expected.get(t.line);</span>
+<span class="a">+          if (!box) expected.set(t.line, { ...t.bbox });</span>
+<span class="a">+          else {</span>
+<span class="a">+            box.x0 = Math.min(box.x0, t.bbox.x0);</span>
+<span class="a">+            box.y0 = Math.min(box.y0, t.bbox.y0);</span>
+<span class="a">+            box.x1 = Math.max(box.x1, t.bbox.x1);</span>
+<span class="a">+            box.y1 = Math.max(box.y1, t.bbox.y1);</span>
+<span class="a">+          }</span>
+<span class="a">+        }</span>
+<span class="a">+        const padded = [...expected.values()].map((b) =&gt; ({</span>
+<span class="a">+          x0: b.x0 - pad,</span>
+<span class="a">+          y0: b.y0 - pad,</span>
+<span class="a">+          x1: b.x1 + pad,</span>
+<span class="a">+          y1: b.y1 + pad,</span>
+<span class="a">+        }));</span>
+<span class="a">+        expect(lineBoxes(page, span, 0, pad)).toEqual(padded);</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+<span class="a">+  });</span>
+ });</pre>
+</div></body></html>

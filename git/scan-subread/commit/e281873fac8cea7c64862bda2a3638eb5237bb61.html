@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scan-subread e281873f - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>scan-subread</h1><span class="desc">PDF reader that follows an audiobook with the SubRead suite</span><p class="url">git clone https://github.com/equwal/scan-subread</p><p><a href="../../scan-subread/index.html">Log</a> | <a href="../../scan-subread/files.html">Files</a> | <a href="../../scan-subread/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit e281873fac8cea7c64862bda2a3638eb5237bb61
+truex &lt;truex@equwal.com&gt;
+2026-09-26 14:19:56 -0700
+
+Keep the last book, its page and its subtitles in IndexedDB
+
+A reload or an app restart forgot the book, the page and the
+subtitles. On Android the system stops the reader while the user is in
+the dictionary or in the player app, so the user came back to an empty
+reader.
+
+Version 3 of the database adds two stores:
+
+- &quot;books&quot; keeps a copy of the last book under the key &quot;last&quot;.
+  putLastBook replaces it and gives false when IndexedDB fails, for
+  example when the quota is full. getLastBook gives the file.
+- &quot;meta&quot; keeps, for each book key, the page, the subtitles and the
+  &quot;Force OCR&quot; setting. putMeta merges a patch in one transaction, and a
+  field that is undefined in the patch is removed.
+
+The upgrade moves each text of the &quot;srt&quot; store to meta.subtitles, with
+the source &quot;subread&quot; and the name of the book with &quot;.srt&quot;, and deletes
+&quot;srt&quot;. The upgrade still deletes the stores of the old dictionary.
+
+clearPages(key) removes only the pages of that book. getSrt and putSrt
+stay as thin wrappers over the meta store, because main.ts still uses
+them. The next change of main.ts removes them.
+
+</pre><pre> src/token-cache.ts       | 176 ++++++++++++++++++++++++++++++++++++++++------
+ test/token-cache.test.ts | 177 +++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 318 insertions(+), 35 deletions(-)
+</pre><pre>diff --git a/src/token-cache.ts b/src/token-cache.ts
+index 5a92872..73c528d 100644
+--- a/src/token-cache.ts
++++ b/src/token-cache.ts
+<span class="h">@@ -1,14 +1,26 @@</span>
+<span class="d">-// The tokens of each page, and the subtitles of each book, in IndexedDB.</span>
+<span class="d">-// Thin browser layer.</span>
+<span class="a">+// What the reader keeps in IndexedDB. Thin browser layer.</span>
+ //
+<span class="d">-// OCR is slow, so a page is read once. The key names the file, the page,</span>
+<span class="d">-// the OCR language and the source (text layer or OCR). The subtitles that</span>
+<span class="d">-// SubRead made are kept under the key of the PDF.</span>
+<span class="a">+// - &quot;pages&quot;: the tokens of each page. OCR is slow, so a page is read once.</span>
+<span class="a">+//   The key names the file, the page, the OCR language and the source (text</span>
+<span class="a">+//   layer or OCR).</span>
+<span class="a">+// - &quot;books&quot;: a copy of the last book, under the key &quot;last&quot;. Android can stop</span>
+<span class="a">+//   the reader while the user is in the dictionary or in the player, and a</span>
+<span class="a">+//   reload forgets the file that the user opened.</span>
+<span class="a">+// - &quot;meta&quot;: for each book, the page that was open, the subtitles and the</span>
+<span class="a">+//   &quot;Force OCR&quot; setting.</span>
+ //
+<span class="d">-// The reader does not need the cache. When IndexedDB fails, a read finds</span>
+<span class="d">-// nothing, a write does nothing, and one warning goes to the console.</span>
+<span class="d">-</span>
+<span class="d">-import { openDB, unwrap, type DBSchema, type IDBPDatabase } from &#x27;idb&#x27;;</span>
+<span class="a">+// The reader does not need IndexedDB. When IndexedDB fails, a read finds</span>
+<span class="a">+// nothing, a write does nothing, and one warning goes to the console. No</span>
+<span class="a">+// function throws.</span>
+<span class="a">+</span>
+<span class="a">+import {</span>
+<span class="a">+  openDB,</span>
+<span class="a">+  unwrap,</span>
+<span class="a">+  type DBSchema,</span>
+<span class="a">+  type IDBPDatabase,</span>
+<span class="a">+  type IDBPTransaction,</span>
+<span class="a">+  type StoreNames,</span>
+<span class="a">+} from &#x27;idb&#x27;;</span>
+ import type { OcrToken } from &#x27;./align&#x27;;
+ 
+ export type TextSource = &#x27;text&#x27; | &#x27;ocr&#x27;;
+<span class="h">@@ -21,28 +33,65 @@ export interface PageEntry {</span>
+   source: TextSource;
+ }
+ 
+<span class="a">+/** The subtitles of a book. */</span>
+<span class="a">+export interface BookSubtitles {</span>
+<span class="a">+  /** The file name, for example &quot;book.srt&quot;. */</span>
+<span class="a">+  name: string;</span>
+<span class="a">+  /** The text of the subtitle file. */</span>
+<span class="a">+  text: string;</span>
+<span class="a">+  /** A file that the user loaded, or the result of SubRead. */</span>
+<span class="a">+  source: &#x27;file&#x27; | &#x27;subread&#x27;;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** What the reader keeps for a book, other than its pages. */</span>
+<span class="a">+export interface BookMeta {</span>
+<span class="a">+  /** The page that was open. 0 is the first page. */</span>
+<span class="a">+  page?: number;</span>
+<span class="a">+  subtitles?: BookSubtitles;</span>
+<span class="a">+  /** The &quot;Force OCR&quot; setting for the book. */</span>
+<span class="a">+  forceOcr?: boolean;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The record of the last book. */</span>
+<span class="a">+interface LastBook {</span>
+<span class="a">+  /** See bookKey. */</span>
+<span class="a">+  key: string;</span>
+<span class="a">+  name: string;</span>
+<span class="a">+  /** The MIME type of the file. */</span>
+<span class="a">+  type: string;</span>
+<span class="a">+  blob: Blob;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ interface Schema extends DBSchema {
+   pages: { key: string; value: PageEntry };
+<span class="a">+  books: { key: string; value: LastBook };</span>
+<span class="a">+  meta: { key: string; value: BookMeta };</span>
+<span class="a">+  /** Only in version 2. The upgrade to version 3 moves the subtitles to &quot;meta&quot;. */</span>
+   srt: { key: string; value: string };
+ }
+ 
+ const DB_NAME = &#x27;scan-subread&#x27;;
+ 
+ /**
+<span class="d">- * Earlier builds of the app made version 1 of this database with the</span>
+<span class="d">- * stores of their dictionary. Version 2 makes sure that the stores of</span>
+<span class="d">- * this schema are there, and deletes the old stores.</span>
+<span class="a">+ * Version 1: earlier builds kept the stores of their dictionary.</span>
+<span class="a">+ * Version 2: &quot;pages&quot; and &quot;srt&quot;. The upgrade deletes the stores of the</span>
+<span class="a">+ * dictionary.</span>
+<span class="a">+ * Version 3: &quot;pages&quot;, &quot;books&quot; and &quot;meta&quot;. The upgrade moves each text of</span>
+<span class="a">+ * &quot;srt&quot; to &quot;meta&quot;, and deletes &quot;srt&quot;.</span>
+  */
+<span class="d">-const DB_VERSION = 2;</span>
+<span class="d">-const STORES = [&#x27;pages&#x27;, &#x27;srt&#x27;] as const;</span>
+<span class="a">+const DB_VERSION = 3;</span>
+<span class="a">+const STORES = [&#x27;pages&#x27;, &#x27;books&#x27;, &#x27;meta&#x27;] as const;</span>
+ const OLD_STORES = [&#x27;dictionaries&#x27;, &#x27;terms&#x27;];
+ 
+<span class="a">+/** The key of the one record in &quot;books&quot;. */</span>
+<span class="a">+const LAST = &#x27;last&#x27;;</span>
+<span class="a">+</span>
+ let dbPromise: Promise&lt;IDBPDatabase&lt;Schema&gt;&gt; | undefined;
+ let warned = false;
+ 
+ function db(): Promise&lt;IDBPDatabase&lt;Schema&gt;&gt; {
+   dbPromise ??= openDB&lt;Schema&gt;(DB_NAME, DB_VERSION, {
+<span class="d">-    upgrade(database) {</span>
+<span class="a">+    async upgrade(database, _oldVersion, _newVersion, transaction) {</span>
+       // The typed database knows only the stores of the schema.
+       const raw = unwrap(database);
+       for (const name of OLD_STORES) {
+<span class="h">@@ -51,11 +100,34 @@ function db(): Promise&lt;IDBPDatabase&lt;Schema&gt;&gt; {</span>
+       for (const name of STORES) {
+         if (!raw.objectStoreNames.contains(name)) raw.createObjectStore(name);
+       }
+<span class="a">+      if (raw.objectStoreNames.contains(&#x27;srt&#x27;)) {</span>
+<span class="a">+        await moveSrtToMeta(transaction);</span>
+<span class="a">+        raw.deleteObjectStore(&#x27;srt&#x27;);</span>
+<span class="a">+      }</span>
+     },
+   });
+   return dbPromise;
+ }
+ 
+<span class="a">+/** Copies each text of &quot;srt&quot; to &quot;meta&quot;, as subtitles from SubRead. */</span>
+<span class="a">+async function moveSrtToMeta(</span>
+<span class="a">+  transaction: IDBPTransaction&lt;Schema, StoreNames&lt;Schema&gt;[], &#x27;versionchange&#x27;&gt;,</span>
+<span class="a">+): Promise&lt;void&gt; {</span>
+<span class="a">+  const meta = transaction.objectStore(&#x27;meta&#x27;);</span>
+<span class="a">+  let cursor = await transaction.objectStore(&#x27;srt&#x27;).openCursor();</span>
+<span class="a">+  while (cursor) {</span>
+<span class="a">+    await meta.put({ subtitles: subreadSubtitles(cursor.key, cursor.value) }, cursor.key);</span>
+<span class="a">+    cursor = await cursor.continue();</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Subtitles from SubRead for the book `key`. &quot;book.pdf|123&quot; gives the name &quot;book.srt&quot;. */</span>
+<span class="a">+function subreadSubtitles(key: string, text: string): BookSubtitles {</span>
+<span class="a">+  const bar = key.lastIndexOf(&#x27;|&#x27;);</span>
+<span class="a">+  const file = bar &lt; 0 ? key : key.slice(0, bar);</span>
+<span class="a">+  return { name: `${file.replace(/\.pdf$/i, &#x27;&#x27;)}.srt`, text, source: &#x27;subread&#x27; };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ /** Runs `op` on the database. Gives undefined when IndexedDB fails, and warns once. */
+ async function tryDb&lt;T&gt;(op: (d: IDBPDatabase&lt;Schema&gt;) =&gt; Promise&lt;T&gt;): Promise&lt;T | undefined&gt; {
+   try {
+<span class="h">@@ -63,7 +135,7 @@ async function tryDb&lt;T&gt;(op: (d: IDBPDatabase&lt;Schema&gt;) =&gt; Promise&lt;T&gt;): Promise&lt;T</span>
+   } catch (err) {
+     if (!warned) {
+       warned = true;
+<span class="d">-      console.warn(&#x27;The page cache is off: IndexedDB failed.&#x27;, err);</span>
+<span class="a">+      console.warn(&#x27;IndexedDB failed. The reader continues without it.&#x27;, err);</span>
+     }
+     return undefined;
+   }
+<span class="h">@@ -88,14 +160,76 @@ export async function putPage(key: string, entry: PageEntry): Promise&lt;void&gt; {</span>
+   await tryDb((d) =&gt; d.put(&#x27;pages&#x27;, entry, key));
+ }
+ 
+<span class="d">-export async function clearPages(): Promise&lt;void&gt; {</span>
+<span class="d">-  await tryDb((d) =&gt; d.clear(&#x27;pages&#x27;));</span>
+<span class="a">+/** Removes the pages of the book `key` (see bookKey). Without a key, removes all pages. */</span>
+<span class="a">+export async function clearPages(key?: string): Promise&lt;void&gt; {</span>
+<span class="a">+  await tryDb((d) =&gt;</span>
+<span class="a">+    key === undefined</span>
+<span class="a">+      ? d.clear(&#x27;pages&#x27;)</span>
+<span class="a">+      : // &quot;}&quot; follows &quot;|&quot; in the order of the code units. So this range holds</span>
+<span class="a">+        // each key that starts with `${key}|`, and no other key.</span>
+<span class="a">+        d.delete(&#x27;pages&#x27;, IDBKeyRange.bound(`${key}|`, `${key}}`, false, true)),</span>
+<span class="a">+  );</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Keeps a copy of `file` as the last book, in place of the book before it.</span>
+<span class="a">+ * Gives false when IndexedDB fails, for example when the file is larger than</span>
+<span class="a">+ * the free quota.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function putLastBook(file: File): Promise&lt;boolean&gt; {</span>
+<span class="a">+  const record: LastBook = { key: bookKey(file), name: file.name, type: file.type, blob: file };</span>
+<span class="a">+  const done = await tryDb(async (d) =&gt; {</span>
+<span class="a">+    await d.put(&#x27;books&#x27;, record, LAST);</span>
+<span class="a">+    return true;</span>
+<span class="a">+  });</span>
+<span class="a">+  return done === true;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The last book, or undefined when there is no last book or IndexedDB fails. */</span>
+<span class="a">+export function getLastBook(): Promise&lt;File | undefined&gt; {</span>
+<span class="a">+  return tryDb(async (d) =&gt; {</span>
+<span class="a">+    const book = await d.get(&#x27;books&#x27;, LAST);</span>
+<span class="a">+    return book &amp;&amp; new File([book.blob], book.name, { type: book.type });</span>
+<span class="a">+  });</span>
+ }
+ 
+<span class="d">-export function getSrt(key: string): Promise&lt;string | undefined&gt; {</span>
+<span class="d">-  return tryDb((d) =&gt; d.get(&#x27;srt&#x27;, key));</span>
+<span class="a">+/** What the reader keeps for the book `key`. An empty object when there is nothing, or IndexedDB fails. */</span>
+<span class="a">+export async function getMeta(key: string): Promise&lt;BookMeta&gt; {</span>
+<span class="a">+  return (await tryDb((d) =&gt; d.get(&#x27;meta&#x27;, key))) ?? {};</span>
+ }
+ 
+<span class="a">+/**</span>
+<span class="a">+ * Merges `patch` into what the reader keeps for the book `key`. A field that</span>
+<span class="a">+ * is undefined in `patch` is removed.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function putMeta(key: string, patch: Partial&lt;BookMeta&gt;): Promise&lt;void&gt; {</span>
+<span class="a">+  await tryDb((d) =&gt; {</span>
+<span class="a">+    // One transaction reads and writes, so two merges at the same time keep</span>
+<span class="a">+    // the fields of both.</span>
+<span class="a">+    const tx = d.transaction(&#x27;meta&#x27;, &#x27;readwrite&#x27;);</span>
+<span class="a">+    const merge = async (): Promise&lt;void&gt; =&gt; {</span>
+<span class="a">+      const meta: BookMeta = { ...(await tx.store.get(key)), ...patch };</span>
+<span class="a">+      for (const field of Object.keys(patch) as (keyof BookMeta)[]) {</span>
+<span class="a">+        if (patch[field] === undefined) delete meta[field];</span>
+<span class="a">+      }</span>
+<span class="a">+      await tx.store.put(meta, key);</span>
+<span class="a">+    };</span>
+<span class="a">+    return Promise.all([merge(), tx.done]);</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * The text of the subtitles of the book `key`.</span>
+<span class="a">+ * @deprecated Use getMeta. The next change of main.ts removes this function.</span>
+<span class="a">+ */</span>
+<span class="a">+export async function getSrt(key: string): Promise&lt;string | undefined&gt; {</span>
+<span class="a">+  return (await getMeta(key)).subtitles?.text;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Keeps the subtitles that SubRead made for the book `key`.</span>
+<span class="a">+ * @deprecated Use putMeta. The next change of main.ts removes this function.</span>
+<span class="a">+ */</span>
+ export async function putSrt(key: string, srt: string): Promise&lt;void&gt; {
+<span class="d">-  await tryDb((d) =&gt; d.put(&#x27;srt&#x27;, srt, key));</span>
+<span class="a">+  await putMeta(key, { subtitles: subreadSubtitles(key, srt) });</span>
+ }
+diff --git a/test/token-cache.test.ts b/test/token-cache.test.ts
+index 1bb572b..98f900d 100644
+--- a/test/token-cache.test.ts
++++ b/test/token-cache.test.ts
+<span class="h">@@ -1,8 +1,9 @@</span>
+ import &#x27;fake-indexeddb/auto&#x27;;
+ import { IDBFactory } from &#x27;fake-indexeddb&#x27;;
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+ import { openDB } from &#x27;idb&#x27;;
+ import { afterEach, beforeEach, describe, expect, it, vi } from &#x27;vitest&#x27;;
+<span class="d">-import type { PageEntry } from &#x27;../src/token-cache&#x27;;</span>
+<span class="a">+import type { BookSubtitles, PageEntry } from &#x27;../src/token-cache&#x27;;</span>
+ 
+ const entry: PageEntry = {
+   tokens: [{ text: &#x27;猫&#x27;, page: 0, line: 0, word: 0, bbox: { x0: 1, y0: 2, x1: 3, y1: 4 } }],
+<span class="h">@@ -19,6 +20,14 @@ async function freshCache() {</span>
+   return import(&#x27;../src/token-cache&#x27;);
+ }
+ 
+<span class="a">+/** The version and the store names of the database. Open the cache first. */</span>
+<span class="a">+async function schema(): Promise&lt;{ version: number; stores: string[] }&gt; {</span>
+<span class="a">+  const d = await openDB(&#x27;scan-subread&#x27;);</span>
+<span class="a">+  const result = { version: d.version, stores: [...d.objectStoreNames].sort() };</span>
+<span class="a">+  d.close();</span>
+<span class="a">+  return result;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+ describe(&#x27;token cache&#x27;, () =&gt; {
+   beforeEach(() =&gt; {
+     // Each test gets an empty IndexedDB.
+<span class="h">@@ -26,7 +35,7 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+   });
+   afterEach(() =&gt; vi.restoreAllMocks());
+ 
+<span class="d">-  it(&#x27;upgrades the database of an earlier build that has other stores&#x27;, async () =&gt; {</span>
+<span class="a">+  it(&#x27;upgrades version 1, which has the stores of the dictionary&#x27;, async () =&gt; {</span>
+     // Earlier builds made version 1 with the stores of the dictionary.
+     const old = await openDB(&#x27;scan-subread&#x27;, 1, {
+       upgrade(d) {
+<span class="h">@@ -40,27 +49,148 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     const cache = await freshCache();
+     await cache.putPage(&#x27;book.pdf|10|0|jpn|ocr&#x27;, entry);
+     expect(await cache.getPage(&#x27;book.pdf|10|0|jpn|ocr&#x27;)).toEqual(entry);
+<span class="d">-    await cache.putSrt(&#x27;book.pdf|10&#x27;, srt);</span>
+<span class="d">-    expect(await cache.getSrt(&#x27;book.pdf|10&#x27;)).toBe(srt);</span>
+<span class="a">+    expect(await schema()).toEqual({ version: 3, stores: [&#x27;books&#x27;, &#x27;meta&#x27;, &#x27;pages&#x27;] });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;upgrades version 2: the pages stay, and the subtitles move to the meta data&#x27;, async () =&gt; {</span>
+<span class="a">+    const old = await openDB(&#x27;scan-subread&#x27;, 2, {</span>
+<span class="a">+      upgrade(d) {</span>
+<span class="a">+        d.createObjectStore(&#x27;pages&#x27;);</span>
+<span class="a">+        d.createObjectStore(&#x27;srt&#x27;);</span>
+<span class="a">+      },</span>
+<span class="a">+    });</span>
+<span class="a">+    await old.put(&#x27;pages&#x27;, entry, &#x27;book.pdf|10|0|jpn|ocr&#x27;);</span>
+<span class="a">+    await old.put(&#x27;srt&#x27;, srt, &#x27;book.pdf|10&#x27;);</span>
+<span class="a">+    await old.put(&#x27;srt&#x27;, &#x27;x&#x27;, &#x27;Neko.PDF|20&#x27;);</span>
+<span class="a">+    await old.put(&#x27;srt&#x27;, &#x27;y&#x27;, &#x27;a|b|30&#x27;);</span>
+<span class="a">+    old.close();</span>
+ 
+<span class="d">-    const after = await openDB(&#x27;scan-subread&#x27;);</span>
+<span class="d">-    expect(after.version).toBe(2);</span>
+<span class="d">-    expect([...after.objectStoreNames].sort()).toEqual([&#x27;pages&#x27;, &#x27;srt&#x27;]);</span>
+<span class="d">-    after.close();</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    expect(await cache.getPage(&#x27;book.pdf|10|0|jpn|ocr&#x27;)).toEqual(entry);</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;book.pdf|10&#x27;)).toEqual({</span>
+<span class="a">+      subtitles: { name: &#x27;book.srt&#x27;, text: srt, source: &#x27;subread&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;Neko.PDF|20&#x27;)).toEqual({</span>
+<span class="a">+      subtitles: { name: &#x27;Neko.srt&#x27;, text: &#x27;x&#x27;, source: &#x27;subread&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;a|b|30&#x27;)).toEqual({</span>
+<span class="a">+      subtitles: { name: &#x27;a|b.srt&#x27;, text: &#x27;y&#x27;, source: &#x27;subread&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(await schema()).toEqual({ version: 3, stores: [&#x27;books&#x27;, &#x27;meta&#x27;, &#x27;pages&#x27;] });</span>
+   });
+ 
+   it(&#x27;makes the stores in a new database&#x27;, async () =&gt; {
+     const cache = await freshCache();
+     expect(await cache.getPage(&#x27;missing&#x27;)).toBeUndefined();
+<span class="d">-    await cache.putPage(&#x27;p&#x27;, entry);</span>
+<span class="d">-    expect(await cache.getPage(&#x27;p&#x27;)).toEqual(entry);</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;missing&#x27;)).toEqual({});</span>
+<span class="a">+    expect(await cache.getLastBook()).toBeUndefined();</span>
+<span class="a">+    expect(await schema()).toEqual({ version: 3, stores: [&#x27;books&#x27;, &#x27;meta&#x27;, &#x27;pages&#x27;] });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the last book, and a new book replaces it&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    const neko = new File([&#x27;%PDF-1.7 猫&#x27;], &#x27;neko.pdf&#x27;, { type: &#x27;application/pdf&#x27; });</span>
+<span class="a">+    expect(await cache.putLastBook(neko)).toBe(true);</span>
+<span class="a">+    const back = await cache.getLastBook();</span>
+<span class="a">+    expect(back).toBeInstanceOf(File);</span>
+<span class="a">+    expect(back?.name).toBe(&#x27;neko.pdf&#x27;);</span>
+<span class="a">+    expect(back?.type).toBe(&#x27;application/pdf&#x27;);</span>
+<span class="a">+    expect(await back?.text()).toBe(&#x27;%PDF-1.7 猫&#x27;);</span>
+<span class="a">+    expect(back &amp;&amp; cache.bookKey(back)).toBe(cache.bookKey(neko));</span>
+<span class="a">+</span>
+<span class="a">+    const inu = new File([&#x27;%PDF-1.7 犬と猫&#x27;], &#x27;inu.pdf&#x27;, { type: &#x27;application/pdf&#x27; });</span>
+<span class="a">+    expect(await cache.putLastBook(inu)).toBe(true);</span>
+<span class="a">+    expect((await cache.getLastBook())?.name).toBe(&#x27;inu.pdf&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+    const d = await openDB(&#x27;scan-subread&#x27;);</span>
+<span class="a">+    expect(await d.getAllKeys(&#x27;books&#x27;)).toEqual([&#x27;last&#x27;]);</span>
+<span class="a">+    const record = await d.get(&#x27;books&#x27;, &#x27;last&#x27;);</span>
+<span class="a">+    d.close();</span>
+<span class="a">+    expect(record).toMatchObject({</span>
+<span class="a">+      key: cache.bookKey(inu),</span>
+<span class="a">+      name: &#x27;inu.pdf&#x27;,</span>
+<span class="a">+      type: &#x27;application/pdf&#x27;,</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(record.blob).toBeInstanceOf(Blob);</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;merges the meta data, and removes a field that is undefined in the patch&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    const subtitles: BookSubtitles = { name: &#x27;neko.srt&#x27;, text: srt, source: &#x27;file&#x27; };</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { page: 3 });</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { subtitles, forceOcr: true });</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({ page: 3, subtitles, forceOcr: true });</span>
+<span class="a">+</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { page: undefined, forceOcr: false });</span>
+<span class="a">+    const meta = await cache.getMeta(&#x27;neko.pdf|10&#x27;);</span>
+<span class="a">+    expect(meta).toEqual({ subtitles, forceOcr: false });</span>
+<span class="a">+    expect(&#x27;page&#x27; in meta).toBe(false);</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;inu.pdf|20&#x27;)).toEqual({});</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the fields of two merges at the same time&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    await Promise.all([</span>
+<span class="a">+      cache.putMeta(&#x27;neko.pdf|10&#x27;, { page: 1 }),</span>
+<span class="a">+      cache.putMeta(&#x27;neko.pdf|10&#x27;, { forceOcr: true }),</span>
+<span class="a">+    ]);</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({ page: 1, forceOcr: true });</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;keeps the subtitles of putSrt in the meta data&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    await cache.putMeta(&#x27;neko.pdf|10&#x27;, { page: 2 });</span>
+<span class="a">+    await cache.putSrt(&#x27;neko.pdf|10&#x27;, srt);</span>
+<span class="a">+    expect(await cache.getSrt(&#x27;neko.pdf|10&#x27;)).toBe(srt);</span>
+<span class="a">+    expect(await cache.getMeta(&#x27;neko.pdf|10&#x27;)).toEqual({</span>
+<span class="a">+      page: 2,</span>
+<span class="a">+      subtitles: { name: &#x27;neko.srt&#x27;, text: srt, source: &#x27;subread&#x27; },</span>
+<span class="a">+    });</span>
+<span class="a">+    expect(await cache.getSrt(&#x27;inu.pdf|20&#x27;)).toBeUndefined();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;clears the pages of one book, or the pages of all books&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    const a = { name: &#x27;a.pdf&#x27;, size: 1 };</span>
+<span class="a">+    // The key of this book, &quot;a.pdf|10&quot;, starts with the key of `a`, &quot;a.pdf|1&quot;.</span>
+<span class="a">+    const a10 = { name: &#x27;a.pdf&#x27;, size: 10 };</span>
+<span class="a">+    const keys = [</span>
+<span class="a">+      cache.pageKey(a, 0, &#x27;jpn&#x27;, &#x27;ocr&#x27;),</span>
+<span class="a">+      cache.pageKey(a, 1, &#x27;jpn&#x27;, &#x27;text&#x27;),</span>
+<span class="a">+      cache.pageKey(a10, 0, &#x27;jpn&#x27;, &#x27;ocr&#x27;),</span>
+<span class="a">+    ] as const;</span>
+<span class="a">+    for (const key of keys) await cache.putPage(key, entry);</span>
+<span class="a">+    await cache.putMeta(cache.bookKey(a), { page: 1 });</span>
+<span class="a">+</span>
+<span class="a">+    await cache.clearPages(cache.bookKey(a));</span>
+<span class="a">+    expect(await cache.getPage(keys[0])).toBeUndefined();</span>
+<span class="a">+    expect(await cache.getPage(keys[1])).toBeUndefined();</span>
+<span class="a">+    expect(await cache.getPage(keys[2])).toEqual(entry);</span>
+<span class="a">+    expect(await cache.getMeta(cache.bookKey(a))).toEqual({ page: 1 });</span>
+<span class="a">+</span>
+     await cache.clearPages();
+<span class="d">-    expect(await cache.getPage(&#x27;p&#x27;)).toBeUndefined();</span>
+<span class="d">-    await cache.putSrt(&#x27;b&#x27;, srt);</span>
+<span class="d">-    expect(await cache.getSrt(&#x27;b&#x27;)).toBe(srt);</span>
+<span class="a">+    expect(await cache.getPage(keys[2])).toBeUndefined();</span>
+<span class="a">+  });</span>
+<span class="a">+</span>
+<span class="a">+  it(&#x27;clears each page key that starts with the book key and &quot;|&quot;, and no other key&#x27;, async () =&gt; {</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    const separator = fc.constantFrom(&#x27;|&#x27;, &#x27;||&#x27;, &#x27;}&#x27;, &#x27;{&#x27;, &#x27;&#x27;, &#x27;￿&#x27;);</span>
+<span class="a">+    const tails = fc.array(fc.tuple(separator, fc.string({ unit: &#x27;binary&#x27; })), { maxLength: 8 });</span>
+<span class="a">+    await fc.assert(</span>
+<span class="a">+      fc.asyncProperty(fc.string({ unit: &#x27;binary&#x27; }), tails, async (book, parts) =&gt; {</span>
+<span class="a">+        await cache.clearPages();</span>
+<span class="a">+        const keys = parts.map(([sep, tail]) =&gt; `${book}${sep}${tail}`);</span>
+<span class="a">+        for (const key of keys) await cache.putPage(key, entry);</span>
+<span class="a">+        await cache.clearPages(book);</span>
+<span class="a">+        for (const key of keys) {</span>
+<span class="a">+          const cleared = key.startsWith(`${book}|`);</span>
+<span class="a">+          expect(await cache.getPage(key), key).toEqual(cleared ? undefined : entry);</span>
+<span class="a">+        }</span>
+<span class="a">+      }),</span>
+<span class="a">+    );</span>
+   });
+ 
+<span class="d">-  it(&#x27;works without the cache when IndexedDB fails, and warns once&#x27;, async () =&gt; {</span>
+<span class="a">+  it(&#x27;works without IndexedDB, and warns once&#x27;, async () =&gt; {</span>
+     const warn = vi.spyOn(console, &#x27;warn&#x27;).mockImplementation(() =&gt; undefined);
+     vi.spyOn(indexedDB, &#x27;open&#x27;).mockImplementation(() =&gt; {
+       throw new DOMException(&#x27;IndexedDB is off.&#x27;, &#x27;SecurityError&#x27;);
+<span class="h">@@ -69,8 +199,27 @@ describe(&#x27;token cache&#x27;, () =&gt; {</span>
+     await expect(cache.getPage(&#x27;p&#x27;)).resolves.toBeUndefined();
+     await expect(cache.putPage(&#x27;p&#x27;, entry)).resolves.toBeUndefined();
+     await expect(cache.clearPages()).resolves.toBeUndefined();
+<span class="a">+    await expect(cache.clearPages(&#x27;b&#x27;)).resolves.toBeUndefined();</span>
+<span class="a">+    await expect(cache.getMeta(&#x27;b&#x27;)).resolves.toEqual({});</span>
+<span class="a">+    await expect(cache.putMeta(&#x27;b&#x27;, { page: 1 })).resolves.toBeUndefined();</span>
+<span class="a">+    await expect(cache.putLastBook(new File([&#x27;x&#x27;], &#x27;b.pdf&#x27;))).resolves.toBe(false);</span>
+<span class="a">+    await expect(cache.getLastBook()).resolves.toBeUndefined();</span>
+     await expect(cache.getSrt(&#x27;b&#x27;)).resolves.toBeUndefined();
+     await expect(cache.putSrt(&#x27;b&#x27;, srt)).resolves.toBeUndefined();
+     expect(warn).toHaveBeenCalledTimes(1);
+   });
+<span class="a">+</span>
+<span class="a">+  it(&#x27;gives false when the book does not fit, and keeps the other data&#x27;, async () =&gt; {</span>
+<span class="a">+    const warn = vi.spyOn(console, &#x27;warn&#x27;).mockImplementation(() =&gt; undefined);</span>
+<span class="a">+    const cache = await freshCache();</span>
+<span class="a">+    await cache.putPage(&#x27;p&#x27;, entry);</span>
+<span class="a">+    const put = vi.spyOn(IDBObjectStore.prototype, &#x27;put&#x27;).mockImplementation(() =&gt; {</span>
+<span class="a">+      throw new DOMException(&#x27;The quota is full.&#x27;, &#x27;QuotaExceededError&#x27;);</span>
+<span class="a">+    });</span>
+<span class="a">+    await expect(cache.putLastBook(new File([&#x27;x&#x27;], &#x27;b.pdf&#x27;))).resolves.toBe(false);</span>
+<span class="a">+    put.mockRestore();</span>
+<span class="a">+    expect(await cache.getPage(&#x27;p&#x27;)).toEqual(entry);</span>
+<span class="a">+    expect(await cache.getLastBook()).toBeUndefined();</span>
+<span class="a">+    expect(warn).toHaveBeenCalledTimes(1);</span>
+<span class="a">+  });</span>
+ });</pre>
+</div></body></html>

@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sbm-sync/feed.go - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sbm-sync</h1><span class="desc">Sync server for sbm bookmark files: one small Go program, plain files, AGPL</span><p class="url">git clone https://github.com/equwal/sbm-sync</p><p><a href="../../sbm-sync/index.html">Log</a> | <a href="../../sbm-sync/files.html">Files</a> | <a href="../../sbm-sync/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>feed.go (21750 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package main
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> // Feeds. An account can follow RSS and Atom feeds. The list of an account
+<a id="l4" href="#l4">4</a> // is one plain file, feeds.txt, with one feed on each line:
+<a id="l5" href="#l5">5</a> //
+<a id="l6" href="#l6">6</a> //	URL&lt;tab&gt;name
+<a id="l7" href="#l7">7</a> //
+<a id="l8" href="#l8">8</a> // The command `sbm-sync feed` (feedjob.go) fetches the feeds with
+<a id="l9" href="#l9">9</a> // sfeed_update into one sfeed(5) file for each feed, looks through the
+<a id="l10" href="#l10">10</a> // bookmarks of the account for feeds with sfeed_web when the account asked
+<a id="l11" href="#l11">11</a> // for it, and sends a daily digest of the new items by email. The page /feed
+<a id="l12" href="#l12">12</a> // shows the items, the feeds and the settings. GET /api/feed gives the items
+<a id="l13" href="#l13">13</a> // in the sfeed format, for sfeed_plain and the other sfeed tools.
+<a id="l14" href="#l14">14</a> //
+<a id="l15" href="#l15">15</a> // The files of an account are under feeds/&lt;account ID&gt;/:
+<a id="l16" href="#l16">16</a> //
+<a id="l17" href="#l17">17</a> //	feeds.txt    the feeds, written by the web pages
+<a id="l18" href="#l18">18</a> //	sfeedrc      the sfeed_update settings, made from feeds.txt by the job
+<a id="l19" href="#l19">19</a> //	items/&lt;file&gt; the items of one feed, written by sfeed_update
+<a id="l20" href="#l20">20</a> //	explore      the feeds found on the bookmarked pages, written by the job
+<a id="l21" href="#l21">21</a> //	mailed       the keys of the items that went out in a digest
+<a id="l22" href="#l22">22</a> //	digest       the time of the last digest
+<a id="l23" href="#l23">23</a> 
+<a id="l24" href="#l24">24</a> import (
+<a id="l25" href="#l25">25</a> 	&quot;errors&quot;
+<a id="l26" href="#l26">26</a> 	&quot;fmt&quot;
+<a id="l27" href="#l27">27</a> 	&quot;io&quot;
+<a id="l28" href="#l28">28</a> 	&quot;io/fs&quot;
+<a id="l29" href="#l29">29</a> 	&quot;net/http&quot;
+<a id="l30" href="#l30">30</a> 	&quot;net/url&quot;
+<a id="l31" href="#l31">31</a> 	&quot;os&quot;
+<a id="l32" href="#l32">32</a> 	&quot;path/filepath&quot;
+<a id="l33" href="#l33">33</a> 	&quot;regexp&quot;
+<a id="l34" href="#l34">34</a> 	&quot;slices&quot;
+<a id="l35" href="#l35">35</a> 	&quot;strconv&quot;
+<a id="l36" href="#l36">36</a> 	&quot;strings&quot;
+<a id="l37" href="#l37">37</a> 	&quot;time&quot;
+<a id="l38" href="#l38">38</a> )
+<a id="l39" href="#l39">39</a> 
+<a id="l40" href="#l40">40</a> const (
+<a id="l41" href="#l41">41</a> 	maxFeeds    = 200  // feeds that an account can follow
+<a id="l42" href="#l42">42</a> 	maxFeedURL  = 2048 // bytes in the URL of a feed
+<a id="l43" href="#l43">43</a> 	maxFeedName = 100  // characters in the name of a feed
+<a id="l44" href="#l44">44</a> 	maxFileName = 40   // characters in the file name of a feed, before a number
+<a id="l45" href="#l45">45</a> 	maxShare    = 50   // feeds in one share link
+<a id="l46" href="#l46">46</a> 	itemsOnPage = 100
+<a id="l47" href="#l47">47</a> 	// nextCookie keeps the share page that a visitor came from, so that the
+<a id="l48" href="#l48">48</a> 	// browser goes back to it after the sign-in or the email check.
+<a id="l49" href="#l49">49</a> 	nextCookie = &quot;sbm_next&quot;
+<a id="l50" href="#l50">50</a> )
+<a id="l51" href="#l51">51</a> 
+<a id="l52" href="#l52">52</a> var (
+<a id="l53" href="#l53">53</a> 	errFeedURL   = errors.New(&quot;the URL must start with http:// or https:// and have no spaces or quotes&quot;)
+<a id="l54" href="#l54">54</a> 	errFeedLong  = errors.New(&quot;the URL is longer than 2048 characters&quot;)
+<a id="l55" href="#l55">55</a> 	errFeedKnown = errors.New(&quot;you follow this feed already&quot;)
+<a id="l56" href="#l56">56</a> 	errFeedMany  = errors.New(&quot;you follow 200 feeds already, the most that this server keeps&quot;)
+<a id="l57" href="#l57">57</a> 	notFile      = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+<a id="l58" href="#l58">58</a> )
+<a id="l59" href="#l59">59</a> 
+<a id="l60" href="#l60">60</a> // feedSettings are the feed choices of an account. The daily email is on
+<a id="l61" href="#l61">61</a> // by default: the account gave its address at sign-up.
+<a id="l62" href="#l62">62</a> type feedSettings struct {
+<a id="l63" href="#l63">63</a> 	NewTab  bool `json:&quot;newtab,omitempty&quot;`  // the feed page opens links in a new tab
+<a id="l64" href="#l64">64</a> 	NoMail  bool `json:&quot;nomail,omitempty&quot;`  // no email with the new items once a day
+<a id="l65" href="#l65">65</a> 	Explore bool `json:&quot;explore,omitempty&quot;` // the job looks through the bookmarks for feeds
+<a id="l66" href="#l66">66</a> }
+<a id="l67" href="#l67">67</a> 
+<a id="l68" href="#l68">68</a> // Feed is one line of feeds.txt. File is the name of the item file of the
+<a id="l69" href="#l69">69</a> // feed under items/, and the name that sfeed_update knows the feed by.
+<a id="l70" href="#l70">70</a> type Feed struct {
+<a id="l71" href="#l71">71</a> 	URL, Name, File string
+<a id="l72" href="#l72">72</a> }
+<a id="l73" href="#l73">73</a> 
+<a id="l74" href="#l74">74</a> // Share gives the share link of the feed: the page that follows it.
+<a id="l75" href="#l75">75</a> func (f Feed) Share() string {
+<a id="l76" href="#l76">76</a> 	return shareLink([]Feed{f})
+<a id="l77" href="#l77">77</a> }
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a> // shareLink gives the address of the page that follows the feeds, for
+<a id="l80" href="#l80">80</a> // anyone with the link. The first maxShare feeds go in.
+<a id="l81" href="#l81">81</a> func shareLink(feeds []Feed) string {
+<a id="l82" href="#l82">82</a> 	v := url.Values{}
+<a id="l83" href="#l83">83</a> 	for i, f := range feeds {
+<a id="l84" href="#l84">84</a> 		if i &gt;= maxShare {
+<a id="l85" href="#l85">85</a> 			break
+<a id="l86" href="#l86">86</a> 		}
+<a id="l87" href="#l87">87</a> 		v.Add(&quot;url&quot;, f.URL)
+<a id="l88" href="#l88">88</a> 		v.Add(&quot;name&quot;, f.Name)
+<a id="l89" href="#l89">89</a> 	}
+<a id="l90" href="#l90">90</a> 	return &quot;/feed/follow?&quot; + v.Encode()
+<a id="l91" href="#l91">91</a> }
+<a id="l92" href="#l92">92</a> 
+<a id="l93" href="#l93">93</a> // sharedFeeds gives the feeds of a share link: the url and name fields, in
+<a id="l94" href="#l94">94</a> // pairs. The values that are not feed addresses come back in bad.
+<a id="l95" href="#l95">95</a> func sharedFeeds(q url.Values) (feeds []Feed, bad []string) {
+<a id="l96" href="#l96">96</a> 	names := q[&quot;name&quot;]
+<a id="l97" href="#l97">97</a> 	for i, u := range q[&quot;url&quot;] {
+<a id="l98" href="#l98">98</a> 		if i &gt;= maxShare {
+<a id="l99" href="#l99">99</a> 			break
+<a id="l100" href="#l100">100</a> 		}
+<a id="l101" href="#l101">101</a> 		addr, err := feedURL(u)
+<a id="l102" href="#l102">102</a> 		if err != nil {
+<a id="l103" href="#l103">103</a> 			bad = append(bad, u)
+<a id="l104" href="#l104">104</a> 			continue
+<a id="l105" href="#l105">105</a> 		}
+<a id="l106" href="#l106">106</a> 		name := &quot;&quot;
+<a id="l107" href="#l107">107</a> 		if i &lt; len(names) {
+<a id="l108" href="#l108">108</a> 			name = names[i]
+<a id="l109" href="#l109">109</a> 		}
+<a id="l110" href="#l110">110</a> 		feeds = append(feeds, Feed{URL: addr, Name: feedName(name, addr)})
+<a id="l111" href="#l111">111</a> 	}
+<a id="l112" href="#l112">112</a> 	return feeds, bad
+<a id="l113" href="#l113">113</a> }
+<a id="l114" href="#l114">114</a> 
+<a id="l115" href="#l115">115</a> // feedURL checks the URL of a feed. It takes only http and https addresses
+<a id="l116" href="#l116">116</a> // of printable ASCII without quotes, so that the URL can go into the
+<a id="l117" href="#l117">117</a> // sfeedrc, a shell script, between single quotes.
+<a id="l118" href="#l118">118</a> func feedURL(raw string) (string, error) {
+<a id="l119" href="#l119">119</a> 	u := strings.TrimSpace(raw)
+<a id="l120" href="#l120">120</a> 	if u == &quot;&quot; {
+<a id="l121" href="#l121">121</a> 		return &quot;&quot;, errNoURL
+<a id="l122" href="#l122">122</a> 	}
+<a id="l123" href="#l123">123</a> 	if len(u) &gt; maxFeedURL {
+<a id="l124" href="#l124">124</a> 		return &quot;&quot;, errFeedLong
+<a id="l125" href="#l125">125</a> 	}
+<a id="l126" href="#l126">126</a> 	for i := 0; i &lt; len(u); i++ {
+<a id="l127" href="#l127">127</a> 		if c := u[i]; c &lt;= &#x27; &#x27; || c &gt; &#x27;~&#x27; || c == &#x27;\&#x27;&#x27; {
+<a id="l128" href="#l128">128</a> 			return &quot;&quot;, errFeedURL
+<a id="l129" href="#l129">129</a> 		}
+<a id="l130" href="#l130">130</a> 	}
+<a id="l131" href="#l131">131</a> 	p, err := url.Parse(u)
+<a id="l132" href="#l132">132</a> 	if err != nil || p.Host == &quot;&quot; || (p.Scheme != &quot;http&quot; &amp;&amp; p.Scheme != &quot;https&quot;) {
+<a id="l133" href="#l133">133</a> 		return &quot;&quot;, errFeedURL
+<a id="l134" href="#l134">134</a> 	}
+<a id="l135" href="#l135">135</a> 	return u, nil
+<a id="l136" href="#l136">136</a> }
+<a id="l137" href="#l137">137</a> 
+<a id="l138" href="#l138">138</a> // feedName gives the name of a feed for feeds.txt: one line of at most
+<a id="l139" href="#l139">139</a> // maxFeedName characters. Without a name, the host of the URL is the name.
+<a id="l140" href="#l140">140</a> func feedName(name, u string) string {
+<a id="l141" href="#l141">141</a> 	n := strings.Join(strings.Fields(name), &quot; &quot;)
+<a id="l142" href="#l142">142</a> 	if n == &quot;&quot; {
+<a id="l143" href="#l143">143</a> 		n = Bookmark{URL: u}.Host()
+<a id="l144" href="#l144">144</a> 	}
+<a id="l145" href="#l145">145</a> 	if r := []rune(n); len(r) &gt; maxFeedName {
+<a id="l146" href="#l146">146</a> 		n = string(r[:maxFeedName])
+<a id="l147" href="#l147">147</a> 	}
+<a id="l148" href="#l148">148</a> 	return n
+<a id="l149" href="#l149">149</a> }
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a> // fileName gives the base of the file name of a feed: the letters, digits,
+<a id="l152" href="#l152">152</a> // dots, dashes and underscores of its name, or &quot;feed&quot;.
+<a id="l153" href="#l153">153</a> func fileName(name string) string {
+<a id="l154" href="#l154">154</a> 	f := strings.Trim(notFile.ReplaceAllString(name, &quot;-&quot;), &quot;-.&quot;)
+<a id="l155" href="#l155">155</a> 	if len(f) &gt; maxFileName {
+<a id="l156" href="#l156">156</a> 		f = strings.Trim(f[:maxFileName], &quot;-.&quot;)
+<a id="l157" href="#l157">157</a> 	}
+<a id="l158" href="#l158">158</a> 	if f == &quot;&quot; {
+<a id="l159" href="#l159">159</a> 		return &quot;feed&quot;
+<a id="l160" href="#l160">160</a> 	}
+<a id="l161" href="#l161">161</a> 	return f
+<a id="l162" href="#l162">162</a> }
+<a id="l163" href="#l163">163</a> 
+<a id="l164" href="#l164">164</a> // parseFeeds gives the feeds of feeds.txt, in the order of the file. Each
+<a id="l165" href="#l165">165</a> // feed gets a file name that no other feed of the file has.
+<a id="l166" href="#l166">166</a> func parseFeeds(text string) []Feed {
+<a id="l167" href="#l167">167</a> 	var out []Feed
+<a id="l168" href="#l168">168</a> 	used := map[string]bool{}
+<a id="l169" href="#l169">169</a> 	for _, l := range lines(text) {
+<a id="l170" href="#l170">170</a> 		u, name, _ := strings.Cut(l, &quot;\t&quot;)
+<a id="l171" href="#l171">171</a> 		if u == &quot;&quot; {
+<a id="l172" href="#l172">172</a> 			continue
+<a id="l173" href="#l173">173</a> 		}
+<a id="l174" href="#l174">174</a> 		f := Feed{URL: u, Name: name, File: fileName(name)}
+<a id="l175" href="#l175">175</a> 		for i := 2; used[f.File]; i++ {
+<a id="l176" href="#l176">176</a> 			f.File = fileName(name) + &quot;-&quot; + strconv.Itoa(i)
+<a id="l177" href="#l177">177</a> 		}
+<a id="l178" href="#l178">178</a> 		used[f.File] = true
+<a id="l179" href="#l179">179</a> 		out = append(out, f)
+<a id="l180" href="#l180">180</a> 	}
+<a id="l181" href="#l181">181</a> 	return out
+<a id="l182" href="#l182">182</a> }
+<a id="l183" href="#l183">183</a> 
+<a id="l184" href="#l184">184</a> // Item is one line of an sfeed(5) file.
+<a id="l185" href="#l185">185</a> type Item struct {
+<a id="l186" href="#l186">186</a> 	Time   time.Time // zero when the feed gives none
+<a id="l187" href="#l187">187</a> 	Title  string
+<a id="l188" href="#l188">188</a> 	Link   string // the address, or &quot;&quot; when it is not http or https
+<a id="l189" href="#l189">189</a> 	Author string
+<a id="l190" href="#l190">190</a> 	Feed   string // the name of the feed
+<a id="l191" href="#l191">191</a> 	File   string // the item file of the feed
+<a id="l192" href="#l192">192</a> 	Key    string // &quot;file&lt;tab&gt;id&quot; names the item in mailed; the link or the title stand in for a missing id
+<a id="l193" href="#l193">193</a> 	Raw    string // the line as sfeed wrote it
+<a id="l194" href="#l194">194</a> }
+<a id="l195" href="#l195">195</a> 
+<a id="l196" href="#l196">196</a> // unescape undoes the escapes of the sfeed format: \t, \n and \\.
+<a id="l197" href="#l197">197</a> func unescape(s string) string {
+<a id="l198" href="#l198">198</a> 	if !strings.Contains(s, `\`) {
+<a id="l199" href="#l199">199</a> 		return s
+<a id="l200" href="#l200">200</a> 	}
+<a id="l201" href="#l201">201</a> 	var b strings.Builder
+<a id="l202" href="#l202">202</a> 	for i := 0; i &lt; len(s); i++ {
+<a id="l203" href="#l203">203</a> 		if s[i] == &#x27;\\&#x27; &amp;&amp; i+1 &lt; len(s) {
+<a id="l204" href="#l204">204</a> 			switch s[i+1] {
+<a id="l205" href="#l205">205</a> 			case &#x27;t&#x27;:
+<a id="l206" href="#l206">206</a> 				b.WriteByte(&#x27;\t&#x27;)
+<a id="l207" href="#l207">207</a> 				i++
+<a id="l208" href="#l208">208</a> 				continue
+<a id="l209" href="#l209">209</a> 			case &#x27;n&#x27;:
+<a id="l210" href="#l210">210</a> 				b.WriteByte(&#x27;\n&#x27;)
+<a id="l211" href="#l211">211</a> 				i++
+<a id="l212" href="#l212">212</a> 				continue
+<a id="l213" href="#l213">213</a> 			case &#x27;\\&#x27;:
+<a id="l214" href="#l214">214</a> 				b.WriteByte(&#x27;\\&#x27;)
+<a id="l215" href="#l215">215</a> 				i++
+<a id="l216" href="#l216">216</a> 				continue
+<a id="l217" href="#l217">217</a> 			}
+<a id="l218" href="#l218">218</a> 		}
+<a id="l219" href="#l219">219</a> 		b.WriteByte(s[i])
+<a id="l220" href="#l220">220</a> 	}
+<a id="l221" href="#l221">221</a> 	return b.String()
+<a id="l222" href="#l222">222</a> }
+<a id="l223" href="#l223">223</a> 
+<a id="l224" href="#l224">224</a> // parseItems gives the items of the sfeed file of a feed, in the order of
+<a id="l225" href="#l225">225</a> // the file.
+<a id="l226" href="#l226">226</a> func parseItems(text string, f Feed) []Item {
+<a id="l227" href="#l227">227</a> 	var out []Item
+<a id="l228" href="#l228">228</a> 	for _, l := range lines(text) {
+<a id="l229" href="#l229">229</a> 		c := strings.Split(l, &quot;\t&quot;)
+<a id="l230" href="#l230">230</a> 		if len(c) &lt; 3 {
+<a id="l231" href="#l231">231</a> 			continue
+<a id="l232" href="#l232">232</a> 		}
+<a id="l233" href="#l233">233</a> 		for len(c) &lt; 9 {
+<a id="l234" href="#l234">234</a> 			c = append(c, &quot;&quot;)
+<a id="l235" href="#l235">235</a> 		}
+<a id="l236" href="#l236">236</a> 		it := Item{Title: unescape(c[1]), Author: unescape(c[6]), Feed: f.Name, File: f.File, Raw: l}
+<a id="l237" href="#l237">237</a> 		if t, err := strconv.ParseInt(c[0], 10, 64); err == nil {
+<a id="l238" href="#l238">238</a> 			it.Time = time.Unix(t, 0).UTC()
+<a id="l239" href="#l239">239</a> 		}
+<a id="l240" href="#l240">240</a> 		link := unescape(c[2])
+<a id="l241" href="#l241">241</a> 		if link != &quot;&quot; {
+<a id="l242" href="#l242">242</a> 			it.Link = Bookmark{URL: link}.Link()
+<a id="l243" href="#l243">243</a> 		}
+<a id="l244" href="#l244">244</a> 		id := c[5]
+<a id="l245" href="#l245">245</a> 		if id == &quot;&quot; {
+<a id="l246" href="#l246">246</a> 			id = c[2]
+<a id="l247" href="#l247">247</a> 		}
+<a id="l248" href="#l248">248</a> 		if id == &quot;&quot; {
+<a id="l249" href="#l249">249</a> 			id = c[1]
+<a id="l250" href="#l250">250</a> 		}
+<a id="l251" href="#l251">251</a> 		it.Key = f.File + &quot;\t&quot; + id
+<a id="l252" href="#l252">252</a> 		if it.Title == &quot;&quot; {
+<a id="l253" href="#l253">253</a> 			it.Title = link
+<a id="l254" href="#l254">254</a> 		}
+<a id="l255" href="#l255">255</a> 		if it.Title == &quot;&quot; {
+<a id="l256" href="#l256">256</a> 			it.Title = &quot;(no title)&quot;
+<a id="l257" href="#l257">257</a> 		}
+<a id="l258" href="#l258">258</a> 		out = append(out, it)
+<a id="l259" href="#l259">259</a> 	}
+<a id="l260" href="#l260">260</a> 	return out
+<a id="l261" href="#l261">261</a> }
+<a id="l262" href="#l262">262</a> 
+<a id="l263" href="#l263">263</a> // ---- the files of an account ----
+<a id="l264" href="#l264">264</a> 
+<a id="l265" href="#l265">265</a> func (s *Store) feedDir(id string) string {
+<a id="l266" href="#l266">266</a> 	return filepath.Join(s.dir, &quot;feeds&quot;, id)
+<a id="l267" href="#l267">267</a> }
+<a id="l268" href="#l268">268</a> 
+<a id="l269" href="#l269">269</a> // defaultFeeds gives the feeds.txt of a new account from the setting
+<a id="l270" href="#l270">270</a> // SBM_DEFAULT_FEEDS: feed URLs with spaces between them. The host of each
+<a id="l271" href="#l271">271</a> // URL is its name.
+<a id="l272" href="#l272">272</a> func defaultFeeds(setting string) (string, error) {
+<a id="l273" href="#l273">273</a> 	var ls []string
+<a id="l274" href="#l274">274</a> 	for _, u := range strings.Fields(setting) {
+<a id="l275" href="#l275">275</a> 		u, err := feedURL(u)
+<a id="l276" href="#l276">276</a> 		if err != nil {
+<a id="l277" href="#l277">277</a> 			return &quot;&quot;, fmt.Errorf(&quot;SBM_DEFAULT_FEEDS: %q: %v&quot;, u, err)
+<a id="l278" href="#l278">278</a> 		}
+<a id="l279" href="#l279">279</a> 		ls = append(ls, u+&quot;\t&quot;+feedName(&quot;&quot;, u))
+<a id="l280" href="#l280">280</a> 	}
+<a id="l281" href="#l281">281</a> 	return join(ls), nil
+<a id="l282" href="#l282">282</a> }
+<a id="l283" href="#l283">283</a> 
+<a id="l284" href="#l284">284</a> // feedsText gives feeds.txt of the account. The caller holds the lock of
+<a id="l285" href="#l285">285</a> // the account. An account without the file has the default feeds.
+<a id="l286" href="#l286">286</a> func (s *Store) feedsText(a *Account) (string, error) {
+<a id="l287" href="#l287">287</a> 	b, err := os.ReadFile(filepath.Join(s.feedDir(a.ID), &quot;feeds.txt&quot;))
+<a id="l288" href="#l288">288</a> 	if errors.Is(err, fs.ErrNotExist) {
+<a id="l289" href="#l289">289</a> 		return s.defaultFeeds, nil
+<a id="l290" href="#l290">290</a> 	}
+<a id="l291" href="#l291">291</a> 	return string(b), err
+<a id="l292" href="#l292">292</a> }
+<a id="l293" href="#l293">293</a> 
+<a id="l294" href="#l294">294</a> // readFeeds gives feeds.txt of the account.
+<a id="l295" href="#l295">295</a> func (s *Store) readFeeds(a *Account) (string, error) {
+<a id="l296" href="#l296">296</a> 	m := s.lock(a.ID)
+<a id="l297" href="#l297">297</a> 	m.Lock()
+<a id="l298" href="#l298">298</a> 	defer m.Unlock()
+<a id="l299" href="#l299">299</a> 	return s.feedsText(a)
+<a id="l300" href="#l300">300</a> }
+<a id="l301" href="#l301">301</a> 
+<a id="l302" href="#l302">302</a> // changeFeeds gives feeds.txt to f and writes what f gives back. No other
+<a id="l303" href="#l303">303</a> // change to the file comes between the two.
+<a id="l304" href="#l304">304</a> func (s *Store) changeFeeds(a *Account, f func(text string) (string, error)) error {
+<a id="l305" href="#l305">305</a> 	m := s.lock(a.ID)
+<a id="l306" href="#l306">306</a> 	m.Lock()
+<a id="l307" href="#l307">307</a> 	defer m.Unlock()
+<a id="l308" href="#l308">308</a> 	dir := s.feedDir(a.ID)
+<a id="l309" href="#l309">309</a> 	old, err := s.feedsText(a)
+<a id="l310" href="#l310">310</a> 	if err != nil {
+<a id="l311" href="#l311">311</a> 		return err
+<a id="l312" href="#l312">312</a> 	}
+<a id="l313" href="#l313">313</a> 	text, err := f(old)
+<a id="l314" href="#l314">314</a> 	if err != nil {
+<a id="l315" href="#l315">315</a> 		return err
+<a id="l316" href="#l316">316</a> 	}
+<a id="l317" href="#l317">317</a> 	if err := os.MkdirAll(dir, 0o700); err != nil {
+<a id="l318" href="#l318">318</a> 		return err
+<a id="l319" href="#l319">319</a> 	}
+<a id="l320" href="#l320">320</a> 	return writeFile(filepath.Join(dir, &quot;feeds.txt&quot;), []byte(text))
+<a id="l321" href="#l321">321</a> }
+<a id="l322" href="#l322">322</a> 
+<a id="l323" href="#l323">323</a> func (s *Store) setFeed(a *Account, f feedSettings) error {
+<a id="l324" href="#l324">324</a> 	s.mu.Lock()
+<a id="l325" href="#l325">325</a> 	defer s.mu.Unlock()
+<a id="l326" href="#l326">326</a> 	a.Feed = f
+<a id="l327" href="#l327">327</a> 	return s.save()
+<a id="l328" href="#l328">328</a> }
+<a id="l329" href="#l329">329</a> 
+<a id="l330" href="#l330">330</a> // all gives every account, oldest first.
+<a id="l331" href="#l331">331</a> func (s *Store) all() []*Account {
+<a id="l332" href="#l332">332</a> 	s.mu.Lock()
+<a id="l333" href="#l333">333</a> 	defer s.mu.Unlock()
+<a id="l334" href="#l334">334</a> 	out := make([]*Account, 0, len(s.accounts))
+<a id="l335" href="#l335">335</a> 	for _, a := range s.accounts {
+<a id="l336" href="#l336">336</a> 		out = append(out, a)
+<a id="l337" href="#l337">337</a> 	}
+<a id="l338" href="#l338">338</a> 	slices.SortFunc(out, func(x, y *Account) int { return x.Created.Compare(y.Created) })
+<a id="l339" href="#l339">339</a> 	return out
+<a id="l340" href="#l340">340</a> }
+<a id="l341" href="#l341">341</a> 
+<a id="l342" href="#l342">342</a> // feedItems gives the items of the feeds of the account, newest first.
+<a id="l343" href="#l343">343</a> // Items without a time come last.
+<a id="l344" href="#l344">344</a> func (s *server) feedItems(a *Account, feeds []Feed) []Item {
+<a id="l345" href="#l345">345</a> 	var all []Item
+<a id="l346" href="#l346">346</a> 	for _, f := range feeds {
+<a id="l347" href="#l347">347</a> 		b, err := os.ReadFile(filepath.Join(s.store.feedDir(a.ID), &quot;items&quot;, f.File))
+<a id="l348" href="#l348">348</a> 		if err != nil {
+<a id="l349" href="#l349">349</a> 			continue // not fetched yet
+<a id="l350" href="#l350">350</a> 		}
+<a id="l351" href="#l351">351</a> 		all = append(all, parseItems(string(b), f)...)
+<a id="l352" href="#l352">352</a> 	}
+<a id="l353" href="#l353">353</a> 	slices.SortStableFunc(all, func(x, y Item) int { return y.Time.Compare(x.Time) })
+<a id="l354" href="#l354">354</a> 	return all
+<a id="l355" href="#l355">355</a> }
+<a id="l356" href="#l356">356</a> 
+<a id="l357" href="#l357">357</a> // suggestion is a feed that the job found on a bookmarked page.
+<a id="l358" href="#l358">358</a> type suggestion struct {
+<a id="l359" href="#l359">359</a> 	URL, Page, Name string
+<a id="l360" href="#l360">360</a> }
+<a id="l361" href="#l361">361</a> 
+<a id="l362" href="#l362">362</a> // suggestions gives the feeds of the explore file that the account does not
+<a id="l363" href="#l363">363</a> // follow, the number of bookmarked pages that the job looked at, and the
+<a id="l364" href="#l364">364</a> // number of bookmarks with a web address.
+<a id="l365" href="#l365">365</a> func (s *server) suggestions(a *Account, feeds []Feed) ([]suggestion, int, int, error) {
+<a id="l366" href="#l366">366</a> 	text, _, err := s.store.read(a, &quot;&quot;)
+<a id="l367" href="#l367">367</a> 	if err != nil {
+<a id="l368" href="#l368">368</a> 		return nil, 0, 0, err
+<a id="l369" href="#l369">369</a> 	}
+<a id="l370" href="#l370">370</a> 	names := map[string]string{}
+<a id="l371" href="#l371">371</a> 	total := 0
+<a id="l372" href="#l372">372</a> 	for _, b := range parse(text) {
+<a id="l373" href="#l373">373</a> 		if l := b.Link(); l != &quot;&quot; {
+<a id="l374" href="#l374">374</a> 			names[l] = b.Desc
+<a id="l375" href="#l375">375</a> 			total++
+<a id="l376" href="#l376">376</a> 		}
+<a id="l377" href="#l377">377</a> 	}
+<a id="l378" href="#l378">378</a> 	b, err := os.ReadFile(filepath.Join(s.store.feedDir(a.ID), &quot;explore&quot;))
+<a id="l379" href="#l379">379</a> 	if err != nil &amp;&amp; !errors.Is(err, fs.ErrNotExist) {
+<a id="l380" href="#l380">380</a> 		return nil, 0, 0, err
+<a id="l381" href="#l381">381</a> 	}
+<a id="l382" href="#l382">382</a> 	known := map[string]bool{}
+<a id="l383" href="#l383">383</a> 	for _, f := range feeds {
+<a id="l384" href="#l384">384</a> 		known[norm(f.URL)] = true
+<a id="l385" href="#l385">385</a> 	}
+<a id="l386" href="#l386">386</a> 	pages := map[string]bool{}
+<a id="l387" href="#l387">387</a> 	var out []suggestion
+<a id="l388" href="#l388">388</a> 	for _, l := range lines(string(b)) {
+<a id="l389" href="#l389">389</a> 		f := strings.Split(l, &quot;\t&quot;)
+<a id="l390" href="#l390">390</a> 		if len(f) &lt; 2 {
+<a id="l391" href="#l391">391</a> 			continue
+<a id="l392" href="#l392">392</a> 		}
+<a id="l393" href="#l393">393</a> 		if _, ok := names[f[0]]; ok {
+<a id="l394" href="#l394">394</a> 			pages[f[0]] = true // a page that is a bookmark still
+<a id="l395" href="#l395">395</a> 		}
+<a id="l396" href="#l396">396</a> 		if f[1] == &quot;-&quot; || known[norm(f[1])] {
+<a id="l397" href="#l397">397</a> 			continue
+<a id="l398" href="#l398">398</a> 		}
+<a id="l399" href="#l399">399</a> 		known[norm(f[1])] = true
+<a id="l400" href="#l400">400</a> 		out = append(out, suggestion{URL: f[1], Page: f[0], Name: feedName(names[f[0]], f[1])})
+<a id="l401" href="#l401">401</a> 	}
+<a id="l402" href="#l402">402</a> 	return out, len(pages), total, nil
+<a id="l403" href="#l403">403</a> }
+<a id="l404" href="#l404">404</a> 
+<a id="l405" href="#l405">405</a> // ---- pages ----
+<a id="l406" href="#l406">406</a> 
+<a id="l407" href="#l407">407</a> // feedPage is the data of the feed page.
+<a id="l408" href="#l408">408</a> type feedPage struct {
+<a id="l409" href="#l409">409</a> 	page
+<a id="l410" href="#l410">410</a> 	Feeds       []Feed
+<a id="l411" href="#l411">411</a> 	ShareAll    string // the share link of all feeds
+<a id="l412" href="#l412">412</a> 	Items       []Item
+<a id="l413" href="#l413">413</a> 	Start, Next int    // the first item on the page, and the start of the next page, or 0
+<a id="l414" href="#l414">414</a> 	Total       int    // items that match
+<a id="l415" href="#l415">415</a> 	Filter      string // the file name of the one feed that the page shows, or &quot;&quot;
+<a id="l416" href="#l416">416</a> 	FilterName  string
+<a id="l417" href="#l417">417</a> 	Settings    feedSettings
+<a id="l418" href="#l418">418</a> 	HasMail     bool   // the server sends email, so the digest is a choice
+<a id="l419" href="#l419">419</a> 	Open        string // &quot;add&quot; when the form to follow a feed must be open
+<a id="l420" href="#l420">420</a> 	Form        struct{ URL, Name string }
+<a id="l421" href="#l421">421</a> 	Done        string
+<a id="l422" href="#l422">422</a> 	Suggestions []suggestion
+<a id="l423" href="#l423">423</a> 	Checked     int // bookmarked pages that the job looked at
+<a id="l424" href="#l424">424</a> 	Bookmarks   int // bookmarks with a web address
+<a id="l425" href="#l425">425</a> }
+<a id="l426" href="#l426">426</a> 
+<a id="l427" href="#l427">427</a> var feedDone = map[string]string{
+<a id="l428" href="#l428">428</a> 	&quot;added&quot;:    &quot;You follow the feed. Its items come with the next update, within 30 minutes.&quot;,
+<a id="l429" href="#l429">429</a> 	&quot;deleted&quot;:  &quot;You do not follow the feed any more.&quot;,
+<a id="l430" href="#l430">430</a> 	&quot;settings&quot;: &quot;Settings saved.&quot;,
+<a id="l431" href="#l431">431</a> }
+<a id="l432" href="#l432">432</a> 
+<a id="l433" href="#l433">433</a> // feedData gives the feed page of the account: the items from start, or
+<a id="l434" href="#l434">434</a> // only the items of the feed with the file name filter.
+<a id="l435" href="#l435">435</a> func (s *server) feedData(a *Account, filter string, start int) (feedPage, error) {
+<a id="l436" href="#l436">436</a> 	p := feedPage{page: s.page(&quot;Your feed&quot;), Filter: filter, Start: start, HasMail: s.mail != nil,
+<a id="l437" href="#l437">437</a> 		Settings: s.store.view(a).Feed}
+<a id="l438" href="#l438">438</a> 	text, err := s.store.readFeeds(a)
+<a id="l439" href="#l439">439</a> 	if err != nil {
+<a id="l440" href="#l440">440</a> 		return p, err
+<a id="l441" href="#l441">441</a> 	}
+<a id="l442" href="#l442">442</a> 	p.Feeds = parseFeeds(text)
+<a id="l443" href="#l443">443</a> 	p.ShareAll = shareLink(p.Feeds)
+<a id="l444" href="#l444">444</a> 	items := s.feedItems(a, p.Feeds)
+<a id="l445" href="#l445">445</a> 	if filter != &quot;&quot; {
+<a id="l446" href="#l446">446</a> 		items = slices.DeleteFunc(items, func(it Item) bool { return it.File != filter })
+<a id="l447" href="#l447">447</a> 		for _, f := range p.Feeds {
+<a id="l448" href="#l448">448</a> 			if f.File == filter {
+<a id="l449" href="#l449">449</a> 				p.FilterName = f.Name
+<a id="l450" href="#l450">450</a> 			}
+<a id="l451" href="#l451">451</a> 		}
+<a id="l452" href="#l452">452</a> 	}
+<a id="l453" href="#l453">453</a> 	p.Total = len(items)
+<a id="l454" href="#l454">454</a> 	if start &gt; len(items) {
+<a id="l455" href="#l455">455</a> 		start = len(items)
+<a id="l456" href="#l456">456</a> 	}
+<a id="l457" href="#l457">457</a> 	p.Items = items[start:min(start+itemsOnPage, len(items))]
+<a id="l458" href="#l458">458</a> 	if start+itemsOnPage &lt; len(items) {
+<a id="l459" href="#l459">459</a> 		p.Next = start + itemsOnPage
+<a id="l460" href="#l460">460</a> 	}
+<a id="l461" href="#l461">461</a> 	if p.Settings.Explore {
+<a id="l462" href="#l462">462</a> 		p.Suggestions, p.Checked, p.Bookmarks, err = s.suggestions(a, p.Feeds)
+<a id="l463" href="#l463">463</a> 	}
+<a id="l464" href="#l464">464</a> 	return p, err
+<a id="l465" href="#l465">465</a> }
+<a id="l466" href="#l466">466</a> 
+<a id="l467" href="#l467">467</a> // feed shows the items of the feeds of the account, newest first: from item
+<a id="l468" href="#l468">468</a> // ?start=, and only the feed ?feed= when that is given.
+<a id="l469" href="#l469">469</a> func (s *server) feed(w http.ResponseWriter, r *http.Request) {
+<a id="l470" href="#l470">470</a> 	u := s.owner(w, r)
+<a id="l471" href="#l471">471</a> 	if u == nil {
+<a id="l472" href="#l472">472</a> 		return
+<a id="l473" href="#l473">473</a> 	}
+<a id="l474" href="#l474">474</a> 	q := r.URL.Query()
+<a id="l475" href="#l475">475</a> 	start, _ := strconv.Atoi(q.Get(&quot;start&quot;))
+<a id="l476" href="#l476">476</a> 	p, err := s.feedData(u, q.Get(&quot;feed&quot;), max(start, 0))
+<a id="l477" href="#l477">477</a> 	if err != nil {
+<a id="l478" href="#l478">478</a> 		s.fail(w, err)
+<a id="l479" href="#l479">479</a> 		return
+<a id="l480" href="#l480">480</a> 	}
+<a id="l481" href="#l481">481</a> 	p.Done = feedDone[q.Get(&quot;done&quot;)]
+<a id="l482" href="#l482">482</a> 	if q.Get(&quot;done&quot;) == &quot;followed&quot; {
+<a id="l483" href="#l483">483</a> 		added, _ := strconv.Atoi(q.Get(&quot;added&quot;))
+<a id="l484" href="#l484">484</a> 		known, _ := strconv.Atoi(q.Get(&quot;known&quot;))
+<a id="l485" href="#l485">485</a> 		p.Done = fmt.Sprintf(&quot;You follow %d new feeds. %d were in your list already.&quot;, added, known)
+<a id="l486" href="#l486">486</a> 	}
+<a id="l487" href="#l487">487</a> 	s.render(w, http.StatusOK, &quot;feed&quot;, p)
+<a id="l488" href="#l488">488</a> }
+<a id="l489" href="#l489">489</a> 
+<a id="l490" href="#l490">490</a> // ---- share links ----
+<a id="l491" href="#l491">491</a> 
+<a id="l492" href="#l492">492</a> // setNext keeps path in the next cookie, or removes the cookie when path
+<a id="l493" href="#l493">493</a> // is &quot;&quot;.
+<a id="l494" href="#l494">494</a> func (s *server) setNext(w http.ResponseWriter, path string) {
+<a id="l495" href="#l495">495</a> 	age := 3600
+<a id="l496" href="#l496">496</a> 	if path == &quot;&quot; {
+<a id="l497" href="#l497">497</a> 		age = -1
+<a id="l498" href="#l498">498</a> 	}
+<a id="l499" href="#l499">499</a> 	http.SetCookie(w, &amp;http.Cookie{Name: nextCookie, Value: path, Path: &quot;/&quot;, MaxAge: age,
+<a id="l500" href="#l500">500</a> 		HttpOnly: true, Secure: s.secure, SameSite: http.SameSiteLaxMode})
+<a id="l501" href="#l501">501</a> }
+<a id="l502" href="#l502">502</a> 
+<a id="l503" href="#l503">503</a> // next gives the page to go to after a sign-in: the share page of the next
+<a id="l504" href="#l504">504</a> // cookie, or fallback. Only a share page counts, so the cookie cannot send
+<a id="l505" href="#l505">505</a> // the browser anywhere else.
+<a id="l506" href="#l506">506</a> func (s *server) next(r *http.Request, fallback string) string {
+<a id="l507" href="#l507">507</a> 	if c, err := r.Cookie(nextCookie); err == nil &amp;&amp; strings.HasPrefix(c.Value, &quot;/feed/follow?&quot;) {
+<a id="l508" href="#l508">508</a> 		return c.Value
+<a id="l509" href="#l509">509</a> 	}
+<a id="l510" href="#l510">510</a> 	return fallback
+<a id="l511" href="#l511">511</a> }
+<a id="l512" href="#l512">512</a> 
+<a id="l513" href="#l513">513</a> // sharedFeed is a feed of a share link on the follow page.
+<a id="l514" href="#l514">514</a> type sharedFeed struct {
+<a id="l515" href="#l515">515</a> 	Feed
+<a id="l516" href="#l516">516</a> 	Known bool // the account follows the feed already
+<a id="l517" href="#l517">517</a> }
+<a id="l518" href="#l518">518</a> 
+<a id="l519" href="#l519">519</a> type followPage struct {
+<a id="l520" href="#l520">520</a> 	page
+<a id="l521" href="#l521">521</a> 	SignedIn bool
+<a id="l522" href="#l522">522</a> 	Feeds    []sharedFeed
+<a id="l523" href="#l523">523</a> 	Bad      []string // values of the link that are not feed addresses
+<a id="l524" href="#l524">524</a> 	New      int      // feeds that the account does not follow yet
+<a id="l525" href="#l525">525</a> }
+<a id="l526" href="#l526">526</a> 
+<a id="l527" href="#l527">527</a> // followPage shows the feeds of a share link. A visitor is asked to sign
+<a id="l528" href="#l528">528</a> // in or to create an account, and comes back here after that. An account
+<a id="l529" href="#l529">529</a> // gets a button that follows the feeds.
+<a id="l530" href="#l530">530</a> func (s *server) follow(w http.ResponseWriter, r *http.Request) {
+<a id="l531" href="#l531">531</a> 	feeds, bad := sharedFeeds(r.URL.Query())
+<a id="l532" href="#l532">532</a> 	p := followPage{page: s.page(&quot;Follow feeds&quot;), Bad: bad}
+<a id="l533" href="#l533">533</a> 	for _, f := range feeds {
+<a id="l534" href="#l534">534</a> 		p.Feeds = append(p.Feeds, sharedFeed{Feed: f})
+<a id="l535" href="#l535">535</a> 	}
+<a id="l536" href="#l536">536</a> 	u := s.user(r)
+<a id="l537" href="#l537">537</a> 	if u == nil {
+<a id="l538" href="#l538">538</a> 		s.setNext(w, r.URL.RequestURI())
+<a id="l539" href="#l539">539</a> 		s.render(w, http.StatusOK, &quot;follow&quot;, p)
+<a id="l540" href="#l540">540</a> 		return
+<a id="l541" href="#l541">541</a> 	}
+<a id="l542" href="#l542">542</a> 	if a := s.store.view(u); !s.verified(a) || !s.active(a) {
+<a id="l543" href="#l543">543</a> 		s.setNext(w, r.URL.RequestURI())
+<a id="l544" href="#l544">544</a> 		http.Redirect(w, r, &quot;/account&quot;, http.StatusSeeOther)
+<a id="l545" href="#l545">545</a> 		return
+<a id="l546" href="#l546">546</a> 	}
+<a id="l547" href="#l547">547</a> 	s.setNext(w, &quot;&quot;)
+<a id="l548" href="#l548">548</a> 	text, err := s.store.readFeeds(u)
+<a id="l549" href="#l549">549</a> 	if err != nil {
+<a id="l550" href="#l550">550</a> 		s.fail(w, err)
+<a id="l551" href="#l551">551</a> 		return
+<a id="l552" href="#l552">552</a> 	}
+<a id="l553" href="#l553">553</a> 	known := map[string]bool{}
+<a id="l554" href="#l554">554</a> 	for _, f := range parseFeeds(text) {
+<a id="l555" href="#l555">555</a> 		known[norm(f.URL)] = true
+<a id="l556" href="#l556">556</a> 	}
+<a id="l557" href="#l557">557</a> 	p.SignedIn = true
+<a id="l558" href="#l558">558</a> 	for i := range p.Feeds {
+<a id="l559" href="#l559">559</a> 		p.Feeds[i].Known = known[norm(p.Feeds[i].URL)]
+<a id="l560" href="#l560">560</a> 		if !p.Feeds[i].Known {
+<a id="l561" href="#l561">561</a> 			p.New++
+<a id="l562" href="#l562">562</a> 		}
+<a id="l563" href="#l563">563</a> 	}
+<a id="l564" href="#l564">564</a> 	s.render(w, http.StatusOK, &quot;follow&quot;, p)
+<a id="l565" href="#l565">565</a> }
+<a id="l566" href="#l566">566</a> 
+<a id="l567" href="#l567">567</a> // followFeeds adds the feeds of the form to feeds.txt, as the button of the
+<a id="l568" href="#l568">568</a> // follow page sends them. Feeds that the account follows already are
+<a id="l569" href="#l569">569</a> // skipped.
+<a id="l570" href="#l570">570</a> func (s *server) followFeeds(w http.ResponseWriter, r *http.Request) {
+<a id="l571" href="#l571">571</a> 	if !s.sameSite(w, r) {
+<a id="l572" href="#l572">572</a> 		return
+<a id="l573" href="#l573">573</a> 	}
+<a id="l574" href="#l574">574</a> 	u := s.owner(w, r)
+<a id="l575" href="#l575">575</a> 	if u == nil {
+<a id="l576" href="#l576">576</a> 		return
+<a id="l577" href="#l577">577</a> 	}
+<a id="l578" href="#l578">578</a> 	r.Body = http.MaxBytesReader(w, r.Body, maxForm)
+<a id="l579" href="#l579">579</a> 	if err := r.ParseForm(); err != nil {
+<a id="l580" href="#l580">580</a> 		http.Error(w, &quot;cannot read the form&quot;, http.StatusBadRequest)
+<a id="l581" href="#l581">581</a> 		return
+<a id="l582" href="#l582">582</a> 	}
+<a id="l583" href="#l583">583</a> 	feeds, _ := sharedFeeds(r.PostForm)
+<a id="l584" href="#l584">584</a> 	added, known := 0, 0
+<a id="l585" href="#l585">585</a> 	err := s.store.changeFeeds(u, func(text string) (string, error) {
+<a id="l586" href="#l586">586</a> 		ls := lines(text)
+<a id="l587" href="#l587">587</a> 		have := map[string]bool{}
+<a id="l588" href="#l588">588</a> 		for _, f := range parseFeeds(text) {
+<a id="l589" href="#l589">589</a> 			have[norm(f.URL)] = true
+<a id="l590" href="#l590">590</a> 		}
+<a id="l591" href="#l591">591</a> 		for _, f := range feeds {
+<a id="l592" href="#l592">592</a> 			switch {
+<a id="l593" href="#l593">593</a> 			case have[norm(f.URL)]:
+<a id="l594" href="#l594">594</a> 				known++
+<a id="l595" href="#l595">595</a> 			case len(have) &gt;= maxFeeds:
+<a id="l596" href="#l596">596</a> 				return &quot;&quot;, errFeedMany
+<a id="l597" href="#l597">597</a> 			default:
+<a id="l598" href="#l598">598</a> 				have[norm(f.URL)] = true
+<a id="l599" href="#l599">599</a> 				ls = append(ls, f.URL+&quot;\t&quot;+f.Name)
+<a id="l600" href="#l600">600</a> 				added++
+<a id="l601" href="#l601">601</a> 			}
+<a id="l602" href="#l602">602</a> 		}
+<a id="l603" href="#l603">603</a> 		return join(ls), nil
+<a id="l604" href="#l604">604</a> 	})
+<a id="l605" href="#l605">605</a> 	if errors.Is(err, errFeedMany) {
+<a id="l606" href="#l606">606</a> 		p, perr := s.feedData(u, &quot;&quot;, 0)
+<a id="l607" href="#l607">607</a> 		if perr != nil {
+<a id="l608" href="#l608">608</a> 			s.fail(w, perr)
+<a id="l609" href="#l609">609</a> 			return
+<a id="l610" href="#l610">610</a> 		}
+<a id="l611" href="#l611">611</a> 		p.Error = sentence(err)
+<a id="l612" href="#l612">612</a> 		s.render(w, http.StatusBadRequest, &quot;feed&quot;, p)
+<a id="l613" href="#l613">613</a> 		return
+<a id="l614" href="#l614">614</a> 	} else if err != nil {
+<a id="l615" href="#l615">615</a> 		s.fail(w, err)
+<a id="l616" href="#l616">616</a> 		return
+<a id="l617" href="#l617">617</a> 	}
+<a id="l618" href="#l618">618</a> 	http.Redirect(w, r, fmt.Sprintf(&quot;/feed?done=followed&amp;added=%d&amp;known=%d&quot;, added, known), http.StatusSeeOther)
+<a id="l619" href="#l619">619</a> }
+<a id="l620" href="#l620">620</a> 
+<a id="l621" href="#l621">621</a> // followFeed adds the feed of the form to feeds.txt.
+<a id="l622" href="#l622">622</a> func (s *server) followFeed(w http.ResponseWriter, r *http.Request) {
+<a id="l623" href="#l623">623</a> 	if !s.sameSite(w, r) {
+<a id="l624" href="#l624">624</a> 		return
+<a id="l625" href="#l625">625</a> 	}
+<a id="l626" href="#l626">626</a> 	u := s.owner(w, r)
+<a id="l627" href="#l627">627</a> 	if u == nil {
+<a id="l628" href="#l628">628</a> 		return
+<a id="l629" href="#l629">629</a> 	}
+<a id="l630" href="#l630">630</a> 	r.Body = http.MaxBytesReader(w, r.Body, maxForm)
+<a id="l631" href="#l631">631</a> 	raw, name := r.PostFormValue(&quot;url&quot;), r.PostFormValue(&quot;name&quot;)
+<a id="l632" href="#l632">632</a> 	addr, err := feedURL(raw)
+<a id="l633" href="#l633">633</a> 	if err == nil {
+<a id="l634" href="#l634">634</a> 		err = s.store.changeFeeds(u, func(text string) (string, error) {
+<a id="l635" href="#l635">635</a> 			feeds := parseFeeds(text)
+<a id="l636" href="#l636">636</a> 			if len(feeds) &gt;= maxFeeds {
+<a id="l637" href="#l637">637</a> 				return &quot;&quot;, errFeedMany
+<a id="l638" href="#l638">638</a> 			}
+<a id="l639" href="#l639">639</a> 			for _, f := range feeds {
+<a id="l640" href="#l640">640</a> 				if norm(f.URL) == norm(addr) {
+<a id="l641" href="#l641">641</a> 					return &quot;&quot;, errFeedKnown
+<a id="l642" href="#l642">642</a> 				}
+<a id="l643" href="#l643">643</a> 			}
+<a id="l644" href="#l644">644</a> 			return join(append(lines(text), addr+&quot;\t&quot;+feedName(name, addr))), nil
+<a id="l645" href="#l645">645</a> 		})
+<a id="l646" href="#l646">646</a> 	}
+<a id="l647" href="#l647">647</a> 	status := http.StatusBadRequest
+<a id="l648" href="#l648">648</a> 	switch {
+<a id="l649" href="#l649">649</a> 	case err == nil:
+<a id="l650" href="#l650">650</a> 		http.Redirect(w, r, &quot;/feed?done=added&quot;, http.StatusSeeOther)
+<a id="l651" href="#l651">651</a> 		return
+<a id="l652" href="#l652">652</a> 	case errors.Is(err, errFeedKnown):
+<a id="l653" href="#l653">653</a> 		status = http.StatusConflict
+<a id="l654" href="#l654">654</a> 	case errors.Is(err, errNoURL), errors.Is(err, errFeedURL), errors.Is(err, errFeedLong), errors.Is(err, errFeedMany):
+<a id="l655" href="#l655">655</a> 	default:
+<a id="l656" href="#l656">656</a> 		s.fail(w, err)
+<a id="l657" href="#l657">657</a> 		return
+<a id="l658" href="#l658">658</a> 	}
+<a id="l659" href="#l659">659</a> 	p, perr := s.feedData(u, &quot;&quot;, 0)
+<a id="l660" href="#l660">660</a> 	if perr != nil {
+<a id="l661" href="#l661">661</a> 		s.fail(w, perr)
+<a id="l662" href="#l662">662</a> 		return
+<a id="l663" href="#l663">663</a> 	}
+<a id="l664" href="#l664">664</a> 	p.Error, p.Open, p.Form.URL, p.Form.Name = sentence(err), &quot;add&quot;, raw, name
+<a id="l665" href="#l665">665</a> 	s.render(w, status, &quot;feed&quot;, p)
+<a id="l666" href="#l666">666</a> }
+<a id="l667" href="#l667">667</a> 
+<a id="l668" href="#l668">668</a> // unfollowFeed removes the feed with the URL of the form from feeds.txt.
+<a id="l669" href="#l669">669</a> func (s *server) unfollowFeed(w http.ResponseWriter, r *http.Request) {
+<a id="l670" href="#l670">670</a> 	if !s.sameSite(w, r) {
+<a id="l671" href="#l671">671</a> 		return
+<a id="l672" href="#l672">672</a> 	}
+<a id="l673" href="#l673">673</a> 	u := s.owner(w, r)
+<a id="l674" href="#l674">674</a> 	if u == nil {
+<a id="l675" href="#l675">675</a> 		return
+<a id="l676" href="#l676">676</a> 	}
+<a id="l677" href="#l677">677</a> 	r.Body = http.MaxBytesReader(w, r.Body, maxForm)
+<a id="l678" href="#l678">678</a> 	k := norm(strings.TrimSpace(r.PostFormValue(&quot;url&quot;)))
+<a id="l679" href="#l679">679</a> 	err := s.store.changeFeeds(u, func(text string) (string, error) {
+<a id="l680" href="#l680">680</a> 		var out []string
+<a id="l681" href="#l681">681</a> 		for _, l := range lines(text) {
+<a id="l682" href="#l682">682</a> 			if k == &quot;&quot; || key(l) != k {
+<a id="l683" href="#l683">683</a> 				out = append(out, l)
+<a id="l684" href="#l684">684</a> 			}
+<a id="l685" href="#l685">685</a> 		}
+<a id="l686" href="#l686">686</a> 		return join(out), nil
+<a id="l687" href="#l687">687</a> 	})
+<a id="l688" href="#l688">688</a> 	if err != nil {
+<a id="l689" href="#l689">689</a> 		s.fail(w, err)
+<a id="l690" href="#l690">690</a> 		return
+<a id="l691" href="#l691">691</a> 	}
+<a id="l692" href="#l692">692</a> 	http.Redirect(w, r, &quot;/feed?done=deleted&quot;, http.StatusSeeOther)
+<a id="l693" href="#l693">693</a> }
+<a id="l694" href="#l694">694</a> 
+<a id="l695" href="#l695">695</a> // saveFeedSettings takes the check boxes of the settings form.
+<a id="l696" href="#l696">696</a> func (s *server) saveFeedSettings(w http.ResponseWriter, r *http.Request) {
+<a id="l697" href="#l697">697</a> 	if !s.sameSite(w, r) {
+<a id="l698" href="#l698">698</a> 		return
+<a id="l699" href="#l699">699</a> 	}
+<a id="l700" href="#l700">700</a> 	u := s.owner(w, r)
+<a id="l701" href="#l701">701</a> 	if u == nil {
+<a id="l702" href="#l702">702</a> 		return
+<a id="l703" href="#l703">703</a> 	}
+<a id="l704" href="#l704">704</a> 	r.Body = http.MaxBytesReader(w, r.Body, maxForm)
+<a id="l705" href="#l705">705</a> 	f := feedSettings{
+<a id="l706" href="#l706">706</a> 		NewTab:  r.PostFormValue(&quot;newtab&quot;) != &quot;&quot;,
+<a id="l707" href="#l707">707</a> 		NoMail:  s.store.view(u).Feed.NoMail,
+<a id="l708" href="#l708">708</a> 		Explore: r.PostFormValue(&quot;explore&quot;) != &quot;&quot;,
+<a id="l709" href="#l709">709</a> 	}
+<a id="l710" href="#l710">710</a> 	// The form has the email box only when the server sends email.
+<a id="l711" href="#l711">711</a> 	if s.mail != nil {
+<a id="l712" href="#l712">712</a> 		f.NoMail = r.PostFormValue(&quot;mail&quot;) == &quot;&quot;
+<a id="l713" href="#l713">713</a> 	}
+<a id="l714" href="#l714">714</a> 	if err := s.store.setFeed(u, f); err != nil {
+<a id="l715" href="#l715">715</a> 		s.fail(w, err)
+<a id="l716" href="#l716">716</a> 		return
+<a id="l717" href="#l717">717</a> 	}
+<a id="l718" href="#l718">718</a> 	http.Redirect(w, r, &quot;/feed?done=settings&quot;, http.StatusSeeOther)
+<a id="l719" href="#l719">719</a> }
+<a id="l720" href="#l720">720</a> 
+<a id="l721" href="#l721">721</a> // ---- API ----
+<a id="l722" href="#l722">722</a> 
+<a id="l723" href="#l723">723</a> // apiOwner gives the account of the token when it can use its bookmarks
+<a id="l724" href="#l724">724</a> // and feeds: as for sync, its email is confirmed and sync is not paused.
+<a id="l725" href="#l725">725</a> // Else apiOwner answers the request and gives nil.
+<a id="l726" href="#l726">726</a> func (s *server) apiOwner(w http.ResponseWriter, r *http.Request) *Account {
+<a id="l727" href="#l727">727</a> 	u := s.apiUser(r)
+<a id="l728" href="#l728">728</a> 	if u == nil {
+<a id="l729" href="#l729">729</a> 		http.Error(w, &quot;not signed in: sign in again&quot;, http.StatusUnauthorized)
+<a id="l730" href="#l730">730</a> 		return nil
+<a id="l731" href="#l731">731</a> 	}
+<a id="l732" href="#l732">732</a> 	if !s.verified(s.store.view(u)) {
+<a id="l733" href="#l733">733</a> 		http.Error(w, &quot;confirm your email address first: open the link in the email from sbm Sync, or see &quot;+s.site+&quot;/account&quot;, http.StatusForbidden)
+<a id="l734" href="#l734">734</a> 		return nil
+<a id="l735" href="#l735">735</a> 	}
+<a id="l736" href="#l736">736</a> 	if !s.active(s.store.view(u)) {
+<a id="l737" href="#l737">737</a> 		http.Error(w, &quot;sbm Sync is paused for this account: see &quot;+s.site+&quot;/account&quot;, http.StatusPaymentRequired)
+<a id="l738" href="#l738">738</a> 		return nil
+<a id="l739" href="#l739">739</a> 	}
+<a id="l740" href="#l740">740</a> 	return u
+<a id="l741" href="#l741">741</a> }
+<a id="l742" href="#l742">742</a> 
+<a id="l743" href="#l743">743</a> // apiFeed gives the items of all feeds of the account in the sfeed format,
+<a id="l744" href="#l744">744</a> // newest first, for the sfeed tools:
+<a id="l745" href="#l745">745</a> //
+<a id="l746" href="#l746">746</a> //	curl -H &quot;Authorization: Bearer $token&quot; https://sbmsync.com/api/feed | sfeed_plain
+<a id="l747" href="#l747">747</a> func (s *server) apiFeed(w http.ResponseWriter, r *http.Request) {
+<a id="l748" href="#l748">748</a> 	u := s.apiOwner(w, r)
+<a id="l749" href="#l749">749</a> 	if u == nil {
+<a id="l750" href="#l750">750</a> 		return
+<a id="l751" href="#l751">751</a> 	}
+<a id="l752" href="#l752">752</a> 	text, err := s.store.readFeeds(u)
+<a id="l753" href="#l753">753</a> 	if err != nil {
+<a id="l754" href="#l754">754</a> 		s.fail(w, err)
+<a id="l755" href="#l755">755</a> 		return
+<a id="l756" href="#l756">756</a> 	}
+<a id="l757" href="#l757">757</a> 	w.Header().Set(&quot;Content-Type&quot;, &quot;text/plain; charset=utf-8&quot;)
+<a id="l758" href="#l758">758</a> 	for _, it := range s.feedItems(u, parseFeeds(text)) {
+<a id="l759" href="#l759">759</a> 		io.WriteString(w, it.Raw+&quot;\n&quot;)
+<a id="l760" href="#l760">760</a> 	}
+<a id="l761" href="#l761">761</a> }
+<a id="l762" href="#l762">762</a> 
+<a id="l763" href="#l763">763</a> // apiFeeds gives feeds.txt: the feeds that the account follows.
+<a id="l764" href="#l764">764</a> func (s *server) apiFeeds(w http.ResponseWriter, r *http.Request) {
+<a id="l765" href="#l765">765</a> 	u := s.apiOwner(w, r)
+<a id="l766" href="#l766">766</a> 	if u == nil {
+<a id="l767" href="#l767">767</a> 		return
+<a id="l768" href="#l768">768</a> 	}
+<a id="l769" href="#l769">769</a> 	text, err := s.store.readFeeds(u)
+<a id="l770" href="#l770">770</a> 	if err != nil {
+<a id="l771" href="#l771">771</a> 		s.fail(w, err)
+<a id="l772" href="#l772">772</a> 		return
+<a id="l773" href="#l773">773</a> 	}
+<a id="l774" href="#l774">774</a> 	w.Header().Set(&quot;Content-Type&quot;, &quot;text/plain; charset=utf-8&quot;)
+<a id="l775" href="#l775">775</a> 	io.WriteString(w, text)
+<a id="l776" href="#l776">776</a> }</pre>
+</div></body></html>

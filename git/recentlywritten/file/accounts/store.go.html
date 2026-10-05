@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>recentlywritten/accounts/store.go - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>recentlywritten</h1><span class="desc">my writings (done recently)</span><p class="url">git clone https://github.com/equwal/recentlywritten</p><p><a href="../../../recentlywritten/index.html">Log</a> | <a href="../../../recentlywritten/files.html">Files</a> | <a href="../../../recentlywritten/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>accounts/store.go (7415 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> package main
+<a id="l2" href="#l2">2</a> 
+<a id="l3" href="#l3">3</a> import (
+<a id="l4" href="#l4">4</a> 	&quot;crypto/rand&quot;
+<a id="l5" href="#l5">5</a> 	&quot;crypto/sha256&quot;
+<a id="l6" href="#l6">6</a> 	&quot;database/sql&quot;
+<a id="l7" href="#l7">7</a> 	&quot;encoding/hex&quot;
+<a id="l8" href="#l8">8</a> 	&quot;errors&quot;
+<a id="l9" href="#l9">9</a> 	&quot;time&quot;
+<a id="l10" href="#l10">10</a> 
+<a id="l11" href="#l11">11</a> 	_ &quot;modernc.org/sqlite&quot;
+<a id="l12" href="#l12">12</a> )
+<a id="l13" href="#l13">13</a> 
+<a id="l14" href="#l14">14</a> // The users table holds only addresses that a sign-in link verified.
+<a id="l15" href="#l15">15</a> // login_tokens and sessions hold SHA-256 hashes of their tokens, so a copy
+<a id="l16" href="#l16">16</a> // of the database does not let a person sign in. feed_token and
+<a id="l17" href="#l17">17</a> // unsub_token are stored as plain text: the site must show them again,
+<a id="l18" href="#l18">18</a> // and they give access only to public posts and to the unsubscribe step.
+<a id="l19" href="#l19">19</a> const schema = `
+<a id="l20" href="#l20">20</a> CREATE TABLE IF NOT EXISTS users (
+<a id="l21" href="#l21">21</a> 	id          INTEGER PRIMARY KEY,
+<a id="l22" href="#l22">22</a> 	email       TEXT NOT NULL UNIQUE,
+<a id="l23" href="#l23">23</a> 	created_at  INTEGER NOT NULL,
+<a id="l24" href="#l24">24</a> 	email_on    INTEGER NOT NULL DEFAULT 1,
+<a id="l25" href="#l25">25</a> 	feed_token  TEXT NOT NULL UNIQUE,
+<a id="l26" href="#l26">26</a> 	unsub_token TEXT NOT NULL UNIQUE
+<a id="l27" href="#l27">27</a> );
+<a id="l28" href="#l28">28</a> CREATE TABLE IF NOT EXISTS muted_tags (
+<a id="l29" href="#l29">29</a> 	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+<a id="l30" href="#l30">30</a> 	tag     TEXT NOT NULL,
+<a id="l31" href="#l31">31</a> 	PRIMARY KEY (user_id, tag)
+<a id="l32" href="#l32">32</a> );
+<a id="l33" href="#l33">33</a> CREATE TABLE IF NOT EXISTS login_tokens (
+<a id="l34" href="#l34">34</a> 	hash       TEXT PRIMARY KEY,
+<a id="l35" href="#l35">35</a> 	email      TEXT NOT NULL,
+<a id="l36" href="#l36">36</a> 	created_at INTEGER NOT NULL,
+<a id="l37" href="#l37">37</a> 	expires_at INTEGER NOT NULL
+<a id="l38" href="#l38">38</a> );
+<a id="l39" href="#l39">39</a> CREATE TABLE IF NOT EXISTS sessions (
+<a id="l40" href="#l40">40</a> 	hash       TEXT PRIMARY KEY,
+<a id="l41" href="#l41">41</a> 	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+<a id="l42" href="#l42">42</a> 	expires_at INTEGER NOT NULL
+<a id="l43" href="#l43">43</a> );
+<a id="l44" href="#l44">44</a> CREATE TABLE IF NOT EXISTS posts (
+<a id="l45" href="#l45">45</a> 	slug       TEXT PRIMARY KEY,
+<a id="l46" href="#l46">46</a> 	first_seen INTEGER NOT NULL
+<a id="l47" href="#l47">47</a> );
+<a id="l48" href="#l48">48</a> CREATE TABLE IF NOT EXISTS deliveries (
+<a id="l49" href="#l49">49</a> 	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+<a id="l50" href="#l50">50</a> 	slug    TEXT NOT NULL,
+<a id="l51" href="#l51">51</a> 	PRIMARY KEY (user_id, slug)
+<a id="l52" href="#l52">52</a> );
+<a id="l53" href="#l53">53</a> `
+<a id="l54" href="#l54">54</a> 
+<a id="l55" href="#l55">55</a> const (
+<a id="l56" href="#l56">56</a> 	loginTTL     = 15 * time.Minute
+<a id="l57" href="#l57">57</a> 	loginSpacing = 2 * time.Minute // minimum time between two links to one address
+<a id="l58" href="#l58">58</a> 	sessionTTL   = 30 * 24 * time.Hour
+<a id="l59" href="#l59">59</a> )
+<a id="l60" href="#l60">60</a> 
+<a id="l61" href="#l61">61</a> var errNotFound = errors.New(&quot;not found&quot;)
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> func openDB(path string) (*sql.DB, error) {
+<a id="l64" href="#l64">64</a> 	db, err := sql.Open(&quot;sqlite&quot;, path+&quot;?_pragma=foreign_keys(1)&amp;_pragma=busy_timeout(5000)&amp;_pragma=journal_mode(WAL)&quot;)
+<a id="l65" href="#l65">65</a> 	if err != nil {
+<a id="l66" href="#l66">66</a> 		return nil, err
+<a id="l67" href="#l67">67</a> 	}
+<a id="l68" href="#l68">68</a> 	// One connection serializes all writes. The site is small, and this
+<a id="l69" href="#l69">69</a> 	// removes the need to handle SQLITE_BUSY. It also keeps a :memory:
+<a id="l70" href="#l70">70</a> 	// database the same for all queries in tests.
+<a id="l71" href="#l71">71</a> 	db.SetMaxOpenConns(1)
+<a id="l72" href="#l72">72</a> 	if _, err := db.Exec(schema); err != nil {
+<a id="l73" href="#l73">73</a> 		db.Close()
+<a id="l74" href="#l74">74</a> 		return nil, err
+<a id="l75" href="#l75">75</a> 	}
+<a id="l76" href="#l76">76</a> 	return db, nil
+<a id="l77" href="#l77">77</a> }
+<a id="l78" href="#l78">78</a> 
+<a id="l79" href="#l79">79</a> // newToken returns a random token with 128 bits of entropy.
+<a id="l80" href="#l80">80</a> func newToken() string { return rand.Text() }
+<a id="l81" href="#l81">81</a> 
+<a id="l82" href="#l82">82</a> func hashToken(t string) string {
+<a id="l83" href="#l83">83</a> 	s := sha256.Sum256([]byte(t))
+<a id="l84" href="#l84">84</a> 	return hex.EncodeToString(s[:])
+<a id="l85" href="#l85">85</a> }
+<a id="l86" href="#l86">86</a> 
+<a id="l87" href="#l87">87</a> type user struct {
+<a id="l88" href="#l88">88</a> 	ID         int64
+<a id="l89" href="#l89">89</a> 	Email      string
+<a id="l90" href="#l90">90</a> 	CreatedAt  int64
+<a id="l91" href="#l91">91</a> 	EmailOn    bool
+<a id="l92" href="#l92">92</a> 	FeedToken  string
+<a id="l93" href="#l93">93</a> 	UnsubToken string
+<a id="l94" href="#l94">94</a> }
+<a id="l95" href="#l95">95</a> 
+<a id="l96" href="#l96">96</a> const userColumns = `id, email, created_at, email_on, feed_token, unsub_token`
+<a id="l97" href="#l97">97</a> 
+<a id="l98" href="#l98">98</a> func scanUser(row *sql.Row) (user, error) {
+<a id="l99" href="#l99">99</a> 	var u user
+<a id="l100" href="#l100">100</a> 	err := row.Scan(&amp;u.ID, &amp;u.Email, &amp;u.CreatedAt, &amp;u.EmailOn, &amp;u.FeedToken, &amp;u.UnsubToken)
+<a id="l101" href="#l101">101</a> 	if errors.Is(err, sql.ErrNoRows) {
+<a id="l102" href="#l102">102</a> 		err = errNotFound
+<a id="l103" href="#l103">103</a> 	}
+<a id="l104" href="#l104">104</a> 	return u, err
+<a id="l105" href="#l105">105</a> }
+<a id="l106" href="#l106">106</a> 
+<a id="l107" href="#l107">107</a> // createLoginToken makes a sign-in token for email. It returns an empty
+<a id="l108" href="#l108">108</a> // token and no error if a token for email was made less than loginSpacing
+<a id="l109" href="#l109">109</a> // ago. This stops a person who uses the form to send many emails to one
+<a id="l110" href="#l110">110</a> // address.
+<a id="l111" href="#l111">111</a> func createLoginToken(db *sql.DB, email string, now time.Time) (string, error) {
+<a id="l112" href="#l112">112</a> 	if _, err := db.Exec(`DELETE FROM login_tokens WHERE expires_at &lt;= ?`, now.Unix()); err != nil {
+<a id="l113" href="#l113">113</a> 		return &quot;&quot;, err
+<a id="l114" href="#l114">114</a> 	}
+<a id="l115" href="#l115">115</a> 	var recent int
+<a id="l116" href="#l116">116</a> 	err := db.QueryRow(`SELECT count(*) FROM login_tokens WHERE email = ? AND created_at &gt; ?`,
+<a id="l117" href="#l117">117</a> 		email, now.Add(-loginSpacing).Unix()).Scan(&amp;recent)
+<a id="l118" href="#l118">118</a> 	if err != nil || recent &gt; 0 {
+<a id="l119" href="#l119">119</a> 		return &quot;&quot;, err
+<a id="l120" href="#l120">120</a> 	}
+<a id="l121" href="#l121">121</a> 	t := newToken()
+<a id="l122" href="#l122">122</a> 	_, err = db.Exec(`INSERT INTO login_tokens (hash, email, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+<a id="l123" href="#l123">123</a> 		hashToken(t), email, now.Unix(), now.Add(loginTTL).Unix())
+<a id="l124" href="#l124">124</a> 	if err != nil {
+<a id="l125" href="#l125">125</a> 		return &quot;&quot;, err
+<a id="l126" href="#l126">126</a> 	}
+<a id="l127" href="#l127">127</a> 	return t, nil
+<a id="l128" href="#l128">128</a> }
+<a id="l129" href="#l129">129</a> 
+<a id="l130" href="#l130">130</a> // consumeLoginToken removes the token and returns the user for its
+<a id="l131" href="#l131">131</a> // address. It makes the user if the address has no account. A token works
+<a id="l132" href="#l132">132</a> // one time only.
+<a id="l133" href="#l133">133</a> func consumeLoginToken(db *sql.DB, token string, now time.Time) (user, error) {
+<a id="l134" href="#l134">134</a> 	var email string
+<a id="l135" href="#l135">135</a> 	err := db.QueryRow(`DELETE FROM login_tokens WHERE hash = ? AND expires_at &gt; ? RETURNING email`,
+<a id="l136" href="#l136">136</a> 		hashToken(token), now.Unix()).Scan(&amp;email)
+<a id="l137" href="#l137">137</a> 	if errors.Is(err, sql.ErrNoRows) {
+<a id="l138" href="#l138">138</a> 		return user{}, errNotFound
+<a id="l139" href="#l139">139</a> 	}
+<a id="l140" href="#l140">140</a> 	if err != nil {
+<a id="l141" href="#l141">141</a> 		return user{}, err
+<a id="l142" href="#l142">142</a> 	}
+<a id="l143" href="#l143">143</a> 	_, err = db.Exec(`INSERT INTO users (email, created_at, feed_token, unsub_token) VALUES (?, ?, ?, ?)
+<a id="l144" href="#l144">144</a> 		ON CONFLICT (email) DO NOTHING`, email, now.Unix(), newToken(), newToken())
+<a id="l145" href="#l145">145</a> 	if err != nil {
+<a id="l146" href="#l146">146</a> 		return user{}, err
+<a id="l147" href="#l147">147</a> 	}
+<a id="l148" href="#l148">148</a> 	return scanUser(db.QueryRow(`SELECT `+userColumns+` FROM users WHERE email = ?`, email))
+<a id="l149" href="#l149">149</a> }
+<a id="l150" href="#l150">150</a> 
+<a id="l151" href="#l151">151</a> func createSession(db *sql.DB, userID int64, now time.Time) (string, error) {
+<a id="l152" href="#l152">152</a> 	if _, err := db.Exec(`DELETE FROM sessions WHERE expires_at &lt;= ?`, now.Unix()); err != nil {
+<a id="l153" href="#l153">153</a> 		return &quot;&quot;, err
+<a id="l154" href="#l154">154</a> 	}
+<a id="l155" href="#l155">155</a> 	t := newToken()
+<a id="l156" href="#l156">156</a> 	_, err := db.Exec(`INSERT INTO sessions (hash, user_id, expires_at) VALUES (?, ?, ?)`,
+<a id="l157" href="#l157">157</a> 		hashToken(t), userID, now.Add(sessionTTL).Unix())
+<a id="l158" href="#l158">158</a> 	return t, err
+<a id="l159" href="#l159">159</a> }
+<a id="l160" href="#l160">160</a> 
+<a id="l161" href="#l161">161</a> func sessionUser(db *sql.DB, token string, now time.Time) (user, error) {
+<a id="l162" href="#l162">162</a> 	return scanUser(db.QueryRow(`SELECT u.id, u.email, u.created_at, u.email_on, u.feed_token, u.unsub_token
+<a id="l163" href="#l163">163</a> 		FROM sessions s JOIN users u ON u.id = s.user_id
+<a id="l164" href="#l164">164</a> 		WHERE s.hash = ? AND s.expires_at &gt; ?`, hashToken(token), now.Unix()))
+<a id="l165" href="#l165">165</a> }
+<a id="l166" href="#l166">166</a> 
+<a id="l167" href="#l167">167</a> func deleteSession(db *sql.DB, token string) error {
+<a id="l168" href="#l168">168</a> 	_, err := db.Exec(`DELETE FROM sessions WHERE hash = ?`, hashToken(token))
+<a id="l169" href="#l169">169</a> 	return err
+<a id="l170" href="#l170">170</a> }
+<a id="l171" href="#l171">171</a> 
+<a id="l172" href="#l172">172</a> func userByFeedToken(db *sql.DB, token string) (user, error) {
+<a id="l173" href="#l173">173</a> 	return scanUser(db.QueryRow(`SELECT `+userColumns+` FROM users WHERE feed_token = ?`, token))
+<a id="l174" href="#l174">174</a> }
+<a id="l175" href="#l175">175</a> 
+<a id="l176" href="#l176">176</a> func mutedTags(db *sql.DB, userID int64) (map[string]bool, error) {
+<a id="l177" href="#l177">177</a> 	rows, err := db.Query(`SELECT tag FROM muted_tags WHERE user_id = ?`, userID)
+<a id="l178" href="#l178">178</a> 	if err != nil {
+<a id="l179" href="#l179">179</a> 		return nil, err
+<a id="l180" href="#l180">180</a> 	}
+<a id="l181" href="#l181">181</a> 	defer rows.Close()
+<a id="l182" href="#l182">182</a> 	muted := map[string]bool{}
+<a id="l183" href="#l183">183</a> 	for rows.Next() {
+<a id="l184" href="#l184">184</a> 		var t string
+<a id="l185" href="#l185">185</a> 		if err := rows.Scan(&amp;t); err != nil {
+<a id="l186" href="#l186">186</a> 			return nil, err
+<a id="l187" href="#l187">187</a> 		}
+<a id="l188" href="#l188">188</a> 		muted[t] = true
+<a id="l189" href="#l189">189</a> 	}
+<a id="l190" href="#l190">190</a> 	return muted, rows.Err()
+<a id="l191" href="#l191">191</a> }
+<a id="l192" href="#l192">192</a> 
+<a id="l193" href="#l193">193</a> // saveSettings sets the email switch and replaces the muted tags.
+<a id="l194" href="#l194">194</a> func saveSettings(db *sql.DB, userID int64, emailOn bool, muted []string) error {
+<a id="l195" href="#l195">195</a> 	tx, err := db.Begin()
+<a id="l196" href="#l196">196</a> 	if err != nil {
+<a id="l197" href="#l197">197</a> 		return err
+<a id="l198" href="#l198">198</a> 	}
+<a id="l199" href="#l199">199</a> 	defer tx.Rollback()
+<a id="l200" href="#l200">200</a> 	if _, err := tx.Exec(`UPDATE users SET email_on = ? WHERE id = ?`, emailOn, userID); err != nil {
+<a id="l201" href="#l201">201</a> 		return err
+<a id="l202" href="#l202">202</a> 	}
+<a id="l203" href="#l203">203</a> 	if _, err := tx.Exec(`DELETE FROM muted_tags WHERE user_id = ?`, userID); err != nil {
+<a id="l204" href="#l204">204</a> 		return err
+<a id="l205" href="#l205">205</a> 	}
+<a id="l206" href="#l206">206</a> 	for _, t := range muted {
+<a id="l207" href="#l207">207</a> 		if _, err := tx.Exec(`INSERT OR IGNORE INTO muted_tags (user_id, tag) VALUES (?, ?)`, userID, t); err != nil {
+<a id="l208" href="#l208">208</a> 			return err
+<a id="l209" href="#l209">209</a> 		}
+<a id="l210" href="#l210">210</a> 	}
+<a id="l211" href="#l211">211</a> 	return tx.Commit()
+<a id="l212" href="#l212">212</a> }
+<a id="l213" href="#l213">213</a> 
+<a id="l214" href="#l214">214</a> // rotateFeedToken gives the user a new feed token. The old feed URL then
+<a id="l215" href="#l215">215</a> // stops working.
+<a id="l216" href="#l216">216</a> func rotateFeedToken(db *sql.DB, userID int64) error {
+<a id="l217" href="#l217">217</a> 	_, err := db.Exec(`UPDATE users SET feed_token = ? WHERE id = ?`, newToken(), userID)
+<a id="l218" href="#l218">218</a> 	return err
+<a id="l219" href="#l219">219</a> }
+<a id="l220" href="#l220">220</a> 
+<a id="l221" href="#l221">221</a> // unsubscribe turns off email for the user with the unsubscribe token. It
+<a id="l222" href="#l222">222</a> // returns errNotFound for an unknown token.
+<a id="l223" href="#l223">223</a> func unsubscribe(db *sql.DB, token string) error {
+<a id="l224" href="#l224">224</a> 	res, err := db.Exec(`UPDATE users SET email_on = 0 WHERE unsub_token = ?`, token)
+<a id="l225" href="#l225">225</a> 	if err != nil {
+<a id="l226" href="#l226">226</a> 		return err
+<a id="l227" href="#l227">227</a> 	}
+<a id="l228" href="#l228">228</a> 	if n, _ := res.RowsAffected(); n == 0 {
+<a id="l229" href="#l229">229</a> 		return errNotFound
+<a id="l230" href="#l230">230</a> 	}
+<a id="l231" href="#l231">231</a> 	return nil
+<a id="l232" href="#l232">232</a> }
+<a id="l233" href="#l233">233</a> 
+<a id="l234" href="#l234">234</a> // deleteUser removes the user. The foreign keys remove the sessions,
+<a id="l235" href="#l235">235</a> // muted tags and delivery records of the user.
+<a id="l236" href="#l236">236</a> func deleteUser(db *sql.DB, userID int64) error {
+<a id="l237" href="#l237">237</a> 	_, err := db.Exec(`DELETE FROM users WHERE id = ?`, userID)
+<a id="l238" href="#l238">238</a> 	return err
+<a id="l239" href="#l239">239</a> }</pre>
+</div></body></html>
