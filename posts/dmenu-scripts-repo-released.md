@@ -27,7 +27,7 @@ links:
 
 - `dkeymap` <a href="static/dkeymap" class="external-link">(file)</a>: select a keymap
 
-- `dintelbacklight`<a href="static/dintelbacklight" class="external-link">(file)</a>: select backlight with dmenu or wjt (a scroll wheel)
+- `dintelbacklight`<a href="static/dintel-backlight" class="external-link">(file)</a>: select backlight with dmenu or wjt (a scroll wheel)
 
 - `ddmenu` <a href="static/ddmenu" class="external-link">(file)</a>: use dmenu to select a dmenu script – dception
 

@@ -51,9 +51,9 @@ Chad Books
 
 #### Computing
 
-- [DJVU](static/doug-hoyte-let-over-lambda.djvu) Let Over Lambda
+- [DJVU](static/book/doug-hoyte-let-over-lambda.djvu) Let Over Lambda
 - Practical Common Lisp (a.k.a PCL)
-- [part1 PDF](static/PAIP-part1.pdf) [part2 PDF"](static/PAIP-part2.pdf)Paradigms of Artifical Intelligence Programming (a.k.a PAIP)
+- [part1 PDF](static/book/PAIP-part1.pdf) [part2 PDF"](static/book/PAIP-part2.pdf)Paradigms of Artifical Intelligence Programming (a.k.a PAIP)
 - Structure and Interpretation of Computer Programs (a.k.a SICP)
 - Coders at Work
 - The C Programming Language (a.k.a The K&R)

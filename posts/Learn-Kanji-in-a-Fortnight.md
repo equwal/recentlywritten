@@ -33,7 +33,7 @@ Rep these really fast, 50/day. They just help to remember the next deck.
 
 It's here: [ankiweb](https://ankiweb.net/shared/info/627768060)
 
-Or here: [mirror](static/simple-rtk.apkg)
+Or here: [mirror](static/book/simple-rtk.apkg)
 
 This is where we have a bit of fun. Rather than trying to rep cards "really hard" with anki's algorithm, we accept that the purpose it merely to get the point where we kind of recognize these cards. Each day, setup a filtered deck for 300 fresh new cards cards. Review as many as you want. Rinse and repeat.
 

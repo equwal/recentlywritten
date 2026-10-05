@@ -28,7 +28,7 @@ Esperanto Hejmpaĝo
 
 ## 25 Mallongaj Noveloj
 
-[HTML ĉe literaturo.esperanto.net](http://literaturo.esperanto.net/noveloj/25.html)    [txt](25-noveloj/25-noveloj.txt)    [zip de txt](25-noveloj/25-noveloj.zip)    [mobi](25-noveloj/25-noveloj.mobi)    [pdf](25-noveloj/25-noveloj.pdf)    [epub](25-noveloj/25-noveloj.epub)
+[HTML ĉe literaturo.esperanto.net](http://literaturo.esperanto.net/noveloj/25.html)    [txt](static/25-noveloj/25-noveloj.txt)    [zip de txt](static/25-noveloj/25-noveloj.zip)    [mobi](static/25-noveloj/25-noveloj.mobi)    [pdf](static/25-noveloj/25-noveloj.pdf)    [epub](static/25-noveloj/25-noveloj.epub)
 
 ![](static/25-new.png)
 

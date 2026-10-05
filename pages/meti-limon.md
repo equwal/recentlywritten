@@ -20,9 +20,9 @@ Meti Limon
 
 ###### Legisto: Spenser Truex
 
-[mp3](meti-limon.mp3)  [mp3 malalta kvalito](meti-limon-malalta-kvalito.mp3)
+[mp3](static/book/meti-limon.mp3)  [mp3 malalta kvalito](static/book/meti-limon-malalta-kvalito.mp3)
 
-[ogg](meti-limon.ogg)  [ogg malalta kvalito](meti-limon-malalta-kvalito.ogg)
+[ogg](static/book/meti-limon.ogg)  [ogg malalta kvalito](static/book/meti-limon-malalta-kvalito.ogg)
 
 [Youtube](https://www.youtube.com/watch?v=L1JJMF8tgvo)
 

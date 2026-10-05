@@ -6,7 +6,7 @@ links:
 - '[25 Noveloj](25-noveloj.html)'
 ---
 
-[txt](sten-johansson/sten-johansson.txt)    [mobi](sten-johansson/sten-johansson.mobi)    [epub](sten-johansson/sten-johansson.epub)    [pdf](sten-johansson/sten-johansson.pdf)
+[txt](static/sten-johansson/sten-johansson.txt)    [mobi](static/sten-johansson/sten-johansson.mobi)    [epub](static/sten-johansson/sten-johansson.epub)    [pdf](static/sten-johansson/sten-johansson.pdf)
 
 ###### HTML
 
