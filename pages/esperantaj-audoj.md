@@ -38,7 +38,7 @@ Esperanto Hejmpaĝo
 - [![](static/kern-punkto-walnut.png)](https://kern.punkto.info/)  
   [Kern Punkto](https://kern.punkto.info/)
 
-- [intervjuoj de aejk (en Afriko)](intervjuoj-de-aejk.html)
+- [intervjuoj de aejk (en Afriko)](intervjujoj-de-aejk.html)
 
 <span class="fishup"> </span>
 
