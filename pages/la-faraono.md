@@ -8,25 +8,23 @@ links:
 
 ###### Bolesław Prus
 
-La Faraono (originala pola titolo Faraon) estas historia kaj politika romano de la pola verkisto Bolesław Prus, unue aperinta serie en varsovia semajna gazeto en 1895 kaj 1896. La scenejo estas la antikva Egiptujo. La precipa temo estas batalado inter la pastraro kaj la kronprinco, kiu volas akiri al si mem la plenpotencon. Priskribataj estas moroj, eĉ la intima vivo de la egiptoj.
+La Faraono (originala pola titolo Faraon) estas historia kaj politika romano de la pola verkisto Bolesław Prus, unue aperinta serie en varsovia semajna gazeto en 1895 kaj 1896. La scenejo estas la antikva Egiptujo. La precipa temo estas batalado inter la pastraro kaj la kronprinco, kiu volas akiri al si mem la plenpotencon. Priskribataj estas moroj, ecx la intima vivo de la egiptoj.
 
-[HTML](http://www.steloj.de/esperanto/verkoj.html)
+[HTML po ĉapitro](http://www.steloj.de/esperanto/verkoj.html)
 
 ##### Plena Libro
 
-[la-faraono-plena.txt](la-faraono/la-faraono-plena.txt)
+[txt](static/la-faraono/la-faraono-plena.txt)    [mobi](static/la-faraono/la-faraono-plena.mobi)    [pdf](static/la-faraono/la-faraono-plena.pdf)    [epub](static/la-faraono/la-faraono-plena.epub)
 
 ##### Po Volumo
 
-- [unua-volumo.txt](la-faraono/unua-volumo.txt)
-- [dua-volumo.txt](la-faraono/dua-volumo.txt)
-- [tria-volumo.txt](la-faraono/tria-volumo.txt)
+- TXT: [unua-volumo](static/la-faraono/unua-volumo.txt)    [dua-volumo](static/la-faraono/dua-volumo.txt)    [tria-volumo](static/la-faraono/tria-volumo.txt)
+- MOBI: [unua-volumo](static/la-faraono/unua-volumo.mobi)    [dua-volumo](static/la-faraono/dua-volumo.mobi)    [tria-volumo](static/la-faraono/tria-volumo.mobi)
+- PDF: [unua-volumo](static/la-faraono/unua-volumo.pdf)   [dua-volumo](static/la-faraono/dua-volumo.pdf)   [tria-volumo](static/la-faraono/tria-volumo.pdf)
+- EPUB: [unua-volumo](static/la-faraono/unua-volumo.epub)    [dua-volumo](static/la-faraono/dua-volumo.epub)    [tria-volumo](static/la-faraono/tria-volumo.epub)
 
 ##### Po Ĉapitro (txt)
 
-- [cxiu-volumo.zip](la-faraono/cxiu-volumo.zip)
-- [unua-volumo.zip](la-faraono/unua-volumo.zip)
-- [dua-volumo.zip](la-faraono/dua-volumo.zip)
-- [tria-volumo.zip](la-faraono/tria-volumo.zip)
+ZIP: [cxiu-volumo](static/la-faraono/cxiu-volumo.zip)    [unua-volumo](static/la-faraono/unua-volumo.zip)    [dua-volumo](static/la-faraono/dua-volumo.zip)    [tria-volumo](static/la-faraono/tria-volumo.zip)
 
-![](static/la-faraono.jpg)
+![Kovrilo de La Faraono](static/la-faraono.jpg)
