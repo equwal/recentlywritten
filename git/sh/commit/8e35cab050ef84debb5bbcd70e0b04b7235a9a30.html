@@ -1,0 +1,1989 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sh 8e35cab0 - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>sh</h1><span class="desc">Small shell and Python scripts</span><p class="url">git clone https://github.com/equwal/sh</p><p><a href="../../sh/index.html">Log</a> | <a href="../../sh/files.html">Files</a> | <a href="../../sh/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 8e35cab050ef84debb5bbcd70e0b04b7235a9a30
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-10-04 22:51:27 -0700
+
+Import scripts from ~/src/sh unchanged
+
+</pre><pre> bm                        | 686 ++++++++++++++++++++++++++++++++++++++++++++++
+ git-update-repos          |  32 +++
+ git-update-worker.sh      |  28 ++
+ group4ify                 |  15 +
+ group4ify-aux             |   2 +
+ http-collect              | 193 +++++++++++++
+ jpegify                   |  15 +
+ jpegify-aux               |   2 +
+ macho                     |  25 ++
+ mpdmenu                   |  76 +++++
+ pashare                   |  13 +
+ pomodoro                  |  83 ++++++
+ pomodoro-files/config.def |   2 +
+ sbm/bm-commit             |  36 +++
+ sbm/bm-page               | 212 ++++++++++++++
+ sbm/bm-sync               | 248 +++++++++++++++++
+ sbm/bm-title              |  33 +++
+ slock-usb-key             |  24 ++
+ tag-music                 |  49 ++++
+ windervolage              |  57 ++++
+ 20 files changed, 1831 insertions(+)
+</pre><pre>diff --git a/bm b/bm
+new file mode 100755
+index 0000000..5b5f090
+--- /dev/null
++++ b/bm
+<span class="h">@@ -0,0 +1,686 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm: bookmarks in a plain file, picked with dmenu (or fzf).</span>
+<span class="a">+#</span>
+<span class="a">+#     URL&lt;tab&gt;description&lt;tab&gt;tag tag tag</span>
+<span class="a">+#</span>
+<span class="a">+# bm owns that file and nothing else. Importing, link checking, the web page</span>
+<span class="a">+# and so on are separate bm-* filters; see README.</span>
+<span class="a">+</span>
+<span class="a">+DMENULINES=${DMENULINES:-15}</span>
+<span class="a">+DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/sbm</span>
+<span class="a">+BOOKMARKS=${BOOKMARKS:-$DATADIR/bookmarks}</span>
+<span class="a">+USERTAGS=${USERTAGS:-$DATADIR/usertags}</span>
+<span class="a">+ENGINES=${SBM_ENGINES:-$DATADIR/engines}</span>
+<span class="a">+SEARCH=${SBM_SEARCH:-https://duckduckgo.com/?q=%s}</span>
+<span class="a">+USAGE=$BOOKMARKS.usage</span>
+<span class="a">+WLOCK=$BOOKMARKS.lock</span>
+<span class="a">+locked=</span>
+<span class="a">+TAB=$(printf &#x27;\t&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+# Two URLs are the same bookmark when they differ only in scheme, a leading</span>
+<span class="a">+# www., trailing slashes or the case of the host.</span>
+<span class="a">+AWK_NORM=&#x27;</span>
+<span class="a">+function norm(u,    host, rest, i) {</span>
+<span class="a">+    sub(/^[A-Za-z][A-Za-z0-9+.-]*:\/\//, &quot;&quot;, u)</span>
+<span class="a">+    i = index(u, &quot;/&quot;)</span>
+<span class="a">+    if (i) { host = substr(u, 1, i - 1); rest = substr(u, i) }</span>
+<span class="a">+    else   { host = u; rest = &quot;&quot; }</span>
+<span class="a">+    host = tolower(host)</span>
+<span class="a">+    sub(/^www\./, &quot;&quot;, host)</span>
+<span class="a">+    sub(/\/+$/, &quot;&quot;, rest)</span>
+<span class="a">+    return host rest</span>
+<span class="a">+}&#x27;</span>
+<span class="a">+</span>
+<span class="a">+die () {</span>
+<span class="a">+    printf &#x27;bm: %s\n&#x27; &quot;$*&quot; &gt;&amp;2</span>
+<span class="a">+    exit 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+have () {</span>
+<span class="a">+    command -v &quot;$1&quot; &gt;/dev/null 2&gt;&amp;1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+usage () {</span>
+<span class="a">+    cat &lt;&lt;&#x27;EOF&#x27;</span>
+<span class="a">+usage: bm [-t tag] [-S order] [action]</span>
+<span class="a">+Without an action: browse. Pick a bookmark, then what to do with it. Text</span>
+<span class="a">+that is no bookmark is opened as an address, or searched for on the web.</span>
+<span class="a">+  -o, --open        open a bookmark, an address or a web search</span>
+<span class="a">+                    (-p, --plumb is the same)</span>
+<span class="a">+  -c, --copy        copy a bookmark&#x27;s URL to the clipboard</span>
+<span class="a">+      --print       print a bookmark&#x27;s URL</span>
+<span class="a">+  -a, --add [url]   add a bookmark; the url defaults to the selection</span>
+<span class="a">+  -e, --edit        open the bookmark file in $EDITOR at a bookmark</span>
+<span class="a">+  -d, --delete      delete a bookmark</span>
+<span class="a">+  -l, --list        print the bookmarks</span>
+<span class="a">+  -m, --merge       add the bookmarks on stdin, skipping the known ones</span>
+<span class="a">+  -t, --tag &lt;tag&gt;   only consider bookmarks with this tag</span>
+<span class="a">+  -S, --sort &lt;o&gt;    used (default), recent, url, desc or tag</span>
+<span class="a">+  -h, --help</span>
+<span class="a">+EOF</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# ---- external programs: menu, clipboard, opener ----</span>
+<span class="a">+</span>
+<span class="a">+# dmenu when there is a display to draw it on and bm does not run in a</span>
+<span class="a">+# terminal, for example from a key of the window manager. In a terminal fzf</span>
+<span class="a">+# is the menu, because its preview shows the page of the bookmark under the</span>
+<span class="a">+# cursor. fzf also stands in when dmenu is not installed.</span>
+<span class="a">+pickmenu () {</span>
+<span class="a">+    [ -n &quot;$SBM_MENU&quot; ] &amp;&amp; return</span>
+<span class="a">+    if [ -n &quot;$DISPLAY$WAYLAND_DISPLAY&quot; ] &amp;&amp; ! { [ -t 0 ] &amp;&amp; [ -t 2 ]; }; then</span>
+<span class="a">+        order=&#x27;dmenu fzf&#x27;</span>
+<span class="a">+    else</span>
+<span class="a">+        order=&#x27;fzf dmenu&#x27;</span>
+<span class="a">+    fi</span>
+<span class="a">+    for menu in $order; do</span>
+<span class="a">+        if have &quot;$menu&quot;; then</span>
+<span class="a">+            SBM_MENU=$menu</span>
+<span class="a">+            return</span>
+<span class="a">+        fi</span>
+<span class="a">+    done</span>
+<span class="a">+    # shellcheck disable=SC2016</span>
+<span class="a">+    die &#x27;no menu program found: install dmenu or fzf, or set $SBM_MENU&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# $SBM_MENU may carry arguments, so it is split on purpose.</span>
+<span class="a">+custommenu () {</span>
+<span class="a">+    # shellcheck disable=SC2086</span>
+<span class="a">+    $SBM_MENU &quot;$@&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+fzfcmd () {</span>
+<span class="a">+    # shellcheck disable=SC2086</span>
+<span class="a">+    fzf -i --reverse --height=40% $SBM_FZF_OPTS &quot;$@&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# fzfpick &lt;fzf options&gt;: the chosen line, or else what was typed, which is</span>
+<span class="a">+# what dmenu gives by itself.</span>
+<span class="a">+fzfpick () {</span>
+<span class="a">+    out=$(fzfcmd --print-query &quot;$@&quot;)</span>
+<span class="a">+    chosen=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p)</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;${chosen:-$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)}&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# pick &lt;prompt&gt;: choices on stdin; the chosen line, or the typed text.</span>
+<span class="a">+pick () {</span>
+<span class="a">+    case $SBM_MENU in</span>
+<span class="a">+        fzf)   fzfpick --prompt=&quot;$1 &quot; ;;</span>
+<span class="a">+        dmenu) dmenu -i -l &quot;$DMENULINES&quot; -p &quot;$1&quot; ;;</span>
+<span class="a">+        *)     custommenu pick &quot;$1&quot; ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# pickmulti &lt;prompt&gt;: like pick, for any number of lines.</span>
+<span class="a">+pickmulti () {</span>
+<span class="a">+    choices=$(cat)</span>
+<span class="a">+    case $SBM_MENU in</span>
+<span class="a">+        fzf)</span>
+<span class="a">+            while :; do</span>
+<span class="a">+                out=$(printf &#x27;%s\n&#x27; &quot;$choices&quot; | fzfcmd --multi --print-query \</span>
+<span class="a">+                      --prompt=&quot;$1 &quot; --header=&#x27;TAB marks, ENTER confirms. No match: ENTER creates the typed tag, ESC finishes.&#x27;)</span>
+<span class="a">+                chosen=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed 1d)</span>
+<span class="a">+                if [ -n &quot;$chosen&quot; ]; then</span>
+<span class="a">+                    printf &#x27;%s\n&#x27; &quot;$chosen&quot;</span>
+<span class="a">+                    break</span>
+<span class="a">+                fi</span>
+<span class="a">+                typed=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)</span>
+<span class="a">+                [ -n &quot;$typed&quot; ] || break</span>
+<span class="a">+                printf &#x27;%s\n&#x27; &quot;$typed&quot;</span>
+<span class="a">+            done</span>
+<span class="a">+            ;;</span>
+<span class="a">+        dmenu)</span>
+<span class="a">+            while :; do</span>
+<span class="a">+                one=$(printf &#x27;done | (choose when done)\n%s\n&#x27; &quot;$choices&quot; \</span>
+<span class="a">+                      | dmenu -i -l &quot;$DMENULINES&quot; -p &quot;$1&quot;)</span>
+<span class="a">+                # An empty answer means the menu was closed.</span>
+<span class="a">+                [ -z &quot;$one&quot; ] || [ &quot;${one%% *}&quot; = &#x27;done&#x27; ] &amp;&amp; break</span>
+<span class="a">+                printf &#x27;%s\n&#x27; &quot;$one&quot;</span>
+<span class="a">+            done</span>
+<span class="a">+            ;;</span>
+<span class="a">+        *)  printf &#x27;%s\n&#x27; &quot;$choices&quot; | custommenu multi &quot;$1&quot; ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# ask &lt;prompt&gt; [default]: free text on stdout.</span>
+<span class="a">+ask () {</span>
+<span class="a">+    case $SBM_MENU in</span>
+<span class="a">+        fzf)</span>
+<span class="a">+            printf &#x27;%s%s: &#x27; &quot;$1&quot; &quot;${2:+ [$2]}&quot; &gt;&amp;2</span>
+<span class="a">+            IFS= read -r reply || reply=</span>
+<span class="a">+            printf &#x27;%s\n&#x27; &quot;${reply:-$2}&quot;</span>
+<span class="a">+            ;;</span>
+<span class="a">+        dmenu)</span>
+<span class="a">+            if [ -n &quot;$2&quot; ]; then printf &#x27;%s\n&#x27; &quot;$2&quot;; fi | dmenu -p &quot;$1:&quot;</span>
+<span class="a">+            ;;</span>
+<span class="a">+        *)</span>
+<span class="a">+            if [ -n &quot;$2&quot; ]; then printf &#x27;%s\n&#x27; &quot;$2&quot;; fi | custommenu ask &quot;$1&quot;</span>
+<span class="a">+            ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+clip_out () {</span>
+<span class="a">+    # shellcheck disable=SC2086,SC2016</span>
+<span class="a">+    if   [ -n &quot;$SBM_COPY&quot; ]; then $SBM_COPY</span>
+<span class="a">+    elif [ -n &quot;$WAYLAND_DISPLAY&quot; ] &amp;&amp; have wl-copy; then wl-copy</span>
+<span class="a">+    elif have xclip; then xclip -i -selection clipboard</span>
+<span class="a">+    elif have xsel; then xsel -ib</span>
+<span class="a">+    else die &#x27;no clipboard program found: set $SBM_COPY&#x27;</span>
+<span class="a">+    fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# The primary selection first, then the clipboard. Never fatal: without</span>
+<span class="a">+# either there is just no URL to suggest.</span>
+<span class="a">+clip_in () {</span>
+<span class="a">+    # shellcheck disable=SC2086</span>
+<span class="a">+    if   [ -n &quot;$SBM_PASTE&quot; ]; then $SBM_PASTE</span>
+<span class="a">+    elif [ -n &quot;$WAYLAND_DISPLAY&quot; ] &amp;&amp; have wl-paste; then</span>
+<span class="a">+        wl-paste -n -p; echo; wl-paste -n</span>
+<span class="a">+    elif have xclip; then</span>
+<span class="a">+        xclip -o; echo; xclip -o -selection clipboard</span>
+<span class="a">+    elif have xsel; then</span>
+<span class="a">+        xsel -op; echo; xsel -ob</span>
+<span class="a">+    fi 2&gt;/dev/null</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+opener () {</span>
+<span class="a">+    # shellcheck disable=SC2086,SC2016</span>
+<span class="a">+    if   [ -n &quot;$SBM_OPEN&quot; ]; then $SBM_OPEN &quot;$1&quot;</span>
+<span class="a">+    elif have xdg-open; then xdg-open &quot;$1&quot;</span>
+<span class="a">+    else die &#x27;no opener found: set $SBM_OPEN&#x27;</span>
+<span class="a">+    fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# ---- the bookmark file ----</span>
+<span class="a">+</span>
+<span class="a">+# Bookmarks restricted to $tagfilter and ordered by $sortorder, each followed</span>
+<span class="a">+# by a fourth field: how often it was used.</span>
+<span class="a">+rows () {</span>
+<span class="a">+    SBM_TAG=$tagfilter SBM_ORDER=$sortorder SBM_USAGE=$USAGE awk -F&#x27;\t&#x27; &#x27;</span>
+<span class="a">+        BEGIN {</span>
+<span class="a">+            while ((getline line &lt; ENVIRON[&quot;SBM_USAGE&quot;]) &gt; 0) {</span>
+<span class="a">+                split(line, f, &quot;\t&quot;)</span>
+<span class="a">+                used[f[1]] = f[2]</span>
+<span class="a">+            }</span>
+<span class="a">+            order = ENVIRON[&quot;SBM_ORDER&quot;]</span>
+<span class="a">+        }</span>
+<span class="a">+        NF == 0 || /^#/ { next }</span>
+<span class="a">+        ENVIRON[&quot;SBM_TAG&quot;] != &quot;&quot; {</span>
+<span class="a">+            hit = 0</span>
+<span class="a">+            n = split($3, tags, &quot; &quot;)</span>
+<span class="a">+            for (i = 1; i &lt;= n; i++)</span>
+<span class="a">+                if (tags[i] == ENVIRON[&quot;SBM_TAG&quot;]) hit = 1</span>
+<span class="a">+            if (!hit) next</span>
+<span class="a">+        }</span>
+<span class="a">+        {</span>
+<span class="a">+            if (order == &quot;used&quot;)        key = sprintf(&quot;%09d&quot;, 999999999 - used[$1])</span>
+<span class="a">+            else if (order == &quot;recent&quot;) key = sprintf(&quot;%09d&quot;, 999999999 - NR)</span>
+<span class="a">+            else if (order == &quot;desc&quot;)   key = tolower($2)</span>
+<span class="a">+            else if (order == &quot;tag&quot;)    key = tolower($3)</span>
+<span class="a">+            else                        key = &quot;&quot;</span>
+<span class="a">+            printf &quot;%s\t%s\t%s\t%s\t%s\t%d\n&quot;, key, tolower($1), $1, $2, $3, used[$1]</span>
+<span class="a">+        }&#x27; &quot;$BOOKMARKS&quot; | LC_ALL=C sort -t&quot;$TAB&quot; -k1,1 -k2,2 | cut -f3-</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# details &lt;url&gt;: a bookmark in full, one field per line.</span>
+<span class="a">+details () {</span>
+<span class="a">+    rows | SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] {</span>
+<span class="a">+        printf &quot;%s\n%s\ntags: %s\nused: %d\n&quot;, $1, $2, $3, $4</span>
+<span class="a">+        exit</span>
+<span class="a">+    }&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+is_bookmark () {</span>
+<span class="a">+    SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { found = 1; exit }</span>
+<span class="a">+        END { exit !found }&#x27; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# For fzf a fifth field is added, and it is all that is listed. The first</span>
+<span class="a">+# four feed the preview, which follows the cursor: the bookmark in full, then</span>
+<span class="a">+# the text of its page when bm-page is installed. fzf stops the preview when</span>
+<span class="a">+# the cursor moves on, so the short sleep keeps a fast scroll from fetching</span>
+<span class="a">+# each page on the way. A sleep that knows no fractions fails and skips it.</span>
+<span class="a">+PREVIEW=&quot;printf &#x27;%s\n%s\ntags: %s\nused: %s\n\n&#x27; {1} {2} {3} {4}; sleep 0.3 2&gt;/dev/null; bm-page {1} 2&gt;/dev/null&quot;</span>
+<span class="a">+fzfrows () {</span>
+<span class="a">+    awk -F&#x27;\t&#x27; &#x27;NF {</span>
+<span class="a">+        desc = $2</span>
+<span class="a">+        if (length(desc) &gt; 44) desc = substr(desc, 1, 42) &quot;..&quot;</span>
+<span class="a">+        printf &quot;%s\t%-44s  %-18s  %s\n&quot;, $0, desc, $3, $1</span>
+<span class="a">+    }&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# withpreview &lt;fzf command and options&gt;: for the output of fzfrows.</span>
+<span class="a">+withpreview () {</span>
+<span class="a">+    &quot;$@&quot; --delimiter=&quot;$TAB&quot; --with-nth=5.. \</span>
+<span class="a">+         --preview-window=right:50%:wrap --preview=&quot;$PREVIEW&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# choose &lt;prompt&gt;: a bookmark&#x27;s URL, or whatever else the user typed.</span>
+<span class="a">+choose () {</span>
+<span class="a">+    if [ &quot;$SBM_MENU&quot; = fzf ]; then</span>
+<span class="a">+        rows | fzfrows | withpreview fzfpick --prompt=&quot;$1 &quot;</span>
+<span class="a">+    else</span>
+<span class="a">+        rows | cut -f1-3 | pick &quot;$1&quot;</span>
+<span class="a">+    fi | cut -f1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# choose_url &lt;prompt&gt;: like choose, but only a bookmark will do.</span>
+<span class="a">+choose_url () {</span>
+<span class="a">+    if [ -z &quot;$(rows)&quot; ]; then</span>
+<span class="a">+        [ -n &quot;$tagfilter&quot; ] &amp;&amp; die &quot;no bookmarks tagged &#x27;$tagfilter&#x27;&quot;</span>
+<span class="a">+        die &#x27;no bookmarks yet; add one with: bm --add&#x27;</span>
+<span class="a">+    fi</span>
+<span class="a">+    url=$(choose &quot;$1&quot;)</span>
+<span class="a">+    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="a">+    is_bookmark &quot;$url&quot; || die &quot;not a bookmark: $url&quot;</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;$url&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# find_dup &lt;url&gt;: print the bookmark that is the same page as &lt;url&gt;, if any.</span>
+<span class="a">+find_dup () {</span>
+<span class="a">+    SBM_URL=$1 awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;</span>
+<span class="a">+        BEGIN { want = norm(ENVIRON[&quot;SBM_URL&quot;]) }</span>
+<span class="a">+        NF &amp;&amp; !/^#/ &amp;&amp; norm($1) == want { print; exit }&#x27; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# tmpfile &lt;file&gt;: create an empty temporary file and print its name. Beside</span>
+<span class="a">+# &lt;file&gt; if that directory can be written to, else in $TMPDIR. noclobber makes</span>
+<span class="a">+# the shell create it with O_EXCL, so a file or symlink planted under that</span>
+<span class="a">+# name in a shared /tmp is refused rather than followed: mktemp, in POSIX.</span>
+<span class="a">+tmpfile () {</span>
+<span class="a">+    for candidate in &quot;$1.tmp.$$&quot; &quot;${TMPDIR:-/tmp}/sbm.$$.${1##*/}&quot;; do</span>
+<span class="a">+        if (umask 077; set -C; : &gt; &quot;$candidate&quot;) 2&gt;/dev/null; then</span>
+<span class="a">+            printf &#x27;%s\n&#x27; &quot;$candidate&quot;</span>
+<span class="a">+            return 0</span>
+<span class="a">+        fi</span>
+<span class="a">+    done</span>
+<span class="a">+    return 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# rewrite &lt;file&gt;: replace &lt;file&gt; with stdin. Through cat, not mv, so that a</span>
+<span class="a">+# symlinked file stays a symlink and keeps its mode.</span>
+<span class="a">+rewrite () {</span>
+<span class="a">+    tmp=$(tmpfile &quot;$1&quot;) || die &quot;cannot create a temporary file for $1&quot;</span>
+<span class="a">+    cat &gt; &quot;$tmp&quot; &amp;&amp; cat &quot;$tmp&quot; &gt; &quot;$1&quot;</span>
+<span class="a">+    rc=$?</span>
+<span class="a">+    rm -f &quot;$tmp&quot;</span>
+<span class="a">+    return $rc</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# lock: take the write lock of the bookmark file, a directory beside it. bm</span>
+<span class="a">+# holds it while it changes the file, and bm-sync while it reads or writes</span>
+<span class="a">+# the file, so that neither writes over a change of the other. A lock whose</span>
+<span class="a">+# process is gone is taken over. After $SBM_LOCK_WAIT seconds (default 10)</span>
+<span class="a">+# bm stops.</span>
+<span class="a">+lock () {</span>
+<span class="a">+    waited=0</span>
+<span class="a">+    until mkdir &quot;$WLOCK&quot; 2&gt;/dev/null; do</span>
+<span class="a">+        pid=$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)</span>
+<span class="a">+        if [ -n &quot;$pid&quot; ] &amp;&amp; ! kill -0 &quot;$pid&quot; 2&gt;/dev/null; then</span>
+<span class="a">+            [ &quot;$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)&quot; != &quot;$pid&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        [ &quot;$waited&quot; -lt &quot;${SBM_LOCK_WAIT:-10}&quot; ] \</span>
+<span class="a">+            || die &quot;$BOOKMARKS is in use (bm -e or bm-sync). If neither runs, remove $WLOCK&quot;</span>
+<span class="a">+        sleep 1</span>
+<span class="a">+        waited=$((waited + 1))</span>
+<span class="a">+    done</span>
+<span class="a">+    echo $$ &gt; &quot;$WLOCK/pid&quot;</span>
+<span class="a">+    locked=1</span>
+<span class="a">+    # Also in the subshell of add_inside, which does not keep these traps.</span>
+<span class="a">+    trap unlock EXIT</span>
+<span class="a">+    trap &#x27;exit 1&#x27; HUP INT TERM</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+unlock () {</span>
+<span class="a">+    [ -z &quot;$locked&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+    locked=</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# bump &lt;url&gt;: count a use, for the &quot;used&quot; order. The counts live beside the</span>
+<span class="a">+# bookmark file, which stays a plain list: url, count, time of last use.</span>
+<span class="a">+# srand() returns the previous seed, and the first seed is the time of day:</span>
+<span class="a">+# that is &quot;date +%s&quot; for a POSIX that has no %s.</span>
+<span class="a">+bump () {</span>
+<span class="a">+    [ -e &quot;$USAGE&quot; ] || : &gt; &quot;$USAGE&quot; || return 0</span>
+<span class="a">+    SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;</span>
+<span class="a">+        BEGIN { OFS = &quot;\t&quot;; srand(); now = srand() }</span>
+<span class="a">+        $1 == ENVIRON[&quot;SBM_URL&quot;] { $2 = $2 + 1; $3 = now; seen = 1 }</span>
+<span class="a">+        { print }</span>
+<span class="a">+        END { if (!seen) print ENVIRON[&quot;SBM_URL&quot;], 1, now }</span>
+<span class="a">+    &#x27; &quot;$USAGE&quot; | rewrite &quot;$USAGE&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# learn_tags: tag names on stdin; the ones $USERTAGS lacks are appended to it.</span>
+<span class="a">+learn_tags () {</span>
+<span class="a">+    [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;</span>
+<span class="a">+    while IFS= read -r name; do</span>
+<span class="a">+        [ -n &quot;$name&quot; ] || continue</span>
+<span class="a">+        sed &#x27;s/[ |].*//&#x27; &quot;$USERTAGS&quot; | grep -Fxq -- &quot;$name&quot; \</span>
+<span class="a">+            || printf &#x27;%s | \n&#x27; &quot;$name&quot; &gt;&gt; &quot;$USERTAGS&quot;</span>
+<span class="a">+    done</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# changed &lt;message&gt;: the file was written. bm-commit, where installed, keeps</span>
+<span class="a">+# its history in git. bm-sync, where installed, tells your other machines; it</span>
+<span class="a">+# runs in the background, so that a slow network never holds the menu up.</span>
+<span class="a">+changed () {</span>
+<span class="a">+    if have bm-commit; then bm-commit &quot;$1&quot;; fi</span>
+<span class="a">+    if have bm-sync; then bm-sync -q &gt;/dev/null 2&gt;&amp;1 &amp; fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# ---- actions ----</span>
+<span class="a">+</span>
+<span class="a">+copy_url () {</span>
+<span class="a">+    bump &quot;$1&quot;</span>
+<span class="a">+    printf &#x27;%s&#x27; &quot;$1&quot; | clip_out</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+open_url () {</span>
+<span class="a">+    bump &quot;$1&quot;</span>
+<span class="a">+    opener &quot;$1&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# The editor reads the file when it starts and writes it when you save, so</span>
+<span class="a">+# bm holds the lock until the editor ends. bm-sync then waits, and syncs the</span>
+<span class="a">+# edit after it.</span>
+<span class="a">+edit_url () {</span>
+<span class="a">+    lock</span>
+<span class="a">+    line=$(SBM_URL=$1 awk -F&#x27;\t&#x27; \</span>
+<span class="a">+           &#x27;$1 == ENVIRON[&quot;SBM_URL&quot;] { print NR; exit }&#x27; &quot;$BOOKMARKS&quot;)</span>
+<span class="a">+    ${VISUAL:-${EDITOR:-vi}} &quot;+${line:-1}&quot; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+    unlock</span>
+<span class="a">+    changed &#x27;bm: edit&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+delete_url () {</span>
+<span class="a">+    lock</span>
+<span class="a">+    for file in &quot;$BOOKMARKS&quot; &quot;$USAGE&quot;; do</span>
+<span class="a">+        [ -e &quot;$file&quot; ] || continue</span>
+<span class="a">+        SBM_URL=$1 awk -F&#x27;\t&#x27; &#x27;$1 != ENVIRON[&quot;SBM_URL&quot;]&#x27; &quot;$file&quot; \</span>
+<span class="a">+            | rewrite &quot;$file&quot; || die &quot;could not rewrite $file&quot;</span>
+<span class="a">+    done</span>
+<span class="a">+    unlock</span>
+<span class="a">+    changed &quot;bm: delete $1&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# urlencode &lt;text&gt;: for a query string. awk has no ord(), hence the table.</span>
+<span class="a">+urlencode () {</span>
+<span class="a">+    printf &#x27;%s&#x27; &quot;$1&quot; | LC_ALL=C awk &#x27;</span>
+<span class="a">+        BEGIN { for (i = 1; i &lt; 256; i++) ord[sprintf(&quot;%c&quot;, i)] = i }</span>
+<span class="a">+        {</span>
+<span class="a">+            for (i = 1; i &lt;= length($0); i++) {</span>
+<span class="a">+                c = substr($0, i, 1)</span>
+<span class="a">+                if (c ~ /[A-Za-z0-9._~-]/) out = out c</span>
+<span class="a">+                else if (c == &quot; &quot;)         out = out &quot;+&quot;</span>
+<span class="a">+                else                       out = out sprintf(&quot;%%%02X&quot;, ord[c])</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        END { printf &quot;%s&quot;, out }&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# go &lt;text&gt;: open text that is not a bookmark. One word with &quot;://&quot; or a dot</span>
+<span class="a">+# in it is an address. Anything else is a web search: by the engine whose</span>
+<span class="a">+# keyword is the first word ($ENGINES holds &quot;keyword | url with %s&quot; lines),</span>
+<span class="a">+# or else by $SEARCH.</span>
+<span class="a">+go () {</span>
+<span class="a">+    case $1 in</span>
+<span class="a">+        *&#x27; &#x27;*) ;;</span>
+<span class="a">+        *://*) opener &quot;$1&quot;; return ;;</span>
+<span class="a">+        *.*)   opener &quot;https://$1&quot;; return ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    engine=$SEARCH</span>
+<span class="a">+    query=$1</span>
+<span class="a">+    if [ &quot;${1%% *}&quot; != &quot;$1&quot; ] &amp;&amp; [ -r &quot;$ENGINES&quot; ]; then</span>
+<span class="a">+        found=$(SBM_KEY=${1%% *} awk -F&#x27; *[|] *&#x27; \</span>
+<span class="a">+                &#x27;$1 == ENVIRON[&quot;SBM_KEY&quot;] { print $2; exit }&#x27; &quot;$ENGINES&quot;)</span>
+<span class="a">+        if [ -n &quot;$found&quot; ]; then</span>
+<span class="a">+            engine=$found</span>
+<span class="a">+            query=${1#* }</span>
+<span class="a">+        fi</span>
+<span class="a">+    fi</span>
+<span class="a">+    opener &quot;$(printf &#x27;%s\n&#x27; &quot;$engine&quot; | sed &quot;s|%s|$(urlencode &quot;$query&quot;)|&quot;)&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+plumb () {</span>
+<span class="a">+    url=$(choose &#x27;open:&#x27;)</span>
+<span class="a">+    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="a">+    if is_bookmark &quot;$url&quot;; then open_url &quot;$url&quot;; else go &quot;$url&quot;; fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# Exit status 3 means &quot;already bookmarked&quot;.</span>
+<span class="a">+add () {</span>
+<span class="a">+    url=$1</span>
+<span class="a">+    if [ -z &quot;$url&quot; ]; then</span>
+<span class="a">+        url=$(ask &#x27;url&#x27; &quot;$(clip_in | grep &#x27;://&#x27; | head -n 1)&quot;)</span>
+<span class="a">+    fi</span>
+<span class="a">+    url=$(printf &#x27;%s&#x27; &quot;$url&quot; | tr -d &#x27;[:space:]&#x27;)</span>
+<span class="a">+    [ -n &quot;$url&quot; ] || exit 1</span>
+<span class="a">+</span>
+<span class="a">+    dup=$(find_dup &quot;$url&quot;)</span>
+<span class="a">+    if [ -n &quot;$dup&quot; ]; then</span>
+<span class="a">+        printf &#x27;bm: already bookmarked:\n%s\n&#x27; &quot;$dup&quot; &gt;&amp;2</span>
+<span class="a">+        exit 3</span>
+<span class="a">+    fi</span>
+<span class="a">+</span>
+<span class="a">+    # bm-title, where installed, fetches the page&#x27;s title.</span>
+<span class="a">+    title=</span>
+<span class="a">+    if have bm-title; then title=$(bm-title &quot;$url&quot;); fi</span>
+<span class="a">+    desc=$(ask &#x27;description&#x27; &quot;$title&quot; | tr &#x27;\t&#x27; &#x27; &#x27;)</span>
+<span class="a">+</span>
+<span class="a">+    [ -e &quot;$USERTAGS&quot; ] || : &gt; &quot;$USERTAGS&quot;</span>
+<span class="a">+    names=$(pickmulti &#x27;tags:&#x27; &lt; &quot;$USERTAGS&quot; | sed &#x27;s/[ |].*//&#x27; | sed &#x27;/^$/d&#x27; \</span>
+<span class="a">+            | sort -u)</span>
+<span class="a">+    printf &#x27;%s\n&#x27; &quot;$names&quot; | learn_tags</span>
+<span class="a">+    tags=$(printf &#x27;%s\n&#x27; &quot;$names&quot; | paste -sd &#x27; &#x27; -)</span>
+<span class="a">+</span>
+<span class="a">+    lock</span>
+<span class="a">+    printf &#x27;%s\t%s\t%s\n&#x27; &quot;$url&quot; &quot;$desc&quot; &quot;$tags&quot; &gt;&gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+    unlock</span>
+<span class="a">+    changed &quot;bm: add $url&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# merge: bookmark lines on stdin (a bare URL per line will do); the ones not</span>
+<span class="a">+# known yet are appended. This is how the output of bm-import gets in.</span>
+<span class="a">+merge () {</span>
+<span class="a">+    new=$(tmpfile &quot;$BOOKMARKS&quot;) || die &#x27;cannot create a temporary file&#x27;</span>
+<span class="a">+    lock</span>
+<span class="a">+    SBM_FILE=$BOOKMARKS SBM_NEW=$new awk -F&#x27;\t&#x27; &quot;$AWK_NORM&quot;&#x27;</span>
+<span class="a">+        BEGIN {</span>
+<span class="a">+            while ((getline line &lt; ENVIRON[&quot;SBM_FILE&quot;]) &gt; 0) {</span>
+<span class="a">+                split(line, f, &quot;\t&quot;)</span>
+<span class="a">+                seen[norm(f[1])] = 1</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        NF == 0 || /^#/ { next }</span>
+<span class="a">+        seen[norm($1)]++ { skipped++; next }</span>
+<span class="a">+        { printf &quot;%s\t%s\t%s\n&quot;, $1, $2, $3 &gt; ENVIRON[&quot;SBM_NEW&quot;]; added++ }</span>
+<span class="a">+        END { printf &quot;added %d, skipped %d duplicates\n&quot;, added, skipped }&#x27;</span>
+<span class="a">+    cut -f3 &quot;$new&quot; | tr &#x27; &#x27; &#x27;\n&#x27; | sort -u | learn_tags</span>
+<span class="a">+    cat &quot;$new&quot; &gt;&gt; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+    unlock</span>
+<span class="a">+    rm -f &quot;$new&quot;</span>
+<span class="a">+    changed &#x27;bm: merge&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+nextorder () {</span>
+<span class="a">+    case $sortorder in</span>
+<span class="a">+        used)   sortorder=recent ;;</span>
+<span class="a">+        recent) sortorder=url ;;</span>
+<span class="a">+        url)    sortorder=desc ;;</span>
+<span class="a">+        desc)   sortorder=tag ;;</span>
+<span class="a">+        *)      sortorder=used ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# add exits, which must not end a browsing session; and when it refuses a</span>
+<span class="a">+# duplicate the user has to get to see that before the list comes back.</span>
+<span class="a">+add_inside () {</span>
+<span class="a">+    ( add &#x27;&#x27; )</span>
+<span class="a">+    if [ $? -eq 3 ]; then</span>
+<span class="a">+        ask &#x27;already bookmarked; press ENTER&#x27; &gt;/dev/null</span>
+<span class="a">+    fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# browse_fzf: fzf can bind keys, so one list does everything. Opening and</span>
+<span class="a">+# copying leave it, the other keys come back to it.</span>
+<span class="a">+browse_fzf () {</span>
+<span class="a">+    while :; do</span>
+<span class="a">+        header=&quot;ENTER open  ^Y copy  ^A add  ^D delete  ^E edit  ^S sort [$sortorder]&quot;</span>
+<span class="a">+        out=$(rows | fzfrows | withpreview fzfcmd --print-query \</span>
+<span class="a">+              --expect=ctrl-y,ctrl-a,ctrl-d,ctrl-e,ctrl-s \</span>
+<span class="a">+              --header=&quot;$header&quot; --prompt=&#x27;bookmark: &#x27;)</span>
+<span class="a">+        [ -n &quot;$out&quot; ] || exit 1</span>
+<span class="a">+        typed=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 1p)</span>
+<span class="a">+        key=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 2p)</span>
+<span class="a">+        url=$(printf &#x27;%s\n&#x27; &quot;$out&quot; | sed -n 3p | cut -f1)</span>
+<span class="a">+</span>
+<span class="a">+        case $key in</span>
+<span class="a">+            ctrl-a) add_inside; continue ;;</span>
+<span class="a">+            ctrl-s) nextorder; continue ;;</span>
+<span class="a">+        esac</span>
+<span class="a">+        if [ -z &quot;$url&quot; ]; then</span>
+<span class="a">+            [ -n &quot;$key&quot; ] &amp;&amp; continue</span>
+<span class="a">+            [ -n &quot;$typed&quot; ] || exit 1</span>
+<span class="a">+            go &quot;$typed&quot;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+        fi</span>
+<span class="a">+        case $key in</span>
+<span class="a">+            ctrl-y) copy_url &quot;$url&quot;; exit 0 ;;</span>
+<span class="a">+            ctrl-e) edit_url &quot;$url&quot; ;;</span>
+<span class="a">+            ctrl-d)</span>
+<span class="a">+                case $(ask &quot;delete $url? (y/N)&quot;) in</span>
+<span class="a">+                    y|Y|yes) delete_url &quot;$url&quot; ;;</span>
+<span class="a">+                esac</span>
+<span class="a">+                ;;</span>
+<span class="a">+            *)      open_url &quot;$url&quot;; exit 0 ;;</span>
+<span class="a">+        esac</span>
+<span class="a">+    done</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# browse_menu: dmenu can neither bind keys nor preview, so a second menu does</span>
+<span class="a">+# both: it shows the bookmark in full and asks what to do with it. Closing it</span>
+<span class="a">+# goes back to the list; closing the list leaves.</span>
+<span class="a">+browse_menu () {</span>
+<span class="a">+    while :; do</span>
+<span class="a">+        chosen=$( { printf &#x27;[add]\n&#x27;; rows | cut -f1-3; } | pick &#x27;bookmark:&#x27;)</span>
+<span class="a">+        [ -n &quot;$chosen&quot; ] || exit 1</span>
+<span class="a">+        if [ &quot;$chosen&quot; = &#x27;[add]&#x27; ]; then</span>
+<span class="a">+            add_inside</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        url=$(printf &#x27;%s\n&#x27; &quot;$chosen&quot; | cut -f1)</span>
+<span class="a">+        if ! is_bookmark &quot;$url&quot;; then</span>
+<span class="a">+            go &quot;$chosen&quot;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+        fi</span>
+<span class="a">+        action=$( { printf &#x27;open\ncopy\nedit\ndelete\n&#x27;</span>
+<span class="a">+                    details &quot;$url&quot; | sed &#x27;s/^/  /&#x27;; } | pick &#x27;do:&#x27;)</span>
+<span class="a">+        case $action in</span>
+<span class="a">+            open)   open_url &quot;$url&quot;; exit 0 ;;</span>
+<span class="a">+            copy)   copy_url &quot;$url&quot;; exit 0 ;;</span>
+<span class="a">+            edit)   edit_url &quot;$url&quot; ;;</span>
+<span class="a">+            delete) delete_url &quot;$url&quot; ;;</span>
+<span class="a">+        esac</span>
+<span class="a">+    done</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# ---- main ----</span>
+<span class="a">+</span>
+<span class="a">+setaction () {</span>
+<span class="a">+    if [ -n &quot;$action&quot; ]; then</span>
+<span class="a">+        printf &#x27;bm: only one action at a time\n&#x27; &gt;&amp;2</span>
+<span class="a">+        exit 2</span>
+<span class="a">+    fi</span>
+<span class="a">+    action=$1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# needarg &lt;flag&gt; &lt;count of remaining arguments&gt; &lt;value&gt;</span>
+<span class="a">+needarg () {</span>
+<span class="a">+    if [ &quot;$2&quot; -lt 2 ] || [ -z &quot;$3&quot; ]; then</span>
+<span class="a">+        printf &#x27;bm: %s needs an argument\n&#x27; &quot;$1&quot; &gt;&amp;2</span>
+<span class="a">+        exit 2</span>
+<span class="a">+    fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+action=</span>
+<span class="a">+addurl=</span>
+<span class="a">+tagfilter=</span>
+<span class="a">+sortorder=${SBM_SORT:-used}</span>
+<span class="a">+while [ $# -gt 0 ]; do</span>
+<span class="a">+    case $1 in</span>
+<span class="a">+        -h|--help)   setaction help ;;</span>
+<span class="a">+        -c|--copy)   setaction copy ;;</span>
+<span class="a">+        --print)     setaction print ;;</span>
+<span class="a">+        -o|--open|-p|--plumb) setaction open ;;</span>
+<span class="a">+        -e|--edit)   setaction edit ;;</span>
+<span class="a">+        -d|--delete) setaction delete ;;</span>
+<span class="a">+        -l|--list)   setaction list ;;</span>
+<span class="a">+        -m|--merge)  setaction merge ;;</span>
+<span class="a">+        -a|--add)</span>
+<span class="a">+            setaction add</span>
+<span class="a">+            case ${2-} in</span>
+<span class="a">+                &#x27;&#x27;|-*) ;;</span>
+<span class="a">+                *) addurl=$2; shift ;;</span>
+<span class="a">+            esac</span>
+<span class="a">+            ;;</span>
+<span class="a">+        -t|--tag)</span>
+<span class="a">+            needarg &quot;$1&quot; $# &quot;${2-}&quot;</span>
+<span class="a">+            tagfilter=$2</span>
+<span class="a">+            shift</span>
+<span class="a">+            ;;</span>
+<span class="a">+        -S|--sort)</span>
+<span class="a">+            needarg &quot;$1&quot; $# &quot;${2-}&quot;</span>
+<span class="a">+            sortorder=$2</span>
+<span class="a">+            shift</span>
+<span class="a">+            ;;</span>
+<span class="a">+        *)</span>
+<span class="a">+            printf &#x27;bm: unknown argument: %s\n&#x27; &quot;$1&quot; &gt;&amp;2</span>
+<span class="a">+            usage &gt;&amp;2</span>
+<span class="a">+            exit 2</span>
+<span class="a">+            ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    shift</span>
+<span class="a">+done</span>
+<span class="a">+</span>
+<span class="a">+case $sortorder in</span>
+<span class="a">+    used|recent|url|desc|tag) ;;</span>
+<span class="a">+    *)</span>
+<span class="a">+        printf &#x27;bm: unknown sort order: %s\n&#x27; &quot;$sortorder&quot; &gt;&amp;2</span>
+<span class="a">+        exit 2</span>
+<span class="a">+        ;;</span>
+<span class="a">+esac</span>
+<span class="a">+</span>
+<span class="a">+if [ &quot;$action&quot; = help ]; then</span>
+<span class="a">+    usage</span>
+<span class="a">+    exit 0</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+mkdir -p &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; || die &quot;cannot create directory for $BOOKMARKS&quot;</span>
+<span class="a">+[ -e &quot;$BOOKMARKS&quot; ] || : &gt; &quot;$BOOKMARKS&quot; || die &quot;cannot create $BOOKMARKS&quot;</span>
+<span class="a">+</span>
+<span class="a">+if awk &#x27;!/\t/ &amp;&amp; !/^#/ &amp;&amp; NF { found = 1; exit } END { exit !found }&#x27; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+then</span>
+<span class="a">+    printf &#x27;bm: %s has lines in the old format; run: bm-migrate\n&#x27; &quot;$BOOKMARKS&quot; &gt;&amp;2</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+case $action in</span>
+<span class="a">+    list|merge) ;;</span>
+<span class="a">+    *) pickmenu ;;</span>
+<span class="a">+esac</span>
+<span class="a">+</span>
+<span class="a">+case $action in</span>
+<span class="a">+    &#x27;&#x27;)</span>
+<span class="a">+        if [ &quot;$SBM_MENU&quot; = fzf ]; then browse_fzf; else browse_menu; fi</span>
+<span class="a">+        ;;</span>
+<span class="a">+    open)   plumb ;;</span>
+<span class="a">+    copy)   url=$(choose_url &#x27;copy:&#x27;)   &amp;&amp; copy_url &quot;$url&quot; ;;</span>
+<span class="a">+    print)  url=$(choose_url &#x27;print:&#x27;)  &amp;&amp; bump &quot;$url&quot; &amp;&amp; printf &#x27;%s\n&#x27; &quot;$url&quot; ;;</span>
+<span class="a">+    edit)   url=$(choose_url &#x27;edit:&#x27;)   &amp;&amp; edit_url &quot;$url&quot; ;;</span>
+<span class="a">+    delete) url=$(choose_url &#x27;delete:&#x27;) &amp;&amp; delete_url &quot;$url&quot; \</span>
+<span class="a">+                &amp;&amp; printf &#x27;deleted %s\n&#x27; &quot;$url&quot; ;;</span>
+<span class="a">+    add)    add &quot;$addurl&quot; ;;</span>
+<span class="a">+    list)   rows | cut -f1-3 ;;</span>
+<span class="a">+    merge)  merge ;;</span>
+<span class="a">+esac</span>
+diff --git a/git-update-repos b/git-update-repos
+new file mode 100644
+index 0000000..1784322
+--- /dev/null
++++ b/git-update-repos
+<span class="h">@@ -0,0 +1,32 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+# Update all git repos in directory tree</span>
+<span class="a">+dir=${1:-&quot;.&quot;}</span>
+<span class="a">+results=$(mktemp)</span>
+<span class="a">+log=$(mktemp)</span>
+<span class="a">+trap &quot;tsp -K; rm -f &quot;$results&quot; &quot;$log&quot;&quot; EXIT</span>
+<span class="a">+echo &quot;Updating repos in: &quot;$dir&quot;&quot;</span>
+<span class="a">+tsp -S 8</span>
+<span class="a">+find &quot;&quot;$dir&quot;&quot; -name &quot;.git&quot; -type d 2&gt;/dev/null | while read git_dir; do</span>
+<span class="a">+	tsp -n git-update-worker.sh &quot;$(dirname &quot;&quot;$git_dir&quot;&quot;)&quot; &quot;&quot;$results&quot;&quot; &quot;&quot;$log&quot;&quot;</span>
+<span class="a">+done</span>
+<span class="a">+tail -f &quot;&quot;$log&quot;&quot; &amp;</span>
+<span class="a">+tail_pid=$!</span>
+<span class="a">+tsp -w</span>
+<span class="a">+kill &quot;$tail_pid&quot; 2&gt;/dev/null</span>
+<span class="a">+conflicts=$(grep -c &quot;^REBASE_CONFLICT:&quot; &quot;&quot;$results&quot;&quot; 2&gt;/dev/null || echo 0)</span>
+<span class="a">+echo &quot;CHANGES:&quot;</span>
+<span class="a">+grep &quot;^UPDATED:&quot; &quot;&quot;$results&quot;&quot; | while IFS=&#x27;|&#x27; read prefix repo changelog; do</span>
+<span class="a">+	repo_name=$(echo &quot;&quot;$repo&quot;&quot; | sed &quot;s|^&quot;$dir&quot;/||&quot; | sed &#x27;s|^./||&#x27;)</span>
+<span class="a">+	echo &quot;\033[32m&quot;$repo_name&quot;:\033[0m&quot;</span>
+<span class="a">+	echo &quot;&quot;$changelog&quot;&quot; | tr &#x27;;&#x27; &#x27;\n&#x27; | sed &#x27;s/^/  /&#x27; | sed &#x27;s/^  $//&#x27;</span>
+<span class="a">+done</span>
+<span class="a">+if grep -q &quot;^REBASE_CONFLICT:&quot; &quot;&quot;$results&quot;&quot;; then</span>
+<span class="a">+	echo &quot;\033[31mREBASE CONFLICTS:\033[0m&quot;</span>
+<span class="a">+	grep &quot;^REBASE_CONFLICT:&quot; &quot;&quot;$results&quot;&quot; | while IFS=&#x27;|&#x27; read prefix repo _; do</span>
+<span class="a">+		repo_name=$(echo &quot;&quot;$repo&quot;&quot; | sed &quot;s|^&quot;$dir&quot;/||&quot; | sed &#x27;s|^./||&#x27;)</span>
+<span class="a">+		echo &quot;\033[31m&quot;$repo_name&quot;: requires manual resolution\033[0m&quot;</span>
+<span class="a">+	done</span>
+<span class="a">+fi</span>
+<span class="a">+if [ &quot;&quot;$conflicts&quot;&quot; ] &amp;&amp; [ &quot;&quot;$conflicts&quot;&quot; -gt 0 ] 2&gt;/dev/null; then</span>
+<span class="a">+	notify-send &quot;Git Rebase Conflicts&quot; &quot;&quot;$conflicts&quot; repos need manual resolution&quot; -u critical -t 10000</span>
+<span class="a">+fi</span>
+diff --git a/git-update-worker.sh b/git-update-worker.sh
+new file mode 100755
+index 0000000..9926866
+--- /dev/null
++++ b/git-update-worker.sh
+<span class="h">@@ -0,0 +1,28 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+repo=&quot;$1&quot;</span>
+<span class="a">+results=&quot;$2&quot;</span>
+<span class="a">+log=&quot;$3&quot;</span>
+<span class="a">+name=$(basename &quot;$repo&quot;)</span>
+<span class="a">+old=$(cd &quot;$repo&quot; &amp;&amp; git rev-parse HEAD 2&gt;/dev/null)</span>
+<span class="a">+if [ -f &quot;$repo/.git/FETCH_HEAD&quot; ]; then</span>
+<span class="a">+	if [ &quot;$(find &quot;$repo/.git/FETCH_HEAD&quot; -mmin -5 2&gt;/dev/null)&quot; ]; then</span>
+<span class="a">+		echo &quot;[$name] skipped&quot; &gt;&gt; &quot;$log&quot;</span>
+<span class="a">+		exit</span>
+<span class="a">+	fi</span>
+<span class="a">+fi</span>
+<span class="a">+(cd &quot;$repo&quot; &amp;&amp; git remote update &gt;/dev/null 2&gt;&amp;1)</span>
+<span class="a">+if (cd &quot;$repo&quot; &amp;&amp; git pull --rebase &gt;/dev/null 2&gt;&amp;1); then</span>
+<span class="a">+	:</span>
+<span class="a">+elif (cd &quot;$repo&quot; &amp;&amp; git rebase --abort &gt;/dev/null 2&gt;&amp;1); then</span>
+<span class="a">+	echo &quot;REBASE_CONFLICT:$repo|&quot; &gt;&gt; &quot;$results&quot;</span>
+<span class="a">+	echo &quot;[$name] REBASE CONFLICT&quot; &gt;&gt; &quot;$log&quot;</span>
+<span class="a">+	exit</span>
+<span class="a">+else</span>
+<span class="a">+	echo &quot;[$name] FAILED&quot; &gt;&gt; &quot;$log&quot;</span>
+<span class="a">+	exit</span>
+<span class="a">+fi</span>
+<span class="a">+new=$(cd &quot;$repo&quot; &amp;&amp; git rev-parse HEAD 2&gt;/dev/null)</span>
+<span class="a">+[ &quot;$old&quot; = &quot;$new&quot; ] &amp;&amp; { echo &quot;[$name] up to date&quot; &gt;&gt; &quot;$log&quot;; exit; }</span>
+<span class="a">+echo &quot;[$name] UPDATED&quot; &gt;&gt; &quot;$log&quot;</span>
+<span class="a">+changelog=$(cd &quot;$repo&quot; &amp;&amp; git log --oneline --no-merges -3 &quot;$old..$new&quot; 2&gt;/dev/null | tr &#x27;\n&#x27; &#x27;;&#x27;)</span>
+<span class="a">+echo &quot;UPDATED:$repo|$changelog&quot; &gt;&gt; &quot;$results&quot;</span>
+\ No newline at end of file
+diff --git a/group4ify b/group4ify
+new file mode 100755
+index 0000000..3674ca6
+--- /dev/null
++++ b/group4ify
+<span class="h">@@ -0,0 +1,15 @@</span>
+<span class="a">+#!/bin/bash</span>
+<span class="a">+TEMP=&quot;$(mktemp)&quot;</span>
+<span class="a">+[ -e &quot;$TEMP&quot; ] &amp;&amp; rm &quot;$TEMP&quot;</span>
+<span class="a">+mkdir &quot;$TEMP&quot;</span>
+<span class="a">+BASE=&quot;$(basename &quot;$1&quot;)&quot;</span>
+<span class="a">+cp &quot;$1&quot; &quot;$TEMP&quot;</span>
+<span class="a">+</span>
+<span class="a">+cd &quot;$TEMP&quot;</span>
+<span class="a">+pdfseparate &quot;$PWD&quot;/&quot;$1&quot; %d.pdf</span>
+<span class="a">+rm &quot;$BASE&quot;</span>
+<span class="a">+find . -name &#x27;*.pdf&#x27; -print0 | grep -z -v group4 | xargs -0 -L1 group4ify-aux</span>
+<span class="a">+cat &lt;(find . -name &#x27;*-group4.pdf&#x27; | sed &#x27;s:^./::&#x27; | sort -h | sed &#x27;s:^\|$:&quot;:g&#x27;) &lt;(echo &quot;$BASE&quot;-group4.pdf) | xargs pdfunite</span>
+<span class="a">+cd -</span>
+<span class="a">+mv &quot;$TEMP&quot;/&quot;$BASE&quot;-group4.pdf .</span>
+<span class="a">+rm -r &quot;$TEMP&quot;</span>
+diff --git a/group4ify-aux b/group4ify-aux
+new file mode 100755
+index 0000000..02daa1b
+--- /dev/null
++++ b/group4ify-aux
+<span class="h">@@ -0,0 +1,2 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+convert -density 300 -compress Group4 -type bilevel &quot;$1&quot; &quot;$1&quot;-group4.pdf</span>
+diff --git a/http-collect b/http-collect
+new file mode 100755
+index 0000000..6ca88e0
+--- /dev/null
++++ b/http-collect
+<span class="h">@@ -0,0 +1,193 @@</span>
+<span class="a">+#!/usr/bin/env python3</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+from argparse import ArgumentParser</span>
+<span class="a">+from os import environ</span>
+<span class="a">+from os.path import isfile</span>
+<span class="a">+from random import randint</span>
+<span class="a">+from re import match</span>
+<span class="a">+from socket import socket, AF_INET, SOCK_STREAM</span>
+<span class="a">+from subprocess import check_output</span>
+<span class="a">+from sys import stderr</span>
+<span class="a">+from time import sleep</span>
+<span class="a">+from uuid import uuid4</span>
+<span class="a">+</span>
+<span class="a">+from flask import Flask, request</span>
+<span class="a">+from qrcode import QRCode</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+app = Flask(__name__)</span>
+<span class="a">+secret = str(uuid4())</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def html(body):</span>
+<span class="a">+    out = &#x27;&#x27;&#x27;</span>
+<span class="a">+&lt;!DOCTYPE html&gt;</span>
+<span class="a">+&lt;html&gt;</span>
+<span class="a">+    &lt;head&gt;</span>
+<span class="a">+        &lt;link href=&quot;data:,&quot; rel=&quot;icon&quot;&gt;</span>
+<span class="a">+        &lt;meta charset=&quot;UTF-8&quot;&gt;</span>
+<span class="a">+        &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1.0&quot;&gt;</span>
+<span class="a">+        &lt;title&gt;http-collect&lt;/title&gt;</span>
+<span class="a">+        &lt;style&gt;</span>
+<span class="a">+body {</span>
+<span class="a">+    max-width: 400px;</span>
+<span class="a">+    margin: 0px auto;</span>
+<span class="a">+    padding: 3em;</span>
+<span class="a">+    font-family: sans-serif;</span>
+<span class="a">+}</span>
+<span class="a">+input, textarea {</span>
+<span class="a">+    width: 100%;</span>
+<span class="a">+    height: 8em;</span>
+<span class="a">+    margin: 0.5em 0px;</span>
+<span class="a">+}</span>
+<span class="a">+        &lt;/style&gt;</span>
+<span class="a">+    &lt;/head&gt;</span>
+<span class="a">+    &lt;body&gt;</span>
+<span class="a">+    &#x27;&#x27;&#x27;</span>
+<span class="a">+    out += body</span>
+<span class="a">+    out += &#x27;&#x27;&#x27;</span>
+<span class="a">+    &lt;/body&gt;</span>
+<span class="a">+&lt;/html&gt;</span>
+<span class="a">+    &#x27;&#x27;&#x27;</span>
+<span class="a">+</span>
+<span class="a">+    return out</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def sanitize_fs(s):</span>
+<span class="a">+    return s.strip().lstrip(&#x27;.&#x27;).replace(&#x27;/&#x27;, &#x27;_&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def sanitize_html(s):</span>
+<span class="a">+    return s.replace(&#x27;&amp;&#x27;, &#x27;&amp;amp&#x27;).replace(&#x27;&lt;&#x27;, &#x27;&amp;lt;&#x27;).replace(&#x27;&gt;&#x27;, &#x27;&amp;gt;&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def suffixify(basename, suff):</span>
+<span class="a">+    m = match(r&#x27;(.+)\.([^.]+)$&#x27;, basename)</span>
+<span class="a">+    if not m:</span>
+<span class="a">+        return f&#x27;{basename} ({suff:03d})&#x27;</span>
+<span class="a">+</span>
+<span class="a">+    return f&#x27;{m.group(1)} ({suff:03d}).{m.group(2)}&#x27;</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def get_final_name(original_name):</span>
+<span class="a">+    candidate = base_name = sanitize_fs(original_name)</span>
+<span class="a">+    suff = 1</span>
+<span class="a">+    while isfile(candidate):</span>
+<span class="a">+        candidate = suffixify(base_name, suff)</span>
+<span class="a">+        suff += 1</span>
+<span class="a">+    return candidate</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+def determine_host_and_port(args):</span>
+<span class="a">+    host = None</span>
+<span class="a">+    port = None</span>
+<span class="a">+</span>
+<span class="a">+    if args.host:</span>
+<span class="a">+        host = args.host</span>
+<span class="a">+    if args.port:</span>
+<span class="a">+        port = args.port</span>
+<span class="a">+</span>
+<span class="a">+    if host is None:</span>
+<span class="a">+        rt = check_output([&#x27;ip&#x27;, &#x27;-4&#x27;, &#x27;route&#x27;]).decode(&#x27;UTF-8&#x27;)</span>
+<span class="a">+        for line in rt.splitlines():</span>
+<span class="a">+            m = match(r&#x27;default.* src ([0-9.]+)&#x27;, line)</span>
+<span class="a">+            if m:</span>
+<span class="a">+                host = m.group(1)</span>
+<span class="a">+</span>
+<span class="a">+        if host is None:</span>
+<span class="a">+            print(&#x27;Could not find my IPv4, using 0.0.0.0&#x27;, file=stderr)</span>
+<span class="a">+            host = &#x27;0.0.0.0&#x27;</span>
+<span class="a">+</span>
+<span class="a">+    success = False</span>
+<span class="a">+    for _ in range(5):</span>
+<span class="a">+        if port is None:</span>
+<span class="a">+            try_port = randint(1025, 65535)</span>
+<span class="a">+        else:</span>
+<span class="a">+            try_port = port</span>
+<span class="a">+</span>
+<span class="a">+        try:</span>
+<span class="a">+            s = socket(AF_INET, SOCK_STREAM)</span>
+<span class="a">+            s.bind((host, try_port))</span>
+<span class="a">+            s.listen()</span>
+<span class="a">+        except Exception as e:</span>
+<span class="a">+            print(f&#x27;Failed to use {host}:{try_port}: {repr(e)}&#x27;)</span>
+<span class="a">+            sleep(1)</span>
+<span class="a">+        else:</span>
+<span class="a">+            port = try_port</span>
+<span class="a">+            success = True</span>
+<span class="a">+            break</span>
+<span class="a">+        finally:</span>
+<span class="a">+            s.close()</span>
+<span class="a">+</span>
+<span class="a">+    if not success:</span>
+<span class="a">+        raise Exception(&#x27;Could not find free port&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+    url = f&#x27;http://{host}:{port}/{secret}&#x27;</span>
+<span class="a">+</span>
+<span class="a">+    qr = QRCode()</span>
+<span class="a">+    qr.add_data(f&#x27;http://{host}:{port}/{secret}&#x27;)</span>
+<span class="a">+    qr.print_ascii(tty=True)</span>
+<span class="a">+</span>
+<span class="a">+    print()</span>
+<span class="a">+    print(url)</span>
+<span class="a">+    print()</span>
+<span class="a">+</span>
+<span class="a">+    return host, port</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@app.route(&#x27;/&lt;secret_from_url&gt;&#x27;, methods=[&#x27;GET&#x27;])</span>
+<span class="a">+def form(secret_from_url):</span>
+<span class="a">+    if secret_from_url != secret:</span>
+<span class="a">+        return &#x27;no&#x27;, 403</span>
+<span class="a">+</span>
+<span class="a">+    return html(&#x27;&#x27;&#x27;</span>
+<span class="a">+    &lt;form method=&quot;POST&quot; enctype=&quot;multipart/form-data&quot;&gt;</span>
+<span class="a">+        &lt;input type=&quot;file&quot; name=&quot;file&quot; multiple&gt;</span>
+<span class="a">+        &lt;textarea name=&quot;textarea&quot;&gt;&lt;/textarea&gt;</span>
+<span class="a">+        &lt;input type=&quot;submit&quot;&gt;</span>
+<span class="a">+    &lt;/form&gt;</span>
+<span class="a">+    &#x27;&#x27;&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+@app.route(&#x27;/&lt;secret_from_url&gt;&#x27;, methods=[&#x27;POST&#x27;])</span>
+<span class="a">+def save(secret_from_url):</span>
+<span class="a">+    if secret_from_url != secret:</span>
+<span class="a">+        return &#x27;no&#x27;, 403</span>
+<span class="a">+</span>
+<span class="a">+    saved = []</span>
+<span class="a">+</span>
+<span class="a">+    for file in request.files.getlist(&#x27;file&#x27;):</span>
+<span class="a">+        if file.filename:</span>
+<span class="a">+            final_name = get_final_name(file.filename)</span>
+<span class="a">+            file.save(final_name)</span>
+<span class="a">+            saved.append(f&#x27;&lt;li&gt;{sanitize_html(final_name)}&lt;/li&gt;&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+    if request.form.get(&#x27;textarea&#x27;):</span>
+<span class="a">+        final_name = get_final_name(&#x27;plain.txt&#x27;)</span>
+<span class="a">+        with open(final_name, &#x27;w&#x27;) as fp:</span>
+<span class="a">+            fp.write(request.form.get(&#x27;textarea&#x27;))</span>
+<span class="a">+        saved.append(f&#x27;&lt;li&gt;{sanitize_html(final_name)}&lt;/li&gt;&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+    num = len(saved)</span>
+<span class="a">+    suffix = &#x27;&#x27; if num == 1 else &#x27;s&#x27;</span>
+<span class="a">+    body = f&#x27;&lt;p&gt;{num} file{suffix} saved:&lt;/p&gt;&lt;ul&gt;&#x27;</span>
+<span class="a">+    body += &#x27;\n&#x27;.join(saved)</span>
+<span class="a">+    body += &#x27;&lt;/ul&gt;&#x27;</span>
+<span class="a">+</span>
+<span class="a">+    body += f&#x27;&lt;p&gt;&lt;a href=&quot;/{secret}&quot;&gt;Back&lt;/a&gt;&lt;/p&gt;&#x27;</span>
+<span class="a">+    return html(body)</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if __name__ == &#x27;__main__&#x27;:</span>
+<span class="a">+    parser = ArgumentParser()</span>
+<span class="a">+    parser.add_argument(&#x27;--host&#x27;)</span>
+<span class="a">+    parser.add_argument(&#x27;--port&#x27;, type=int)</span>
+<span class="a">+    parser.add_argument(&#x27;--secret&#x27;)</span>
+<span class="a">+    args = parser.parse_args()</span>
+<span class="a">+</span>
+<span class="a">+    if args.secret:</span>
+<span class="a">+        secret = args.secret</span>
+<span class="a">+</span>
+<span class="a">+    host, port = determine_host_and_port(args)</span>
+<span class="a">+    app.run(host=host, port=port)</span>
+diff --git a/jpegify b/jpegify
+new file mode 100755
+index 0000000..5768d5c
+--- /dev/null
++++ b/jpegify
+<span class="h">@@ -0,0 +1,15 @@</span>
+<span class="a">+#!/bin/bash</span>
+<span class="a">+TEMP=&quot;$(mktemp)&quot;</span>
+<span class="a">+[ -e &quot;$TEMP&quot; ] &amp;&amp; rm &quot;$TEMP&quot;</span>
+<span class="a">+mkdir &quot;$TEMP&quot;</span>
+<span class="a">+BASE=&quot;$(basename &quot;$1&quot;)&quot;</span>
+<span class="a">+cp &quot;$1&quot; &quot;$TEMP&quot;</span>
+<span class="a">+</span>
+<span class="a">+cd &quot;$TEMP&quot;</span>
+<span class="a">+pdfseparate &quot;$PWD&quot;/&quot;$1&quot; %d.pdf</span>
+<span class="a">+rm &quot;$BASE&quot;</span>
+<span class="a">+find . -name &#x27;*.pdf&#x27; -print0 | grep -z -v jpeg | xargs -0 -L1 jpegify-aux</span>
+<span class="a">+cat &lt;(find . -name &#x27;*-jpeg.pdf&#x27; | sed &#x27;s:^./::&#x27; | sort -h | sed &#x27;s:^\|$:&quot;:g&#x27;) &lt;(echo &quot;$BASE&quot;-jpeg.pdf) | xargs pdfunite</span>
+<span class="a">+cd -</span>
+<span class="a">+mv &quot;$TEMP&quot;/&quot;$BASE&quot;-jpeg.pdf .</span>
+<span class="a">+rm -r &quot;$TEMP&quot;</span>
+diff --git a/jpegify-aux b/jpegify-aux
+new file mode 100755
+index 0000000..2690656
+--- /dev/null
++++ b/jpegify-aux
+<span class="h">@@ -0,0 +1,2 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+convert -density 100 -compress JPEG  -quality 70 &quot;$1&quot; &quot;$1&quot;-jpeg.pdf</span>
+diff --git a/macho b/macho
+new file mode 100755
+index 0000000..2566d7d
+--- /dev/null
++++ b/macho
+<span class="h">@@ -0,0 +1,25 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+export FZF_DEFAULT_OPTS=&#x27;</span>
+<span class="a">+--height=30%</span>
+<span class="a">+--layout=reverse</span>
+<span class="a">+--prompt=&quot;Manual: &quot;</span>
+<span class="a">+--preview=&quot;echo {1} | sed -E \&quot;s/^\((.+)\)/\1/\&quot; | xargs -I{S} man -Pcat {S} {2} 2&gt;/dev/null&quot;&#x27;</span>
+<span class="a">+</span>
+<span class="a">+while getopts &quot;:s:&quot; opt; do</span>
+<span class="a">+    case $opt in</span>
+<span class="a">+        s ) SECTION=$OPTARG; shift; shift;;</span>
+<span class="a">+        \?) echo &quot;Invalid option: -$OPTARG&quot; &gt;&amp;2; exit 1;;</span>
+<span class="a">+        : ) echo &quot;Option -$OPTARG requires an argument&quot; &gt;&amp;2; exit 1;;</span>
+<span class="a">+    esac</span>
+<span class="a">+done</span>
+<span class="a">+</span>
+<span class="a">+manual=$(apropos -s ${SECTION:-&#x27;&#x27;} ${@:-.} | \</span>
+<span class="a">+    grep -v -E &#x27;^.+ \(0\)&#x27; |\</span>
+<span class="a">+    awk &#x27;{print $2 &quot;    &quot; $1}&#x27; | \</span>
+<span class="a">+    sort | \</span>
+<span class="a">+    fzf  | \</span>
+<span class="a">+    sed -E &#x27;s/^\((.+)\)/\1/&#x27;)</span>
+<span class="a">+</span>
+<span class="a">+[ -z &quot;$manual&quot; ] &amp;&amp; exit 0</span>
+<span class="a">+man $manual</span>
+diff --git a/mpdmenu b/mpdmenu
+new file mode 100755
+index 0000000..d32d957
+--- /dev/null
++++ b/mpdmenu
+<span class="h">@@ -0,0 +1,76 @@</span>
+<span class="a">+#!/bin/bash</span>
+<span class="a">+</span>
+<span class="a">+all_name=&#x27;[ALL]&#x27;</span>
+<span class="a">+mode=library</span>
+<span class="a">+</span>
+<span class="a">+d_artist() {</span>
+<span class="a">+    mpc list artist | sort -f | dmenu -p artist &quot;${dmenu_args[@]}&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+d_album() {</span>
+<span class="a">+    local artist=&quot;$1&quot;</span>
+<span class="a">+    local albums</span>
+<span class="a">+</span>
+<span class="a">+    mapfile -t albums &lt; &lt;(mpc list album artist &quot;$artist&quot;)</span>
+<span class="a">+    if (( ${#albums[@]} &gt; 1 )) ; then</span>
+<span class="a">+        {</span>
+<span class="a">+            printf &#x27;%s\n&#x27; &quot;$all_name&quot;</span>
+<span class="a">+            printf &#x27;%s\n&#x27; &quot;${albums[@]}&quot; | sort -f</span>
+<span class="a">+        } | dmenu -p album &quot;${dmenu_args[@]}&quot;</span>
+<span class="a">+    else</span>
+<span class="a">+        # We only have one album, so just use that.</span>
+<span class="a">+        printf &#x27;%s\n&#x27; &quot;${albums[0]}&quot;</span>
+<span class="a">+    fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+d_playlist() {</span>
+<span class="a">+    local format=&quot;%position% %title%&quot;</span>
+<span class="a">+    local extra_format=&quot;(%artist% - %album%)&quot;</span>
+<span class="a">+    local track</span>
+<span class="a">+    local num_extras</span>
+<span class="a">+</span>
+<span class="a">+    # If all tracks are from the same artist and album, no need to display that</span>
+<span class="a">+    num_extras=$(mpc playlist -f &quot;$extra_format&quot; | sort | uniq | wc -l)</span>
+<span class="a">+    (( num_extras == 1 )) || format+=&quot; $extra_format&quot;</span>
+<span class="a">+</span>
+<span class="a">+    track=$(mpc playlist -f &quot;$format&quot; | dmenu -p track &quot;${dmenu_args[@]}&quot;)</span>
+<span class="a">+    printf &#x27;%s&#x27; &quot;${track%% *}&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+i=2</span>
+<span class="a">+</span>
+<span class="a">+for arg do</span>
+<span class="a">+    if [[ $arg == :: ]]; then</span>
+<span class="a">+        dmenu_args=( &quot;${@:$i}&quot; )</span>
+<span class="a">+        break</span>
+<span class="a">+    fi</span>
+<span class="a">+</span>
+<span class="a">+    case &quot;$arg&quot; in</span>
+<span class="a">+        -l) mode=library ;;</span>
+<span class="a">+        -p) mode=playlist ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+</span>
+<span class="a">+    let i++</span>
+<span class="a">+done</span>
+<span class="a">+</span>
+<span class="a">+case &quot;$mode&quot; in</span>
+<span class="a">+    library)</span>
+<span class="a">+        artist=$(d_artist)</span>
+<span class="a">+        [[ $artist ]] || exit 1</span>
+<span class="a">+</span>
+<span class="a">+        album=$(d_album &quot;$artist&quot;)</span>
+<span class="a">+        [[ $album ]] || exit 2</span>
+<span class="a">+</span>
+<span class="a">+        mpc clear</span>
+<span class="a">+        if [[ $album == &quot;$all_name&quot; ]]; then</span>
+<span class="a">+            mpc find artist &quot;$artist&quot; | sort | mpc add</span>
+<span class="a">+        else</span>
+<span class="a">+            mpc find artist &quot;$artist&quot; album &quot;$album&quot; | sort | mpc add</span>
+<span class="a">+        fi</span>
+<span class="a">+</span>
+<span class="a">+        mpc play &gt;/dev/null</span>
+<span class="a">+    ;;</span>
+<span class="a">+    playlist)</span>
+<span class="a">+        mpc play &quot;$(d_playlist)&quot; &gt;/dev/null</span>
+<span class="a">+    ;;</span>
+<span class="a">+esac</span>
+diff --git a/pashare b/pashare
+new file mode 100755
+index 0000000..8b47bd8
+--- /dev/null
++++ b/pashare
+<span class="h">@@ -0,0 +1,13 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+case &quot;$1&quot; in</span>
+<span class="a">+  start)</span>
+<span class="a">+    $0 stop </span>
+<span class="a">+    pactl load-module module-simple-protocol-tcp rate=48000 format=s16le channels=2 source=alsa_output.pci-0000_00_1f.3.iec958-stereo.monitor record=true port=8000</span>
+<span class="a">+    ;;</span>
+<span class="a">+  stop)</span>
+<span class="a">+    pactl unload-module `pactl list | grep &#x27;Monitor Source&#x27; | grep tcp -B1 | grep M | sed &#x27;s/[^0-9]//g&#x27;`</span>
+<span class="a">+    ;;</span>
+<span class="a">+  *)</span>
+<span class="a">+    echo &quot;Usage: $0 start|stop&quot; &gt;&amp;2</span>
+<span class="a">+    ;;</span>
+<span class="a">+esac</span>
+diff --git a/pomodoro b/pomodoro
+new file mode 100755
+index 0000000..ac786b0
+--- /dev/null
++++ b/pomodoro
+<span class="h">@@ -0,0 +1,83 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+remaining() {</span>
+<span class="a">+  if [ -e $statusfile ]; then</span>
+<span class="a">+    stime=$(cat $statusfile | awk &#x27;/start/ {print $2}&#x27;)</span>
+<span class="a">+    time=$(cat $configfile | awk &#x27;/&#x27;$(current)&#x27; / {print $2}&#x27;)</span>
+<span class="a">+    echo $(($stime - $(date +%s) + $time))</span>
+<span class="a">+  fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+current() {</span>
+<span class="a">+  ! [ -e $statusfile ] &amp;&amp; echo &quot;null&quot; || cat $statusfile | awk &#x27;/current/ {print $2}&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+next() {</span>
+<span class="a">+  cat $configfile | awk &#x27;/&#x27;$(current)&#x27; / {print $3}&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+update() {</span>
+<span class="a">+  printf &quot;current %s\nstart %s&quot; $1 $(date +%s) &gt; $statusfile</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+list() {</span>
+<span class="a">+  cat $configfile | awk &#x27;{print $1}&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+configdir=&quot;$HOME/.config/pomodoro&quot;</span>
+<span class="a">+configfile=&quot;$configdir/config&quot;</span>
+<span class="a">+statusfile=&quot;/tmp/.pomodoro&quot;</span>
+<span class="a">+</span>
+<span class="a">+# Check for config file, if it doesnt exist, copy the default.</span>
+<span class="a">+if ! [ -e $configfile ]; then</span>
+<span class="a">+  mkdir -p $configdir</span>
+<span class="a">+  cp /usr/share/doc/pomodoro/config.def $configfile</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+# Set flags for the arguments.</span>
+<span class="a">+while getopts &quot;:sgk&quot; opt; do</span>
+<span class="a">+  case $opt in</span>
+<span class="a">+    s)</span>
+<span class="a">+      s=0</span>
+<span class="a">+      ;;</span>
+<span class="a">+    k)</span>
+<span class="a">+      k=0</span>
+<span class="a">+      ;;</span>
+<span class="a">+    g)</span>
+<span class="a">+      g=0</span>
+<span class="a">+      ;;</span>
+<span class="a">+    \?)</span>
+<span class="a">+      exit 1</span>
+<span class="a">+  esac</span>
+<span class="a">+done</span>
+<span class="a">+</span>
+<span class="a">+# If no input arguments, show a simple menu.</span>
+<span class="a">+if [ $# -le 0 ]; then </span>
+<span class="a">+  selection=$(printf &quot;start\nkill&quot; | dmenu)</span>
+<span class="a">+  [ $? -ne 0 ] &amp;&amp; exit</span>
+<span class="a">+  [ &quot;$selection&quot; = &quot;start&quot; ] &amp;&amp; s=0 || k=0</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+# Handlers.</span>
+<span class="a">+if [ $s ]; then</span>
+<span class="a">+  if [ $# -le 1 ]; then</span>
+<span class="a">+    profile=$(list | dmenu)</span>
+<span class="a">+    [ $? -ne 0 ] &amp;&amp; exit</span>
+<span class="a">+  else</span>
+<span class="a">+    profile=$2</span>
+<span class="a">+  fi</span>
+<span class="a">+  update $profile</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+[ $k ] &amp;&amp; rm $statusfile</span>
+<span class="a">+</span>
+<span class="a">+if [ $g ]; then</span>
+<span class="a">+  [ &quot;$(current)&quot; = &quot;null&quot; ] &amp;&amp; exit 1</span>
+<span class="a">+  if [ $(remaining) -le 0 ]; then</span>
+<span class="a">+    notify-send &quot;Timer $(current)&quot; &quot;done&quot;</span>
+<span class="a">+    update $(next)</span>
+<span class="a">+    pomodoro -g</span>
+<span class="a">+  else</span>
+<span class="a">+    echo $(printf &quot;%s %02d:%02d&quot; $(current) $(($(remaining) / 60)) $(($(remaining) % 60)))</span>
+<span class="a">+  fi</span>
+<span class="a">+fi</span>
+diff --git a/pomodoro-files/config.def b/pomodoro-files/config.def
+new file mode 100644
+index 0000000..e8b6f2f
+--- /dev/null
++++ b/pomodoro-files/config.def
+<span class="h">@@ -0,0 +1,2 @@</span>
+<span class="a">+work 1500 break</span>
+<span class="a">+break 300 work</span>
+diff --git a/sbm/bm-commit b/sbm/bm-commit
+new file mode 100755
+index 0000000..fbefcca
+--- /dev/null
++++ b/sbm/bm-commit
+<span class="h">@@ -0,0 +1,36 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-commit [message]: commit the bookmark file, and the tag file beside it,</span>
+<span class="a">+# when their directory is a git repository of its own. bm runs it after every</span>
+<span class="a">+# change when it is installed. It never pushes or pulls.</span>
+<span class="a">+#</span>
+<span class="a">+#     cd ~/.local/share/sbm &amp;&amp; git init</span>
+<span class="a">+#     printf &#x27;%s\n&#x27; &#x27;*.usage&#x27; &#x27;*.bak*&#x27; &gt; .gitignore</span>
+<span class="a">+#</span>
+<span class="a">+# A file that merely sits somewhere inside a bigger repository (your dotfiles,</span>
+<span class="a">+# say) is left alone, unless SBM_GIT=1. SBM_GIT=0 turns commits off.</span>
+<span class="a">+</span>
+<span class="a">+DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/sbm</span>
+<span class="a">+BOOKMARKS=${BOOKMARKS:-$DATADIR/bookmarks}</span>
+<span class="a">+USERTAGS=${USERTAGS:-$DATADIR/usertags}</span>
+<span class="a">+</span>
+<span class="a">+[ &quot;${SBM_GIT:-auto}&quot; != 0 ] || exit 0</span>
+<span class="a">+dir=$(cd &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; 2&gt;/dev/null &amp;&amp; pwd -P) || exit 0</span>
+<span class="a">+top=$(git -C &quot;$dir&quot; rev-parse --show-toplevel 2&gt;/dev/null) || exit 0</span>
+<span class="a">+[ &quot;${SBM_GIT:-auto}&quot; = 1 ] || [ &quot;$top&quot; = &quot;$dir&quot; ] || exit 0</span>
+<span class="a">+</span>
+<span class="a">+set -- &quot;${1:-bm: update}&quot; &quot;$BOOKMARKS&quot;</span>
+<span class="a">+if [ -e &quot;$USERTAGS&quot; ] \</span>
+<span class="a">+    &amp;&amp; [ &quot;$(cd &quot;$(dirname &quot;$USERTAGS&quot;)&quot; 2&gt;/dev/null &amp;&amp; pwd -P)&quot; = &quot;$dir&quot; ]</span>
+<span class="a">+then</span>
+<span class="a">+    set -- &quot;$@&quot; &quot;$USERTAGS&quot;</span>
+<span class="a">+fi</span>
+<span class="a">+message=$1</span>
+<span class="a">+shift</span>
+<span class="a">+</span>
+<span class="a">+git -C &quot;$dir&quot; add -- &quot;$@&quot; 2&gt;/dev/null || exit 0</span>
+<span class="a">+git -C &quot;$dir&quot; diff --cached --quiet -- &quot;$@&quot; &amp;&amp; exit 0</span>
+<span class="a">+if ! git -C &quot;$dir&quot; commit -q -m &quot;$message&quot; -- &quot;$@&quot; &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+    printf &#x27;bm-commit: git commit failed in %s\n&#x27; &quot;$dir&quot; &gt;&amp;2</span>
+<span class="a">+    exit 1</span>
+<span class="a">+fi</span>
+diff --git a/sbm/bm-page b/sbm/bm-page
+new file mode 100755
+index 0000000..41d73ce
+--- /dev/null
++++ b/sbm/bm-page
+<span class="h">@@ -0,0 +1,212 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-page: print a web page as plain text: its title, a blank line, then its</span>
+<span class="a">+# text. When it is installed, the fzf list of bm shows the page of the</span>
+<span class="a">+# bookmark under the cursor in the preview, live. SBM_FETCH=0 keeps it off</span>
+<span class="a">+# the network.</span>
+<span class="a">+#</span>
+<span class="a">+#     bm-page https://suckless.org/ | less</span>
+<span class="a">+#</span>
+<span class="a">+# Only http and https pages are fetched. curl stops after 5 seconds, and dd</span>
+<span class="a">+# passes at most 512k of the page. Scripts, styles and comments are left</span>
+<span class="a">+# out. Control characters are removed, so that a page cannot send escape</span>
+<span class="a">+# sequences to the terminal.</span>
+<span class="a">+</span>
+<span class="a">+if [ $# -ne 1 ]; then</span>
+<span class="a">+    printf &#x27;usage: bm-page &lt;url&gt;\n&#x27; &gt;&amp;2</span>
+<span class="a">+    exit 2</span>
+<span class="a">+fi</span>
+<span class="a">+[ &quot;${SBM_FETCH:-1}&quot; != 0 ] || exit 0</span>
+<span class="a">+case $(printf &#x27;%s&#x27; &quot;$1&quot; | tr &#x27;[:upper:]&#x27; &#x27;[:lower:]&#x27;) in</span>
+<span class="a">+    http://*|https://*) ;;</span>
+<span class="a">+    *) exit 0 ;;</span>
+<span class="a">+esac</span>
+<span class="a">+</span>
+<span class="a">+# The first awk reads the page as one record (RS is a control character),</span>
+<span class="a">+# then splits it at each &quot;&lt;&quot;. Each part starts with a tag and ends with the</span>
+<span class="a">+# text after it, so one pass through the parts reads the page in linear</span>
+<span class="a">+# time. The second awk tidies the white space.</span>
+<span class="a">+curl -sL --max-time 5 -A &#x27;Mozilla/5.0&#x27; -- &quot;$1&quot; 2&gt;/dev/null \</span>
+<span class="a">+    | dd bs=1024 count=512 2&gt;/dev/null | LC_ALL=C awk &#x27;</span>
+<span class="a">+    function utf8(c) {</span>
+<span class="a">+        if (c == 160) return &quot; &quot;</span>
+<span class="a">+        if (c &lt; 128) return sprintf(&quot;%c&quot;, c)</span>
+<span class="a">+        if (c &lt; 2048) return sprintf(&quot;%c%c&quot;, 192 + int(c / 64), 128 + c % 64)</span>
+<span class="a">+        if (c &lt; 65536)</span>
+<span class="a">+            return sprintf(&quot;%c%c%c&quot;, 224 + int(c / 4096), 128 + int(c / 64) % 64, 128 + c % 64)</span>
+<span class="a">+        if (c &lt; 1114112)</span>
+<span class="a">+            return sprintf(&quot;%c%c%c%c&quot;, 240 + int(c / 262144), 128 + int(c / 4096) % 64,</span>
+<span class="a">+                           128 + int(c / 64) % 64, 128 + c % 64)</span>
+<span class="a">+        return &quot;&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+    function entity(name,    n, i) {</span>
+<span class="a">+        if (name ~ /^#[0-9]+$/) return utf8(substr(name, 2) + 0)</span>
+<span class="a">+        if (name ~ /^#[xX][0-9A-Fa-f]+$/) {</span>
+<span class="a">+            n = 0</span>
+<span class="a">+            for (i = 3; i &lt;= length(name); i++)</span>
+<span class="a">+                n = n * 16 + index(&quot;0123456789abcdef&quot;, tolower(substr(name, i, 1))) - 1</span>
+<span class="a">+            return utf8(n)</span>
+<span class="a">+        }</span>
+<span class="a">+        if (name in named) return named[name]</span>
+<span class="a">+        return &quot;&amp;&quot; name &quot;;&quot;</span>
+<span class="a">+    }</span>
+<span class="a">+    function decode(s,    out, i, j, name) {</span>
+<span class="a">+        out = &quot;&quot;</span>
+<span class="a">+        while ((i = index(s, &quot;&amp;&quot;)) &gt; 0) {</span>
+<span class="a">+            out = out substr(s, 1, i - 1)</span>
+<span class="a">+            s = substr(s, i + 1)</span>
+<span class="a">+            j = index(s, &quot;;&quot;)</span>
+<span class="a">+            name = substr(s, 1, j - 1)</span>
+<span class="a">+            if (j &gt; 1 &amp;&amp; j &lt;= 12 &amp;&amp; name ~ /^(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*)$/) {</span>
+<span class="a">+                out = out entity(name)</span>
+<span class="a">+                s = substr(s, j + 1)</span>
+<span class="a">+            } else {</span>
+<span class="a">+                out = out &quot;&amp;&quot;</span>
+<span class="a">+            }</span>
+<span class="a">+        }</span>
+<span class="a">+        return out s</span>
+<span class="a">+    }</span>
+<span class="a">+    # text: the text of the page, or of its title. As in a browser, a line</span>
+<span class="a">+    # break in the text is a space. The line breaks come from the tags: brk</span>
+<span class="a">+    # tells how many are waiting for the next text.</span>
+<span class="a">+    function text(s) {</span>
+<span class="a">+        if (intitle) {</span>
+<span class="a">+            title = title &quot; &quot; s</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        s = decode(s)</span>
+<span class="a">+        gsub(/[ \t\r\n]+/, &quot; &quot;, s)</span>
+<span class="a">+        if (s == &quot;&quot; || s == &quot; &quot;) {</span>
+<span class="a">+            if (s == &quot; &quot; &amp;&amp; !brk) printf &quot; &quot;</span>
+<span class="a">+            return</span>
+<span class="a">+        }</span>
+<span class="a">+        if (brk) {</span>
+<span class="a">+            printf &quot;%s&quot;, brk == 2 ? &quot;\n\n&quot; : &quot;\n&quot;</span>
+<span class="a">+            brk = 0</span>
+<span class="a">+            sub(/^ /, &quot;&quot;, s)</span>
+<span class="a">+        }</span>
+<span class="a">+        printf &quot;%s&quot;, s</span>
+<span class="a">+    }</span>
+<span class="a">+    BEGIN {</span>
+<span class="a">+        RS = &quot;\001&quot;</span>
+<span class="a">+        named[&quot;amp&quot;] = &quot;&amp;&quot;; named[&quot;lt&quot;] = &quot;&lt;&quot;; named[&quot;gt&quot;] = &quot;&gt;&quot;; named[&quot;quot&quot;] = &quot;\&quot;&quot;</span>
+<span class="a">+        named[&quot;apos&quot;] = &quot;\047&quot;; named[&quot;nbsp&quot;] = &quot; &quot;</span>
+<span class="a">+        named[&quot;ndash&quot;] = utf8(8211); named[&quot;mdash&quot;] = utf8(8212); named[&quot;hellip&quot;] = utf8(8230)</span>
+<span class="a">+        named[&quot;lsquo&quot;] = utf8(8216); named[&quot;rsquo&quot;] = utf8(8217)</span>
+<span class="a">+        named[&quot;ldquo&quot;] = utf8(8220); named[&quot;rdquo&quot;] = utf8(8221)</span>
+<span class="a">+        named[&quot;laquo&quot;] = utf8(171); named[&quot;raquo&quot;] = utf8(187); named[&quot;middot&quot;] = utf8(183)</span>
+<span class="a">+        named[&quot;bull&quot;] = utf8(8226); named[&quot;copy&quot;] = utf8(169); named[&quot;reg&quot;] = utf8(174)</span>
+<span class="a">+        named[&quot;trade&quot;] = utf8(8482); named[&quot;deg&quot;] = utf8(176); named[&quot;times&quot;] = utf8(215)</span>
+<span class="a">+        named[&quot;euro&quot;] = utf8(8364)</span>
+<span class="a">+        # Tags that start a line, and tags that start a paragraph.</span>
+<span class="a">+        split(&quot;br div li tr dt dd header footer nav main section article aside &quot; \</span>
+<span class="a">+              &quot;figure figcaption form details summary address hr&quot;, b, &quot; &quot;)</span>
+<span class="a">+        for (i in b) line[b[i]] = 1</span>
+<span class="a">+        split(&quot;p h1 h2 h3 h4 h5 h6 ul ol dl table blockquote pre&quot;, b, &quot; &quot;)</span>
+<span class="a">+        for (i in b) para[b[i]] = 1</span>
+<span class="a">+        # Tags whose content is no text of the page.</span>
+<span class="a">+        split(&quot;script style noscript template svg iframe object&quot;, b, &quot; &quot;)</span>
+<span class="a">+        for (i in b) hidden[b[i]] = 1</span>
+<span class="a">+    }</span>
+<span class="a">+    { page = page $0 }</span>
+<span class="a">+    END {</span>
+<span class="a">+        if (substr(page, 1, 5) == &quot;%PDF-&quot;) {</span>
+<span class="a">+            print &quot;(a PDF document)&quot;</span>
+<span class="a">+            exit</span>
+<span class="a">+        }</span>
+<span class="a">+        n = split(page, part, &quot;&lt;&quot;)</span>
+<span class="a">+        text(part[1])</span>
+<span class="a">+        for (i = 2; i &lt;= n; i++) {</span>
+<span class="a">+            p = part[i]</span>
+<span class="a">+            if (comment || substr(p, 1, 3) == &quot;!--&quot;) {</span>
+<span class="a">+                k = index(p, &quot;--&gt;&quot;)</span>
+<span class="a">+                comment = !k</span>
+<span class="a">+                if (k &amp;&amp; skip == &quot;&quot;) text(substr(p, k + 3))</span>
+<span class="a">+                continue</span>
+<span class="a">+            }</span>
+<span class="a">+            k = index(p, &quot;&gt;&quot;)</span>
+<span class="a">+            if (!k) {</span>
+<span class="a">+                # A &quot;&lt;&quot; in the text, or the end of a page that dd cut off.</span>
+<span class="a">+                if (skip == &quot;&quot; &amp;&amp; i &lt; n) text(&quot;&lt;&quot; p)</span>
+<span class="a">+                continue</span>
+<span class="a">+            }</span>
+<span class="a">+            tag = tolower(substr(p, 1, k - 1))</span>
+<span class="a">+            closing = substr(tag, 1, 1) == &quot;/&quot;</span>
+<span class="a">+            name = tag</span>
+<span class="a">+            sub(/^\//, &quot;&quot;, name)</span>
+<span class="a">+            sub(/[^a-z0-9].*/, &quot;&quot;, name)</span>
+<span class="a">+            rest = substr(p, k + 1)</span>
+<span class="a">+            if (skip != &quot;&quot;) {</span>
+<span class="a">+                if (closing &amp;&amp; name == skip) {</span>
+<span class="a">+                    skip = &quot;&quot;</span>
+<span class="a">+                    text(rest)</span>
+<span class="a">+                }</span>
+<span class="a">+                continue</span>
+<span class="a">+            }</span>
+<span class="a">+            if (name in hidden &amp;&amp; !closing &amp;&amp; substr(tag, length(tag)) != &quot;/&quot;) {</span>
+<span class="a">+                skip = name</span>
+<span class="a">+                continue</span>
+<span class="a">+            }</span>
+<span class="a">+            if (name == &quot;title&quot; &amp;&amp; !done) {</span>
+<span class="a">+                if (closing) {</span>
+<span class="a">+                    intitle = 0</span>
+<span class="a">+                    done = 1</span>
+<span class="a">+                    t = decode(title)</span>
+<span class="a">+                    gsub(/[ \t\r\n]+/, &quot; &quot;, t)</span>
+<span class="a">+                    printf &quot;\n\001T%s\n&quot;, t</span>
+<span class="a">+                    brk = 0</span>
+<span class="a">+                } else {</span>
+<span class="a">+                    intitle = 1</span>
+<span class="a">+                }</span>
+<span class="a">+            } else if (name == &quot;main&quot;) {</span>
+<span class="a">+                # Marks for the second awk: the main part of the page.</span>
+<span class="a">+                printf &quot;\n\001%s\n&quot;, closing ? &quot;&gt;&quot; : &quot;&lt;&quot;</span>
+<span class="a">+                brk = 0</span>
+<span class="a">+            } else if (name in para) {</span>
+<span class="a">+                brk = 2</span>
+<span class="a">+            } else if (name in line) {</span>
+<span class="a">+                if (!brk) brk = 1</span>
+<span class="a">+            } else if (name == &quot;td&quot; || name == &quot;th&quot;) {</span>
+<span class="a">+                text(&quot; &quot;)</span>
+<span class="a">+            }</span>
+<span class="a">+            text(rest)</span>
+<span class="a">+        }</span>
+<span class="a">+        print &quot;&quot;</span>
+<span class="a">+    }&#x27; | LC_ALL=C awk &#x27;</span>
+<span class="a">+    {</span>
+<span class="a">+        gsub(/\302\240/, &quot; &quot;)</span>
+<span class="a">+        gsub(/\302[\200-\237]/, &quot;&quot;)</span>
+<span class="a">+        gsub(/[ \t\r]+/, &quot; &quot;)</span>
+<span class="a">+        sub(/^ /, &quot;&quot;)</span>
+<span class="a">+        sub(/ $/, &quot;&quot;)</span>
+<span class="a">+    }</span>
+<span class="a">+    /^\001T/ {</span>
+<span class="a">+        if (title == &quot;&quot;) {</span>
+<span class="a">+            title = substr($0, 3)</span>
+<span class="a">+            sub(/^ /, &quot;&quot;, title)</span>
+<span class="a">+        }</span>
+<span class="a">+        next</span>
+<span class="a">+    }</span>
+<span class="a">+    /^\001&lt;/ { if (!opened) { opened = 1; from = n + 1 }; next }</span>
+<span class="a">+    /^\001&gt;/ { if (opened &amp;&amp; !closed) { closed = 1; to = n }; next }</span>
+<span class="a">+    { line[++n] = $0 }</span>
+<span class="a">+    # The title, then the main part of the page when the page marks one, so</span>
+<span class="a">+    # that menus do not fill the preview. At most one blank line in a row.</span>
+<span class="a">+    END {</span>
+<span class="a">+        if (!opened) from = 1</span>
+<span class="a">+        if (!closed) to = n</span>
+<span class="a">+        if (title != &quot;&quot;) {</span>
+<span class="a">+            print title</span>
+<span class="a">+            seen = blank = 1</span>
+<span class="a">+        }</span>
+<span class="a">+        for (i = from; i &lt;= to; i++) {</span>
+<span class="a">+            if (line[i] == &quot;&quot;) {</span>
+<span class="a">+                blank = seen</span>
+<span class="a">+                continue</span>
+<span class="a">+            }</span>
+<span class="a">+            if (blank) print &quot;&quot;</span>
+<span class="a">+            print line[i]</span>
+<span class="a">+            seen = 1</span>
+<span class="a">+            blank = 0</span>
+<span class="a">+        }</span>
+<span class="a">+    }&#x27; | tr -d &#x27;\000-\010\013-\037\177&#x27;</span>
+diff --git a/sbm/bm-sync b/sbm/bm-sync
+new file mode 100755
+index 0000000..b4e233d
+--- /dev/null
++++ b/sbm/bm-sync
+<span class="h">@@ -0,0 +1,248 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-sync: keep the bookmark file the same on all your devices, through an</span>
+<span class="a">+# sbm-sync server (https://github.com/equwal/sbm-sync). bm runs it after each</span>
+<span class="a">+# change when it is installed; you can also run it yourself, or from cron.</span>
+<span class="a">+#</span>
+<span class="a">+# The server merges: bookmarks that you add or remove here are added or</span>
+<span class="a">+# removed there, and the other way round. The file stays a plain file.</span>
+<span class="a">+</span>
+<span class="a">+DATADIR=${XDG_DATA_HOME:-$HOME/.local/share}/sbm</span>
+<span class="a">+BOOKMARKS=${BOOKMARKS:-$DATADIR/bookmarks}</span>
+<span class="a">+CONFIG=${SBM_SYNC_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/sbm/sync}</span>
+<span class="a">+SERVER=https://sbmsync.com</span>
+<span class="a">+STATE=$BOOKMARKS.sync   # name of the version of the last sync</span>
+<span class="a">+LOCK=$BOOKMARKS.sync.lock</span>
+<span class="a">+WLOCK=$BOOKMARKS.lock   # the write lock of bm</span>
+<span class="a">+quiet=</span>
+<span class="a">+</span>
+<span class="a">+usage () {</span>
+<span class="a">+    cat &lt;&lt;&#x27;EOF&#x27;</span>
+<span class="a">+usage: bm-sync [-q] [login [server] | logout | status]</span>
+<span class="a">+Without a command: sync the bookmark file now.</span>
+<span class="a">+  login     sign in to the server (default https://sbmsync.com)</span>
+<span class="a">+            and sync; asks for your email and password</span>
+<span class="a">+  logout    sign out on this computer</span>
+<span class="a">+  status    show the server and the time of the last sync</span>
+<span class="a">+  -q        print nothing but errors</span>
+<span class="a">+EOF</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+die () {</span>
+<span class="a">+    printf &#x27;bm-sync: %s\n&#x27; &quot;$*&quot; &gt;&amp;2</span>
+<span class="a">+    exit 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+say () {</span>
+<span class="a">+    [ -n &quot;$quiet&quot; ] || printf &#x27;bm-sync: %s\n&#x27; &quot;$*&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# setting &lt;name&gt;: a value from the config file.</span>
+<span class="a">+setting () {</span>
+<span class="a">+    sed -n &quot;s/^$1=//p&quot; &quot;$CONFIG&quot; 2&gt;/dev/null | head -n 1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# private &lt;file&gt;: make &lt;file&gt; an empty file that only you can read. umask</span>
+<span class="a">+# sets the mode of a new file. chmod sets the mode of a file that exists</span>
+<span class="a">+# already, for example the config file of an earlier login.</span>
+<span class="a">+private () {</span>
+<span class="a">+    (umask 077; : &gt; &quot;$1&quot;) &amp;&amp; chmod 600 &quot;$1&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+cleanup () {</span>
+<span class="a">+    rm -rf &quot;$work&quot;</span>
+<span class="a">+    [ -z &quot;$locked&quot; ] || rm -rf &quot;$LOCK&quot;</span>
+<span class="a">+    wunlock</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# wlock: take the write lock of bm, as bm does. bm holds it while it changes</span>
+<span class="a">+# the file: while bm -e runs, that is until the editor ends. After</span>
+<span class="a">+# $SBM_LOCK_WAIT seconds (default 10) bm-sync stops, and the next change in</span>
+<span class="a">+# bm syncs again.</span>
+<span class="a">+wlock () {</span>
+<span class="a">+    waited=0</span>
+<span class="a">+    until mkdir &quot;$WLOCK&quot; 2&gt;/dev/null; do</span>
+<span class="a">+        pid=$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)</span>
+<span class="a">+        if [ -n &quot;$pid&quot; ] &amp;&amp; ! kill -0 &quot;$pid&quot; 2&gt;/dev/null; then</span>
+<span class="a">+            [ &quot;$(cat &quot;$WLOCK/pid&quot; 2&gt;/dev/null)&quot; != &quot;$pid&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        [ &quot;$waited&quot; -lt &quot;${SBM_LOCK_WAIT:-10}&quot; ] \</span>
+<span class="a">+            || die &quot;$BOOKMARKS is in use (bm -e?): sync again later&quot;</span>
+<span class="a">+        sleep 1</span>
+<span class="a">+        waited=$((waited + 1))</span>
+<span class="a">+    done</span>
+<span class="a">+    echo $$ &gt; &quot;$WLOCK/pid&quot;</span>
+<span class="a">+    wlocked=1</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+wunlock () {</span>
+<span class="a">+    [ -z &quot;$wlocked&quot; ] || rm -rf &quot;$WLOCK&quot;</span>
+<span class="a">+    wlocked=</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+login () {</span>
+<span class="a">+    server=${1:-$SERVER}</span>
+<span class="a">+    server=${server%/}</span>
+<span class="a">+    printf &#x27;email: &#x27; &gt;&amp;2</span>
+<span class="a">+    read -r email || exit 1</span>
+<span class="a">+    printf &#x27;password: &#x27; &gt;&amp;2</span>
+<span class="a">+    stty -echo 2&gt;/dev/null</span>
+<span class="a">+    IFS= read -r password</span>
+<span class="a">+    rc=$?</span>
+<span class="a">+    stty echo 2&gt;/dev/null</span>
+<span class="a">+    printf &#x27;\n&#x27; &gt;&amp;2</span>
+<span class="a">+    [ $rc -eq 0 ] || exit 1</span>
+<span class="a">+</span>
+<span class="a">+    # The password goes through stdin: on the command line, other users</span>
+<span class="a">+    # could see it with ps.</span>
+<span class="a">+    code=$(printf &#x27;%s&#x27; &quot;$password&quot; | curl -sS -o &quot;$work/out&quot; -w &#x27;%{http_code}&#x27; \</span>
+<span class="a">+        --data-urlencode &quot;email=$email&quot; --data-urlencode &#x27;password@-&#x27; \</span>
+<span class="a">+        -- &quot;$server/api/login&quot;) || die &quot;cannot reach $server&quot;</span>
+<span class="a">+    [ &quot;$code&quot; = 200 ] || die &quot;$(cat &quot;$work/out&quot;)&quot;</span>
+<span class="a">+    token=$(tr -d &#x27;\r\n&#x27; &lt; &quot;$work/out&quot;)</span>
+<span class="a">+</span>
+<span class="a">+    mkdir -p &quot;$(dirname &quot;$CONFIG&quot;)&quot; || exit 1</span>
+<span class="a">+    private &quot;$CONFIG&quot; || exit 1</span>
+<span class="a">+    printf &#x27;server=%s\ntoken=%s\n&#x27; &quot;$server&quot; &quot;$token&quot; &gt; &quot;$CONFIG&quot;</span>
+<span class="a">+    rm -f &quot;$STATE&quot;</span>
+<span class="a">+    say &quot;signed in to $server&quot;</span>
+<span class="a">+    sync</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+logout () {</span>
+<span class="a">+    if [ -e &quot;$CONFIG&quot; ]; then</span>
+<span class="a">+        private &quot;$work/auth&quot;</span>
+<span class="a">+        printf &#x27;Authorization: Bearer %s\n&#x27; &quot;$(setting token)&quot; &gt; &quot;$work/auth&quot;</span>
+<span class="a">+        curl -sS -o /dev/null -X POST -H &quot;@$work/auth&quot; -- &quot;$(setting server)/api/logout&quot; \</span>
+<span class="a">+            2&gt;/dev/null</span>
+<span class="a">+        rm -f &quot;$CONFIG&quot; &quot;$STATE&quot;</span>
+<span class="a">+    fi</span>
+<span class="a">+    say &#x27;signed out&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+status () {</span>
+<span class="a">+    if [ ! -e &quot;$CONFIG&quot; ]; then</span>
+<span class="a">+        echo &#x27;not signed in: run bm-sync login&#x27;</span>
+<span class="a">+        return</span>
+<span class="a">+    fi</span>
+<span class="a">+    echo &quot;server: $(setting server)&quot;</span>
+<span class="a">+    if [ -e &quot;$STATE&quot; ]; then</span>
+<span class="a">+        echo &quot;last sync: $(ls -l &quot;$STATE&quot; | awk &#x27;{ print $6, $7, $8 }&#x27;)&quot;</span>
+<span class="a">+    else</span>
+<span class="a">+        echo &#x27;last sync: never&#x27;</span>
+<span class="a">+    fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+# sync: send the file with the name of its last version; the server gives</span>
+<span class="a">+# back the merged file and the name of the new version.</span>
+<span class="a">+sync () {</span>
+<span class="a">+    [ -e &quot;$CONFIG&quot; ] || die &#x27;not signed in: run bm-sync login&#x27;</span>
+<span class="a">+    server=$(setting server)</span>
+<span class="a">+    token=$(setting token)</span>
+<span class="a">+    [ -n &quot;$server&quot; ] &amp;&amp; [ -n &quot;$token&quot; ] || die &quot;$CONFIG is damaged: run bm-sync login&quot;</span>
+<span class="a">+</span>
+<span class="a">+    # One sync at a time. A second bm-sync leaves a note and exits: the</span>
+<span class="a">+    # first one then syncs again, so that no change waits for the next one.</span>
+<span class="a">+    if ! mkdir &quot;$LOCK&quot; 2&gt;/dev/null; then</span>
+<span class="a">+        pid=$(cat &quot;$LOCK/pid&quot; 2&gt;/dev/null)</span>
+<span class="a">+        if [ -n &quot;$pid&quot; ] &amp;&amp; kill -0 &quot;$pid&quot; 2&gt;/dev/null; then</span>
+<span class="a">+            : &gt; &quot;$LOCK/again&quot;</span>
+<span class="a">+            exit 0</span>
+<span class="a">+        fi</span>
+<span class="a">+        rm -rf &quot;$LOCK&quot;   # left by a bm-sync that was killed</span>
+<span class="a">+        mkdir &quot;$LOCK&quot; 2&gt;/dev/null || die &quot;cannot lock $LOCK&quot;</span>
+<span class="a">+    fi</span>
+<span class="a">+    locked=1</span>
+<span class="a">+    echo $$ &gt; &quot;$LOCK/pid&quot;</span>
+<span class="a">+</span>
+<span class="a">+    private &quot;$work/auth&quot;</span>
+<span class="a">+    printf &#x27;Authorization: Bearer %s\n&#x27; &quot;$token&quot; &gt; &quot;$work/auth&quot;</span>
+<span class="a">+    if [ ! -e &quot;$BOOKMARKS&quot; ]; then</span>
+<span class="a">+        mkdir -p &quot;$(dirname &quot;$BOOKMARKS&quot;)&quot; &amp;&amp; : &gt; &quot;$BOOKMARKS&quot; || exit 1</span>
+<span class="a">+    fi</span>
+<span class="a">+</span>
+<span class="a">+    tries=0</span>
+<span class="a">+    while :; do</span>
+<span class="a">+        rm -f &quot;$LOCK/again&quot;</span>
+<span class="a">+        # bm writes a delete as an empty file and then the new text. Without</span>
+<span class="a">+        # the lock, bm-sync could send the half-written file, and the server</span>
+<span class="a">+        # would delete the lines that it lacks.</span>
+<span class="a">+        wlock</span>
+<span class="a">+        cat &quot;$BOOKMARKS&quot; &gt; &quot;$work/sent&quot;</span>
+<span class="a">+        wunlock</span>
+<span class="a">+        # An empty file with a version would delete all bookmarks on the</span>
+<span class="a">+        # server, and then on all devices. Without a version, the server</span>
+<span class="a">+        # deletes nothing, and sends all bookmarks back.</span>
+<span class="a">+        [ -s &quot;$work/sent&quot; ] || rm -f &quot;$STATE&quot;</span>
+<span class="a">+        base=$(cat &quot;$STATE&quot; 2&gt;/dev/null)</span>
+<span class="a">+        code=$(curl -sS --max-time 60 -o &quot;$work/out&quot; -D &quot;$work/head&quot; -w &#x27;%{http_code}&#x27; \</span>
+<span class="a">+            -H &quot;@$work/auth&quot; -H &#x27;Content-Type: text/plain; charset=utf-8&#x27; \</span>
+<span class="a">+            --data-binary &quot;@$work/sent&quot; -- &quot;$server/api/sync?base=$base&quot;) \</span>
+<span class="a">+            || die &quot;cannot reach $server&quot;</span>
+<span class="a">+        case $code in</span>
+<span class="a">+            200) ;;</span>
+<span class="a">+            401) die &#x27;not signed in: run bm-sync login&#x27; ;;</span>
+<span class="a">+            *)   die &quot;$(cat &quot;$work/out&quot;)&quot; ;;</span>
+<span class="a">+        esac</span>
+<span class="a">+        version=$(tr -d &#x27;\r&#x27; &lt; &quot;$work/head&quot; | sed -n &#x27;s/^[Ss][Bb][Mm]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]: *//p&#x27;)</span>
+<span class="a">+        [ -n &quot;$version&quot; ] || die &#x27;the server gave no version&#x27;</span>
+<span class="a">+</span>
+<span class="a">+        # Hold the lock from the check to the write, so that no change of bm</span>
+<span class="a">+        # comes between them.</span>
+<span class="a">+        wlock</span>
+<span class="a">+        # bm changed the file while it was away: send the new file. The</span>
+<span class="a">+        # answer to the old one is of no use.</span>
+<span class="a">+        if ! cmp -s &quot;$work/sent&quot; &quot;$BOOKMARKS&quot;; then</span>
+<span class="a">+            wunlock</span>
+<span class="a">+            tries=$((tries + 1))</span>
+<span class="a">+            [ $tries -lt 5 ] || die &#x27;the file changes all the time: try again later&#x27;</span>
+<span class="a">+            continue</span>
+<span class="a">+        fi</span>
+<span class="a">+        wrote=</span>
+<span class="a">+        if ! cmp -s &quot;$work/out&quot; &quot;$BOOKMARKS&quot;; then</span>
+<span class="a">+            # Forget the version first, and keep the new one only after the</span>
+<span class="a">+            # write. If the write stops part way (a full disk), the next sync</span>
+<span class="a">+            # sends no version, so the server deletes none of the lost lines.</span>
+<span class="a">+            rm -f &quot;$STATE&quot;</span>
+<span class="a">+            # Through cat, not mv, as in bm: a symlinked file stays a symlink.</span>
+<span class="a">+            cat &quot;$work/out&quot; &gt; &quot;$BOOKMARKS&quot; || die &quot;cannot write $BOOKMARKS&quot;</span>
+<span class="a">+            wrote=1</span>
+<span class="a">+        fi</span>
+<span class="a">+        printf &#x27;%s\n&#x27; &quot;$version&quot; &gt; &quot;$STATE&quot;</span>
+<span class="a">+        wunlock</span>
+<span class="a">+        if [ -n &quot;$wrote&quot; ] &amp;&amp; command -v bm-commit &gt;/dev/null 2&gt;&amp;1; then</span>
+<span class="a">+            bm-commit &#x27;bm-sync: merge&#x27;</span>
+<span class="a">+        fi</span>
+<span class="a">+        [ -e &quot;$LOCK/again&quot; ] || break</span>
+<span class="a">+    done</span>
+<span class="a">+    say &quot;in sync: $(grep -c -v -e &#x27;^#&#x27; -e &#x27;^[[:space:]]*$&#x27; &quot;$BOOKMARKS&quot;) bookmarks&quot;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+while [ $# -gt 0 ]; do</span>
+<span class="a">+    case $1 in</span>
+<span class="a">+        -q) quiet=1 ;;</span>
+<span class="a">+        -h|--help) usage; exit 0 ;;</span>
+<span class="a">+        -*) usage &gt;&amp;2; exit 2 ;;</span>
+<span class="a">+        *)  break ;;</span>
+<span class="a">+    esac</span>
+<span class="a">+    shift</span>
+<span class="a">+done</span>
+<span class="a">+</span>
+<span class="a">+command -v curl &gt;/dev/null 2&gt;&amp;1 || die &#x27;curl is not installed&#x27;</span>
+<span class="a">+# mkdir fails when the name exists: a directory planted in a shared /tmp is</span>
+<span class="a">+# refused, not used.</span>
+<span class="a">+work=${TMPDIR:-/tmp}/bm-sync.$$</span>
+<span class="a">+mkdir -m 700 &quot;$work&quot; || die &quot;cannot create $work&quot;</span>
+<span class="a">+locked=</span>
+<span class="a">+wlocked=</span>
+<span class="a">+trap cleanup EXIT</span>
+<span class="a">+trap &#x27;exit 1&#x27; INT TERM</span>
+<span class="a">+</span>
+<span class="a">+case ${1:-sync} in</span>
+<span class="a">+    login)  shift; login &quot;$@&quot; ;;</span>
+<span class="a">+    logout) logout ;;</span>
+<span class="a">+    status) status ;;</span>
+<span class="a">+    sync)   sync ;;</span>
+<span class="a">+    *)      usage &gt;&amp;2; exit 2 ;;</span>
+<span class="a">+esac</span>
+diff --git a/sbm/bm-title b/sbm/bm-title
+new file mode 100755
+index 0000000..84a17ba
+--- /dev/null
++++ b/sbm/bm-title
+<span class="h">@@ -0,0 +1,33 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+# bm-title: print the &lt;title&gt; of a web page, or nothing.</span>
+<span class="a">+# When it is installed, &quot;bm --add&quot; offers the title as the description.</span>
+<span class="a">+# SBM_FETCH=0 keeps it off the network.</span>
+<span class="a">+</span>
+<span class="a">+if [ $# -ne 1 ]; then</span>
+<span class="a">+    printf &#x27;usage: bm-title &lt;url&gt;\n&#x27; &gt;&amp;2</span>
+<span class="a">+    exit 2</span>
+<span class="a">+fi</span>
+<span class="a">+[ &quot;${SBM_FETCH:-1}&quot; != 0 ] || exit 0</span>
+<span class="a">+</span>
+<span class="a">+# Lines are gathered until the title has been closed; awk then leaves, and</span>
+<span class="a">+# curl stops downloading. dd caps it at 64k for pages that are one long line</span>
+<span class="a">+# (it may pass a little less when its reads come up short; never more).</span>
+<span class="a">+curl -sL --max-time 3 -A &#x27;Mozilla/5.0&#x27; -- &quot;$1&quot; 2&gt;/dev/null \</span>
+<span class="a">+    | dd bs=1024 count=64 2&gt;/dev/null | LC_ALL=C awk &#x27;</span>
+<span class="a">+    function title(s,    start, end) {</span>
+<span class="a">+        start = index(tolower(s), &quot;&lt;title&quot;)</span>
+<span class="a">+        if (!start) return</span>
+<span class="a">+        s = substr(s, start)</span>
+<span class="a">+        s = substr(s, index(s, &quot;&gt;&quot;) + 1)</span>
+<span class="a">+        end = index(tolower(s), &quot;&lt;/title&quot;)</span>
+<span class="a">+        if (end) s = substr(s, 1, end - 1)</span>
+<span class="a">+        gsub(/&amp;lt;/, &quot;&lt;&quot;, s); gsub(/&amp;gt;/, &quot;&gt;&quot;, s); gsub(/&amp;quot;/, &quot;\&quot;&quot;, s)</span>
+<span class="a">+        gsub(/&amp;#39;|&amp;#x27;|&amp;apos;/, &quot;\047&quot;, s); gsub(/&amp;nbsp;/, &quot; &quot;, s)</span>
+<span class="a">+        gsub(/&amp;amp;/, &quot;\\&amp;&quot;, s)</span>
+<span class="a">+        gsub(/[ \t\r]+/, &quot; &quot;, s); sub(/^ /, &quot;&quot;, s); sub(/ $/, &quot;&quot;, s)</span>
+<span class="a">+        print s</span>
+<span class="a">+    }</span>
+<span class="a">+    { page = page &quot; &quot; $0 }</span>
+<span class="a">+    index(tolower($0), &quot;&lt;/title&quot;) || NR &gt;= 500 { exit }</span>
+<span class="a">+    END { title(page) }&#x27;</span>
+diff --git a/slock-usb-key b/slock-usb-key
+new file mode 100755
+index 0000000..6aed366
+--- /dev/null
++++ b/slock-usb-key
+<span class="h">@@ -0,0 +1,24 @@</span>
+<span class="a">+#!/usr/bin/env python3</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+from os.path import expanduser</span>
+<span class="a">+from subprocess import Popen</span>
+<span class="a">+</span>
+<span class="a">+import signal</span>
+<span class="a">+import pyudev</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+signal.signal(signal.SIGCHLD, signal.SIG_IGN)</span>
+<span class="a">+</span>
+<span class="a">+with open(expanduser(&#x27;~/.slock-usb-key&#x27;), &#x27;r&#x27;) as fp:</span>
+<span class="a">+    serial = fp.read().strip()</span>
+<span class="a">+</span>
+<span class="a">+context = pyudev.Context()</span>
+<span class="a">+monitor = pyudev.Monitor.from_netlink(context)</span>
+<span class="a">+monitor.filter_by(&#x27;block&#x27;)</span>
+<span class="a">+for device in iter(monitor.poll, None):</span>
+<span class="a">+    if device.get(&#x27;ID_SERIAL&#x27;) == serial:</span>
+<span class="a">+        if device.action == &#x27;add&#x27;:</span>
+<span class="a">+            Popen([&#x27;sudo&#x27;, &#x27;/usr/bin/killall&#x27;, &#x27;slock&#x27;])</span>
+<span class="a">+        elif device.action == &#x27;remove&#x27;:</span>
+<span class="a">+            Popen([&#x27;slock&#x27;])</span>
+diff --git a/tag-music b/tag-music
+new file mode 100755
+index 0000000..92d6323
+--- /dev/null
++++ b/tag-music
+<span class="h">@@ -0,0 +1,49 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+</span>
+<span class="a">+err() { echo &quot;Usage:</span>
+<span class="a">+	tag [OPTIONS] file</span>
+<span class="a">+Options:</span>
+<span class="a">+	-a: artist/author</span>
+<span class="a">+	-t: song/chapter title</span>
+<span class="a">+	-A: album/book title</span>
+<span class="a">+	-n: track/chapter number</span>
+<span class="a">+	-N: total number of tracks/chapters</span>
+<span class="a">+	-d: year of publication</span>
+<span class="a">+	-g: genre</span>
+<span class="a">+	-c: comment</span>
+<span class="a">+You will be prompted for title, artist, album and track if not given.&quot; &amp;&amp; exit 1 ;}</span>
+<span class="a">+</span>
+<span class="a">+while getopts &quot;a:t:A:n:N:d:g:c:&quot; o; do case &quot;${o}&quot; in</span>
+<span class="a">+	a) artist=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	t) title=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	A) album=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	n) track=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	N) total=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	d) date=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	g) genre=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	c) comment=&quot;${OPTARG}&quot; ;;</span>
+<span class="a">+	*) printf &quot;Invalid option: -%s\\n&quot; &quot;$OPTARG&quot; &amp;&amp; err ;;</span>
+<span class="a">+esac done</span>
+<span class="a">+</span>
+<span class="a">+shift $((OPTIND - 1))</span>
+<span class="a">+</span>
+<span class="a">+file=&quot;$1&quot;</span>
+<span class="a">+</span>
+<span class="a">+temp=&quot;$(mktemp -p &quot;$(dirname &quot;$file&quot;)&quot;)&quot;</span>
+<span class="a">+trap &#x27;rm -f $temp&#x27; HUP INT QUIT TERM PWR EXIT</span>
+<span class="a">+</span>
+<span class="a">+[ ! -f &quot;$file&quot; ] &amp;&amp; echo &#x27;Provide file to tag.&#x27; &amp;&amp; err</span>
+<span class="a">+</span>
+<span class="a">+[ -z &quot;$title&quot; ] &amp;&amp; echo &#x27;Enter a title.&#x27; &amp;&amp; read -r title</span>
+<span class="a">+[ -z &quot;$artist&quot; ] &amp;&amp; echo &#x27;Enter an artist.&#x27; &amp;&amp; read -r artist</span>
+<span class="a">+[ -z &quot;$album&quot; ] &amp;&amp; echo &#x27;Enter an album.&#x27; &amp;&amp; read -r album</span>
+<span class="a">+[ -z &quot;$track&quot; ] &amp;&amp; echo &#x27;Enter a track number.&#x27; &amp;&amp; read -r track</span>
+<span class="a">+</span>
+<span class="a">+cp -f &quot;$file&quot; &quot;$temp&quot; &amp;&amp; ffmpeg -i &quot;$temp&quot; -map 0 -y -codec copy \</span>
+<span class="a">+	-metadata title=&quot;$title&quot; \</span>
+<span class="a">+	-metadata album=&quot;$album&quot; \</span>
+<span class="a">+	-metadata artist=&quot;$artist&quot; \</span>
+<span class="a">+	-metadata track=&quot;${track}${total:+/&quot;$total&quot;}&quot; \</span>
+<span class="a">+	${date:+-metadata date=&quot;$date&quot;} \</span>
+<span class="a">+	${genre:+-metadata genre=&quot;$genre&quot;} \</span>
+<span class="a">+	${comment:+-metadata comment=&quot;$comment&quot;} &quot;$file&quot;</span>
+diff --git a/windervolage b/windervolage
+new file mode 100755
+index 0000000..faac9fd
+--- /dev/null
++++ b/windervolage
+<span class="h">@@ -0,0 +1,57 @@</span>
+<span class="a">+#!/bin/sh</span>
+<span class="a">+#</span>
+<span class="a">+# wv - Wiedervorlage (bring forward file)</span>
+<span class="a">+# schedule a reminder mail to yourself at a given date using at(1)</span>
+<span class="a">+#</span>
+<span class="a">+# markus schnalke &lt;meillo@marmaro.de&gt;</span>
+<span class="a">+</span>
+<span class="a">+queue=w</span>
+<span class="a">+</span>
+<span class="a">+cd  # move to home directory</span>
+<span class="a">+</span>
+<span class="a">+listone() {</span>
+<span class="a">+	atq -q &quot;$queue&quot; | awk &quot;/^$1\t/ {sub(/ $queue .*/,\&quot;\&quot;);print}&quot; </span>
+<span class="a">+	at -c &quot;$1&quot; | sed &#x27;</span>
+<span class="a">+		1,/^# wv/d;</span>
+<span class="a">+		/^mail /{s,[^&quot;]*&quot;,,; s,&quot;.*,,};</span>
+<span class="a">+		s,^,\t,</span>
+<span class="a">+		&#x27;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+list() {</span>
+<span class="a">+	if [ $# -eq 0 ] ; then</span>
+<span class="a">+		atq -q &quot;$queue&quot; | while read id rest ; do</span>
+<span class="a">+			listone &quot;$id&quot;</span>
+<span class="a">+		done</span>
+<span class="a">+	else</span>
+<span class="a">+		for i in &quot;$@&quot; ; do</span>
+<span class="a">+			listone &quot;$i&quot;</span>
+<span class="a">+		done</span>
+<span class="a">+	fi</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+</span>
+<span class="a">+if [ $# -eq 0 ] ; then</span>
+<span class="a">+	cat &gt;&amp;2 &lt;&lt;!</span>
+<span class="a">+Usage: ${0##*/} timespec...</span>
+<span class="a">+       ${0##*/} -l [jobid...]</span>
+<span class="a">+!</span>
+<span class="a">+	exit 1</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+if [ &quot;$1&quot; = &quot;-l&quot; ] ; then</span>
+<span class="a">+	shift</span>
+<span class="a">+	list &quot;$@&quot;</span>
+<span class="a">+	exit</span>
+<span class="a">+fi</span>
+<span class="a">+</span>
+<span class="a">+echo At: `date +&quot;%Y-%m-%d %H:%M&quot; -d &quot;$*&quot;`</span>
+<span class="a">+printf &quot;Subject: &quot;</span>
+<span class="a">+read sub</span>
+<span class="a">+</span>
+<span class="a">+at -q &quot;$queue&quot; &quot;$@&quot; &lt;&lt;!</span>
+<span class="a">+# wv</span>
+<span class="a">+mail -s &quot;Wv: $sub&quot; `id -un` &lt;&lt;EOF</span>
+<span class="a">+`cat`</span>
+<span class="a">+EOF</span>
+<span class="a">+!</span></pre>
+</div></body></html>
