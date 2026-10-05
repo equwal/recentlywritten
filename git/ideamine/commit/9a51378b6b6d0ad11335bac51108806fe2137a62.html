@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine 9a51378b - Recently Written</title>
+<link rel="stylesheet" href="../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../index.html">Recently Written</a> &middot; <a href="../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../ideamine/index.html">Log</a> | <a href="../../ideamine/files.html">Files</a> | <a href="../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<pre>commit 9a51378b6b6d0ad11335bac51108806fe2137a62
+equwal &lt;13551856+equwal@users.noreply.github.com&gt;
+2026-10-05 00:30:39 -0700
+
+Coop agents build the ideas dropped in Doing: atomic claim, send to any, DONE closes the card
+
+</pre><pre> bin/ideamine.js      |   2 +
+ dashboard/index.html |   5 +-
+ src/config.js        |   7 ++
+ src/coop.js          | 167 ++++++++++++++++++++++++++++++++++++++++++
+ src/serve.js         |  10 +--
+ src/store.js         |  11 +++
+ tests/coop.test.js   | 199 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ tests/serve.test.js  |   3 +-
+ 8 files changed, 397 insertions(+), 7 deletions(-)
+</pre><pre>diff --git a/bin/ideamine.js b/bin/ideamine.js
+index c3d4aa5..55ef7b3 100644
+--- a/bin/ideamine.js
++++ b/bin/ideamine.js
+<span class="h">@@ -238,6 +238,8 @@ async function main() {</span>
+       });
+       server.on(&#x27;close&#x27;, () =&gt; process.exit(0)); // /ideas-web off
+       console.log(serve.logLine(`the dashboard with buttons runs at ${url} (Ctrl+C stops it)`));
+<span class="a">+      // Only the server role holds the archive, so only it gives ideas to coop agents.</span>
+<span class="a">+      if (!(await import(&#x27;../src/sync.js&#x27;)).enabled()) (await import(&#x27;../src/coop.js&#x27;)).start({ log: (text) =&gt; console.log(serve.logLine(text)) });</span>
+       break;
+     }
+     case &#x27;sync&#x27;: {
+diff --git a/dashboard/index.html b/dashboard/index.html
+index ad3adc2..9915e77 100644
+--- a/dashboard/index.html
++++ b/dashboard/index.html
+<span class="h">@@ -645,8 +645,8 @@ function makeDraggable(card, idea) {</span>
+ 
+ /**
+  * The command for a card that the user drops in `lane`, or null when the drop changes nothing.
+<span class="d">- * A drop in Doing starts the build where Claude Code is. A page without Claude Code only moves the</span>
+<span class="d">- * idea, and the machine with the login builds it.</span>
+<span class="a">+ * A drop in Doing starts the build where Claude Code is. On a server with coop, a free coop agent</span>
+<span class="a">+ * builds it. Elsewhere the drop only moves the idea.</span>
+  */
+ function dropCommand(idea, lane) {
+   if (!idea || idea.lane === lane) return null;
+<span class="h">@@ -654,6 +654,7 @@ function dropCommand(idea, lane) {</span>
+   if (lane === &#x27;doing&#x27; &amp;&amp; live.claude &amp;&amp; live.window) {
+     return { action: &#x27;go&#x27;, body: { id: idea.id }, busy: &#x27;Opening Claude Code for &#x27; + idea.key + &#x27;…&#x27; };
+   }
+<span class="a">+  if (lane === &#x27;doing&#x27; &amp;&amp; live.coop) return { action: &#x27;update&#x27;, body: { id: idea.id, status: &#x27;doing&#x27;, agent: &#x27;any&#x27; } };</span>
+   if ([&#x27;doing&#x27;, &#x27;done&#x27;, &#x27;dropped&#x27;, &#x27;inbox&#x27;].includes(lane)) return { action: &#x27;update&#x27;, body: { id: idea.id, status: lane } };
+   if ([&#x27;do&#x27;, &#x27;maybe&#x27;, &#x27;skip&#x27;].includes(lane)) return { action: &#x27;verdict&#x27;, body: { id: idea.id, verdict: lane } };
+   return null;
+diff --git a/src/config.js b/src/config.js
+index ed235be..11956c4 100644
+--- a/src/config.js
++++ b/src/config.js
+<span class="h">@@ -52,6 +52,13 @@ export const SETTINGS = {</span>
+     value: &#x27;&#x27;,
+     about: &#x27;memstated daemon that the Memory tab of `ideamine serve` reads (empty: no Memory tab)&#x27;,
+   },
+<span class="a">+  // The token of the hub is never a setting: it comes only from IDEAMINE_COOP_TOKEN.</span>
+<span class="a">+  coop_url: {</span>
+<span class="a">+    env: &#x27;IDEAMINE_COOP_URL&#x27;,</span>
+<span class="a">+    value: &#x27;&#x27;,</span>
+<span class="a">+    about: &#x27;coop hub whose agents build the ideas dropped in Doing (empty: off; needs IDEAMINE_COOP_TOKEN)&#x27;,</span>
+<span class="a">+  },</span>
+<span class="a">+  coop_session: { env: &#x27;IDEAMINE_COOP_SESSION&#x27;, value: &#x27;workers&#x27;, about: &#x27;coop session of those agents&#x27; },</span>
+ };
+ 
+ const configPath = () =&gt; path.join(home(), &#x27;config.json&#x27;);
+diff --git a/src/coop.js b/src/coop.js
+new file mode 100644
+index 0000000..a1334f5
+--- /dev/null
++++ b/src/coop.js
+<span class="h">@@ -0,0 +1,167 @@</span>
+<span class="a">+// The agents of a coop session build the ideas that wait in Doing. On the ideamine server, a loop</span>
+<span class="a">+// takes one waiting idea at a time and sends it to `any` in the coop session: the coop hub gives</span>
+<span class="a">+// it to a free agent. The idea shows that agent. The answer of the agent closes the idea (DONE)</span>
+<span class="a">+// or puts it back in Do with the answer as a note.</span>
+<span class="a">+//</span>
+<span class="a">+// idea.agent: { name: &#x27;any&#x27; } waits; { name: &#x27;coop&#x27; } is being sent; { name, msg } is with the</span>
+<span class="a">+// agent `name` (agent@machine), and msg is the id of the coop message with the task.</span>
+<span class="a">+</span>
+<span class="a">+import * as config from &#x27;./config.js&#x27;;</span>
+<span class="a">+import * as store from &#x27;./store.js&#x27;;</span>
+<span class="a">+import { clip } from &#x27;./text.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const ROUND_MS = 15000;</span>
+<span class="a">+const SEND_MS = 60000; // a card that stays &quot;being sent&quot; longer than this waits again (the server stopped mid-send)</span>
+<span class="a">+// ponytail: one limit for every card. A limit per size of the idea if real builds need more.</span>
+<span class="a">+const ANSWER_MS = 3 * 3600000;</span>
+<span class="a">+const PAGE = 200;</span>
+<span class="a">+</span>
+<span class="a">+const now = () =&gt; new Date().toISOString();</span>
+<span class="a">+</span>
+<span class="a">+/** The hub, the session, and the token, or null when coop is off. The token is only in the environment. */</span>
+<span class="a">+export function settings() {</span>
+<span class="a">+  const url = config.get(&#x27;coop_url&#x27;);</span>
+<span class="a">+  const token = process.env.IDEAMINE_COOP_TOKEN;</span>
+<span class="a">+  return url &amp;&amp; token ? { url: url.replace(/\/+$/, &#x27;&#x27;), session: config.get(&#x27;coop_session&#x27;), token } : null;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+async function hub(s, method, route, body) {</span>
+<span class="a">+  const res = await fetch(`${s.url}/v1/admin/sessions/${encodeURIComponent(s.session)}/${route}`, {</span>
+<span class="a">+    method,</span>
+<span class="a">+    headers: { authorization: `Bearer ${s.token}`, &#x27;content-type&#x27;: &#x27;application/json&#x27; },</span>
+<span class="a">+    body: body &amp;&amp; JSON.stringify(body),</span>
+<span class="a">+    signal: AbortSignal.timeout(10000),</span>
+<span class="a">+  });</span>
+<span class="a">+  const json = await res.json().catch(() =&gt; ({}));</span>
+<span class="a">+  return { status: res.status, json };</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+const waiting = (i, t) =&gt; i.status === &#x27;doing&#x27; &amp;&amp; (i.agent?.name === &#x27;any&#x27; || (i.agent?.name === &#x27;coop&#x27; &amp;&amp; t - Date.parse(i.agent.at) &gt; SEND_MS));</span>
+<span class="a">+</span>
+<span class="a">+/**</span>
+<span class="a">+ * Take the idea that waits longest for an agent. The archive lock makes the take atomic: two</span>
+<span class="a">+ * rounds, or two servers, never take the same idea. Null when no idea waits.</span>
+<span class="a">+ */</span>
+<span class="a">+export function claim() {</span>
+<span class="a">+  if (!store.load().ideas.some((i) =&gt; waiting(i, Date.now()))) return null; // no write when nothing waits</span>
+<span class="a">+  return store.mutate((db) =&gt; {</span>
+<span class="a">+    const t = Date.now();</span>
+<span class="a">+    const idea = db.ideas.filter((i) =&gt; waiting(i, t)).sort((a, b) =&gt; a.agent.at.localeCompare(b.agent.at))[0];</span>
+<span class="a">+    if (!idea) return null;</span>
+<span class="a">+    idea.agent = { name: &#x27;coop&#x27;, at: now() };</span>
+<span class="a">+    return structuredClone(idea);</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Change the idea only if it still has the agent state `was` (the user can move a card at any time). */</span>
+<span class="a">+function ifStill(id, was, fn) {</span>
+<span class="a">+  return store.mutate((db) =&gt; {</span>
+<span class="a">+    const idea = store.findIdea(db, id);</span>
+<span class="a">+    if (!idea || idea.status !== &#x27;doing&#x27; || idea.agent?.name !== was.name || idea.agent?.msg !== was.msg) return false;</span>
+<span class="a">+    fn(idea);</span>
+<span class="a">+    idea.updated = now();</span>
+<span class="a">+    return true;</span>
+<span class="a">+  });</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** The message that the agent gets. */</span>
+<span class="a">+export function task(idea) {</span>
+<span class="a">+  const t = idea.triage || {};</span>
+<span class="a">+  const facts = [</span>
+<span class="a">+    t.brief &amp;&amp; `Plan from the triage: ${t.brief}`,</span>
+<span class="a">+    idea.project &amp;&amp; `Project folder on jose&#x27;s PC: ${idea.project}`,</span>
+<span class="a">+    t.model &amp;&amp; `Suggested model: ${t.model}`,</span>
+<span class="a">+  ].filter(Boolean);</span>
+<span class="a">+  return [</span>
+<span class="a">+    `Card IDEA-${idea.id} of jose&#x27;s ideamine board: ${idea.title}`,</span>
+<span class="a">+    idea.text,</span>
+<span class="a">+    facts.join(&#x27;\n&#x27;),</span>
+<span class="a">+    &#x27;Answer with DONE: and one line that says what you did and where (commit, branch, file), or with FAILED: and the reason.\n&#x27; +</span>
+<span class="a">+      &#x27;DONE moves the card to Done. Any other answer puts it back in Do with your answer as a note.&#x27;,</span>
+<span class="a">+  ].filter(Boolean).join(&#x27;\n\n&#x27;);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Send one waiting idea to a free agent. */</span>
+<span class="a">+async function dispatch(s, log) {</span>
+<span class="a">+  const idea = claim();</span>
+<span class="a">+  if (!idea) return;</span>
+<span class="a">+  const sending = { name: &#x27;coop&#x27; };</span>
+<span class="a">+  const back = (why) =&gt; {</span>
+<span class="a">+    ifStill(idea.id, sending, (i) =&gt; (i.agent = { name: &#x27;any&#x27;, at: now() }));</span>
+<span class="a">+    if (why) log(`coop: IDEA-${idea.id} waits again: ${why}`);</span>
+<span class="a">+  };</span>
+<span class="a">+  let res;</span>
+<span class="a">+  try {</span>
+<span class="a">+    res = await hub(s, &#x27;POST&#x27;, &#x27;messages&#x27;, { to: &#x27;any&#x27;, text: task(idea) });</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    return back(`cannot reach the hub (${e.message})`);</span>
+<span class="a">+  }</span>
+<span class="a">+  // 404: no agent is free now. A worker is offline for a moment between its rounds, so try again later.</span>
+<span class="a">+  if (res.status === 404) return back(null);</span>
+<span class="a">+  if (res.status !== 200 || !res.json.id || !res.json.to) return back(`the hub answered ${res.status} ${res.json.error || &#x27;&#x27;}`.trim());</span>
+<span class="a">+  const { id: msg, to } = res.json;</span>
+<span class="a">+  ifStill(idea.id, sending, (i) =&gt; {</span>
+<span class="a">+    i.agent = { name: to, msg: String(msg), at: now() };</span>
+<span class="a">+    (i.notes ||= []).push({ at: now(), text: `coop gave it to ${to}` });</span>
+<span class="a">+  });</span>
+<span class="a">+  log(`coop: IDEA-${idea.id} went to ${to} (message ${msg})`);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Read the answers of the agents. DONE closes the idea; any other answer, or none in time, puts it back in Do. */</span>
+<span class="a">+async function collect(s, log) {</span>
+<span class="a">+  const out = store.load().ideas.filter((i) =&gt; i.status === &#x27;doing&#x27; &amp;&amp; i.agent?.msg);</span>
+<span class="a">+  if (!out.length) return;</span>
+<span class="a">+  const replies = new Map();</span>
+<span class="a">+  for (let after = Math.min(...out.map((i) =&gt; Number(i.agent.msg))); ; ) {</span>
+<span class="a">+    const res = await hub(s, &#x27;GET&#x27;, `messages?after=${after}&amp;limit=${PAGE}`);</span>
+<span class="a">+    if (res.status !== 200) throw new Error(`the hub answered ${res.status} to a read of the messages`);</span>
+<span class="a">+    const messages = res.json.messages || [];</span>
+<span class="a">+    for (const m of messages) if (m.reply_to) replies.set(String(m.reply_to), m);</span>
+<span class="a">+    if (messages.length &lt; PAGE) break;</span>
+<span class="a">+    after = messages[messages.length - 1].id;</span>
+<span class="a">+  }</span>
+<span class="a">+  for (const idea of out) {</span>
+<span class="a">+    const reply = replies.get(idea.agent.msg);</span>
+<span class="a">+    const late = !reply &amp;&amp; Date.now() - Date.parse(idea.agent.at) &gt; ANSWER_MS;</span>
+<span class="a">+    if (!reply &amp;&amp; !late) continue;</span>
+<span class="a">+    const done = !!reply &amp;&amp; /^\s*DONE\b/i.test(reply.text);</span>
+<span class="a">+    const note = reply ? `${reply.from}: ${clip(reply.text, 500)}` : `no answer from ${idea.agent.name} in ${ANSWER_MS / 3600000} h`;</span>
+<span class="a">+    ifStill(idea.id, idea.agent, (i) =&gt; {</span>
+<span class="a">+      i.status = done ? &#x27;done&#x27; : i.triage ? &#x27;triaged&#x27; : &#x27;inbox&#x27;;</span>
+<span class="a">+      if (done) i.closed = now();</span>
+<span class="a">+      delete i.agent;</span>
+<span class="a">+      (i.notes ||= []).push({ at: now(), text: note });</span>
+<span class="a">+    });</span>
+<span class="a">+    log(`coop: IDEA-${idea.id} ${done ? &#x27;done&#x27; : &#x27;back in the queue&#x27;}: ${note}`);</span>
+<span class="a">+  }</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** One round: read the answers, then send one waiting idea. */</span>
+<span class="a">+export async function round(s, { log = () =&gt; {} } = {}) {</span>
+<span class="a">+  try {</span>
+<span class="a">+    await collect(s, log);</span>
+<span class="a">+  } catch (e) {</span>
+<span class="a">+    log(`coop: ${e.message}`);</span>
+<span class="a">+  }</span>
+<span class="a">+  await dispatch(s, log);</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+/** Run a round every 15 s on the ideamine server. Returns a function that stops it, or null when coop is off. */</span>
+<span class="a">+export function start({ log = () =&gt; {} } = {}) {</span>
+<span class="a">+  const s = settings();</span>
+<span class="a">+  if (!s) return null;</span>
+<span class="a">+  let running = false;</span>
+<span class="a">+  const timer = setInterval(async () =&gt; {</span>
+<span class="a">+    if (running) return;</span>
+<span class="a">+    running = true;</span>
+<span class="a">+    try {</span>
+<span class="a">+      await round(s, { log });</span>
+<span class="a">+    } catch (e) {</span>
+<span class="a">+      log(`coop: ${e.message}`);</span>
+<span class="a">+    } finally {</span>
+<span class="a">+      running = false;</span>
+<span class="a">+    }</span>
+<span class="a">+  }, ROUND_MS);</span>
+<span class="a">+  log(`coop: the agents of session ${s.session} at ${s.url} build the ideas dropped in Doing`);</span>
+<span class="a">+  return () =&gt; clearInterval(timer);</span>
+<span class="a">+}</span>
+diff --git a/src/serve.js b/src/serve.js
+index 8f991ec..1382869 100644
+--- a/src/serve.js
++++ b/src/serve.js
+<span class="h">@@ -19,6 +19,7 @@ import path from &#x27;node:path&#x27;;</span>
+ import { fileURLToPath } from &#x27;node:url&#x27;;
+ import * as archive from &#x27;./archive.js&#x27;;
+ import * as config from &#x27;./config.js&#x27;;
+<span class="a">+import * as coop from &#x27;./coop.js&#x27;;</span>
+ import * as publish from &#x27;./publish.js&#x27;;
+ import { renderAdded, stamp } from &#x27;./render.js&#x27;;
+ import * as store from &#x27;./store.js&#x27;;
+<span class="h">@@ -174,6 +175,7 @@ async function liveData() {</span>
+       prompts: synced || fs.existsSync(promptsPath()),
+       memory: synced || !!config.get(&#x27;memstate_url&#x27;),
+       usage: synced || fs.existsSync(transcriptsDir()) || Object.keys(loadUsage().machines).length &gt; 0,
+<span class="a">+      coop: !synced &amp;&amp; !!coop.settings(), // a drop in Doing asks a coop agent to build the idea</span>
+     },
+   };
+ }
+<span class="h">@@ -411,10 +413,10 @@ const ACTIONS = {</span>
+     return gone.queued ? archive.queuedText(gone) : gone.map((i) =&gt; `Removed #${i.id} · ${clip(i.title, 60)}`).join(&#x27;\n&#x27;);
+   },
+ 
+<span class="d">-  /** /ideas-done, /ideas-reopen, and the verbs start, drop, note, and model of the CLI. */</span>
+<span class="d">-  async update({ id, status, note, model }) {</span>
+<span class="d">-    if (!status &amp;&amp; !note &amp;&amp; !model) throw new Error(&#x27;nothing to change&#x27;);</span>
+<span class="d">-    const idea = await archive.update(id, { status, note, model });</span>
+<span class="a">+  /** /ideas-done, /ideas-reopen, and the verbs start, drop, note, and model of the CLI. agent &quot;any&quot;: a coop agent builds it. */</span>
+<span class="a">+  async update({ id, status, note, model, agent }) {</span>
+<span class="a">+    if (!status &amp;&amp; !note &amp;&amp; !model &amp;&amp; !agent) throw new Error(&#x27;nothing to change&#x27;);</span>
+<span class="a">+    const idea = await archive.update(id, { status, note, model, agent });</span>
+     if (idea.queued) return archive.queuedText(idea);
+     const bits = [`#${idea.id} ${clip(idea.title, 60)} → ${store.lane(idea)}`];
+     if (model) bits.push(`model ${idea.triage.model}`);
+diff --git a/src/store.js b/src/store.js
+index e6c4b08..49989f5 100644
+--- a/src/store.js
++++ b/src/store.js
+<span class="h">@@ -374,6 +374,17 @@ export function updateIdea(id, patch = {}) {</span>
+       idea.status = status;
+       if (status === &#x27;done&#x27; || status === &#x27;dropped&#x27;) idea.closed = now();
+       else delete idea.closed;
+<span class="a">+      if (status !== &#x27;doing&#x27;) delete idea.agent; // an agent works only on an idea in Doing</span>
+<span class="a">+    }</span>
+<span class="a">+    // agent &quot;any&quot;: an agent of coop builds the idea (see coop.js). Only an idea in Doing can wait for one.</span>
+<span class="a">+    if (patch.agent != null) {</span>
+<span class="a">+      if (patch.agent !== &#x27;any&#x27;) throw new Error(&#x27;agent must be &quot;any&quot;&#x27;);</span>
+<span class="a">+      if (idea.status !== &#x27;doing&#x27;) throw new Error(&#x27;only an idea in Doing can wait for an agent&#x27;);</span>
+<span class="a">+      if (!idea.agent) {</span>
+<span class="a">+        idea.agent = { name: &#x27;any&#x27;, at: now() };</span>
+<span class="a">+        idea.notes ||= [];</span>
+<span class="a">+        idea.notes.push({ at: now(), text: &#x27;waits for a free coop agent&#x27; });</span>
+<span class="a">+      }</span>
+     }
+     if (patch.text) idea.text = String(patch.text).trim();
+     if (patch.title) idea.title = clip(patch.title, 90);
+diff --git a/tests/coop.test.js b/tests/coop.test.js
+new file mode 100644
+index 0000000..7608ad7
+--- /dev/null
++++ b/tests/coop.test.js
+<span class="h">@@ -0,0 +1,199 @@</span>
+<span class="a">+import assert from &#x27;node:assert/strict&#x27;;</span>
+<span class="a">+import { spawn } from &#x27;node:child_process&#x27;;</span>
+<span class="a">+import fs from &#x27;node:fs&#x27;;</span>
+<span class="a">+import http from &#x27;node:http&#x27;;</span>
+<span class="a">+import os from &#x27;node:os&#x27;;</span>
+<span class="a">+import path from &#x27;node:path&#x27;;</span>
+<span class="a">+import { afterEach, beforeEach, test } from &#x27;node:test&#x27;;</span>
+<span class="a">+import fc from &#x27;fast-check&#x27;;</span>
+<span class="a">+import * as config from &#x27;../src/config.js&#x27;;</span>
+<span class="a">+import * as coop from &#x27;../src/coop.js&#x27;;</span>
+<span class="a">+import * as store from &#x27;../src/store.js&#x27;;</span>
+<span class="a">+</span>
+<span class="a">+const TOKEN = &#x27;test-operator-token&#x27;;</span>
+<span class="a">+let hub; // a fake coop hub: { url, sent, answers, messages, close }</span>
+<span class="a">+let logs;</span>
+<span class="a">+</span>
+<span class="a">+/** A coop hub with the two operator routes that ideamine uses. `answers` are the replies to the next sends. */</span>
+<span class="a">+function startHub() {</span>
+<span class="a">+  const h = { sent: [], answers: [], messages: [], auth: [] };</span>
+<span class="a">+  const server = http.createServer((req, res) =&gt; {</span>
+<span class="a">+    const chunks = [];</span>
+<span class="a">+    req.on(&#x27;data&#x27;, (c) =&gt; chunks.push(c));</span>
+<span class="a">+    req.on(&#x27;end&#x27;, () =&gt; {</span>
+<span class="a">+      h.auth.push(req.headers.authorization);</span>
+<span class="a">+      const reply = (status, json) =&gt; res.writeHead(status, { &#x27;content-type&#x27;: &#x27;application/json&#x27; }).end(JSON.stringify(json));</span>
+<span class="a">+      const u = new URL(req.url, &#x27;http://hub&#x27;);</span>
+<span class="a">+      if (req.headers.authorization !== `Bearer ${TOKEN}`) return reply(401, { error: &#x27;unauthorized&#x27; });</span>
+<span class="a">+      if (req.method === &#x27;POST&#x27; &amp;&amp; u.pathname === &#x27;/v1/admin/sessions/workers/messages&#x27;) {</span>
+<span class="a">+        h.sent.push(JSON.parse(Buffer.concat(chunks).toString()));</span>
+<span class="a">+        const [status, json] = h.answers.shift() || [404, { error: &#x27;not_found&#x27;, message: &#x27;no peer in this session can take work now&#x27; }];</span>
+<span class="a">+        return reply(status, json);</span>
+<span class="a">+      }</span>
+<span class="a">+      if (req.method === &#x27;GET&#x27; &amp;&amp; u.pathname === &#x27;/v1/admin/sessions/workers/messages&#x27;) {</span>
+<span class="a">+        const after = Number(u.searchParams.get(&#x27;after&#x27;));</span>
+<span class="a">+        return reply(200, { messages: h.messages.filter((m) =&gt; Number(m.id) &gt; after).slice(0, Number(u.searchParams.get(&#x27;limit&#x27;))) });</span>
+<span class="a">+      }</span>
+<span class="a">+      reply(404, { error: &#x27;not_found&#x27; });</span>
+<span class="a">+    });</span>
+<span class="a">+  });</span>
+<span class="a">+  return new Promise((resolve) =&gt;</span>
+<span class="a">+    server.listen(0, &#x27;127.0.0.1&#x27;, () =&gt; resolve({ ...h, h, url: `http://127.0.0.1:${server.address().port}`, close: () =&gt; new Promise((r) =&gt; server.close(r)) })),</span>
+<span class="a">+  );</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+beforeEach(async () =&gt; {</span>
+<span class="a">+  process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-coop-&#x27;));</span>
+<span class="a">+  hub = await startHub();</span>
+<span class="a">+  process.env.IDEAMINE_COOP_URL = hub.url;</span>
+<span class="a">+  process.env.IDEAMINE_COOP_TOKEN = TOKEN;</span>
+<span class="a">+  logs = [];</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+afterEach(async () =&gt; {</span>
+<span class="a">+  await hub.close();</span>
+<span class="a">+  delete process.env.IDEAMINE_COOP_URL;</span>
+<span class="a">+  delete process.env.IDEAMINE_COOP_TOKEN;</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+const round = () =&gt; coop.round(coop.settings(), { log: (line) =&gt; logs.push(line) });</span>
+<span class="a">+const idea = (id) =&gt; store.findIdea(store.load(), id);</span>
+<span class="a">+const lastNote = (id) =&gt; idea(id).notes.at(-1).text;</span>
+<span class="a">+</span>
+<span class="a">+/** An idea that the user dropped in Doing on a board with coop, through the page&#x27;s own dropCommand. */</span>
+<span class="a">+function dropInDoing(text = &#x27;build the thing&#x27;) {</span>
+<span class="a">+  const [{ idea: added }] = store.addIdeas(text);</span>
+<span class="a">+  store.applyTriage([{ id: added.id, verdict: &#x27;do&#x27;, brief: &#x27;the plan&#x27;, model: &#x27;sonnet&#x27; }]);</span>
+<span class="a">+  const page = fs.readFileSync(new URL(&#x27;../dashboard/index.html&#x27;, import.meta.url), &#x27;utf8&#x27;);</span>
+<span class="a">+  const dropCommand = new Function(&#x27;state&#x27;, `${/function dropCommand[\s\S]*?\n}\n/.exec(page)[0]}; return dropCommand;`)({ data: { live: { coop: true } } });</span>
+<span class="a">+  const command = dropCommand({ ...added, lane: &#x27;do&#x27; }, &#x27;doing&#x27;);</span>
+<span class="a">+  assert.deepEqual(command, { action: &#x27;update&#x27;, body: { id: added.id, status: &#x27;doing&#x27;, agent: &#x27;any&#x27; } });</span>
+<span class="a">+  const { id, ...patch } = command.body;</span>
+<span class="a">+  store.updateIdea(id, patch);</span>
+<span class="a">+  return id;</span>
+<span class="a">+}</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;coop is off without a hub url or without a token, the token is never a setting, and only Doing waits for an agent&#x27;, () =&gt; {</span>
+<span class="a">+  assert.ok(coop.settings());</span>
+<span class="a">+  assert.ok(!Object.keys(config.SETTINGS).some((key) =&gt; key.includes(&#x27;token&#x27;)));</span>
+<span class="a">+  delete process.env.IDEAMINE_COOP_TOKEN;</span>
+<span class="a">+  assert.equal(coop.settings(), null);</span>
+<span class="a">+  process.env.IDEAMINE_COOP_TOKEN = TOKEN;</span>
+<span class="a">+  delete process.env.IDEAMINE_COOP_URL;</span>
+<span class="a">+  assert.equal(coop.settings(), null);</span>
+<span class="a">+  const [{ idea: i }] = store.addIdeas(&#x27;x&#x27;);</span>
+<span class="a">+  assert.throws(() =&gt; store.updateIdea(i.id, { agent: &#x27;any&#x27; }), /only an idea in Doing can wait for an agent/);</span>
+<span class="a">+  assert.throws(() =&gt; store.updateIdea(i.id, { status: &#x27;doing&#x27;, agent: &#x27;claude@g&#x27; }), /agent must be &quot;any&quot;/);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;a card dropped in Doing goes to a free agent, shows its name, and DONE closes it&#x27;, async () =&gt; {</span>
+<span class="a">+  const id = dropInDoing();</span>
+<span class="a">+  assert.equal(lastNote(id), &#x27;waits for a free coop agent&#x27;);</span>
+<span class="a">+  hub.h.answers.push([200, { id: &#x27;101&#x27;, to: &#x27;claude@gentoo&#x27;, sent_at: &#x27;now&#x27; }]);</span>
+<span class="a">+  await round();</span>
+<span class="a">+  assert.equal(hub.h.sent.length, 1);</span>
+<span class="a">+  assert.equal(hub.h.sent[0].to, &#x27;any&#x27;);</span>
+<span class="a">+  assert.match(hub.h.sent[0].text, /^Card IDEA-1 of jose&#x27;s ideamine board: build the thing\n\nbuild the thing\n\nPlan from the triage: the plan\n/);</span>
+<span class="a">+  assert.deepEqual([idea(id).status, idea(id).agent.name, idea(id).agent.msg], [&#x27;doing&#x27;, &#x27;claude@gentoo&#x27;, &#x27;101&#x27;]);</span>
+<span class="a">+  assert.equal(lastNote(id), &#x27;coop gave it to claude@gentoo&#x27;);</span>
+<span class="a">+</span>
+<span class="a">+  await round(); // no answer yet: nothing changes, and nothing else is sent</span>
+<span class="a">+  assert.equal(idea(id).agent.name, &#x27;claude@gentoo&#x27;);</span>
+<span class="a">+  assert.equal(hub.h.sent.length, 1);</span>
+<span class="a">+</span>
+<span class="a">+  hub.h.messages.push({ id: &#x27;102&#x27;, from: &#x27;claude@gentoo&#x27;, to: &#x27;operator&#x27;, reply_to: &#x27;101&#x27;, text: &#x27;DONE: pushed abc123 to main&#x27; });</span>
+<span class="a">+  await round();</span>
+<span class="a">+  assert.equal(store.lane(idea(id)), &#x27;done&#x27;);</span>
+<span class="a">+  assert.equal(idea(id).agent, undefined);</span>
+<span class="a">+  assert.equal(lastNote(id), &#x27;claude@gentoo: DONE: pushed abc123 to main&#x27;);</span>
+<span class="a">+  assert.ok(hub.h.auth.every((a) =&gt; a === `Bearer ${TOKEN}`));</span>
+<span class="a">+  assert.ok(logs.every((line) =&gt; !line.includes(TOKEN)), &#x27;the token stays out of the log&#x27;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;an answer without DONE puts the card back in Do, with the answer as a note&#x27;, async () =&gt; {</span>
+<span class="a">+  const id = dropInDoing();</span>
+<span class="a">+  hub.h.answers.push([200, { id: &#x27;7&#x27;, to: &#x27;codex@gentoo&#x27; }]);</span>
+<span class="a">+  await round();</span>
+<span class="a">+  hub.h.messages.push({ id: &#x27;8&#x27;, from: &#x27;codex@gentoo&#x27;, reply_to: &#x27;7&#x27;, text: &#x27;FAILED: the project is not on this machine&#x27; });</span>
+<span class="a">+  await round();</span>
+<span class="a">+  assert.equal(store.lane(idea(id)), &#x27;do&#x27;);</span>
+<span class="a">+  assert.equal(lastNote(id), &#x27;codex@gentoo: FAILED: the project is not on this machine&#x27;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;when no agent is free, the card waits and goes in a later round&#x27;, async () =&gt; {</span>
+<span class="a">+  const id = dropInDoing();</span>
+<span class="a">+  await round(); // the hub answers 404</span>
+<span class="a">+  assert.equal(idea(id).agent.name, &#x27;any&#x27;);</span>
+<span class="a">+  assert.equal(logs.length, 0, &#x27;a busy pool is normal, not an error&#x27;);</span>
+<span class="a">+  hub.h.answers.push([200, { id: &#x27;5&#x27;, to: &#x27;claude@subread&#x27; }]);</span>
+<span class="a">+  await round();</span>
+<span class="a">+  assert.equal(idea(id).agent.name, &#x27;claude@subread&#x27;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;a card that the user moves out of Doing is free of its agent, and a late answer changes nothing&#x27;, async () =&gt; {</span>
+<span class="a">+  const id = dropInDoing();</span>
+<span class="a">+  hub.h.answers.push([200, { id: &#x27;3&#x27;, to: &#x27;claude@honjimaku&#x27; }]);</span>
+<span class="a">+  await round();</span>
+<span class="a">+  store.updateIdea(id, { status: &#x27;reopen&#x27; });</span>
+<span class="a">+  assert.equal(idea(id).agent, undefined);</span>
+<span class="a">+  hub.h.messages.push({ id: &#x27;4&#x27;, from: &#x27;claude@honjimaku&#x27;, reply_to: &#x27;3&#x27;, text: &#x27;DONE: late&#x27; });</span>
+<span class="a">+  await round();</span>
+<span class="a">+  assert.equal(store.lane(idea(id)), &#x27;do&#x27;);</span>
+<span class="a">+  assert.notEqual(lastNote(id), &#x27;claude@honjimaku: DONE: late&#x27;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;a card without an answer for 3 hours goes back in Do&#x27;, async () =&gt; {</span>
+<span class="a">+  const id = dropInDoing();</span>
+<span class="a">+  hub.h.answers.push([200, { id: &#x27;9&#x27;, to: &#x27;claude@gentoo&#x27; }]);</span>
+<span class="a">+  await round();</span>
+<span class="a">+  store.mutate((db) =&gt; (store.findIdea(db, id).agent.at = new Date(Date.now() - 4 * 3600000).toISOString()));</span>
+<span class="a">+  await round();</span>
+<span class="a">+  assert.equal(store.lane(idea(id)), &#x27;do&#x27;);</span>
+<span class="a">+  assert.equal(lastNote(id), &#x27;no answer from claude@gentoo in 3 h&#x27;);</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;claim takes each waiting card once, oldest first, and never another card: a property&#x27;, () =&gt; {</span>
+<span class="a">+  fc.assert(</span>
+<span class="a">+    fc.property(fc.array(fc.constantFrom(&#x27;waits&#x27;, &#x27;doing&#x27;, &#x27;do&#x27;, &#x27;inbox&#x27;, &#x27;done&#x27;), { maxLength: 12 }), (kinds) =&gt; {</span>
+<span class="a">+      process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-claim-&#x27;));</span>
+<span class="a">+      const waits = [];</span>
+<span class="a">+      kinds.forEach((kind, n) =&gt; {</span>
+<span class="a">+        const [{ idea: i }] = store.addIdeas(`idea ${n}`);</span>
+<span class="a">+        if (kind === &#x27;do&#x27;) store.applyTriage([{ id: i.id, verdict: &#x27;do&#x27; }]);</span>
+<span class="a">+        if ([&#x27;waits&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;].includes(kind)) store.updateIdea(i.id, { status: kind === &#x27;done&#x27; ? &#x27;done&#x27; : &#x27;doing&#x27; });</span>
+<span class="a">+        if (kind === &#x27;waits&#x27;) {</span>
+<span class="a">+          store.updateIdea(i.id, { agent: &#x27;any&#x27; });</span>
+<span class="a">+          store.mutate((db) =&gt; (store.findIdea(db, i.id).agent.at = new Date(Date.UTC(2026, 0, 1, 0, 0, 59 - n)).toISOString()));</span>
+<span class="a">+          waits.push(i.id);</span>
+<span class="a">+        }</span>
+<span class="a">+      });</span>
+<span class="a">+      const taken = [];</span>
+<span class="a">+      for (let c; (c = coop.claim()); ) taken.push(c.id);</span>
+<span class="a">+      assert.deepEqual(taken, waits.reverse()); // the later idea waits longer here</span>
+<span class="a">+      assert.ok(store.load().ideas.every((i) =&gt; (waits.includes(i.id) ? i.agent.name === &#x27;coop&#x27; : !i.agent)));</span>
+<span class="a">+    }),</span>
+<span class="a">+    { numRuns: 60 },</span>
+<span class="a">+  );</span>
+<span class="a">+});</span>
+<span class="a">+</span>
+<span class="a">+test(&#x27;claims from many processes at once never give one card twice&#x27;, async () =&gt; {</span>
+<span class="a">+  const cards = 24;</span>
+<span class="a">+  for (let n = 0; n &lt; cards; n++) {</span>
+<span class="a">+    const [{ idea: i }] = store.addIdeas(`card ${n}`);</span>
+<span class="a">+    store.updateIdea(i.id, { status: &#x27;doing&#x27;, agent: &#x27;any&#x27; });</span>
+<span class="a">+  }</span>
+<span class="a">+  const mod = new URL(&#x27;../src/coop.js&#x27;, import.meta.url).href;</span>
+<span class="a">+  const run = () =&gt;</span>
+<span class="a">+    new Promise((resolve, reject) =&gt; {</span>
+<span class="a">+      const script = `const c = await import(${JSON.stringify(mod)}); const got = []; for (let x; (x = c.claim()); ) got.push(x.id); console.log(JSON.stringify(got));`;</span>
+<span class="a">+      const child = spawn(process.execPath, [&#x27;--input-type=module&#x27;, &#x27;-e&#x27;, script], { env: process.env, stdio: [&#x27;ignore&#x27;, &#x27;pipe&#x27;, &#x27;pipe&#x27;] });</span>
+<span class="a">+      let out = &#x27;&#x27;;</span>
+<span class="a">+      let err = &#x27;&#x27;;</span>
+<span class="a">+      child.stdout.on(&#x27;data&#x27;, (d) =&gt; (out += d));</span>
+<span class="a">+      child.stderr.on(&#x27;data&#x27;, (d) =&gt; (err += d));</span>
+<span class="a">+      child.on(&#x27;close&#x27;, (code) =&gt; (code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err))));</span>
+<span class="a">+    });</span>
+<span class="a">+  const all = (await Promise.all(Array.from({ length: 6 }, run))).flat();</span>
+<span class="a">+  assert.equal(all.length, cards);</span>
+<span class="a">+  assert.equal(new Set(all).size, cards);</span>
+<span class="a">+});</span>
+diff --git a/tests/serve.test.js b/tests/serve.test.js
+index f0abf3d..c8496bb 100644
+--- a/tests/serve.test.js
++++ b/tests/serve.test.js
+<span class="h">@@ -28,7 +28,7 @@ beforeEach(async () =&gt; {</span>
+   // The triage and the questions must never reach the real claude or the projects of this machine.
+   process.env.IDEAMINE_CLAUDE_BIN = fileURLToPath(new URL(&#x27;./fixtures/fake-claude.js&#x27;, import.meta.url));
+   process.env.CLAUDE_CONFIG_DIR = process.env.IDEAMINE_HOME;
+<span class="d">-  for (const name of [&#x27;IDEAMINE_SYNC_URL&#x27;, &#x27;IDEAMINE_MEMSTATE_URL&#x27;, &#x27;IDEAMINE_SERVE_HOSTS&#x27;, &#x27;IDEAMINE_PROMPT_LOG&#x27;]) delete process.env[name];</span>
+<span class="a">+  for (const name of [&#x27;IDEAMINE_SYNC_URL&#x27;, &#x27;IDEAMINE_MEMSTATE_URL&#x27;, &#x27;IDEAMINE_SERVE_HOSTS&#x27;, &#x27;IDEAMINE_PROMPT_LOG&#x27;, &#x27;IDEAMINE_COOP_URL&#x27;, &#x27;IDEAMINE_COOP_TOKEN&#x27;]) delete process.env[name];</span>
+   embedServer = await startFakeServer();
+   process.env.IDEAMINE_EMBED_URL = `${embedServer.url}/v1`;
+   opened = [];
+<span class="h">@@ -142,6 +142,7 @@ test(&#x27;the page comes with live data, and no other page can frame it&#x27;, async () =</span>
+     prompts: false,
+     memory: false,
+     usage: false, // no transcripts of Claude Code in the test home
+<span class="a">+    coop: false, // no coop hub: a drop in Doing only moves the card</span>
+   });
+   assert.match(data.live.watch.status, /^ideamine watch: off/);
+ });</pre>
+</div></body></html>

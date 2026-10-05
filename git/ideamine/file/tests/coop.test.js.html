@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ideamine/tests/coop.test.js - Recently Written</title>
+<link rel="stylesheet" href="../../../stagit.css" />
+</head><body>
+<div id="top"><a href="../../../../index.html">Recently Written</a> &middot; <a href="../../../index.html">git</a></div>
+<h1>ideamine</h1><span class="desc">An idea inbox for Claude Code: /idea saves ideas at zero tokens; Claude triages them and routes each to the cheapest model that can build it.</span><p class="url">git clone https://github.com/equwal/ideamine</p><p><a href="../../../ideamine/index.html">Log</a> | <a href="../../../ideamine/files.html">Files</a> | <a href="../../../ideamine/refs.html">Refs</a></p><hr/>
+<div id="content">
+<p>tests/coop.test.js (9705 bytes)</p><pre class="src"><a id="l1" href="#l1">1</a> import assert from &#x27;node:assert/strict&#x27;;
+<a id="l2" href="#l2">2</a> import { spawn } from &#x27;node:child_process&#x27;;
+<a id="l3" href="#l3">3</a> import fs from &#x27;node:fs&#x27;;
+<a id="l4" href="#l4">4</a> import http from &#x27;node:http&#x27;;
+<a id="l5" href="#l5">5</a> import os from &#x27;node:os&#x27;;
+<a id="l6" href="#l6">6</a> import path from &#x27;node:path&#x27;;
+<a id="l7" href="#l7">7</a> import { afterEach, beforeEach, test } from &#x27;node:test&#x27;;
+<a id="l8" href="#l8">8</a> import fc from &#x27;fast-check&#x27;;
+<a id="l9" href="#l9">9</a> import * as config from &#x27;../src/config.js&#x27;;
+<a id="l10" href="#l10">10</a> import * as coop from &#x27;../src/coop.js&#x27;;
+<a id="l11" href="#l11">11</a> import * as store from &#x27;../src/store.js&#x27;;
+<a id="l12" href="#l12">12</a> 
+<a id="l13" href="#l13">13</a> const TOKEN = &#x27;test-operator-token&#x27;;
+<a id="l14" href="#l14">14</a> let hub; // a fake coop hub: { url, sent, answers, messages, close }
+<a id="l15" href="#l15">15</a> let logs;
+<a id="l16" href="#l16">16</a> 
+<a id="l17" href="#l17">17</a> /** A coop hub with the two operator routes that ideamine uses. `answers` are the replies to the next sends. */
+<a id="l18" href="#l18">18</a> function startHub() {
+<a id="l19" href="#l19">19</a>   const h = { sent: [], answers: [], messages: [], auth: [] };
+<a id="l20" href="#l20">20</a>   const server = http.createServer((req, res) =&gt; {
+<a id="l21" href="#l21">21</a>     const chunks = [];
+<a id="l22" href="#l22">22</a>     req.on(&#x27;data&#x27;, (c) =&gt; chunks.push(c));
+<a id="l23" href="#l23">23</a>     req.on(&#x27;end&#x27;, () =&gt; {
+<a id="l24" href="#l24">24</a>       h.auth.push(req.headers.authorization);
+<a id="l25" href="#l25">25</a>       const reply = (status, json) =&gt; res.writeHead(status, { &#x27;content-type&#x27;: &#x27;application/json&#x27; }).end(JSON.stringify(json));
+<a id="l26" href="#l26">26</a>       const u = new URL(req.url, &#x27;http://hub&#x27;);
+<a id="l27" href="#l27">27</a>       if (req.headers.authorization !== `Bearer ${TOKEN}`) return reply(401, { error: &#x27;unauthorized&#x27; });
+<a id="l28" href="#l28">28</a>       if (req.method === &#x27;POST&#x27; &amp;&amp; u.pathname === &#x27;/v1/admin/sessions/workers/messages&#x27;) {
+<a id="l29" href="#l29">29</a>         h.sent.push(JSON.parse(Buffer.concat(chunks).toString()));
+<a id="l30" href="#l30">30</a>         const [status, json] = h.answers.shift() || [404, { error: &#x27;not_found&#x27;, message: &#x27;no peer in this session can take work now&#x27; }];
+<a id="l31" href="#l31">31</a>         return reply(status, json);
+<a id="l32" href="#l32">32</a>       }
+<a id="l33" href="#l33">33</a>       if (req.method === &#x27;GET&#x27; &amp;&amp; u.pathname === &#x27;/v1/admin/sessions/workers/messages&#x27;) {
+<a id="l34" href="#l34">34</a>         const after = Number(u.searchParams.get(&#x27;after&#x27;));
+<a id="l35" href="#l35">35</a>         return reply(200, { messages: h.messages.filter((m) =&gt; Number(m.id) &gt; after).slice(0, Number(u.searchParams.get(&#x27;limit&#x27;))) });
+<a id="l36" href="#l36">36</a>       }
+<a id="l37" href="#l37">37</a>       reply(404, { error: &#x27;not_found&#x27; });
+<a id="l38" href="#l38">38</a>     });
+<a id="l39" href="#l39">39</a>   });
+<a id="l40" href="#l40">40</a>   return new Promise((resolve) =&gt;
+<a id="l41" href="#l41">41</a>     server.listen(0, &#x27;127.0.0.1&#x27;, () =&gt; resolve({ ...h, h, url: `http://127.0.0.1:${server.address().port}`, close: () =&gt; new Promise((r) =&gt; server.close(r)) })),
+<a id="l42" href="#l42">42</a>   );
+<a id="l43" href="#l43">43</a> }
+<a id="l44" href="#l44">44</a> 
+<a id="l45" href="#l45">45</a> beforeEach(async () =&gt; {
+<a id="l46" href="#l46">46</a>   process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-coop-&#x27;));
+<a id="l47" href="#l47">47</a>   hub = await startHub();
+<a id="l48" href="#l48">48</a>   process.env.IDEAMINE_COOP_URL = hub.url;
+<a id="l49" href="#l49">49</a>   process.env.IDEAMINE_COOP_TOKEN = TOKEN;
+<a id="l50" href="#l50">50</a>   logs = [];
+<a id="l51" href="#l51">51</a> });
+<a id="l52" href="#l52">52</a> 
+<a id="l53" href="#l53">53</a> afterEach(async () =&gt; {
+<a id="l54" href="#l54">54</a>   await hub.close();
+<a id="l55" href="#l55">55</a>   delete process.env.IDEAMINE_COOP_URL;
+<a id="l56" href="#l56">56</a>   delete process.env.IDEAMINE_COOP_TOKEN;
+<a id="l57" href="#l57">57</a> });
+<a id="l58" href="#l58">58</a> 
+<a id="l59" href="#l59">59</a> const round = () =&gt; coop.round(coop.settings(), { log: (line) =&gt; logs.push(line) });
+<a id="l60" href="#l60">60</a> const idea = (id) =&gt; store.findIdea(store.load(), id);
+<a id="l61" href="#l61">61</a> const lastNote = (id) =&gt; idea(id).notes.at(-1).text;
+<a id="l62" href="#l62">62</a> 
+<a id="l63" href="#l63">63</a> /** An idea that the user dropped in Doing on a board with coop, through the page&#x27;s own dropCommand. */
+<a id="l64" href="#l64">64</a> function dropInDoing(text = &#x27;build the thing&#x27;) {
+<a id="l65" href="#l65">65</a>   const [{ idea: added }] = store.addIdeas(text);
+<a id="l66" href="#l66">66</a>   store.applyTriage([{ id: added.id, verdict: &#x27;do&#x27;, brief: &#x27;the plan&#x27;, model: &#x27;sonnet&#x27; }]);
+<a id="l67" href="#l67">67</a>   const page = fs.readFileSync(new URL(&#x27;../dashboard/index.html&#x27;, import.meta.url), &#x27;utf8&#x27;);
+<a id="l68" href="#l68">68</a>   const dropCommand = new Function(&#x27;state&#x27;, `${/function dropCommand[\s\S]*?\n}\n/.exec(page)[0]}; return dropCommand;`)({ data: { live: { coop: true } } });
+<a id="l69" href="#l69">69</a>   const command = dropCommand({ ...added, lane: &#x27;do&#x27; }, &#x27;doing&#x27;);
+<a id="l70" href="#l70">70</a>   assert.deepEqual(command, { action: &#x27;update&#x27;, body: { id: added.id, status: &#x27;doing&#x27;, agent: &#x27;any&#x27; } });
+<a id="l71" href="#l71">71</a>   const { id, ...patch } = command.body;
+<a id="l72" href="#l72">72</a>   store.updateIdea(id, patch);
+<a id="l73" href="#l73">73</a>   return id;
+<a id="l74" href="#l74">74</a> }
+<a id="l75" href="#l75">75</a> 
+<a id="l76" href="#l76">76</a> test(&#x27;coop is off without a hub url or without a token, the token is never a setting, and only Doing waits for an agent&#x27;, () =&gt; {
+<a id="l77" href="#l77">77</a>   assert.ok(coop.settings());
+<a id="l78" href="#l78">78</a>   assert.ok(!Object.keys(config.SETTINGS).some((key) =&gt; key.includes(&#x27;token&#x27;)));
+<a id="l79" href="#l79">79</a>   delete process.env.IDEAMINE_COOP_TOKEN;
+<a id="l80" href="#l80">80</a>   assert.equal(coop.settings(), null);
+<a id="l81" href="#l81">81</a>   process.env.IDEAMINE_COOP_TOKEN = TOKEN;
+<a id="l82" href="#l82">82</a>   delete process.env.IDEAMINE_COOP_URL;
+<a id="l83" href="#l83">83</a>   assert.equal(coop.settings(), null);
+<a id="l84" href="#l84">84</a>   const [{ idea: i }] = store.addIdeas(&#x27;x&#x27;);
+<a id="l85" href="#l85">85</a>   assert.throws(() =&gt; store.updateIdea(i.id, { agent: &#x27;any&#x27; }), /only an idea in Doing can wait for an agent/);
+<a id="l86" href="#l86">86</a>   assert.throws(() =&gt; store.updateIdea(i.id, { status: &#x27;doing&#x27;, agent: &#x27;claude@g&#x27; }), /agent must be &quot;any&quot;/);
+<a id="l87" href="#l87">87</a> });
+<a id="l88" href="#l88">88</a> 
+<a id="l89" href="#l89">89</a> test(&#x27;a card dropped in Doing goes to a free agent, shows its name, and DONE closes it&#x27;, async () =&gt; {
+<a id="l90" href="#l90">90</a>   const id = dropInDoing();
+<a id="l91" href="#l91">91</a>   assert.equal(lastNote(id), &#x27;waits for a free coop agent&#x27;);
+<a id="l92" href="#l92">92</a>   hub.h.answers.push([200, { id: &#x27;101&#x27;, to: &#x27;claude@gentoo&#x27;, sent_at: &#x27;now&#x27; }]);
+<a id="l93" href="#l93">93</a>   await round();
+<a id="l94" href="#l94">94</a>   assert.equal(hub.h.sent.length, 1);
+<a id="l95" href="#l95">95</a>   assert.equal(hub.h.sent[0].to, &#x27;any&#x27;);
+<a id="l96" href="#l96">96</a>   assert.match(hub.h.sent[0].text, /^Card IDEA-1 of jose&#x27;s ideamine board: build the thing\n\nbuild the thing\n\nPlan from the triage: the plan\n/);
+<a id="l97" href="#l97">97</a>   assert.deepEqual([idea(id).status, idea(id).agent.name, idea(id).agent.msg], [&#x27;doing&#x27;, &#x27;claude@gentoo&#x27;, &#x27;101&#x27;]);
+<a id="l98" href="#l98">98</a>   assert.equal(lastNote(id), &#x27;coop gave it to claude@gentoo&#x27;);
+<a id="l99" href="#l99">99</a> 
+<a id="l100" href="#l100">100</a>   await round(); // no answer yet: nothing changes, and nothing else is sent
+<a id="l101" href="#l101">101</a>   assert.equal(idea(id).agent.name, &#x27;claude@gentoo&#x27;);
+<a id="l102" href="#l102">102</a>   assert.equal(hub.h.sent.length, 1);
+<a id="l103" href="#l103">103</a> 
+<a id="l104" href="#l104">104</a>   hub.h.messages.push({ id: &#x27;102&#x27;, from: &#x27;claude@gentoo&#x27;, to: &#x27;operator&#x27;, reply_to: &#x27;101&#x27;, text: &#x27;DONE: pushed abc123 to main&#x27; });
+<a id="l105" href="#l105">105</a>   await round();
+<a id="l106" href="#l106">106</a>   assert.equal(store.lane(idea(id)), &#x27;done&#x27;);
+<a id="l107" href="#l107">107</a>   assert.equal(idea(id).agent, undefined);
+<a id="l108" href="#l108">108</a>   assert.equal(lastNote(id), &#x27;claude@gentoo: DONE: pushed abc123 to main&#x27;);
+<a id="l109" href="#l109">109</a>   assert.ok(hub.h.auth.every((a) =&gt; a === `Bearer ${TOKEN}`));
+<a id="l110" href="#l110">110</a>   assert.ok(logs.every((line) =&gt; !line.includes(TOKEN)), &#x27;the token stays out of the log&#x27;);
+<a id="l111" href="#l111">111</a> });
+<a id="l112" href="#l112">112</a> 
+<a id="l113" href="#l113">113</a> test(&#x27;an answer without DONE puts the card back in Do, with the answer as a note&#x27;, async () =&gt; {
+<a id="l114" href="#l114">114</a>   const id = dropInDoing();
+<a id="l115" href="#l115">115</a>   hub.h.answers.push([200, { id: &#x27;7&#x27;, to: &#x27;codex@gentoo&#x27; }]);
+<a id="l116" href="#l116">116</a>   await round();
+<a id="l117" href="#l117">117</a>   hub.h.messages.push({ id: &#x27;8&#x27;, from: &#x27;codex@gentoo&#x27;, reply_to: &#x27;7&#x27;, text: &#x27;FAILED: the project is not on this machine&#x27; });
+<a id="l118" href="#l118">118</a>   await round();
+<a id="l119" href="#l119">119</a>   assert.equal(store.lane(idea(id)), &#x27;do&#x27;);
+<a id="l120" href="#l120">120</a>   assert.equal(lastNote(id), &#x27;codex@gentoo: FAILED: the project is not on this machine&#x27;);
+<a id="l121" href="#l121">121</a> });
+<a id="l122" href="#l122">122</a> 
+<a id="l123" href="#l123">123</a> test(&#x27;when no agent is free, the card waits and goes in a later round&#x27;, async () =&gt; {
+<a id="l124" href="#l124">124</a>   const id = dropInDoing();
+<a id="l125" href="#l125">125</a>   await round(); // the hub answers 404
+<a id="l126" href="#l126">126</a>   assert.equal(idea(id).agent.name, &#x27;any&#x27;);
+<a id="l127" href="#l127">127</a>   assert.equal(logs.length, 0, &#x27;a busy pool is normal, not an error&#x27;);
+<a id="l128" href="#l128">128</a>   hub.h.answers.push([200, { id: &#x27;5&#x27;, to: &#x27;claude@subread&#x27; }]);
+<a id="l129" href="#l129">129</a>   await round();
+<a id="l130" href="#l130">130</a>   assert.equal(idea(id).agent.name, &#x27;claude@subread&#x27;);
+<a id="l131" href="#l131">131</a> });
+<a id="l132" href="#l132">132</a> 
+<a id="l133" href="#l133">133</a> test(&#x27;a card that the user moves out of Doing is free of its agent, and a late answer changes nothing&#x27;, async () =&gt; {
+<a id="l134" href="#l134">134</a>   const id = dropInDoing();
+<a id="l135" href="#l135">135</a>   hub.h.answers.push([200, { id: &#x27;3&#x27;, to: &#x27;claude@honjimaku&#x27; }]);
+<a id="l136" href="#l136">136</a>   await round();
+<a id="l137" href="#l137">137</a>   store.updateIdea(id, { status: &#x27;reopen&#x27; });
+<a id="l138" href="#l138">138</a>   assert.equal(idea(id).agent, undefined);
+<a id="l139" href="#l139">139</a>   hub.h.messages.push({ id: &#x27;4&#x27;, from: &#x27;claude@honjimaku&#x27;, reply_to: &#x27;3&#x27;, text: &#x27;DONE: late&#x27; });
+<a id="l140" href="#l140">140</a>   await round();
+<a id="l141" href="#l141">141</a>   assert.equal(store.lane(idea(id)), &#x27;do&#x27;);
+<a id="l142" href="#l142">142</a>   assert.notEqual(lastNote(id), &#x27;claude@honjimaku: DONE: late&#x27;);
+<a id="l143" href="#l143">143</a> });
+<a id="l144" href="#l144">144</a> 
+<a id="l145" href="#l145">145</a> test(&#x27;a card without an answer for 3 hours goes back in Do&#x27;, async () =&gt; {
+<a id="l146" href="#l146">146</a>   const id = dropInDoing();
+<a id="l147" href="#l147">147</a>   hub.h.answers.push([200, { id: &#x27;9&#x27;, to: &#x27;claude@gentoo&#x27; }]);
+<a id="l148" href="#l148">148</a>   await round();
+<a id="l149" href="#l149">149</a>   store.mutate((db) =&gt; (store.findIdea(db, id).agent.at = new Date(Date.now() - 4 * 3600000).toISOString()));
+<a id="l150" href="#l150">150</a>   await round();
+<a id="l151" href="#l151">151</a>   assert.equal(store.lane(idea(id)), &#x27;do&#x27;);
+<a id="l152" href="#l152">152</a>   assert.equal(lastNote(id), &#x27;no answer from claude@gentoo in 3 h&#x27;);
+<a id="l153" href="#l153">153</a> });
+<a id="l154" href="#l154">154</a> 
+<a id="l155" href="#l155">155</a> test(&#x27;claim takes each waiting card once, oldest first, and never another card: a property&#x27;, () =&gt; {
+<a id="l156" href="#l156">156</a>   fc.assert(
+<a id="l157" href="#l157">157</a>     fc.property(fc.array(fc.constantFrom(&#x27;waits&#x27;, &#x27;doing&#x27;, &#x27;do&#x27;, &#x27;inbox&#x27;, &#x27;done&#x27;), { maxLength: 12 }), (kinds) =&gt; {
+<a id="l158" href="#l158">158</a>       process.env.IDEAMINE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), &#x27;ideamine-claim-&#x27;));
+<a id="l159" href="#l159">159</a>       const waits = [];
+<a id="l160" href="#l160">160</a>       kinds.forEach((kind, n) =&gt; {
+<a id="l161" href="#l161">161</a>         const [{ idea: i }] = store.addIdeas(`idea ${n}`);
+<a id="l162" href="#l162">162</a>         if (kind === &#x27;do&#x27;) store.applyTriage([{ id: i.id, verdict: &#x27;do&#x27; }]);
+<a id="l163" href="#l163">163</a>         if ([&#x27;waits&#x27;, &#x27;doing&#x27;, &#x27;done&#x27;].includes(kind)) store.updateIdea(i.id, { status: kind === &#x27;done&#x27; ? &#x27;done&#x27; : &#x27;doing&#x27; });
+<a id="l164" href="#l164">164</a>         if (kind === &#x27;waits&#x27;) {
+<a id="l165" href="#l165">165</a>           store.updateIdea(i.id, { agent: &#x27;any&#x27; });
+<a id="l166" href="#l166">166</a>           store.mutate((db) =&gt; (store.findIdea(db, i.id).agent.at = new Date(Date.UTC(2026, 0, 1, 0, 0, 59 - n)).toISOString()));
+<a id="l167" href="#l167">167</a>           waits.push(i.id);
+<a id="l168" href="#l168">168</a>         }
+<a id="l169" href="#l169">169</a>       });
+<a id="l170" href="#l170">170</a>       const taken = [];
+<a id="l171" href="#l171">171</a>       for (let c; (c = coop.claim()); ) taken.push(c.id);
+<a id="l172" href="#l172">172</a>       assert.deepEqual(taken, waits.reverse()); // the later idea waits longer here
+<a id="l173" href="#l173">173</a>       assert.ok(store.load().ideas.every((i) =&gt; (waits.includes(i.id) ? i.agent.name === &#x27;coop&#x27; : !i.agent)));
+<a id="l174" href="#l174">174</a>     }),
+<a id="l175" href="#l175">175</a>     { numRuns: 60 },
+<a id="l176" href="#l176">176</a>   );
+<a id="l177" href="#l177">177</a> });
+<a id="l178" href="#l178">178</a> 
+<a id="l179" href="#l179">179</a> test(&#x27;claims from many processes at once never give one card twice&#x27;, async () =&gt; {
+<a id="l180" href="#l180">180</a>   const cards = 24;
+<a id="l181" href="#l181">181</a>   for (let n = 0; n &lt; cards; n++) {
+<a id="l182" href="#l182">182</a>     const [{ idea: i }] = store.addIdeas(`card ${n}`);
+<a id="l183" href="#l183">183</a>     store.updateIdea(i.id, { status: &#x27;doing&#x27;, agent: &#x27;any&#x27; });
+<a id="l184" href="#l184">184</a>   }
+<a id="l185" href="#l185">185</a>   const mod = new URL(&#x27;../src/coop.js&#x27;, import.meta.url).href;
+<a id="l186" href="#l186">186</a>   const run = () =&gt;
+<a id="l187" href="#l187">187</a>     new Promise((resolve, reject) =&gt; {
+<a id="l188" href="#l188">188</a>       const script = `const c = await import(${JSON.stringify(mod)}); const got = []; for (let x; (x = c.claim()); ) got.push(x.id); console.log(JSON.stringify(got));`;
+<a id="l189" href="#l189">189</a>       const child = spawn(process.execPath, [&#x27;--input-type=module&#x27;, &#x27;-e&#x27;, script], { env: process.env, stdio: [&#x27;ignore&#x27;, &#x27;pipe&#x27;, &#x27;pipe&#x27;] });
+<a id="l190" href="#l190">190</a>       let out = &#x27;&#x27;;
+<a id="l191" href="#l191">191</a>       let err = &#x27;&#x27;;
+<a id="l192" href="#l192">192</a>       child.stdout.on(&#x27;data&#x27;, (d) =&gt; (out += d));
+<a id="l193" href="#l193">193</a>       child.stderr.on(&#x27;data&#x27;, (d) =&gt; (err += d));
+<a id="l194" href="#l194">194</a>       child.on(&#x27;close&#x27;, (code) =&gt; (code === 0 ? resolve(JSON.parse(out)) : reject(new Error(err))));
+<a id="l195" href="#l195">195</a>     });
+<a id="l196" href="#l196">196</a>   const all = (await Promise.all(Array.from({ length: 6 }, run))).flat();
+<a id="l197" href="#l197">197</a>   assert.equal(all.length, cards);
+<a id="l198" href="#l198">198</a>   assert.equal(new Set(all).size, cards);
+<a id="l199" href="#l199">199</a> });</pre>
+</div></body></html>
