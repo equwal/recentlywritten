@@ -373,9 +373,11 @@ echo "  posts: $(wc -l < "$WORK/posts.tsv" | tr -d ' ')   pages: $(wc -l < "$WOR
 # the repo. The P (protect) rule stops --delete from removing the server
 # copy when the working tree has no audio, but the audio that the working
 # tree has still uploads.
+# sitemap.xml and robots.txt were written on the server and are not built here.
 if [ "$DEPLOY" = yes ]; then
     rsync -avzP --delete --exclude=/git/ --exclude=/git.html \
         --exclude=/static/book/ --filter='P /static/language-podcast/***' \
+        --exclude=/sitemap.xml --exclude=/robots.txt \
         "$SITE_DIR/" "$DEPLOY_HOST:$DEPLOY_PATH"
     ssh "$DEPLOY_HOST" "chmod -R a+rX $DEPLOY_PATH"
 fi
