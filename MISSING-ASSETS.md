@@ -18,8 +18,12 @@ than served as downloads that fail halfway.
 No copy of these survives online. Re-create each as `pages/<name>.md`.
 
 
-## Attachments referenced by the posts and pages (28)
+## Attachments referenced by the posts and pages (59)
 
+- Less_9780307485397_epub_css_r1.css  — used by korean-genius.html
+- about  — used by injector.html
+- ajax/libs/html5shiv/3.7.3/html5shiv-printshiv.min.js  — used by coleslaw.html
+- apple-touch-icon.png.pagespeed.ce.60l8vOTzHU.png  — used by injector.html
 - book/bible-as-literature-bates.pdf  — used by biblio.html
 - book/budhismaj-rakontoj-16-malalta-kvalito.mp3  — used by cervido.html
 - book/budhismaj-rakontoj-16-malalta-kvalito.ogg  — used by cervido.html
@@ -32,13 +36,40 @@ No copy of these survives online. Re-create each as `pages/<name>.md`.
 - book/rut-malalta-kvalito.ogg  — used by rut.html
 - book/rut.mp3  — used by rut.html
 - book/rut.ogg  — used by rut.html
-- eforth  — used by Forthe.html
+- css/A.non-critical.css.pagespeed.cf.igO-fVfzYM.css  — used by injector.html
+- css/style.css  — used by kazuki.html
+- drafts/pull-reqs/coleslaw-rsync.org::*Todo:  — used by coleslaw.html
+- favicon-16x16.png.pagespeed.ce.Pb3x7-YlHZ.png  — used by injector.html
+- favicon-32x32.png.pagespeed.ce.OszSqYKQei.png  — used by injector.html
+- fonts/fira-code-latin-300.woff2  — used by injector.html
+- fonts/fira-code-latin-400.woff2  — used by injector.html
+- fonts/fira-code-latin-700.woff2  — used by injector.html
+- fonts/roboto-slab-latin-400.woff2  — used by injector.html
+- fonts/roboto-slab-latin-700.woff2  — used by injector.html
 - fung-vol-1.pdf  — used by books.html
 - fung-vol-2.pdf  — used by books.html
+- images/Less_9780307485397_epub_L03_r1.jpg  — used by korean-genius.html
+- images/serious_thumbnail.webp.pagespeed.ce.0VEgJ_1gR6.webp  — used by injector.html
+- impressum/  — used by injector.html
+- jailbreak-resume.png.pagespeed.ce.GouXXf1H7_.png  — used by injector.html
+- js/flexsearch.js.pagespeed.ce.7vOvUkICMA.js  — used by injector.html
+- js/main.js  — used by injector.html
+- js/pdf-lib.min.js  — used by injector.html
 - links/atom.xml  — used by links.html
 - links/links.txt  — used by links.html
+- livereload.js  — used by injector.html
 - nada.mp3  — used by books.html
-- sl--dependency-language  — used by SL--Dependency-Language.html
+- page-template.xpgt  — used by korean-genius.html
+- posts  — used by injector.html
+- posts/inject-my-pdf/banner.png.pagespeed.ce.c1P8o5Yi6k.png  — used by injector.html
+- posts/inject-my-pdf/img.png  — used by injector.html
+- prism-themes/A.prism-gruvbox-dark.css.pagespeed.cf.xYrh7Zyuq-.css  — used by injector.html
+- prism-themes/prism-gruvbox-dark.css  — used by injector.html
+- prism-themes/prism-gruvbox-light.css  — used by injector.html
+- privacypolicy/  — used by injector.html
+- projects  — used by injector.html
+- safari-pinned-tab.svg  — used by injector.html
+- site.webmanifest  — used by injector.html
 - static/book/apl-pedagogical.pdf  — used by books.html
 - static/book/bates-literature-bible.pdf  — used by books.html
 - static/book/bicameral.epub  — used by books.html

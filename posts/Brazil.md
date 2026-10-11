@@ -14,12 +14,10 @@ I've spend a total of 13 months in Brazil in my adult life.
 
 Here I am about to go up Pão de Açúcar.
 
-  
-<img src="static/paodeacucartop.jpg" data-a="" data-cloud="" data-in="" data-m="" data-no="" data-sad.="" data-standing="" data-very="" data-view="" alt="I" />
+![I'm standing in a cloud no view, very sad.](static/paodeacucartop.jpg)
 
 And at the top
 
-  
-<img src="static/esperanto.jpg" data-a="" data-dozen="" data-esperantists="" data-in="" data-m="" data-middle="" data-of="" data-posing.="" data-the="" alt="I" />
+![I'm in the middle of a dozen esperantists posing.](static/esperanto.jpg)
 
 I met some people at an esperanto group in Rio.

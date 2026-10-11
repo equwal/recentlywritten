@@ -13,9 +13,9 @@ links:
 
 Version 0.0.2
 
-Docs available as: HTML([https://recentlywritten.com/eforth)](eforth).html) \| ORG-mode(<https://github.com/equwal/Forthe/blob/master/README.org)>
+Docs available as: [HTML](Forthe.html) | [ORG-mode](https://github.com/equwal/Forthe/blob/master/README.org)
 
-Code on github(<https://github.com/equwal/Forthe)>
+[Code on GitHub](https://github.com/equwal/Forthe)
 
 This is an implementation of an elisp-based FORTH. This means that elisp is used to write the function definitions. In fact, no FORTH function definitions are provided at all to the Forthe macro from the library. The main benefit comes from reducing the verbosity of elisp in a small Domain Specific Language the programmer defines.
 

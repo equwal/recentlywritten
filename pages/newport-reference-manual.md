@@ -17,7 +17,7 @@ links:
 
 ------------------------------------------------------------------------
 
-<img src="static/p-identical-to-p-tiny.png" data-a="" data-by="" data-followed="" data-identical-to="" data-p.="" alt="Logo fo Newport. A p followed by a triple bar (a math symbol for " />
+![Logo for Newport. A p followed by a triple bar (a math symbol for 'identical-to') followed by a p.](static/p-identical-to-p-tiny.png)
 
 #### Contents
 

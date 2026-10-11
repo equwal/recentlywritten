@@ -9,10 +9,10 @@ links:
 - '[Newport](Newport.html)'
 ---
 
-\[image /static/bnf-sl.png\]
+![BNF for SL](static/bnf-sl.png)
 
-\[Github\](<https://github.com/equwal/sl)> \|  
-\[Homepage\]([https://recentlywritten.com/sl--dependency-language)](sl--dependency-language).html)
+[Github](https://github.com/equwal/sl) |  
+[Homepage](SL--Dependency-Language.html)
 
 SL is a Domain Specific Language (ie. simple programming language) for dealing with ambiguous dependency situations. It is more expressive than the standard method in Common Lisp: the use of reader macros.
 

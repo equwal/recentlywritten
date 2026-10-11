@@ -1,0 +1,11 @@
+(defun eforth--inner (lang list)
+  (let ((s))
+    (dolist (i list)
+      (if (assoc i lang)
+          (let ((fn (cadr (assoc i lang))))
+            (if s
+                (progn (apply fn s) (setf s nil))
+              (funcall fn)))
+        (push i s)))))
+(defmacro eforth (lang list)
+  `(eforth--inner ,lang ',list))
